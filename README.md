@@ -1,50 +1,44 @@
-# void Image Viewer
-A lightweight image viewer for Windows with animated GIF/WEBP support.  
-Opens and displays BMP, GIF, ICO, PNG, JPG, TIF and WEBP images as fast as possible.  
-Animate GIF/WEBP files as accurately as possible.  
+# riviv
 
-[Download](#download)<br/>
-[See also](#See-also)<br/>
-<br/><br/><br/>
+Unofficial Rust rewrite of [voidtools/voidImageViewer](https://github.com/voidtools/voidImageViewer) (MIT) — a lightweight, single-executable image viewer for Windows.
 
+Based on voidImageViewer by David Carpenter / voidtools. See [LICENSE](LICENSE). The original C implementation is preserved under [`c-original/`](c-original/) as a read-only behavioral reference.
 
+> **Status: early development (M1 skeleton).** Current scope: Win32 window + GDI rendering + static image display (PNG / JPEG / BMP / ICO / TIFF / GIF / WebP first frame) with drag & drop. Animation, playlist, zoom/pan and settings land in M2/M3 — see [Roadmap](#roadmap).
 
-Download
---------
-https://github.com/voidtools/voidImageViewer/releases
+## Build
 
-https://www.voidtools.com/forum/viewtopic.php?t=5623
-<br/><br/><br/>
+Requires the Rust toolchain with the MSVC target.
 
+```text
+cargo build --release
+```
 
-void Image Viewer main window:
+## Usage
 
-![Void Image Viewer Image View](https://www.voidtools.com/voidImageViewer.Image.View10.gif)
-<br/><br/><br/>
+```text
+riviv.exe <image path>    open an image
+riviv.exe                 empty window; press Ctrl+O to pick a file
+```
 
+Drag & drop a file onto the window to switch images (a single dropped file replaces the current image, matching upstream behavior).
 
+## Roadmap
 
-void Image Viewer General Options:
+- [x] M1 — skeleton: Win32 window + GDI rendering + static image display
+- [ ] M2 — animated GIF/WebP, playlist, zoom/pan, background decoding
+- [ ] M3 — settings & custom shortcuts, Everything IPC, file associations, localization, installer
 
-![Void Image Viewer Options General](https://www.voidtools.com/voidImageViewer.Options.General10.png)
-<br/><br/><br/>
+## Differences from upstream (intentional, M1)
 
+- The window opens at image size (upstream: remembered window rect, or 60% auto-fit on first run — restored in M3 with config persistence).
+- Images are never upscaled beyond 100% (upstream default `fill_window=0`).
+- The window never resizes when switching images via drag & drop (upstream behavior).
+- Default window icon for now (upstream ships its own icon).
+- Only the first frame of animated images is shown until M2.
 
+Agent workflow: see [AGENTS.md](AGENTS.md). Decisions: `docs/adr/`.
 
-void Image Viewer View Options:
+## License
 
-![Void Image Viewer Options View](https://www.voidtools.com/voidImageViewer.Options.View10.png)
-<br/><br/><br/>
-
-
-
-void Image Viewer Controls Options:
-
-![Void Image Viewer Image Controls](https://www.voidtools.com/voidImageViewer.Options.Controls10.png)
-<br/><br/><br/>
-
-
-
-See also
---------
-https://www.voidtools.com/forum/viewtopic.php?t=5623
+MIT — same as upstream. Original C implementation © voidtools / David Carpenter.

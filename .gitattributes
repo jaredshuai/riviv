@@ -1,0 +1,16 @@
+# LF 统一:避免 CRLF 噪声 diff;保证 .githooks 脚本与 CI 在 bash 下行为一致
+* text=auto eol=lf
+
+# 二进制资产(图片/图标/构建产物)
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.bmp binary
+*.ico binary
+*.webp binary
+*.tif binary
+*.tiff binary
+*.exe binary
+*.lib binary
+*.pdb binary
