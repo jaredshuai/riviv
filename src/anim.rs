@@ -51,19 +51,13 @@ pub(crate) struct FrameScheduler {
 
 impl FrameScheduler {
     /// A scheduler starting at `tick_start` with no accumulated time
-    /// (upstream `_viv_start_first_frame`, viv.c:14312-14317).
+    /// (upstream `_viv_start_first_frame`, viv.c:14312-14317) — the only
+    /// anchor: playback keeps it until the image is replaced.
     pub(crate) fn new(tick_start: u64) -> Self {
         FrameScheduler {
             timer_tick: 0,
             tick_start,
         }
-    }
-
-    /// Restart from `tick_start` as if the animation had just been opened
-    /// (upstream resets both fields whenever the displayed image or frame
-    /// position is re-anchored, viv.c:1898/9274/10072/14315).
-    pub(crate) fn restart(&mut self, tick_start: u64) {
-        *self = FrameScheduler::new(tick_start);
     }
 
     /// Process one timer event measured at `now` (QPC ticks, `freq` ticks
@@ -239,22 +233,6 @@ mod tests {
         assert!(adv.repaint);
         let adv = s.on_timer(26, FREQ, &delays, adv.position, true);
         assert_eq!(adv.position, 2);
-    }
-
-    #[test]
-    fn restart_anchors_accumulation_to_the_given_tick() {
-        let mut s = scheduler_starting_at(0);
-        let delays = [100, 100];
-        let _ = s.on_timer(50, FREQ, &delays, 0, true);
-        // Reopening the image restarts the timeline: 50 ms of stale
-        // accumulation must not survive into the new playback.
-        s.restart(1_000);
-        let adv = s.on_timer(1_050, FREQ, &delays, 0, true);
-        assert_eq!(adv.position, 0);
-        assert!(!adv.repaint);
-        let adv = s.on_timer(1_100, FREQ, &delays, 0, true);
-        assert_eq!(adv.position, 1);
-        assert!(adv.repaint);
     }
 
     #[test]

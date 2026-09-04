@@ -24,7 +24,7 @@ use image::{AnimationDecoder, Frames, GenericImageView, ImageDecoder, ImageForma
 
 use crate::anim::{FrameScheduler, gif_delay_ms};
 use crate::pixels::{WINDOWED_BACKGROUND_RGB, composite_over_background_in_place};
-use crate::surface::Surface;
+use crate::surface::{DibFrame, Surface};
 
 /// Cumulative decoded-frame budget. Without a total cap a hostile file
 /// could declare an unbounded frame stream and exhaust memory — streaming
@@ -45,8 +45,11 @@ const MAX_FRAMES: usize = 4096;
 
 /// One step of the load protocol, in delivery order (upstream
 /// `_VIV_REPLY_LOAD_IMAGE_*`, viv.c:310-313). Generic over the frame
-/// payload so the UI-side state machine is unit-testable without GDI.
-pub(crate) enum LoadReply<F = Surface> {
+/// payload: the worker sends bare DIBs (`DibFrame`, the default); the UI
+/// maps them to DC-wrapping `Surface`s before applying, so the state
+/// machine is unit-testable without GDI.
+#[derive(Debug, PartialEq)]
+pub(crate) enum LoadReply<F = DibFrame> {
     /// The first decoded frame — the UI swaps the display to it (old image
     /// visible until this arrives). `delay_ms` is the frame's own delay,
     /// relevant only if more frames follow.
@@ -239,9 +242,9 @@ fn stream_animation(
         // Resolve transparency against the windowed background before the
         // DIB copy — the render path has no alpha channel of its own.
         composite_over_background_in_place(&mut buffer, WINDOWED_BACKGROUND_RGB);
-        // Surface failures are purely system-level (GDI allocation); fail
+        // DIB failures are purely system-level (GDI allocation); fail
         // loud (ADR 0001) through the FatalSystem reply.
-        let frame = Surface::from_rgba(w, h, &mut buffer.into_raw()).map_err(Stop::Fatal)?;
+        let frame = DibFrame::from_rgba(w, h, &mut buffer.into_raw()).map_err(Stop::Fatal)?;
         if emitted == 0 {
             sink(LoadReply::FirstFrame { frame, delay_ms });
         } else {
@@ -282,14 +285,34 @@ fn sink_static<D: ImageDecoder>(
     // RGB under the alpha channel (upstream composites over
     // config_windowed_background_color; identity for opaque images).
     composite_over_background_in_place(&mut rgba, WINDOWED_BACKGROUND_RGB);
-    let surface = Surface::from_rgba(w, h, &mut rgba).map_err(Stop::Fatal)?;
+    let frame = DibFrame::from_rgba(w, h, &mut rgba).map_err(Stop::Fatal)?;
     // A static image is a one-frame stream: first frame, then Complete from
     // decode_to_sink. delay_ms is unused (no second frame ever follows).
-    sink(LoadReply::FirstFrame {
-        frame: surface,
-        delay_ms: 0,
-    });
+    sink(LoadReply::FirstFrame { frame, delay_ms: 0 });
     Ok(())
+}
+
+/// Convert a reply's frame payload — the UI thread maps worker DIBs into
+/// DC-carrying Surfaces (memory DCs belong to their creating thread), with
+/// a conversion failure surfacing as the system-level FatalSystem reply
+/// (GDI exhaustion, ADR 0001).
+pub(crate) fn map_reply_frame<E, F>(
+    reply: LoadReply<E>,
+    convert: impl Fn(E) -> Result<F, String>,
+) -> LoadReply<F> {
+    match reply {
+        LoadReply::FirstFrame { frame, delay_ms } => match convert(frame) {
+            Ok(frame) => LoadReply::FirstFrame { frame, delay_ms },
+            Err(msg) => LoadReply::FatalSystem(msg),
+        },
+        LoadReply::AdditionalFrame { frame, delay_ms } => match convert(frame) {
+            Ok(frame) => LoadReply::AdditionalFrame { frame, delay_ms },
+            Err(msg) => LoadReply::FatalSystem(msg),
+        },
+        LoadReply::Complete => LoadReply::Complete,
+        LoadReply::FailedUser(msg) => LoadReply::FailedUser(msg),
+        LoadReply::FatalSystem(msg) => LoadReply::FatalSystem(msg),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -313,10 +336,13 @@ impl FrameDims for Surface {
 /// as the background decode streams them in, `decode_complete` flips on
 /// the terminal reply and unlocks wrap-around.
 ///
-/// The scheduler's time anchor is (re)set when frames are applied — see
-/// `apply_reply` (upstream `_viv_start_first_frame` is likewise a UI-side
-/// action, viv.c:14310).
-pub(crate) struct LoadedImage<F = Surface> {
+/// The timeline is anchored once, at the first frame's display (upstream
+/// `_viv_start_first_frame`, viv.c:14312-14317) — and deliberately NOT
+/// re-anchored when later frames arrive: the scheduler's stall branch
+/// already discards time accumulated while waiting at the loaded edge, so
+/// a frame that arrives *before* the edge lets playback advance on
+/// schedule (upstream semantics).
+pub(crate) struct LoadedImage<F = crate::surface::Surface> {
     frames: Vec<F>,
     /// Per-frame delays in ms, parallel to `frames` (a frame's delay only
     /// matters once a successor exists).
@@ -339,21 +365,18 @@ impl<F> LoadedImage<F> {
         }
     }
 
-    /// Append a streamed frame. Returns `true` when this frame made the
-    /// image animated (1 -> 2 frames) — the caller re-anchors the timeline
-    /// and starts the timer on that transition (upstream knows the count
-    /// up front and starts the timer at the first frame; without a
+    /// Append a streamed frame. The window layer derives the animation
+    /// timer from the resulting image state (upstream knows the frame
+    /// count up front and starts the timer at the first frame; without a
     /// pre-known count the second frame is the earliest animation signal).
-    fn push_frame(&mut self, frame: F, delay_ms: u32) -> bool {
+    fn push_frame(&mut self, frame: F, delay_ms: u32) {
         if self.decode_complete {
             // Defensive: the producer never sends frames past Complete; a
             // completed frame set is final, so a late frame is dropped.
-            return false;
+            return;
         }
-        let became_animated = self.frames.len() == 1;
         self.frames.push(frame);
         self.delays_ms.push(delay_ms);
-        became_animated
     }
 
     /// The stream ended: the loaded prefix is the full frame set
@@ -386,13 +409,6 @@ impl<F> LoadedImage<F> {
         self.frames.len() > 1
     }
 
-    /// Show frame 0 and anchor the animation timeline to `tick_start`
-    /// (upstream `_viv_start_first_frame`, viv.c:14312-14317).
-    pub(crate) fn restart_animation(&mut self, tick_start: u64) {
-        self.position = 0;
-        self.scheduler.restart(tick_start);
-    }
-
     /// WM_TIMER body: advance by the time elapsed since the last event and
     /// return whether the displayed frame changed (a repaint is due).
     pub(crate) fn advance_on_timer(&mut self, now: u64, freq: u64) -> bool {
@@ -410,14 +426,13 @@ impl<F> LoadedImage<F> {
 }
 
 /// What the window layer must do after a reply is applied (batched so the
-/// Win32 calls happen outside the state borrow, in a fixed order).
+/// Win32 calls happen outside the state borrow, in a fixed order). The
+/// animation timer is deliberately NOT an action: the window layer
+/// reconciles it from the final image state after the whole drain, so a
+/// batch that both starts and retires an animation cannot leave a stale
+/// timer running.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum UiAction {
-    /// The displayed image became animated — run the animation timer.
-    StartAnimationTimer,
-    /// The displayed image stopped being animated (replaced/cleared) —
-    /// stop the timer if it runs.
-    StopAnimationTimer,
     /// The pixels on screen changed — repaint.
     Invalidate,
     /// Adopt the session's path (window title + Ctrl+O initial dir).
@@ -440,13 +455,18 @@ pub(crate) struct ReplyOutcome {
 /// `displayed_from` tracks which session produced the currently displayed
 /// image, so replies from a superseded or failed load are inert.
 ///
+/// `startup_resize_session` is the session the startup resize belongs to —
+/// only THAT session's first frame consumes it, so a startup load that is
+/// superseded or fails pre-first-frame cannot make a later open resize
+/// the window.
+///
 /// `now` is the QPC reading taken before any state borrow (the caller's
 /// fatal path must not run across a borrow — PR #10 P1).
 pub(crate) fn apply_reply<F>(
     image: &mut Option<LoadedImage<F>>,
     displayed_from: &mut Option<u64>,
     session_id: u64,
-    startup_resize_pending: &mut bool,
+    startup_resize_session: &mut Option<u64>,
     now: u64,
     reply: LoadReply<F>,
 ) -> ReplyOutcome {
@@ -457,15 +477,11 @@ pub(crate) fn apply_reply<F>(
             // and hold down right, we might never see an image"); a newer
             // session's first frame simply wins by construction — this
             // handler only ever drains the newest session's queue.
-            let was_animated = image.as_ref().is_some_and(LoadedImage::is_animated);
             *image = Some(LoadedImage::first_frame(frame, delay_ms, now));
             *displayed_from = Some(session_id);
             let mut actions = vec![UiAction::Invalidate, UiAction::SetWindowTitle];
-            if was_animated {
-                actions.push(UiAction::StopAnimationTimer);
-            }
-            if *startup_resize_pending {
-                *startup_resize_pending = false;
+            if *startup_resize_session == Some(session_id) {
+                *startup_resize_session = None;
                 actions.push(UiAction::ResizeWindowToImage);
             }
             ReplyOutcome {
@@ -476,21 +492,15 @@ pub(crate) fn apply_reply<F>(
         LoadReply::AdditionalFrame { frame, delay_ms } => {
             // Only append to the image this session produced (defensive:
             // per-session queues already make cross-session delivery
-            // impossible, this pins the protocol).
+            // impossible, this pins the protocol). The timeline is NOT
+            // re-anchored: a frame arriving before the loaded edge lets
+            // playback advance on schedule, and one arriving after finds
+            // the stall branch already zeroing the accumulated time —
+            // upstream semantics either way (viv.c:3233-3240).
             if *displayed_from == Some(session_id)
                 && let Some(img) = image.as_mut()
-                && img.push_frame(frame, delay_ms)
             {
-                // The image just became animated: anchor playback to this
-                // moment — time elapsed between the first frame's display
-                // and this arrival must not count against frame 0's delay
-                // (the stall branch would have zeroed it every tick anyway,
-                // viv.c:3233-3240).
-                img.restart_animation(now);
-                return ReplyOutcome {
-                    actions: vec![UiAction::StartAnimationTimer],
-                    fatal: None,
-                };
+                img.push_frame(frame, delay_ms);
             }
             ReplyOutcome::default()
         }
@@ -507,15 +517,10 @@ pub(crate) fn apply_reply<F>(
                 // A partial image of ours is (or was) on screen — the old
                 // image is gone, so clear to blank like upstream's FAILED
                 // handler (viv.c:2832-2840).
-                let was_animated = image.as_ref().is_some_and(LoadedImage::is_animated);
                 *image = None;
                 *displayed_from = None;
-                let mut actions = vec![UiAction::Invalidate, UiAction::SetWindowTitle];
-                if was_animated {
-                    actions.push(UiAction::StopAnimationTimer);
-                }
                 ReplyOutcome {
-                    actions,
+                    actions: vec![UiAction::Invalidate, UiAction::SetWindowTitle],
                     fatal: None,
                 }
             } else {
@@ -560,26 +565,22 @@ mod tests {
     }
 
     #[test]
-    fn first_frame_swaps_the_display_and_stops_the_old_animation_timer() {
+    fn first_frame_swaps_the_display() {
         let mut image = Some(Img::first_frame(7, 100, 0));
         image.as_mut().unwrap().push_frame(8, 100); // old image animated
         let mut displayed_from = Some(99);
-        let mut resize_pending = false;
+        let mut resize_session = None;
         let out = apply_reply(
             &mut image,
             &mut displayed_from,
             1,
-            &mut resize_pending,
+            &mut resize_session,
             0,
             frame(1),
         );
         assert_eq!(
             out.actions,
-            vec![
-                UiAction::Invalidate,
-                UiAction::SetWindowTitle,
-                UiAction::StopAnimationTimer
-            ]
+            vec![UiAction::Invalidate, UiAction::SetWindowTitle]
         );
         assert_eq!(displayed_from, Some(1));
         let img = image.unwrap();
@@ -588,60 +589,112 @@ mod tests {
     }
 
     #[test]
-    fn the_startup_resize_is_consumed_by_the_first_frame_only() {
+    fn the_startup_resize_belongs_to_its_session_only() {
         let mut image = None;
         let mut displayed_from = None;
-        let mut resize_pending = true;
+        let mut resize_session = Some(1);
         let out = apply_reply(
             &mut image,
             &mut displayed_from,
             1,
-            &mut resize_pending,
+            &mut resize_session,
             0,
             frame(1),
         );
         assert!(out.actions.contains(&UiAction::ResizeWindowToImage));
-        assert!(!resize_pending, "pending flag cleared with the action");
+        assert_eq!(resize_session, None, "consumed with the action");
         // A later first frame (another open) must not resize again.
         let out = apply_reply(
             &mut image,
             &mut displayed_from,
             2,
-            &mut resize_pending,
+            &mut resize_session,
             10,
             frame(2),
         );
         assert!(!out.actions.contains(&UiAction::ResizeWindowToImage));
+
+        // A startup load superseded before its first frame: the pending
+        // resize belongs to the dead session, so the superseding open's
+        // first frame must not consume it (image switches never resize).
+        let mut resize_session = Some(5);
+        let out = apply_reply(
+            &mut image,
+            &mut displayed_from,
+            6,
+            &mut resize_session,
+            20,
+            frame(3),
+        );
+        assert!(!out.actions.contains(&UiAction::ResizeWindowToImage));
+        assert_eq!(resize_session, Some(5), "not consumed by another session");
     }
 
     #[test]
-    fn the_second_frame_starts_the_timer_and_reanchors_the_timeline() {
+    fn the_second_frame_arriving_early_keeps_the_first_frame_anchor() {
         let mut image = None;
         let mut displayed_from = None;
-        let mut resize_pending = false;
+        let mut resize_session = None;
         apply_reply(
             &mut image,
             &mut displayed_from,
             1,
-            &mut resize_pending,
+            &mut resize_session,
             0,
             frame(1),
         );
-        // Frame 2 arrives 5 s after frame 1 was displayed: playback anchors
-        // to the arrival, so frame 1 shows for its full delay from here.
+        // Frame 2 arrives at t=80, before frame 1's 100 ms delay expires:
+        // playback must advance on schedule at t=100, not restart the
+        // clock at the arrival (upstream runs the timer from the first
+        // frame; the stall branch only discards time once the edge is
+        // actually reached, viv.c:3233-3240).
         let out = apply_reply(
             &mut image,
             &mut displayed_from,
             1,
-            &mut resize_pending,
+            &mut resize_session,
+            80,
+            additional(2),
+        );
+        assert_eq!(out.actions, Vec::<UiAction>::new());
+        let mut img = image.unwrap();
+        assert!(img.is_animated());
+        assert!(!img.advance_on_timer(99, FREQ));
+        assert_eq!(*img.surface(), 1);
+        assert!(img.advance_on_timer(100, FREQ));
+        assert_eq!(*img.surface(), 2);
+    }
+
+    #[test]
+    fn the_second_frame_arriving_late_advances_within_the_catchup_cap() {
+        let mut image = None;
+        let mut displayed_from = None;
+        let mut resize_session = None;
+        apply_reply(
+            &mut image,
+            &mut displayed_from,
+            1,
+            &mut resize_session,
+            0,
+            frame(1),
+        );
+        // Frame 2 arrives 5 s later: the first timer event credits at most
+        // 1 s (the catch-up cap), which advances to frame 1 and then stalls
+        // at the next unloaded edge with a zeroed accumulator — the same
+        // wait-at-the-edge semantics upstream's per-tick stall produces.
+        apply_reply(
+            &mut image,
+            &mut displayed_from,
+            1,
+            &mut resize_session,
             5_000,
             additional(2),
         );
-        assert_eq!(out.actions, vec![UiAction::StartAnimationTimer]);
         let mut img = image.unwrap();
-        assert!(img.is_animated());
-        assert!(!img.advance_on_timer(5_099, FREQ), "99 < 100 ms elapsed");
-        assert!(img.advance_on_timer(5_100, FREQ), "full delay reached");
+        assert!(img.advance_on_timer(5_010, FREQ));
+        assert_eq!(*img.surface(), 2);
+        // No frame 3: hold at the edge without accumulating.
+        assert!(!img.advance_on_timer(8_000, FREQ));
         assert_eq!(*img.surface(), 2);
     }
 
@@ -649,12 +702,12 @@ mod tests {
     fn frames_beyond_the_second_do_not_disturb_the_running_timeline() {
         let mut image = None;
         let mut displayed_from = None;
-        let mut resize_pending = false;
+        let mut resize_session = None;
         apply_reply(
             &mut image,
             &mut displayed_from,
             1,
-            &mut resize_pending,
+            &mut resize_session,
             0,
             frame(1),
         );
@@ -662,25 +715,22 @@ mod tests {
             &mut image,
             &mut displayed_from,
             1,
-            &mut resize_pending,
+            &mut resize_session,
             100,
             additional(2),
         );
-        // Frame 3 arrives 100 ms later, mid-playback: no re-anchor (only the
-        // became-animated transition restarts the timeline).
-        let out = apply_reply(
+        // Frame 3 arrives 100 ms later, mid-playback: the anchor stays at
+        // the first frame — 350 ms of elapsed playback crosses the delays
+        // of frames 1 and 2 (100 + 100) and stops at frame 3's.
+        apply_reply(
             &mut image,
             &mut displayed_from,
             1,
-            &mut resize_pending,
+            &mut resize_session,
             200,
             additional(3),
         );
-        assert_eq!(out.actions, Vec::<UiAction>::new());
         let mut img = image.unwrap();
-        // 250 ms since the anchor at 100: crosses the delays of frames 1
-        // and 2 (100 + 100), stops at frame 3's. A wrongful re-anchor at
-        // 200 would credit only 150 ms and stop one frame earlier.
         assert!(img.advance_on_timer(350, FREQ));
         assert_eq!(*img.surface(), 3);
     }
@@ -689,7 +739,7 @@ mod tests {
     fn stale_session_frames_are_dropped_without_touching_the_display() {
         let mut image = Some(Img::first_frame(1, 100, 0));
         let mut displayed_from = Some(1);
-        let mut resize_pending = false;
+        let mut resize_session = None;
         // A frame from any session other than the one that produced the
         // display is dropped. Per-session queues make this unreachable in
         // practice (the handler drains one queue in delivery order); the
@@ -698,7 +748,7 @@ mod tests {
             &mut image,
             &mut displayed_from,
             2,
-            &mut resize_pending,
+            &mut resize_session,
             10,
             additional(2),
         );
@@ -711,12 +761,12 @@ mod tests {
     fn completion_unlocks_wrapping_at_the_loaded_edge() {
         let mut image = None;
         let mut displayed_from = None;
-        let mut resize_pending = false;
+        let mut resize_session = None;
         apply_reply(
             &mut image,
             &mut displayed_from,
             1,
-            &mut resize_pending,
+            &mut resize_session,
             0,
             frame(1),
         );
@@ -724,7 +774,7 @@ mod tests {
             &mut image,
             &mut displayed_from,
             1,
-            &mut resize_pending,
+            &mut resize_session,
             0,
             additional(2),
         );
@@ -744,12 +794,12 @@ mod tests {
     fn user_failure_before_our_first_frame_keeps_the_old_display() {
         let mut image = Some(Img::first_frame(1, 100, 0));
         let mut displayed_from = Some(7); // displayed image from another load
-        let mut resize_pending = false;
+        let mut resize_session = None;
         let out = apply_reply(
             &mut image,
             &mut displayed_from,
             1,
-            &mut resize_pending,
+            &mut resize_session,
             10,
             Reply::FailedUser("bad file".into()),
         );
@@ -764,7 +814,7 @@ mod tests {
             &mut image,
             &mut displayed_from,
             1,
-            &mut resize_pending,
+            &mut resize_session,
             10,
             Reply::FailedUser("bad file".into()),
         );
@@ -777,12 +827,12 @@ mod tests {
         // Static partial (first frame only).
         let mut image = None;
         let mut displayed_from = None;
-        let mut resize_pending = false;
+        let mut resize_session = None;
         apply_reply(
             &mut image,
             &mut displayed_from,
             1,
-            &mut resize_pending,
+            &mut resize_session,
             0,
             frame(1),
         );
@@ -790,7 +840,7 @@ mod tests {
             &mut image,
             &mut displayed_from,
             1,
-            &mut resize_pending,
+            &mut resize_session,
             10,
             Reply::FailedUser("over budget".into()),
         );
@@ -801,14 +851,15 @@ mod tests {
         assert!(image.is_none(), "partial image cleared");
         assert_eq!(displayed_from, None);
 
-        // Animated partial (timer running).
+        // Animated partial: same clear (the window layer stops the timer
+        // from the cleared image state).
         let mut image = None;
         let mut displayed_from = None;
         apply_reply(
             &mut image,
             &mut displayed_from,
             1,
-            &mut resize_pending,
+            &mut resize_session,
             0,
             frame(1),
         );
@@ -816,7 +867,7 @@ mod tests {
             &mut image,
             &mut displayed_from,
             1,
-            &mut resize_pending,
+            &mut resize_session,
             0,
             additional(2),
         );
@@ -824,11 +875,14 @@ mod tests {
             &mut image,
             &mut displayed_from,
             1,
-            &mut resize_pending,
+            &mut resize_session,
             10,
             Reply::FailedUser("over budget".into()),
         );
-        assert!(out.actions.contains(&UiAction::StopAnimationTimer));
+        assert_eq!(
+            out.actions,
+            vec![UiAction::Invalidate, UiAction::SetWindowTitle]
+        );
         assert!(image.is_none());
     }
 
@@ -836,12 +890,12 @@ mod tests {
     fn system_failure_is_surfaced_for_the_ui_thread_to_fail_loud() {
         let mut image = None;
         let mut displayed_from = None;
-        let mut resize_pending = false;
+        let mut resize_session = None;
         let out = apply_reply(
             &mut image,
             &mut displayed_from,
             1,
-            &mut resize_pending,
+            &mut resize_session,
             0,
             Reply::FatalSystem("CreateDIBSection failed".into()),
         );
@@ -853,12 +907,12 @@ mod tests {
     fn complete_for_a_stale_session_leaves_the_displayed_stream_open() {
         let mut image = None;
         let mut displayed_from = None;
-        let mut resize_pending = false;
+        let mut resize_session = None;
         apply_reply(
             &mut image,
             &mut displayed_from,
             1,
-            &mut resize_pending,
+            &mut resize_session,
             0,
             frame(1),
         );
@@ -866,7 +920,7 @@ mod tests {
             &mut image,
             &mut displayed_from,
             1,
-            &mut resize_pending,
+            &mut resize_session,
             0,
             additional(2),
         );
@@ -875,7 +929,7 @@ mod tests {
             &mut image,
             &mut displayed_from,
             2,
-            &mut resize_pending,
+            &mut resize_session,
             0,
             Reply::Complete,
         );
@@ -884,5 +938,36 @@ mod tests {
         // Still open at the edge: holds instead of wrapping.
         assert!(!img.advance_on_timer(5_000, FREQ));
         assert_eq!(*img.surface(), 2);
+    }
+
+    #[test]
+    fn reply_frame_mapping_wraps_worker_dibs_and_surfaces_wrap_failures() {
+        // DibFrame -> Surface conversion is the UI-side job; the pure
+        // mapping keeps protocol replies intact and turns conversion
+        // failures into the fail-loud reply.
+        let convert = |n: u32| -> Result<u32, String> {
+            if n == 13 {
+                Err("CreateCompatibleDC failed".into())
+            } else {
+                Ok(n + 100)
+            }
+        };
+        let first = map_reply_frame(frame(1), convert);
+        assert_eq!(
+            first,
+            Reply::FirstFrame {
+                frame: 101,
+                delay_ms: 100
+            }
+        );
+        let failed = map_reply_frame(additional(13), convert);
+        assert_eq!(
+            failed,
+            Reply::FatalSystem("CreateCompatibleDC failed".to_string())
+        );
+        let terminal = map_reply_frame(Reply::Complete, convert);
+        assert_eq!(terminal, Reply::Complete);
+        let user = map_reply_frame(Reply::FailedUser("x".into()), convert);
+        assert_eq!(user, Reply::FailedUser("x".to_string()));
     }
 }
