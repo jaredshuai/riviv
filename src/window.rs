@@ -100,6 +100,11 @@ pub(crate) struct WindowState {
     /// (upstream reads it from the load's WIN32_FIND_DATA, viv.c:11152) —
     /// None/0 omits the size clause.
     pub(crate) displayed_file_bytes: Option<u64>,
+    /// Byte size of the in-flight load's file, staged at `request_open` and
+    /// committed to `displayed_file_bytes` only when its first frame takes
+    /// the display — a failed replacement must not clobber the old image's
+    /// size in the status bar (cubic PR #13).
+    pub(crate) pending_file_bytes: Option<u64>,
 }
 
 /// Window state pointer stored in GWLP_USERDATA between WM_NCCREATE and
@@ -213,9 +218,12 @@ fn request_open(hwnd: HWND, path: &OsStr, is_startup: bool) {
         // (viv.c:1447-1458).
         state.status_file_not_found = false;
         state.status_load_failed = false;
-        // The byte size belongs to the requested path until the load
-        // commits (FirstFrame moves it to `displayed_file_bytes`).
-        state.displayed_file_bytes = file_bytes;
+        // The byte size is STAGED, not committed: a replacement load that
+        // fails before its first frame keeps the old image on screen, and
+        // the status bar must keep showing the OLD file's size with it
+        // (cubic PR #13). Committed to `displayed_file_bytes` when this
+        // session's first frame takes the display.
+        state.pending_file_bytes = file_bytes;
         let session = state.load_thread.request(hwnd, path.to_os_string());
         if is_startup {
             state.startup_resize_session = Some(session.id());
@@ -296,6 +304,10 @@ fn on_load_replies(hwnd: HWND) {
                         if state.displayed_from == Some(session_id) {
                             state.path = Some(session_path.clone());
                             title = Some(HSTRING::from_wide(&title_wide(state.path.as_deref())));
+                            // Commit the staged size now that THIS session's
+                            // image is on screen (a failed replacement never
+                            // reaches here, so the old size survives).
+                            state.displayed_file_bytes = state.pending_file_bytes.take();
                         } else {
                             state.path = None;
                             title = Some(HSTRING::from_wide(&title_wide(None)));
@@ -831,6 +843,7 @@ pub(crate) fn run(arg_path: Option<OsString>) -> Result<(), String> {
         status_file_not_found: false,
         status_load_failed: false,
         displayed_file_bytes: None,
+        pending_file_bytes: None,
     };
     // SAFETY: process-wide and must run before any window exists (matches the
     // upstream manifest's dpiAware=true). ERROR_ACCESS_DENIED means the process
