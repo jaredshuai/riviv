@@ -34,8 +34,8 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{GetStartupInfoW, STARTF_USESHOWWINDOW, STARTUPINFOW};
 use windows::Win32::UI::Controls::Dialogs::{
-    CommDlgExtendedError, GetOpenFileNameW, OFN_FILEMUSTEXIST, OFN_HIDEREADONLY, OFN_PATHMUSTEXIST,
-    OPENFILENAMEW,
+    CommDlgExtendedError, GetOpenFileNameW, OFN_FILEMUSTEXIST, OFN_HIDEREADONLY, OFN_NOCHANGEDIR,
+    OFN_PATHMUSTEXIST, OPENFILENAMEW,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL};
 use windows::Win32::UI::Shell::{DragFinish, DragQueryFileW, HDROP};
@@ -318,7 +318,7 @@ fn open_file_dialog(hwnd: HWND, initial_dir: Option<&OsStr>) -> Option<OsString>
             Some(h) => PCWSTR(h.as_ptr()),
             None => PCWSTR::null(),
         },
-        Flags: OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY,
+        Flags: OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY | OFN_NOCHANGEDIR,
         ..Default::default()
     };
     // SAFETY: `ofn` borrows stack locals (filter/file buffer/dir) that all
@@ -404,9 +404,11 @@ fn paint(hwnd: HWND) {
             let (dw, dh) = fit_shrink(surface.width, surface.height, cw, ch);
             let dx = client.left + (cw - dw) / 2;
             let dy = client.top + (ch - dh) / 2;
-            // Upstream shrink path: HALFTONE + brush-org realignment (viv.c:4205-4209).
+            // Upstream shrink path: HALFTONE + brush-org realignment anchored to
+            // the destination image (viv.c:4205-4209 uses -rx,-ry) so the dither
+            // pattern does not drift as the centered image moves on resize.
             let _ = SetStretchBltMode(hdc, HALFTONE);
-            let _ = SetBrushOrgEx(hdc, 0, 0, None);
+            let _ = SetBrushOrgEx(hdc, -dx, -dy, None);
             // Fail-soft by design: upstream viv.c:4278 also continues past a failed
             // StretchBlt (debug_printf only) — one bad frame must not kill the
             // window. M2 adds a debug-log channel to surface GLE.
@@ -515,7 +517,9 @@ fn initial_window_rect(surface: Option<&Surface>) -> Result<RECT, String> {
     // SAFETY: read-only monitor/geometry queries; AdjustWindowRect only computes.
     unsafe {
         let mut cursor = POINT::default();
-        let _ = GetCursorPos(&mut cursor);
+        // Fail loud: a zero cursor point would silently center on whichever
+        // monitor is nearest (0,0) instead of the user's (ADR 0001).
+        GetCursorPos(&mut cursor).map_err(|e| format!("GetCursorPos failed: {e}"))?;
         let monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
         let mut mi = MONITORINFO {
             cbSize: size_of::<MONITORINFO>() as u32,
@@ -621,8 +625,11 @@ fn run(arg_path: Option<OsString>) -> Result<(), String> {
         style: CS_DBLCLKS | CS_VREDRAW | CS_HREDRAW, // CS_DBLCLKS now, double-click = M2
         lpfnWndProc: Some(wnd_proc),
         hInstance: hinstance.into(),
-        // SAFETY: IDC_ARROW is a predefined resource; null instance loads system cursors.
-        hCursor: unsafe { LoadCursorW(None, IDC_ARROW) }.unwrap_or_default(),
+        // SAFETY: IDC_ARROW is a predefined system resource; failing here would
+        // register a cursorless class (no pointer over the client), so
+        // propagate instead (ADR 0001).
+        hCursor: unsafe { LoadCursorW(None, IDC_ARROW) }
+            .map_err(|e| format!("LoadCursorW failed: {e}"))?,
         hbrBackground: HBRUSH((COLOR_BTNFACE.0 as usize + 1) as *mut c_void), // upstream viv.c:5348
         lpszClassName: CLASS_NAME,
         ..Default::default()
