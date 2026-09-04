@@ -1,9 +1,10 @@
 //! Window shell: window state, the message pump, class registration, and the
 //! input/open-action handlers hung off the single wnd_proc.
 //!
-//! M2 seam: fullscreen toggle + cursor-hide timers (#8), animation timer
-//! wiring (#3) and drop→playlist / navigation key wiring (#6) land here,
-//! dispatching into their own subsystem modules.
+//! The animation timer wiring (#3) is landed: open/display anchors the
+//! frame scheduler and runs a USER_TIMER_MINIMUM SetTimer for exactly as
+//! long as an animation is displayed. M2 seams left: fullscreen toggle +
+//! cursor-hide timers (#8) and drop→playlist / navigation key wiring (#6).
 
 use std::ffi::{OsStr, OsString, c_void};
 use std::mem::size_of;
@@ -19,6 +20,7 @@ use windows::Win32::Graphics::Gdi::{
     MonitorFromPoint,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows::Win32::System::Threading::{GetStartupInfoW, STARTF_USESHOWWINDOW, STARTUPINFOW};
 use windows::Win32::UI::Controls::Dialogs::{
     CommDlgExtendedError, GetOpenFileNameW, OFN_FILEMUSTEXIST, OFN_HIDEREADONLY, OFN_NOCHANGEDIR,
@@ -29,18 +31,18 @@ use windows::Win32::UI::Shell::{DragFinish, DragQueryFileW, HDROP};
 use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRect, CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CreateWindowExW,
     DefWindowProcW, DispatchMessageW, GWLP_USERDATA, GetCursorPos, GetMessageW, GetWindowLongPtrW,
-    IDC_ARROW, LoadCursorW, MB_ICONERROR, MINMAXINFO, MSG, MessageBoxW, PostQuitMessage,
-    RegisterClassExW, SHOW_WINDOW_CMD, SW_SHOW, SetForegroundWindow, SetProcessDPIAware,
-    SetWindowLongPtrW, SetWindowTextW, ShowWindow, TranslateMessage, WM_DESTROY, WM_DROPFILES,
-    WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WNDCLASSEXW,
-    WS_EX_ACCEPTFILES, WS_OVERLAPPEDWINDOW,
+    IDC_ARROW, KillTimer, LoadCursorW, MB_ICONERROR, MINMAXINFO, MSG, MessageBoxW, PostQuitMessage,
+    RegisterClassExW, SHOW_WINDOW_CMD, SW_SHOW, SetForegroundWindow, SetProcessDPIAware, SetTimer,
+    SetWindowLongPtrW, SetWindowTextW, ShowWindow, TranslateMessage, USER_TIMER_MINIMUM,
+    WM_DESTROY, WM_DROPFILES, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN, WM_NCCREATE,
+    WM_NCDESTROY, WM_PAINT, WM_TIMER, WNDCLASSEXW, WS_EX_ACCEPTFILES, WS_OVERLAPPEDWINDOW,
 };
 use windows::core::{HSTRING, PCWSTR, w};
 
+use crate::anim::ANIMATION_TIMER_ID;
 use crate::fit::fit_shrink;
-use crate::loader::{LoadError, load_surface};
+use crate::loader::{LoadError, LoadedImage, load_image};
 use crate::paint::paint;
-use crate::surface::Surface;
 use crate::text::{dialog_filter, title_wide, to_wide};
 
 /// Window class name. Deliberately different from upstream's `VOIDIMAGEVIEWER`
@@ -51,8 +53,11 @@ const CLASS_NAME: PCWSTR = w!("riviv");
 const MIN_TRACK: POINT = POINT { x: 160, y: 120 };
 
 pub(crate) struct WindowState {
-    pub(crate) surface: Option<Surface>,
+    pub(crate) image: Option<LoadedImage>,
     pub(crate) path: Option<OsString>,
+    /// Performance-counter frequency (ticks per second) — the unit of the
+    /// animation timeline. Constant for the process lifetime.
+    pub(crate) timer_freq: u64,
 }
 
 /// Window state pointer stored in GWLP_USERDATA between WM_NCCREATE and
@@ -88,22 +93,49 @@ fn open_image(hwnd: HWND, path: &OsStr) {
     // Decode and triage errors BEFORE borrowing window state: `fatal` shows a
     // modal box, which pumps messages and could reenter wnd_proc (and another
     // state_of) while a borrow is live.
-    let surface = match load_surface(path) {
-        Ok(surface) => surface,
+    let image = match load_image(path) {
+        Ok(image) => image,
         // User-level failure: keep the current image, no popup, no exit
         // (ADR 0001 / upstream `_viv_load_failed` behavior).
         Err(LoadError::User(_)) => return,
         // System-level GDI failure: fail loud (ADR 0001), borrow-free.
         Err(LoadError::System(msg)) => fatal(&msg),
     };
+    // Read the animation clock before the borrow for the same reason (its
+    // failure path is the fatal modal). The anchor is display time, not
+    // decode time — upstream's _viv_start_first_frame (viv.c:14310-14322).
+    let animation_start = if image.is_animated() {
+        Some(qpc_now())
+    } else {
+        None
+    };
     // SAFETY: the borrow spans only field writes plus SetWindowTextW /
-    // InvalidateRect. SetWindowTextW synchronously reenters wnd_proc with
-    // WM_SETTEXT, which DefWindowProcW handles without touching
-    // GWLP_USERDATA, so no second state_of borrow can alias this one;
-    // InvalidateRect merely queues a WM_PAINT.
+    // InvalidateRect / SetTimer / KillTimer. SetWindowTextW synchronously
+    // reenters wnd_proc with WM_SETTEXT, which DefWindowProcW handles without
+    // touching GWLP_USERDATA, so no second state_of borrow can alias this
+    // one; the other three never pump messages (a due WM_TIMER is queued,
+    // not delivered synchronously).
     if let Some(state) = unsafe { state_of(hwnd) } {
-        state.surface = Some(surface); // replacing drops the old surface
+        let was_animated = state.image.as_ref().is_some_and(LoadedImage::is_animated);
+        state.image = Some(image); // replacing drops the old frame surfaces
         state.path = Some(path.to_os_string());
+        if let Some(start) = animation_start {
+            if let Some(image) = state.image.as_mut() {
+                image.restart_animation(start);
+            }
+            // Run the timer for exactly as long as an animation is displayed
+            // (upstream _viv_timer_start, viv.c:9123-9145).
+            // SAFETY: hwnd is live and owned by this thread. Fail-soft like
+            // upstream viv.c:9144 (unchecked SetTimer): a failed timer merely
+            // freezes the animation.
+            let _ = unsafe { SetTimer(Some(hwnd), ANIMATION_TIMER_ID, USER_TIMER_MINIMUM, None) };
+        } else if was_animated {
+            // The old image was animated and this one is not: stop the timer
+            // (upstream _viv_timer_stop on clear, viv.c:9613-9631).
+            // SAFETY: hwnd is live; a failed kill leaves a stale timer that
+            // the WM_TIMER guard below no-ops on.
+            let _ = unsafe { KillTimer(Some(hwnd), ANIMATION_TIMER_ID) };
+        }
         let title = HSTRING::from_wide(&title_wide(state.path.as_deref()));
         // SAFETY: hwnd is live; the HSTRING outlives the call.
         // Fail-soft on purpose: upstream viv.c:1249 ignores SetWindowTextW's
@@ -114,6 +146,59 @@ fn open_image(hwnd: HWND, path: &OsStr) {
         // invalidated) is irrelevant here — WM_PAINT will come.
         let _ = unsafe { InvalidateRect(Some(hwnd), None, true) };
     }
+}
+
+/// WM_TIMER for the animation timer: advance the animation by the time
+/// elapsed since the previous event and repaint when the displayed frame
+/// changed (upstream viv.c:3171-3292).
+fn on_animation_timer(hwnd: HWND) {
+    // Read the clock before any state borrow — its failure path is the fatal
+    // modal (see open_image).
+    let now = qpc_now();
+    // SAFETY: the borrow spans only scheduler/position field updates and a
+    // final InvalidateRect; nothing here pumps messages, so no second
+    // state_of borrow can alias this one.
+    let repaint = match unsafe { state_of(hwnd) } {
+        Some(state) => {
+            let freq = state.timer_freq;
+            match state.image.as_mut() {
+                // The timer only runs while an animation is displayed; the
+                // guard also makes a stale timer (failed KillTimer) harmless.
+                Some(image) if image.is_animated() => image.advance_on_timer(now, freq),
+                _ => false,
+            }
+        }
+        None => false,
+    };
+    if repaint {
+        // SAFETY: queues a WM_PAINT; never pumps messages. Erase is FALSE
+        // like upstream viv.c:3284 — WM_PAINT fills the whole client itself.
+        let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+    }
+}
+
+/// Performance-counter reading — the animation clock (upstream
+/// os_get_tick_count, os.c:1297-1307).
+fn qpc_now() -> u64 {
+    let mut tick: i64 = 0;
+    // SAFETY: `tick` is a valid out-pointer for the duration of the call.
+    // Failure is a broken system facility (documented to always succeed on
+    // Windows XP+) and the whole frame-timing model rests on it, so fail
+    // loud (ADR 0001) instead of animating on a stuck clock.
+    if let Err(e) = unsafe { QueryPerformanceCounter(&mut tick) } {
+        fatal(&format!("QueryPerformanceCounter failed: {e}"));
+    }
+    tick as u64
+}
+
+/// Performance-counter frequency, read once at startup (constant for the
+/// process lifetime) — upstream os_get_tick_freq, os.c:1310-1319.
+fn qpc_frequency() -> Result<u64, String> {
+    let mut freq: i64 = 0;
+    // SAFETY: `freq` is a valid out-pointer for the duration of the call.
+    unsafe { QueryPerformanceFrequency(&mut freq) }
+        .map_err(|e| format!("QueryPerformanceFrequency failed: {e}"))?;
+    Ok(freq as u64)
 }
 
 fn open_file_dialog(hwnd: HWND, initial_dir: Option<&OsStr>) -> Option<OsString> {
@@ -266,6 +351,16 @@ unsafe extern "system" fn wnd_proc(
             on_drop_files(hwnd, HDROP(wparam.0 as *mut c_void));
             LRESULT(0)
         }
+        WM_TIMER => {
+            if wparam.0 == ANIMATION_TIMER_ID {
+                on_animation_timer(hwnd);
+                LRESULT(0)
+            } else {
+                // SAFETY: hwnd/msg are exactly what this callback received;
+                // the default procedure handles everything we do not.
+                unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+            }
+        }
         WM_DESTROY => {
             // SAFETY: legal on the owning thread while quitting the message loop.
             unsafe { PostQuitMessage(0) };
@@ -280,7 +375,7 @@ unsafe extern "system" fn wnd_proc(
 /// Outer window rect: client = image size shrunk to fit the work area of the
 /// monitor under the cursor (upstream centers on the cursor's monitor,
 /// viv.c:5359-5387); no image -> 60% auto-fit with a 640x480 floor.
-fn initial_window_rect(surface: Option<&Surface>) -> Result<RECT, String> {
+fn initial_window_rect(image: Option<&LoadedImage>) -> Result<RECT, String> {
     // SAFETY: read-only monitor/geometry queries; AdjustWindowRect only computes.
     unsafe {
         let mut cursor = POINT::default();
@@ -312,10 +407,10 @@ fn initial_window_rect(surface: Option<&Surface>) -> Result<RECT, String> {
             .map_err(|e| format!("AdjustWindowRect failed: {e}"))?;
         let avail_w = (work.right - work.left - (frame.right - frame.left)).max(1);
         let avail_h = (work.bottom - work.top - (frame.bottom - frame.top)).max(1);
-        let (cw, ch) = match surface {
+        let (cw, ch) = match image {
             // Window = image size (upstream Alt+2 semantics); the remembered-rect /
             // 60%-first-run model returns with M3 config persistence.
-            Some(s) => fit_shrink(s.width(), s.height(), avail_w, avail_h),
+            Some(img) => fit_shrink(img.width(), img.height(), avail_w, avail_h),
             None => (
                 // floor 640x480, but never beyond the available client area
                 // (clamp would panic when min > max on tiny screens/VMs).
@@ -353,14 +448,18 @@ pub(crate) fn fatal(message: &str) -> ! {
 }
 
 pub(crate) fn run(arg_path: Option<OsString>) -> Result<(), String> {
+    // The animation clock's unit, read once (constant for the process
+    // lifetime). Read before any window exists: failure is fatal (ADR 0001).
+    let timer_freq = qpc_frequency()?;
     let mut state = WindowState {
-        surface: None,
+        image: None,
         path: None,
+        timer_freq,
     };
     if let Some(path) = arg_path.as_ref() {
-        match load_surface(path) {
-            Ok(surface) => {
-                state.surface = Some(surface);
+        match load_image(path) {
+            Ok(image) => {
+                state.image = Some(image);
                 state.path = Some(path.clone());
             }
             // Bad path / undecodable file -> empty window, per upstream
@@ -409,7 +508,7 @@ pub(crate) fn run(arg_path: Option<OsString>) -> Result<(), String> {
         return Err(format!("RegisterClassExW failed (GLE={gle})"));
     }
 
-    let rect = initial_window_rect(state.surface.as_ref())?;
+    let rect = initial_window_rect(state.image.as_ref())?;
     let title = HSTRING::from_wide(&title_wide(state.path.as_deref()));
     let state_ptr = Box::into_raw(Box::new(state));
 
@@ -434,6 +533,25 @@ pub(crate) fn run(arg_path: Option<OsString>) -> Result<(), String> {
         )
     }
     .map_err(|e| format!("CreateWindowExW failed: {e}"))?;
+
+    // Anchor the initial animation to first display and start its timer —
+    // open_image does this for every later load, but at decode time the
+    // window (and its timer) did not exist yet. The clock is read before the
+    // borrow because its failure path is the fatal modal, which pumps
+    // messages.
+    let now = qpc_now();
+    // SAFETY: the state slot was just published by WM_NCCREATE; the borrow
+    // spans only the scheduler anchor plus a SetTimer that never pumps
+    // messages.
+    if let Some(image) = (unsafe { state_of(hwnd) })
+        .and_then(|state| state.image.as_mut())
+        .filter(|image| image.is_animated())
+    {
+        image.restart_animation(now);
+        // SAFETY: hwnd is live and owned by this thread. Fail-soft like
+        // upstream viv.c:9144 (unchecked SetTimer).
+        let _ = unsafe { SetTimer(Some(hwnd), ANIMATION_TIMER_ID, USER_TIMER_MINIMUM, None) };
+    }
 
     // Honor the launcher's requested show state ("run maximized/minimized"
     // shortcuts) like upstream viv.c:5424-5451; SW_SHOW is the default when
