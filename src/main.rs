@@ -32,6 +32,7 @@ use windows::Win32::Graphics::Gdi::{
     SetBrushOrgEx, SetStretchBltMode, StretchBlt, WHITE_BRUSH,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Threading::{GetStartupInfoW, STARTF_USESHOWWINDOW, STARTUPINFOW};
 use windows::Win32::UI::Controls::Dialogs::{
     CommDlgExtendedError, GetOpenFileNameW, OFN_FILEMUSTEXIST, OFN_HIDEREADONLY, OFN_PATHMUSTEXIST,
     OPENFILENAMEW,
@@ -42,10 +43,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRect, CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CreateWindowExW,
     DefWindowProcW, DispatchMessageW, GWLP_USERDATA, GetClientRect, GetCursorPos, GetMessageW,
     GetWindowLongPtrW, IDC_ARROW, LoadCursorW, MB_ICONERROR, MINMAXINFO, MSG, MessageBoxW,
-    PostQuitMessage, RegisterClassExW, SW_SHOW, SetForegroundWindow, SetProcessDPIAware,
-    SetWindowLongPtrW, SetWindowTextW, ShowWindow, TranslateMessage, WM_DESTROY, WM_DROPFILES,
-    WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WNDCLASSEXW,
-    WS_EX_ACCEPTFILES, WS_OVERLAPPEDWINDOW,
+    PostQuitMessage, RegisterClassExW, SHOW_WINDOW_CMD, SW_SHOW, SetForegroundWindow,
+    SetProcessDPIAware, SetWindowLongPtrW, SetWindowTextW, ShowWindow, TranslateMessage,
+    WM_DESTROY, WM_DROPFILES, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN, WM_NCCREATE,
+    WM_NCDESTROY, WM_PAINT, WNDCLASSEXW, WS_EX_ACCEPTFILES, WS_OVERLAPPEDWINDOW,
 };
 use windows::core::{HSTRING, PCWSTR, w};
 
@@ -286,6 +287,9 @@ fn open_image(hwnd: HWND, path: &OsStr) {
             state.path = Some(path.to_os_string());
             let title = HSTRING::from_wide(&title_wide(state.path.as_deref()));
             // SAFETY: hwnd is live; the HSTRING outlives the call.
+            // Fail-soft on purpose: upstream viv.c:1249 ignores SetWindowTextW's
+            // return too — a stale caption beats killing the viewer (ADR 0001
+            // leaves user-visible captions out of the fatal layer).
             let _ = unsafe { SetWindowTextW(hwnd, &title) };
             // SAFETY: repaint request; the return value (whether any region was
             // invalidated) is irrelevant here — WM_PAINT will come.
@@ -361,7 +365,7 @@ fn on_drop_files(hwnd: HWND, hdrop: HDROP) {
         // multi-file / shift-drop build a playlist (M2) — we take the first file.
         if DragQueryFileW(hdrop, u32::MAX, None) > 0 {
             let len = DragQueryFileW(hdrop, 0, None) as usize;
-            if len > 0 && len < 4096 {
+            if len > 0 && len < 32768 {
                 let mut buf = vec![0u16; len + 1];
                 if DragQueryFileW(hdrop, 0, Some(&mut buf)) as usize == len {
                     let path = OsString::from_wide(&buf[..len]);
@@ -383,6 +387,13 @@ fn paint(hwnd: HWND) {
     unsafe {
         let mut ps = PAINTSTRUCT::default();
         let hdc = BeginPaint(hwnd, &mut ps);
+        if hdc.is_invalid() {
+            // Already inside this function's outer unsafe block.
+            let gle = GetLastError().0;
+            // System-level failure (ADR 0001): painting with a null DC would
+            // silently produce a blank client.
+            fatal(&format!("BeginPaint failed (GLE={gle})"));
+        }
         let mut client = RECT::default();
         let _ = GetClientRect(hwnd, &mut client);
         let cw = (client.right - client.left).max(1);
@@ -650,9 +661,22 @@ fn run(arg_path: Option<OsString>) -> Result<(), String> {
     }
     .map_err(|e| format!("CreateWindowExW failed: {e}"))?;
 
-    // SAFETY: hwnd is live; SW_SHOW is the M1 simplification (upstream honors
-    // nCmdShow / STARTUPINFO for "run maximized" shortcuts — M3).
-    let _ = unsafe { ShowWindow(hwnd, SW_SHOW) };
+    // Honor the launcher's requested show state ("run maximized/minimized"
+    // shortcuts) like upstream viv.c:5424-5451; SW_SHOW is the default when
+    // the launcher did not ask for anything specific.
+    let mut si = STARTUPINFOW {
+        cb: size_of::<STARTUPINFOW>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: fills this process's STARTUPINFOW; a read-only query.
+    unsafe { GetStartupInfoW(&mut si) };
+    let show_cmd = if (si.dwFlags & STARTF_USESHOWWINDOW).0 != 0 {
+        SHOW_WINDOW_CMD(i32::from(si.wShowWindow))
+    } else {
+        SW_SHOW
+    };
+    // SAFETY: hwnd is live; show per the launcher's request.
+    let _ = unsafe { ShowWindow(hwnd, show_cmd) };
 
     let mut msg = MSG::default();
     loop {
