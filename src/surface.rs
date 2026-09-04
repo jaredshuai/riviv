@@ -27,6 +27,13 @@ pub(crate) struct Surface {
     height: i32,
 }
 
+// SAFETY: GDI handles are process-global with no thread affinity — a
+// Surface is created on the decode worker, displayed and dropped on the UI
+// thread, the same cross-thread handoff upstream does with frame HBITMAPs
+// (first/additional-frame replies, viv.c:2900/2989). The raw pointers
+// inside HDC/HBITMAP only make std conservative about the move.
+unsafe impl Send for Surface {}
+
 impl Surface {
     /// Errors are plain system-level messages (GDI allocation failures only);
     /// the loader maps them into its two-layer `LoadError` — keeps this module

@@ -14,10 +14,16 @@
 //! means repeated event handling can never accumulate rounding drift —
 //! a truncated-milliseconds accumulator would lose up to 1 ms per event.
 //!
-//! M2 seams landing later: the background decode thread's
-//! "next frame not decoded yet" branch (upstream resets `_viv_timer_tick`
-//! and waits, viv.c:3233-3240 — with synchronous decode every frame is
-//! always ready) and the animation-rate speed table (upstream
+//! The streamed-loading branch (#4, landed): while the background decode
+//! is still delivering frames, reaching the loaded-prefix edge zeroes the
+//! accumulator and waits for the next frame (upstream resets
+//! `_viv_timer_tick` and breaks, viv.c:3233-3240 — with the decode fully
+//! done the same edge wraps to frame 0 instead). Wrapping is keyed on the
+//! caller's `complete` flag (decode finished) rather than upstream's
+//! pre-known `_viv_frame_count` because the image crate's frame iterators
+//! cannot report a total up front.
+//!
+//! M2 seams landing later: the animation-rate speed table (upstream
 //! `_viv_animation_rates`, a menu/keyboard feature).
 
 /// SetTimer id for the animation timer. Any private id works (it is only
@@ -62,17 +68,22 @@ impl FrameScheduler {
 
     /// Process one timer event measured at `now` (QPC ticks, `freq` ticks
     /// per second) against the per-frame `delays_ms` from `position`.
+    /// `delays_ms.len()` is the loaded-prefix length; `complete` says the
+    /// decode stream has ended, making that prefix the full frame set.
     ///
     /// When the accumulated time covers several frame delays the loop keeps
     /// advancing until the remainder is below the next delay — catch-up
     /// paints only the final position, exactly like upstream's loop
-    /// (viv.c:3225-3272).
+    /// (viv.c:3225-3272). At the loaded-prefix edge a completed animation
+    /// wraps to frame 0; an in-flight one zeroes the accumulator and waits
+    /// for the next streamed frame (viv.c:3233-3240).
     pub(crate) fn on_timer(
         &mut self,
         now: u64,
         freq: u64,
         delays_ms: &[u32],
         position: usize,
+        complete: bool,
     ) -> FrameAdvance {
         let elapsed = now.saturating_sub(self.tick_start);
         self.tick_start = now;
@@ -94,13 +105,23 @@ impl FrameScheduler {
             // and the catch-up loop below would never terminate.
             let delay_ticks = ((delay_ms * freq) / 1000).max(1);
             if self.timer_tick >= delay_ticks {
-                self.timer_tick -= delay_ticks;
-                position += 1;
-                if position == delays_ms.len() {
-                    // Loop the animation (viv.c:3243-3248; upstream has a
-                    // play-once slideshow variant we don't build in #3).
-                    position = 0;
+                if position + 1 == delays_ms.len() {
+                    if complete {
+                        // Loop the animation (viv.c:3243-3248; upstream has a
+                        // play-once slideshow variant we don't build in #3).
+                        position = 0;
+                    } else {
+                        // The next frame is still decoding: ignore this tick,
+                        // zero the accumulator, and wait at the prefix edge
+                        // (viv.c:3233-3240) so playback resumes from the
+                        // moment the frame arrives instead of fast-forwarding.
+                        self.timer_tick = 0;
+                        break;
+                    }
+                } else {
+                    position += 1;
                 }
+                self.timer_tick -= delay_ticks;
                 repaint = true;
             } else {
                 break;
@@ -140,7 +161,7 @@ mod tests {
         let mut s = scheduler_starting_at(0);
         let delays = [100, 100, 100];
         // 99 ms accumulated: below the 100 ms first-frame delay.
-        let adv = s.on_timer(99, FREQ, &delays, 0);
+        let adv = s.on_timer(99, FREQ, &delays, 0, true);
         assert_eq!(adv.position, 0);
         assert!(!adv.repaint);
     }
@@ -149,7 +170,7 @@ mod tests {
     fn one_full_delay_of_elapsed_time_advances_exactly_one_frame() {
         let mut s = scheduler_starting_at(0);
         let delays = [100, 100, 100];
-        let adv = s.on_timer(100, FREQ, &delays, 0);
+        let adv = s.on_timer(100, FREQ, &delays, 0, true);
         assert_eq!(adv.position, 1);
         assert!(adv.repaint);
     }
@@ -160,9 +181,9 @@ mod tests {
         let delays = [100, 100, 100];
         // Two 60 ms ticks: neither reaches the delay alone, together they do
         // (60 + 60 = 120 >= 100) and the leftover 20 ms is retained.
-        let adv = s.on_timer(60, FREQ, &delays, 0);
+        let adv = s.on_timer(60, FREQ, &delays, 0, true);
         assert_eq!(adv.position, 0);
-        let adv = s.on_timer(120, FREQ, &delays, 0);
+        let adv = s.on_timer(120, FREQ, &delays, 0, true);
         assert_eq!(adv.position, 1);
         assert!(adv.repaint);
     }
@@ -172,7 +193,7 @@ mod tests {
         let mut s = scheduler_starting_at(0);
         let delays = [100, 100];
         // Frame 1's delay elapses while sitting on the last frame.
-        let adv = s.on_timer(100, FREQ, &delays, 1);
+        let adv = s.on_timer(100, FREQ, &delays, 1, true);
         assert_eq!(adv.position, 0);
         assert!(adv.repaint);
     }
@@ -184,11 +205,11 @@ mod tests {
         // 10 seconds of wall time in one event: only 1 s is credited, so the
         // animation advances ten 100 ms frames (back to frame 1) instead of
         // a hundred.
-        let adv = s.on_timer(10_000, FREQ, &delays, 0);
+        let adv = s.on_timer(10_000, FREQ, &delays, 0, true);
         assert_eq!(adv.position, 1);
         assert!(adv.repaint);
         // The next event measures from the truncation point, not real time.
-        let adv = s.on_timer(10_100, FREQ, &delays, adv.position);
+        let adv = s.on_timer(10_100, FREQ, &delays, adv.position, true);
         assert_eq!(adv.position, 2);
         assert!(adv.repaint);
     }
@@ -201,7 +222,7 @@ mod tests {
         // on frame 3 and the two intermediate frames are skipped without
         // their own repaints (upstream counts them as frames_skipped,
         // viv.c:3220/3257-3260).
-        let adv = s.on_timer(350, FREQ, &delays, 0);
+        let adv = s.on_timer(350, FREQ, &delays, 0, true);
         assert_eq!(adv.position, 3);
         assert!(adv.repaint);
     }
@@ -213,10 +234,10 @@ mod tests {
         // (viv.c:3211-3214) so the loop cannot spin unbounded within one
         // event: 25 ms advances exactly 25 one-millisecond frames.
         let delays = [0, 0, 0];
-        let adv = s.on_timer(25, FREQ, &delays, 0);
+        let adv = s.on_timer(25, FREQ, &delays, 0, true);
         assert_eq!(adv.position, 1);
         assert!(adv.repaint);
-        let adv = s.on_timer(26, FREQ, &delays, adv.position);
+        let adv = s.on_timer(26, FREQ, &delays, adv.position, true);
         assert_eq!(adv.position, 2);
     }
 
@@ -224,15 +245,73 @@ mod tests {
     fn restart_anchors_accumulation_to_the_given_tick() {
         let mut s = scheduler_starting_at(0);
         let delays = [100, 100];
-        let _ = s.on_timer(50, FREQ, &delays, 0);
+        let _ = s.on_timer(50, FREQ, &delays, 0, true);
         // Reopening the image restarts the timeline: 50 ms of stale
         // accumulation must not survive into the new playback.
         s.restart(1_000);
-        let adv = s.on_timer(1_050, FREQ, &delays, 0);
+        let adv = s.on_timer(1_050, FREQ, &delays, 0, true);
         assert_eq!(adv.position, 0);
         assert!(!adv.repaint);
-        let adv = s.on_timer(1_100, FREQ, &delays, 0);
+        let adv = s.on_timer(1_100, FREQ, &delays, 0, true);
         assert_eq!(adv.position, 1);
+        assert!(adv.repaint);
+    }
+
+    #[test]
+    fn the_loaded_prefix_edge_waits_for_the_next_streamed_frame() {
+        let mut s = scheduler_starting_at(0);
+        let delays = [100, 100];
+        // Sitting on the only loaded frame with decode still in flight: any
+        // amount of elapsed time is discarded and the frame is held
+        // (upstream viv.c:3233-3240).
+        let adv = s.on_timer(250, FREQ, &delays, 1, false);
+        assert_eq!(adv.position, 1);
+        assert!(!adv.repaint);
+        // The accumulator was zeroed, not banked: another long event while
+        // still waiting must not fast-forward once the frame lands.
+        let adv = s.on_timer(1_000, FREQ, &delays, 1, false);
+        assert_eq!(adv.position, 1);
+        assert!(!adv.repaint);
+    }
+
+    #[test]
+    fn a_partial_advance_into_the_edge_stalls_after_repainting() {
+        let mut s = scheduler_starting_at(0);
+        let delays = [50, 100];
+        // 150 ms covers frame 0's 50 ms (advance, repaint) and then meets
+        // frame 1's 100 ms exactly at the not-yet-loaded edge: the advance
+        // stops there, the repaint of the partial advance is kept, and the
+        // leftover 100 ms is discarded rather than banked.
+        let adv = s.on_timer(150, FREQ, &delays, 0, false);
+        assert_eq!(adv.position, 1);
+        assert!(adv.repaint);
+        let adv = s.on_timer(160, FREQ, &delays, adv.position, false);
+        assert_eq!(adv.position, 1);
+        assert!(!adv.repaint);
+    }
+
+    #[test]
+    fn the_prefix_edge_wraps_once_the_decode_completes() {
+        let mut s = scheduler_starting_at(0);
+        let delays = [100, 100];
+        // Same stall conditions, but the stream has ended: the edge is the
+        // whole frame set, so it wraps like a fully-decoded animation.
+        // 150 ms = the last frame's delay (wraps to 0) + 50 ms below
+        // frame 0's delay (stays there).
+        let adv = s.on_timer(150, FREQ, &delays, 1, true);
+        assert_eq!(adv.position, 0);
+        assert!(adv.repaint);
+    }
+
+    #[test]
+    fn frames_arriving_after_completion_are_ignored_by_the_scheduler() {
+        // The caller never grows delays past completion; this pins the
+        // contract that `complete` freezes the frame set (the wrap branch
+        // must keep using the slice length it was given).
+        let mut s = scheduler_starting_at(0);
+        let delays = [100];
+        let adv = s.on_timer(100, FREQ, &delays, 0, true);
+        assert_eq!(adv.position, 0);
         assert!(adv.repaint);
     }
 
