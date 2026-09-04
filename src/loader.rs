@@ -122,12 +122,15 @@ pub(crate) fn load_image(path: &OsStr) -> Result<LoadedImage, LoadError> {
         .map_err(|e| user(e.to_string()))?;
     // GIF and WebP are the only formats whose animation we honor — APNG stays
     // static, matching upstream where GDI+ exposes no time dimension for it.
-    // Both go through the animation iterators even when they decode to a
-    // single frame, so transparency compositing is uniform.
+    // Animated formats go through the frame iterators so transparency
+    // compositing and dispose handling are uniform.
     match reader.format() {
         Some(ImageFormat::Gif) => load_gif(reader.into_inner(), &user),
         Some(ImageFormat::WebP) => load_webp(reader.into_inner(), &user),
-        _ => load_static(reader, &user),
+        _ => load_static(
+            reader.into_decoder().map_err(|e| user(e.to_string()))?,
+            &user,
+        ),
     }
 }
 
@@ -157,6 +160,12 @@ fn load_webp(
     decoder
         .set_limits(image::Limits::default())
         .map_err(|e| user(e.to_string()))?;
+    // The WebP frame iterator reports num_frames() == 0 for non-animated
+    // bitstreams, so still WebP files must take the static decoder or they
+    // surface as "no frames decoded" load failures.
+    if !decoder.has_animation() {
+        return load_static(decoder, user);
+    }
     let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
     // WebP delays are the decoder's millisecond values, used as-is like
     // upstream's libwebp path (viv.c:10289 — no zero fallback; the scheduler
@@ -228,11 +237,10 @@ fn load_frames(
     Ok(LoadedImage::new(frame_surfaces, delays_ms))
 }
 
-fn load_static(
-    reader: ImageReader<BufReader<File>>,
+fn load_static<D: ImageDecoder>(
+    mut decoder: D,
     user: &impl Fn(String) -> LoadError,
 ) -> Result<LoadedImage, LoadError> {
-    let mut decoder = reader.into_decoder().map_err(|e| user(e.to_string()))?;
     // Guard against hostile/corrupt headers declaring huge pixel sizes: the
     // default 512MB allocation cap turns them into user-level load errors
     // instead of an OOM crash (ADR 0001 — a bad file must not kill the viewer).
