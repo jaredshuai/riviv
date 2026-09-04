@@ -39,9 +39,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRect, CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CreateWindowExW,
     DefWindowProcW, DispatchMessageW, GWLP_USERDATA, GetClientRect, GetCursorPos, GetMessageW,
     GetWindowLongPtrW, IDC_ARROW, LoadCursorW, MB_ICONERROR, MINMAXINFO, MSG, MessageBoxW,
-    PostQuitMessage, RegisterClassExW, SW_SHOW, SetProcessDPIAware, SetWindowLongPtrW,
-    SetWindowTextW, ShowWindow, TranslateMessage, WM_DESTROY, WM_DROPFILES, WM_ERASEBKGND,
-    WM_GETMINMAXINFO, WM_KEYDOWN, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WNDCLASSEXW,
+    PostQuitMessage, RegisterClassExW, SW_SHOW, SetForegroundWindow, SetProcessDPIAware,
+    SetWindowLongPtrW, SetWindowTextW, ShowWindow, TranslateMessage, WM_DESTROY, WM_DROPFILES,
+    WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WNDCLASSEXW,
     WS_EX_ACCEPTFILES, WS_OVERLAPPEDWINDOW,
 };
 use windows::core::{HSTRING, PCWSTR, w};
@@ -70,17 +70,28 @@ fn rgba8_to_bgra_in_place(buf: &mut [u8]) {
 }
 
 /// Fit `(src_w, src_h)` inside `(max_w, max_h)` keeping aspect ratio,
-/// never upscaling (upstream `fill_window = 0`: small images render 1:1).
+/// never upscaling (upstream `fill_window = 0`). The derived side rounds UP
+/// with integer math — upstream viv.c:6895-6913 deliberately adds `high - 1`
+/// so a 50%-window resize still stretches to the screen edges.
 fn fit_shrink(src_w: i32, src_h: i32, max_w: i32, max_h: i32) -> (i32, i32) {
     if src_w <= 0 || src_h <= 0 || max_w <= 0 || max_h <= 0 {
         return (src_w.max(1), src_h.max(1));
     }
-    let scale = 1.0_f64
-        .min(max_w as f64 / src_w as f64)
-        .min(max_h as f64 / src_h as f64);
-    let w = ((src_w as f64 * scale).round() as i32).clamp(1, src_w);
-    let h = ((src_h as f64 * scale).round() as i32).clamp(1, src_h);
-    (w, h)
+    let (w, h) = (i64::from(src_w), i64::from(src_h));
+    let (mw, mh) = (i64::from(max_w), i64::from(max_h));
+    let (mut rw, mut rh) = if mh * w < mw * h {
+        // tall: height binds, width is derived (ceil)
+        ((mh * w + h - 1) / h, mh)
+    } else {
+        // long: width binds, height is derived (ceil)
+        (mw, (mw * h + w - 1) / w)
+    };
+    // never upscale (upstream !fill_window clamp, viv.c:6922-6928)
+    if rw > w || rh > h {
+        rw = w;
+        rh = h;
+    }
+    (rw as i32, rh as i32)
 }
 
 /// Upstream title format (`_viv_update_title`): `filename - AppName`,
@@ -178,6 +189,17 @@ impl Surface {
         }
         // SAFETY: `bitmap` is a valid GDI bitmap handle owned by us.
         let old_bitmap = unsafe { SelectObject(memdc, HGDIOBJ(bitmap.0)) };
+        if old_bitmap.is_invalid() {
+            // SAFETY: selection failed, so the DC still holds its stock 1x1
+            // bitmap — plain DeleteDC then DeleteObject is the correct teardown.
+            unsafe {
+                let _ = DeleteDC(memdc);
+                let _ = DeleteObject(HGDIOBJ(bitmap.0));
+            }
+            return Err(LoadError::System(
+                "SelectObject failed to select the DIB".to_string(),
+            ));
+        }
         Ok(Surface {
             memdc,
             bitmap,
@@ -340,6 +362,10 @@ fn on_drop_files(hwnd: HWND, hdrop: HDROP) {
             }
         }
         DragFinish(hdrop);
+        // Upstream re-activates the viewer after a drop (viv.c:3126) so the
+        // drag source window does not stay in front of the result.
+        // SAFETY: hwnd is live and owned by this thread.
+        let _ = SetForegroundWindow(hwnd);
     }
 }
 
@@ -461,7 +487,11 @@ fn initial_window_rect(surface: Option<&Surface>) -> Result<RECT, String> {
             cbSize: size_of::<MONITORINFO>() as u32,
             ..Default::default()
         };
-        let _ = GetMonitorInfoW(monitor, &mut mi);
+        if !GetMonitorInfoW(monitor, &mut mi).as_bool() {
+            // Already inside this function's outer unsafe block.
+            let gle = GetLastError().0;
+            return Err(format!("GetMonitorInfoW failed (GLE={gle})"));
+        }
         let work = mi.rcWork;
         // Reserve the non-client frame up front so a full-height fit cannot push
         // the outer window past the work area (portrait images used to clip
@@ -482,8 +512,10 @@ fn initial_window_rect(surface: Option<&Surface>) -> Result<RECT, String> {
             // 60%-first-run model returns with M3 config persistence.
             Some(s) => fit_shrink(s.width, s.height, avail_w, avail_h),
             None => (
-                ((work.right - work.left) * 3 / 5).clamp(640, avail_w),
-                ((work.bottom - work.top) * 3 / 5).clamp(480, avail_h),
+                // floor 640x480, but never beyond the available client area
+                // (clamp would panic when min > max on tiny screens/VMs).
+                ((work.right - work.left) * 3 / 5).max(640).min(avail_w),
+                ((work.bottom - work.top) * 3 / 5).max(480).min(avail_h),
             ),
         };
         let mut rc = RECT {
@@ -647,6 +679,14 @@ mod tests {
     #[test]
     fn fit_floors_at_one_pixel() {
         assert_eq!(fit_shrink(10000, 10000, 1, 1), (1, 1));
+    }
+
+    #[test]
+    fn fit_rounds_derived_side_upstream_style() {
+        // upstream viv.c:6895-6913: 1000x333 into 400x400 -> 400x134 (not 133),
+        // so a 50%-window resize still stretches to the screen edges.
+        assert_eq!(fit_shrink(1000, 333, 400, 400), (400, 134));
+        assert_eq!(fit_shrink(333, 1000, 400, 400), (134, 400));
     }
 
     #[test]
