@@ -37,6 +37,7 @@ Drag & drop a file onto the window to switch images (a single dropped file repla
 - Default window icon for now (upstream ships its own icon).
 - Only the first frame of animated images is shown until M2.
 - Transparent areas of PNG/WebP are drawn with their raw RGB values (no alpha compositing) until M2.
+- Large images decode synchronously on the UI thread — the window may briefly freeze while opening them; background decoding lands in M2.
 
 Agent workflow: see [AGENTS.md](AGENTS.md). Decisions: `docs/adr/`.
 
