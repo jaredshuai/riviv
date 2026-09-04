@@ -36,6 +36,13 @@ pub(crate) fn paint(hwnd: HWND) {
         // yields a degenerate paint, not a dead window (ADR 0001 leaves
         // paint-path diagnostics to the debug-log channel landing in M2).
         let _ = GetClientRect(hwnd, &mut client);
+        // The render area excludes the status bar (#5) — the image fits
+        // and centers above it (upstream subtracts `_viv_get_status_high()`
+        // from the client height at paint time, viv.c:4072).
+        let status_h = state_of(hwnd).map(|s| crate::status::height(s.status));
+        if let Some(h) = status_h {
+            client.bottom = (client.bottom - h).max(client.top);
+        }
         let cw = (client.right - client.left).max(1);
         let ch = (client.bottom - client.top).max(1);
         // Windowed background fill: a solid brush from the same constant the

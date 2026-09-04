@@ -27,7 +27,8 @@
 //!   stall branch (#3/#4, landed); M2 seams left: the rate table
 //! - `pixels` — BGRA conversion + alpha compositing (#3, landed); M2: mip math (#9)
 //! - `fit` — fit-to-window math; M2: zoom presets / pan clamp (#7)
-//! - `text` — title & wide-string construction; M2: status-bar text (#5)
+//! - `text` — title & wide-string construction + the status-bar text and
+//!   part-width model (#5, landed)
 //! - `surface` — DIB section + memory DC; one per decoded frame (#3, landed);
 //!   M2: mipmap surfaces (#9)
 //! - `loader` — streaming decode pipeline + the load reply state machine
@@ -35,8 +36,10 @@
 //! - `loadthread` — background decode session: worker thread, reply queue,
 //!   kick message (#4, landed)
 //! - `paint` — WM_PAINT render; M2: stitch/mip (#9), zoom (#7)
+//! - `status` — the status-bar common control: creation, height, and the
+//!   measure → parts → texts update over `text`'s pure model (#5, landed)
 //! - `window` — wnd_proc shell, pump, input/open actions, animation timer,
-//!   reply handler (#3/#4, landed); M2: fullscreen (#8), playlist wiring (#6)
+//!   reply handler (#3/#4/#5, landed); M2: fullscreen (#8), playlist wiring (#6)
 
 #![windows_subsystem = "windows"]
 
@@ -46,6 +49,7 @@ mod loader;
 mod loadthread;
 mod paint;
 mod pixels;
+mod status;
 mod surface;
 mod text;
 mod window;
