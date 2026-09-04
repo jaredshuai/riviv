@@ -85,31 +85,34 @@ pub(crate) unsafe fn state_of(hwnd: HWND) -> Option<&'static mut WindowState> {
 }
 
 fn open_image(hwnd: HWND, path: &OsStr) {
-    // SAFETY: the borrow lives only across non-pumping calls (decode, set
-    // caption, invalidate) — none reenter wnd_proc, so no second borrow can
-    // be taken while this one is live.
-    let Some(state) = (unsafe { state_of(hwnd) }) else {
-        return;
-    };
-    match load_surface(path) {
-        Ok(surface) => {
-            state.surface = Some(surface); // replacing drops the old surface
-            state.path = Some(path.to_os_string());
-            let title = HSTRING::from_wide(&title_wide(state.path.as_deref()));
-            // SAFETY: hwnd is live; the HSTRING outlives the call.
-            // Fail-soft on purpose: upstream viv.c:1249 ignores SetWindowTextW's
-            // return too — a stale caption beats killing the viewer (ADR 0001
-            // leaves user-visible captions out of the fatal layer).
-            let _ = unsafe { SetWindowTextW(hwnd, &title) };
-            // SAFETY: repaint request; the return value (whether any region was
-            // invalidated) is irrelevant here — WM_PAINT will come.
-            let _ = unsafe { InvalidateRect(Some(hwnd), None, true) };
-        }
+    // Decode and triage errors BEFORE borrowing window state: `fatal` shows a
+    // modal box, which pumps messages and could reenter wnd_proc (and another
+    // state_of) while a borrow is live.
+    let surface = match load_surface(path) {
+        Ok(surface) => surface,
         // User-level failure: keep the current image, no popup, no exit
         // (ADR 0001 / upstream `_viv_load_failed` behavior).
-        Err(LoadError::User(_)) => {}
-        // System-level GDI failure: fail loud (ADR 0001).
+        Err(LoadError::User(_)) => return,
+        // System-level GDI failure: fail loud (ADR 0001), borrow-free.
         Err(LoadError::System(msg)) => fatal(&msg),
+    };
+    // SAFETY: the borrow spans only field writes plus SetWindowTextW /
+    // InvalidateRect. SetWindowTextW synchronously reenters wnd_proc with
+    // WM_SETTEXT, which DefWindowProcW handles without touching
+    // GWLP_USERDATA, so no second state_of borrow can alias this one;
+    // InvalidateRect merely queues a WM_PAINT.
+    if let Some(state) = unsafe { state_of(hwnd) } {
+        state.surface = Some(surface); // replacing drops the old surface
+        state.path = Some(path.to_os_string());
+        let title = HSTRING::from_wide(&title_wide(state.path.as_deref()));
+        // SAFETY: hwnd is live; the HSTRING outlives the call.
+        // Fail-soft on purpose: upstream viv.c:1249 ignores SetWindowTextW's
+        // return too — a stale caption beats killing the viewer (ADR 0001
+        // leaves user-visible captions out of the fatal layer).
+        let _ = unsafe { SetWindowTextW(hwnd, &title) };
+        // SAFETY: repaint request; the return value (whether any region was
+        // invalidated) is irrelevant here — WM_PAINT will come.
+        let _ = unsafe { InvalidateRect(Some(hwnd), None, true) };
     }
 }
 
