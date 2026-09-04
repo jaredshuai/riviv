@@ -140,6 +140,7 @@ fn on_load_replies(hwnd: HWND) {
     let mut stop_timer = false;
     let mut invalidate = false;
     let mut title: Option<HSTRING> = None;
+    let mut resize_to_image = false;
     let mut resize_rect: Option<RECT> = None;
     {
         // Copy the session facts out first so the immutable borrow ends
@@ -178,20 +179,24 @@ fn on_load_replies(hwnd: HWND) {
                         state.path = Some(session_path.clone());
                         title = Some(HSTRING::from_wide(&title_wide(state.path.as_deref())));
                     }
-                    UiAction::ResizeWindowToImage => {
-                        // The startup load's first frame sizes the window to
-                        // the image (M1 behavior under async startup); a
-                        // geometry failure is fatal exactly like run()'s
-                        // initial rect.
-                        match initial_window_rect(state.image.as_ref()) {
-                            Ok(rect) => resize_rect = Some(rect),
-                            Err(msg) => fatal_msg = Some(msg),
-                        }
-                    }
+                    // Deferred to after the drain: a later reply in the same
+                    // batch (mid-stream failure) may clear the image again —
+                    // sizing the window to an image that is no longer shown
+                    // would be nonsense.
+                    UiAction::ResizeWindowToImage => resize_to_image = true,
                 }
             }
             if fatal_msg.is_some() {
                 break;
+            }
+        }
+        if resize_to_image && state.image.is_some() {
+            // The startup load's first frame sizes the window to the image
+            // (M1 behavior under async startup); a geometry failure is fatal
+            // exactly like run()'s initial rect.
+            match initial_window_rect(state.image.as_ref()) {
+                Ok(rect) => resize_rect = Some(rect),
+                Err(msg) => fatal_msg = Some(msg),
             }
         }
     }
