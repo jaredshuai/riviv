@@ -38,10 +38,12 @@ use crate::surface::DibFrame;
 /// Kick message, posted whenever the worker queues a reply (upstream
 /// `_VIV_WM_REPLY`; `WM_APP + n` is the reserved range for private
 /// window-class messages). Unlike upstream — which posts only on the
-/// queue's empty -> non-empty transition — every push posts: a lost kick
-/// (e.g. the destination queue momentarily at its quota) is then healed
-/// by the next push instead of stranding a non-empty queue forever. The
-/// extra messages are bounded by the reply count and drain to no-ops.
+/// queue's empty -> non-empty transition — every push posts, and a failed
+/// post is retried until it lands or the job is terminated: a lost kick
+/// (e.g. the destination queue momentarily at its quota) must not strand
+/// a non-empty queue, least of all the stream's final reply, which has no
+/// successor push to heal it. The extra messages are bounded by the reply
+/// count and drain to no-ops.
 pub(crate) const REPLY_KICK_MESSAGE: u32 = WM_APP + 1;
 
 /// Session ids, so the UI can tell which load produced the displayed
@@ -148,18 +150,37 @@ fn worker(receiver: Receiver<Job>) {
         if terminate.load(Ordering::Relaxed) {
             continue;
         }
+        // The sink gets its own handle for its retry loop; the original
+        // stays with the decode call's terminate parameter.
+        let sink_terminate = Arc::clone(&terminate);
         let mut sink = move |reply: LoadReply<DibFrame>| {
             // unwrap: a poisoned lock means some thread panicked while
             // holding the queue — an undefined state we fail loud on
             // (ADR 0001) rather than limp past.
             queue.lock().unwrap().push_back(reply);
-            // SAFETY: `hwnd` is a valid handle captured for this job;
-            // PostMessageW never dereferences it on this thread and
-            // validates it on the owning thread's queue, failing cleanly
-            // if the window is gone (the queue — not the kick — owns the
-            // replies, so a lost post costs drain latency, never data;
-            // the next push posts again).
-            let _ = unsafe { PostMessageW(Some(hwnd), REPLY_KICK_MESSAGE, WPARAM(0), LPARAM(0)) };
+            // The kick must survive a full destination queue: the LAST
+            // reply of a stream has no successor push to heal a lost post,
+            // so retry until it lands or the job is terminated. Teardown
+            // sets the terminate flag before the window finishes dying
+            // (WM_NCDESTROY terminates the session, then quits the worker),
+            // which bounds the loop; a post to the dead window fails
+            // harmlessly until then.
+            loop {
+                // SAFETY: `hwnd` is a valid handle captured for this job;
+                // PostMessageW never dereferences it on this thread and
+                // validates it on the owning thread's queue (the queue —
+                // not the kick — owns the replies, so a lost post costs
+                // drain latency, never data).
+                if unsafe { PostMessageW(Some(hwnd), REPLY_KICK_MESSAGE, WPARAM(0), LPARAM(0)) }
+                    .is_ok()
+                {
+                    break;
+                }
+                if sink_terminate.load(Ordering::Relaxed) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
         };
         decode_to_sink(&path, &terminate, &mut sink);
     }
@@ -203,9 +224,14 @@ impl LoadSession {
 
 impl Drop for LoadSession {
     fn drop(&mut self) {
-        // Supersession or window teardown: flag the job; the worker skips
-        // or abandons it, and the queue's Arc frees any undrained replies
-        // when the last holder drops.
+        // Supersession or window teardown: flag the job (the worker skips
+        // or abandons it) and free the replies already queued for this
+        // dead session immediately — the worker's Arc keeps the queue
+        // alive until its final push, but holding already-decoded frames
+        // hostage until then would pin a superseded load's full frame
+        // budget for no one's benefit.
         self.terminate();
+        // unwrap on poisoning, as in the sink.
+        self.queue.lock().unwrap().clear();
     }
 }

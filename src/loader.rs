@@ -337,11 +337,11 @@ impl FrameDims for Surface {
 /// the terminal reply and unlocks wrap-around.
 ///
 /// The timeline is anchored once, at the first frame's display (upstream
-/// `_viv_start_first_frame`, viv.c:14312-14317) — and deliberately NOT
-/// re-anchored when later frames arrive: the scheduler's stall branch
-/// already discards time accumulated while waiting at the loaded edge, so
-/// a frame that arrives *before* the edge lets playback advance on
-/// schedule (upstream semantics).
+/// `_viv_start_first_frame`, viv.c:14312-14317). A frame arriving *before*
+/// the loaded edge keeps that anchor (playback advances on schedule); one
+/// arriving *after* it re-anchors to the arrival — synthesizing what a
+/// running timer's stall branch would have zeroed while waiting
+/// (viv.c:3233-3240).
 pub(crate) struct LoadedImage<F = crate::surface::Surface> {
     frames: Vec<F>,
     /// Per-frame delays in ms, parallel to `frames` (a frame's delay only
@@ -377,6 +377,26 @@ impl<F> LoadedImage<F> {
         }
         self.frames.push(frame);
         self.delays_ms.push(delay_ms);
+    }
+
+    /// A second frame arrived, making the image animated. If playback had
+    /// already reached the loaded edge (frame 0's delay fully elapsed
+    /// while no timer ran), the anchor resets to the arrival — the first
+    /// timer event must not credit the whole decode gap against frames
+    /// that just landed. Before the edge, the anchor stands and playback
+    /// advances on schedule.
+    fn second_frame(&mut self, frame: F, delay_ms: u32, now: u64, freq: u64) {
+        if self.decode_complete {
+            // Defensive, same as push_frame: a completed frame set is final.
+            return;
+        }
+        if self
+            .scheduler
+            .at_frame_edge(now, freq, &self.delays_ms, self.position)
+        {
+            self.scheduler = FrameScheduler::new(now);
+        }
+        self.push_frame(frame, delay_ms);
     }
 
     /// The stream ended: the loaded prefix is the full frame set
@@ -461,13 +481,16 @@ pub(crate) struct ReplyOutcome {
 /// the window.
 ///
 /// `now` is the QPC reading taken before any state borrow (the caller's
-/// fatal path must not run across a borrow — PR #10 P1).
+/// fatal path must not run across a borrow — PR #10 P1); `freq` is the
+/// same QPC frequency, needed to judge whether a late second frame
+/// arrived past the loaded edge (see `LoadedImage::second_frame`).
 pub(crate) fn apply_reply<F>(
     image: &mut Option<LoadedImage<F>>,
     displayed_from: &mut Option<u64>,
     session_id: u64,
     startup_resize_session: &mut Option<u64>,
     now: u64,
+    freq: u64,
     reply: LoadReply<F>,
 ) -> ReplyOutcome {
     match reply {
@@ -492,15 +515,15 @@ pub(crate) fn apply_reply<F>(
         LoadReply::AdditionalFrame { frame, delay_ms } => {
             // Only append to the image this session produced (defensive:
             // per-session queues already make cross-session delivery
-            // impossible, this pins the protocol). The timeline is NOT
-            // re-anchored: a frame arriving before the loaded edge lets
-            // playback advance on schedule, and one arriving after finds
-            // the stall branch already zeroing the accumulated time —
-            // upstream semantics either way (viv.c:3233-3240).
+            // impossible, this pins the protocol).
             if *displayed_from == Some(session_id)
                 && let Some(img) = image.as_mut()
             {
-                img.push_frame(frame, delay_ms);
+                if img.is_animated() {
+                    img.push_frame(frame, delay_ms);
+                } else {
+                    img.second_frame(frame, delay_ms, now, freq);
+                }
             }
             ReplyOutcome::default()
         }
@@ -527,7 +550,14 @@ pub(crate) fn apply_reply<F>(
                 // Nothing of this session ever reached the screen (failure
                 // before its first frame): keep the old image and title,
                 // no popup, no exit (issue #4 mandate; upstream clears here
-                // — registered in README Differences).
+                // — registered in README Differences). The kept image's own
+                // stream was superseded (that is why this load ran at all),
+                // so no frames or Complete will ever arrive for it —
+                // finalize its prefix instead of leaving playback stalled
+                // at the loaded edge forever.
+                if let Some(img) = image.as_mut() {
+                    img.mark_complete();
+                }
                 ReplyOutcome::default()
             }
         }
@@ -576,6 +606,7 @@ mod tests {
             1,
             &mut resize_session,
             0,
+            FREQ,
             frame(1),
         );
         assert_eq!(
@@ -599,6 +630,7 @@ mod tests {
             1,
             &mut resize_session,
             0,
+            FREQ,
             frame(1),
         );
         assert!(out.actions.contains(&UiAction::ResizeWindowToImage));
@@ -610,6 +642,7 @@ mod tests {
             2,
             &mut resize_session,
             10,
+            FREQ,
             frame(2),
         );
         assert!(!out.actions.contains(&UiAction::ResizeWindowToImage));
@@ -624,6 +657,7 @@ mod tests {
             6,
             &mut resize_session,
             20,
+            FREQ,
             frame(3),
         );
         assert!(!out.actions.contains(&UiAction::ResizeWindowToImage));
@@ -641,6 +675,7 @@ mod tests {
             1,
             &mut resize_session,
             0,
+            FREQ,
             frame(1),
         );
         // Frame 2 arrives at t=80, before frame 1's 100 ms delay expires:
@@ -654,6 +689,7 @@ mod tests {
             1,
             &mut resize_session,
             80,
+            FREQ,
             additional(2),
         );
         assert_eq!(out.actions, Vec::<UiAction>::new());
@@ -666,7 +702,7 @@ mod tests {
     }
 
     #[test]
-    fn the_second_frame_arriving_late_advances_within_the_catchup_cap() {
+    fn the_second_frame_arriving_late_reanchors_to_the_arrival() {
         let mut image = None;
         let mut displayed_from = None;
         let mut resize_session = None;
@@ -676,26 +712,81 @@ mod tests {
             1,
             &mut resize_session,
             0,
+            FREQ,
             frame(1),
         );
-        // Frame 2 arrives 5 s later: the first timer event credits at most
-        // 1 s (the catch-up cap), which advances to frame 1 and then stalls
-        // at the next unloaded edge with a zeroed accumulator — the same
-        // wait-at-the-edge semantics upstream's per-tick stall produces.
+        // Frame 2 arrives 5 s after frame 1's display: playback had long
+        // reached the loaded edge with no timer running (a one-frame prefix
+        // is static), so the anchor resets to the arrival — the decode gap
+        // is NOT credited against the freshly arrived frames. Upstream's
+        // timer would have been running the stall branch all along, zeroing
+        // the accumulated time at every tick (viv.c:3233-3240); the re-anchor
+        // synthesizes exactly that.
         apply_reply(
             &mut image,
             &mut displayed_from,
             1,
             &mut resize_session,
             5_000,
+            FREQ,
             additional(2),
         );
         let mut img = image.unwrap();
-        assert!(img.advance_on_timer(5_010, FREQ));
+        assert!(!img.advance_on_timer(5_099, FREQ), "99 ms since arrival");
+        assert_eq!(*img.surface(), 1);
+        assert!(img.advance_on_timer(5_100, FREQ));
         assert_eq!(*img.surface(), 2);
         // No frame 3: hold at the edge without accumulating.
         assert!(!img.advance_on_timer(8_000, FREQ));
         assert_eq!(*img.surface(), 2);
+    }
+
+    #[test]
+    fn a_replacement_failing_pre_first_frame_finalizes_the_kept_animation() {
+        // An animation mid-decode is superseded by a new open whose decode
+        // fails before producing a frame: the old image is kept (issue #4
+        // mandate), but its own stream is dead — the superseding session
+        // replaced it and no worker will deliver its remaining frames or
+        // Complete. Finalizing the kept prefix lets playback wrap at the
+        // edge instead of stalling forever.
+        let mut image = None;
+        let mut displayed_from = None;
+        let mut resize_session = None;
+        apply_reply(
+            &mut image,
+            &mut displayed_from,
+            1,
+            &mut resize_session,
+            0,
+            FREQ,
+            frame(1),
+        );
+        apply_reply(
+            &mut image,
+            &mut displayed_from,
+            1,
+            &mut resize_session,
+            100,
+            FREQ,
+            additional(2),
+        );
+        // Session 2 superseded session 1 and failed pre-first-frame.
+        apply_reply(
+            &mut image,
+            &mut displayed_from,
+            2,
+            &mut resize_session,
+            150,
+            FREQ,
+            Reply::FailedUser("bad file".into()),
+        );
+        let mut img = image.unwrap();
+        assert!(img.is_animated(), "old animation kept");
+        // The kept prefix plays and wraps — not stalled at the edge.
+        assert!(img.advance_on_timer(200, FREQ));
+        assert_eq!(*img.surface(), 2);
+        assert!(img.advance_on_timer(300, FREQ), "wraps at the edge");
+        assert_eq!(*img.surface(), 1);
     }
 
     #[test]
@@ -709,6 +800,7 @@ mod tests {
             1,
             &mut resize_session,
             0,
+            FREQ,
             frame(1),
         );
         apply_reply(
@@ -717,6 +809,7 @@ mod tests {
             1,
             &mut resize_session,
             100,
+            FREQ,
             additional(2),
         );
         // Frame 3 arrives 100 ms later, mid-playback: the anchor stays at
@@ -728,6 +821,7 @@ mod tests {
             1,
             &mut resize_session,
             200,
+            FREQ,
             additional(3),
         );
         let mut img = image.unwrap();
@@ -750,6 +844,7 @@ mod tests {
             2,
             &mut resize_session,
             10,
+            FREQ,
             additional(2),
         );
         assert_eq!(out.actions, Vec::<UiAction>::new());
@@ -768,6 +863,7 @@ mod tests {
             1,
             &mut resize_session,
             0,
+            FREQ,
             frame(1),
         );
         apply_reply(
@@ -776,6 +872,7 @@ mod tests {
             1,
             &mut resize_session,
             0,
+            FREQ,
             additional(2),
         );
         let img = image.as_mut().unwrap();
@@ -801,6 +898,7 @@ mod tests {
             1,
             &mut resize_session,
             10,
+            FREQ,
             Reply::FailedUser("bad file".into()),
         );
         assert_eq!(out.actions, Vec::<UiAction>::new());
@@ -816,6 +914,7 @@ mod tests {
             1,
             &mut resize_session,
             10,
+            FREQ,
             Reply::FailedUser("bad file".into()),
         );
         assert_eq!(out.actions, Vec::<UiAction>::new());
@@ -834,6 +933,7 @@ mod tests {
             1,
             &mut resize_session,
             0,
+            FREQ,
             frame(1),
         );
         let out = apply_reply(
@@ -842,6 +942,7 @@ mod tests {
             1,
             &mut resize_session,
             10,
+            FREQ,
             Reply::FailedUser("over budget".into()),
         );
         assert_eq!(
@@ -861,6 +962,7 @@ mod tests {
             1,
             &mut resize_session,
             0,
+            FREQ,
             frame(1),
         );
         apply_reply(
@@ -869,6 +971,7 @@ mod tests {
             1,
             &mut resize_session,
             0,
+            FREQ,
             additional(2),
         );
         let out = apply_reply(
@@ -877,6 +980,7 @@ mod tests {
             1,
             &mut resize_session,
             10,
+            FREQ,
             Reply::FailedUser("over budget".into()),
         );
         assert_eq!(
@@ -897,6 +1001,7 @@ mod tests {
             1,
             &mut resize_session,
             0,
+            FREQ,
             Reply::FatalSystem("CreateDIBSection failed".into()),
         );
         assert_eq!(out.fatal.as_deref(), Some("CreateDIBSection failed"));
@@ -914,6 +1019,7 @@ mod tests {
             1,
             &mut resize_session,
             0,
+            FREQ,
             frame(1),
         );
         apply_reply(
@@ -922,6 +1028,7 @@ mod tests {
             1,
             &mut resize_session,
             0,
+            FREQ,
             additional(2),
         );
         // Session 2's Complete must not freeze session 1's frame set.
@@ -931,6 +1038,7 @@ mod tests {
             2,
             &mut resize_session,
             0,
+            FREQ,
             Reply::Complete,
         );
         let mut img = image.unwrap();

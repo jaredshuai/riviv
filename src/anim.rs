@@ -60,6 +60,25 @@ impl FrameScheduler {
         }
     }
 
+    /// Whether the time accumulated since the anchor already covers the
+    /// current frame's delay — i.e. playback is at the loaded edge where
+    /// a running timer's stall branch would have been zeroing time every
+    /// tick (viv.c:3233-3240). Used to re-anchor when a streamed frame
+    /// arrives after that edge: without a running timer nothing zeroed
+    /// the elapsed time, so the anchor must be reset to the arrival or
+    /// the first timer event would credit the whole decode gap.
+    pub(crate) fn at_frame_edge(
+        &self,
+        now: u64,
+        freq: u64,
+        delays_ms: &[u32],
+        position: usize,
+    ) -> bool {
+        let elapsed = now.saturating_sub(self.tick_start).min(freq);
+        let delay_ticks = ((delays_ms[position].max(1) as u64 * freq) / 1000).max(1);
+        self.timer_tick + elapsed >= delay_ticks
+    }
+
     /// Process one timer event measured at `now` (QPC ticks, `freq` ticks
     /// per second) against the per-frame `delays_ms` from `position`.
     /// `delays_ms.len()` is the loaded-prefix length; `complete` says the
