@@ -198,7 +198,7 @@ fn load_webp(
 /// `per_frame_bytes` is the canvas cost of one frame (`w * h * 4`), known
 /// from the decoder header before any frame is decoded.
 fn load_frames(
-    frames: Frames<'_>,
+    mut frames: Frames<'_>,
     normalize_delay: fn(u32) -> u32,
     orientation: Orientation,
     per_frame_bytes: usize,
@@ -208,17 +208,23 @@ fn load_frames(
     let mut delays_ms: Vec<u32> = Vec::new();
     let mut canvas: Option<(u32, u32)> = None;
     let mut total_frame_bytes: usize = 0;
-    for frame in frames {
-        // Gate BEFORE pulling the next frame: the iterator allocates the
-        // frame's full canvas before it is handed to us, so checking after
-        // the decode would let a hostile file overshoot the budget by a
-        // canvas (plus the iterator's own compositing canvas) before the
-        // user-level error lands.
+    // Explicit next() loop (not `for`): the budget gate must run BEFORE the
+    // iterator is asked for the next frame — Frames::next() decodes and
+    // allocates the frame's full canvas before returning it, so a gate that
+    // runs after the pull would let a hostile file overshoot the budget by
+    // one canvas (plus the iterator's own compositing canvas) before the
+    // user-level error lands. A file landing exactly on the budget edge is
+    // rejected conservatively (keep the old image) — distinguishing it from
+    // "one more frame exists" would require decoding that frame.
+    loop {
         if frame_surfaces.len() >= MAX_FRAMES
             || total_frame_bytes + per_frame_bytes > MAX_TOTAL_FRAME_BYTES
         {
             return Err(user("animation exceeds the decode budget".to_string()));
         }
+        let Some(frame) = frames.next() else {
+            break;
+        };
         let frame = frame.map_err(|e| user(e.to_string()))?;
         let (numer, denom) = frame.delay().numer_denom_ms();
         // Both animated formats report whole-millisecond delays (GIF cs × 10,
