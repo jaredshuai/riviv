@@ -16,11 +16,14 @@
 use std::ffi::{OsStr, OsString, c_void};
 use std::iter::once;
 use std::mem::size_of;
-use std::os::windows::ffi::OsStringExt;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::Path;
 
 use image::{GenericImageView, ImageDecoder};
-use windows::Win32::Foundation::{GetLastError, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{
+    ERROR_ACCESS_DENIED, GetLastError, HWND, LPARAM, LRESULT, POINT, RECT, SetLastError,
+    WIN32_ERROR, WPARAM,
+};
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BeginPaint, COLOR_BTNFACE, CreateCompatibleDC,
     CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, EndPaint, FillRect, GetMonitorInfoW,
@@ -95,12 +98,17 @@ fn fit_shrink(src_w: i32, src_h: i32, max_w: i32, max_h: i32) -> (i32, i32) {
 }
 
 /// Upstream title format (`_viv_update_title`): `filename - AppName`,
-/// app name only when no image is loaded.
-fn title_text(path: Option<&OsStr>) -> String {
-    match path.and_then(|p| Path::new(p).file_name()) {
-        Some(name) => format!("{} - riviv", name.to_string_lossy()),
-        None => "riviv".to_string(),
+/// app name only when no image is loaded. Built from raw wide code units so
+/// filenames containing unpaired UTF-16 surrogates survive verbatim instead
+/// of collapsing into U+FFFD replacement characters.
+fn title_wide(path: Option<&OsStr>) -> Vec<u16> {
+    let mut title: Vec<u16> = Vec::new();
+    if let Some(name) = path.and_then(|p| Path::new(p).file_name()) {
+        title.extend(name.encode_wide());
+        title.extend(" - ".encode_utf16());
     }
+    title.extend("riviv".encode_utf16());
+    title
 }
 
 fn to_wide(s: &str) -> Vec<u16> {
@@ -276,7 +284,7 @@ fn open_image(hwnd: HWND, path: &OsStr) {
         Ok(surface) => {
             state.surface = Some(surface); // replacing drops the old surface
             state.path = Some(path.to_os_string());
-            let title = HSTRING::from(title_text(state.path.as_deref()));
+            let title = HSTRING::from_wide(&title_wide(state.path.as_deref()));
             // SAFETY: hwnd is live; the HSTRING outlives the call.
             let _ = unsafe { SetWindowTextW(hwnd, &title) };
             // SAFETY: repaint request; the return value (whether any region was
@@ -424,9 +432,24 @@ unsafe extern "system" fn wnd_proc(
             // SAFETY: the CREATESTRUCTW field still owns the Box leaked by run();
             // adopting it here is the single hand-off, freed in WM_NCDESTROY.
             let state = unsafe { Box::from_raw(cs.lpCreateParams.cast::<WindowState>()) };
+            let state_ptr = Box::into_raw(state);
+            // SAFETY: clearing the thread's last error so a zero return from
+            // SetWindowLongPtrW is distinguishable from "previous value was 0".
+            unsafe { SetLastError(WIN32_ERROR(0)) };
             // SAFETY: hwnd is being created; storing our exclusively-owned pointer.
-            let _ =
-                unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize) };
+            let prev = unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, state_ptr as isize) };
+            if prev == 0 {
+                // SAFETY: reading the thread's last error immediately after the call.
+                let gle = unsafe { GetLastError().0 };
+                if gle != 0 {
+                    // Store failed: the window would run stateless (blank client,
+                    // dead Ctrl+O/drops). Reclaim the box and abort creation.
+                    // SAFETY: the failed store never published the pointer, so it
+                    // is still exclusively ours.
+                    drop(unsafe { Box::from_raw(state_ptr) });
+                    return LRESULT(0); // FALSE aborts CreateWindowExW
+                }
+            }
             // SAFETY: hwnd/msg are exactly what this callback received; forwarding
             // to the default procedure must return its verdict untouched.
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
@@ -566,8 +589,17 @@ fn run(arg_path: Option<OsString>) -> Result<(), String> {
         }
     }
     // SAFETY: process-wide and must run before any window exists (matches the
-    // upstream manifest's dpiAware=true).
-    let _ = unsafe { SetProcessDPIAware() };
+    // upstream manifest's dpiAware=true). ERROR_ACCESS_DENIED means the process
+    // is already DPI-aware (e.g. a manifest got embedded later) — that is a
+    // success state; any other failure undermines the whole 1:1 / work-area
+    // geometry model, so fail loud (ADR 0001).
+    if !unsafe { SetProcessDPIAware() }.as_bool() {
+        // SAFETY: reading the thread's last error immediately after the failed call.
+        let gle = unsafe { GetLastError().0 };
+        if gle != ERROR_ACCESS_DENIED.0 {
+            return Err(format!("SetProcessDPIAware failed (GLE={gle})"));
+        }
+    }
 
     // SAFETY: returns the module handle of this exe; no side effects.
     let hinstance =
@@ -593,7 +625,7 @@ fn run(arg_path: Option<OsString>) -> Result<(), String> {
     }
 
     let rect = initial_window_rect(state.surface.as_ref())?;
-    let title = HSTRING::from(title_text(state.path.as_deref()));
+    let title = HSTRING::from_wide(&title_wide(state.path.as_deref()));
     let state_ptr = Box::into_raw(Box::new(state));
 
     // SAFETY: all parameters are valid for the call; state_ptr ownership moves
@@ -691,14 +723,25 @@ mod tests {
 
     #[test]
     fn title_is_filename_first_then_app_name() {
-        assert_eq!(
-            title_text(Some(OsStr::new(r"C:\pics\cat.png"))),
-            "cat.png - riviv"
-        );
+        let title = title_wide(Some(OsStr::new(r"C:\pics\cat.png")));
+        assert_eq!(String::from_utf16_lossy(&title), "cat.png - riviv");
+    }
+
+    #[test]
+    fn title_preserves_unpaired_surrogate_code_units() {
+        // Windows filenames may contain unpaired UTF-16 surrogates; they must
+        // reach the title verbatim (upstream SetWindowTextW takes wide strings).
+        let name = OsString::from_wide(&[0xD800, u16::from(b'a')]);
+        let title = title_wide(Some(name.as_os_str()));
+        let expected: Vec<u16> = [0xD800, u16::from(b'a')]
+            .into_iter()
+            .chain(" - riviv".encode_utf16())
+            .collect();
+        assert_eq!(title, expected);
     }
 
     #[test]
     fn title_without_image_is_app_name_only() {
-        assert_eq!(title_text(None), "riviv");
+        assert_eq!(String::from_utf16_lossy(&title_wide(None)), "riviv");
     }
 }
