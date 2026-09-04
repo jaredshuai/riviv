@@ -4,7 +4,7 @@ Unofficial Rust rewrite of [voidtools/voidImageViewer](https://github.com/voidto
 
 Based on voidImageViewer by David Carpenter / voidtools. See [LICENSE](LICENSE). The original C implementation is preserved under [`c-original/`](c-original/) as a read-only behavioral reference.
 
-> **Status: early development (M2 in progress).** Current scope: Win32 window + GDI rendering, animated GIF/WebP playback at author timing, and alpha-composited transparency (PNG / JPEG / BMP / ICO / TIFF included) with drag & drop. Playlist, zoom/pan and settings land in M2/M3 — see [Roadmap](#roadmap).
+> **Status: early development (M2 in progress).** Current scope: Win32 window + GDI rendering, animated GIF/WebP playback at author timing, and alpha-composited transparency for every supported format (PNG, JPEG, BMP, ICO, TIFF, GIF and WebP) with drag & drop. Playlist, zoom/pan and settings land in M2/M3 — see [Roadmap](#roadmap).
 
 ## Build
 
