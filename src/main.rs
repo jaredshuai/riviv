@@ -19,7 +19,7 @@ use std::mem::size_of;
 use std::os::windows::ffi::OsStringExt;
 use std::path::Path;
 
-use image::GenericImageView;
+use image::{GenericImageView, ImageDecoder};
 use windows::Win32::Foundation::{GetLastError, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BeginPaint, COLOR_BTNFACE, CreateCompatibleDC,
@@ -30,7 +30,8 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::Dialogs::{
-    GetOpenFileNameW, OFN_FILEMUSTEXIST, OFN_HIDEREADONLY, OFN_PATHMUSTEXIST, OPENFILENAMEW,
+    CommDlgExtendedError, GetOpenFileNameW, OFN_FILEMUSTEXIST, OFN_HIDEREADONLY, OFN_PATHMUSTEXIST,
+    OPENFILENAMEW,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL};
 use windows::Win32::UI::Shell::{DragFinish, DragQueryFileW, HDROP};
@@ -111,6 +112,18 @@ fn dialog_filter() -> Vec<u16> {
 // (CreateCompatibleBitmap + SetDIBits -> mem DC -> StretchBlt, viv.c:10263-10271, 4273).
 // ---------------------------------------------------------------------------
 
+/// Two failure layers (ADR 0001): user-level keeps the old image / opens an
+/// empty window (upstream `_viv_load_failed` behavior); system-level GDI
+/// failures are fatal with context.
+enum LoadError {
+    /// Bad path / undecodable image — user-level, suppressed silently.
+    /// The message is unused in M1 and becomes the M2 status-bar text
+    /// (upstream "Failed to load image.").
+    User(#[allow(dead_code)] String),
+    /// DIB/DC infrastructure failure — system-level, fail loud.
+    System(String),
+}
+
 struct Surface {
     memdc: HDC,
     bitmap: HBITMAP,
@@ -120,7 +133,7 @@ struct Surface {
 }
 
 impl Surface {
-    fn from_rgba(width: u32, height: u32, rgba: &mut [u8]) -> Result<Self, String> {
+    fn from_rgba(width: u32, height: u32, rgba: &mut [u8]) -> Result<Self, LoadError> {
         let info = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
                 biSize: size_of::<BITMAPINFOHEADER>() as u32,
@@ -137,9 +150,14 @@ impl Surface {
         // SAFETY: `info` is a valid stack BITMAPINFO outliving the call; we own the
         // returned DIB section (no file mapping, no palette with BI_RGB).
         let bitmap = unsafe { CreateDIBSection(None, &info, DIB_RGB_COLORS, &mut bits, None, 0) }
-            .map_err(|e| format!("CreateDIBSection failed: {e}"))?;
+            .map_err(|e| LoadError::System(format!("CreateDIBSection failed: {e}")))?;
         if bits.is_null() {
-            return Err("CreateDIBSection returned NULL bits".into());
+            // SAFETY: bitmap was created above and is owned by us; no DC
+            // references it yet, so plain DeleteObject is the correct teardown.
+            let _ = unsafe { DeleteObject(HGDIOBJ(bitmap.0)) };
+            return Err(LoadError::System(
+                "CreateDIBSection returned NULL bits".into(),
+            ));
         }
         rgba8_to_bgra_in_place(rgba);
         let byte_len = width as usize * height as usize * 4;
@@ -152,7 +170,11 @@ impl Surface {
         if memdc.is_invalid() {
             // SAFETY: reading the thread's last error immediately after the failed call.
             let gle = unsafe { GetLastError().0 };
-            return Err(format!("CreateCompatibleDC failed (GLE={gle})"));
+            // SAFETY: bitmap is owned by us and was never selected into a DC.
+            let _ = unsafe { DeleteObject(HGDIOBJ(bitmap.0)) };
+            return Err(LoadError::System(format!(
+                "CreateCompatibleDC failed (GLE={gle})"
+            )));
         }
         // SAFETY: `bitmap` is a valid GDI bitmap handle owned by us.
         let old_bitmap = unsafe { SelectObject(memdc, HGDIOBJ(bitmap.0)) };
@@ -178,12 +200,24 @@ impl Drop for Surface {
     }
 }
 
-fn load_surface(path: &OsStr) -> Result<Surface, String> {
+fn load_surface(path: &OsStr) -> Result<Surface, LoadError> {
     let shown = path.to_string_lossy();
-    let img = image::open(Path::new(path)).map_err(|e| format!("{shown}: {e}"))?;
+    let user = |msg: String| LoadError::User(format!("{shown}: {msg}"));
+    // Sniff the format from file contents (upstream GDI+ behavior): renamed or
+    // extensionless files still decode.
+    let reader = image::ImageReader::open(Path::new(path)).map_err(|e| user(e.to_string()))?;
+    let reader = reader
+        .with_guessed_format()
+        .map_err(|e| user(e.to_string()))?;
+    let mut decoder = reader.into_decoder().map_err(|e| user(e.to_string()))?;
+    // Apply EXIF orientation before reading dimensions (upstream
+    // config_orientation = 1, config.c:90) so phone photos are not sideways.
+    let orientation = decoder.orientation().map_err(|e| user(e.to_string()))?;
+    let mut img = image::DynamicImage::from_decoder(decoder).map_err(|e| user(e.to_string()))?;
+    img.apply_orientation(orientation);
     let (w, h) = img.dimensions();
     if w == 0 || h == 0 {
-        return Err(format!("{shown}: empty image"));
+        return Err(user("empty image".to_string()));
     }
     let mut rgba = img.into_rgba8().into_raw();
     Surface::from_rgba(w, h, &mut rgba)
@@ -216,23 +250,29 @@ fn state_of(hwnd: HWND) -> Option<&'static mut WindowState> {
 
 fn open_image(hwnd: HWND, path: &OsStr) {
     let Some(state) = state_of(hwnd) else { return };
-    // User-level failure: keep the current image, no popup, no exit (ADR 0001 /
-    // upstream `_viv_load_failed` behavior).
-    if let Ok(surface) = load_surface(path) {
-        state.surface = Some(surface); // replacing drops the old surface
-        state.path = Some(path.to_os_string());
-        let title = HSTRING::from(title_text(state.path.as_deref()));
-        // SAFETY: hwnd is live; the HSTRING outlives the call.
-        let _ = unsafe { SetWindowTextW(hwnd, &title) };
-        // SAFETY: repaint request; the return value (whether any region was
-        // invalidated) is irrelevant here — WM_PAINT will come.
-        let _ = unsafe { InvalidateRect(Some(hwnd), None, true) };
+    match load_surface(path) {
+        Ok(surface) => {
+            state.surface = Some(surface); // replacing drops the old surface
+            state.path = Some(path.to_os_string());
+            let title = HSTRING::from(title_text(state.path.as_deref()));
+            // SAFETY: hwnd is live; the HSTRING outlives the call.
+            let _ = unsafe { SetWindowTextW(hwnd, &title) };
+            // SAFETY: repaint request; the return value (whether any region was
+            // invalidated) is irrelevant here — WM_PAINT will come.
+            let _ = unsafe { InvalidateRect(Some(hwnd), None, true) };
+        }
+        // User-level failure: keep the current image, no popup, no exit
+        // (ADR 0001 / upstream `_viv_load_failed` behavior).
+        Err(LoadError::User(_)) => {}
+        // System-level GDI failure: fail loud (ADR 0001).
+        Err(LoadError::System(msg)) => fatal(&msg),
     }
 }
 
 fn open_file_dialog(hwnd: HWND, initial_dir: Option<&OsStr>) -> Option<OsString> {
     let filter = dialog_filter();
-    let mut file_buf = vec![0u16; 1024];
+    // 32768 code units: long paths must not trip FNERR_BUFFERTOOSMALL.
+    let mut file_buf = vec![0u16; 32768];
     let dir = initial_dir.map(HSTRING::from);
     let mut ofn = OPENFILENAMEW {
         lStructSize: size_of::<OPENFILENAMEW>() as u32,
@@ -250,7 +290,17 @@ fn open_file_dialog(hwnd: HWND, initial_dir: Option<&OsStr>) -> Option<OsString>
     // SAFETY: `ofn` borrows stack locals (filter/file buffer/dir) that all
     // outlive this modal call.
     if !unsafe { GetOpenFileNameW(&mut ofn) }.as_bool() {
-        return None; // cancelled
+        // SAFETY: pure query of this thread's last common-dialog error; zero
+        // means a plain user cancel.
+        let err = unsafe { CommDlgExtendedError() };
+        if err.0 != 0 {
+            // System-level failure (ADR 0001): report instead of a dead Ctrl+O.
+            fatal(&format!(
+                "GetOpenFileNameW failed (CommDlgExtendedError={})",
+                err.0
+            ));
+        }
+        return None; // user cancelled
     }
     let len = file_buf.iter().position(|&c| c == 0).unwrap_or(0);
     Some(OsString::from_wide(&file_buf[..len]))
@@ -312,6 +362,9 @@ fn paint(hwnd: HWND) {
             // Upstream shrink path: HALFTONE + brush-org realignment (viv.c:4205-4209).
             let _ = SetStretchBltMode(hdc, HALFTONE);
             let _ = SetBrushOrgEx(hdc, 0, 0, None);
+            // Fail-soft by design: upstream viv.c:4278 also continues past a failed
+            // StretchBlt (debug_printf only) — one bad frame must not kill the
+            // window. M2 adds a debug-log channel to surface GLE.
             let _ = StretchBlt(
                 hdc,
                 dx,
@@ -410,18 +463,27 @@ fn initial_window_rect(surface: Option<&Surface>) -> Result<RECT, String> {
         };
         let _ = GetMonitorInfoW(monitor, &mut mi);
         let work = mi.rcWork;
+        // Reserve the non-client frame up front so a full-height fit cannot push
+        // the outer window past the work area (portrait images used to clip
+        // under the taskbar). AdjustWindowRect on a zero rect yields the frame
+        // extents; with WS_OVERLAPPEDWINDOW and no menu they are size-independent.
+        let mut frame = RECT {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        AdjustWindowRect(&mut frame, WS_OVERLAPPEDWINDOW, false)
+            .map_err(|e| format!("AdjustWindowRect failed: {e}"))?;
+        let avail_w = (work.right - work.left - (frame.right - frame.left)).max(1);
+        let avail_h = (work.bottom - work.top - (frame.bottom - frame.top)).max(1);
         let (cw, ch) = match surface {
             // Window = image size (upstream Alt+2 semantics); the remembered-rect /
             // 60%-first-run model returns with M3 config persistence.
-            Some(s) => fit_shrink(
-                s.width,
-                s.height,
-                work.right - work.left,
-                work.bottom - work.top,
-            ),
+            Some(s) => fit_shrink(s.width, s.height, avail_w, avail_h),
             None => (
-                ((work.right - work.left) * 3 / 5).max(640),
-                ((work.bottom - work.top) * 3 / 5).max(480),
+                ((work.right - work.left) * 3 / 5).clamp(640, avail_w),
+                ((work.bottom - work.top) * 3 / 5).clamp(480, avail_h),
             ),
         };
         let mut rc = RECT {
@@ -459,10 +521,16 @@ fn run(arg_path: Option<OsString>) -> Result<(), String> {
         path: None,
     };
     if let Some(path) = arg_path.as_ref() {
-        // Bad path -> empty window, per upstream (ADR 0001 user-level failures).
-        if let Ok(surface) = load_surface(path) {
-            state.surface = Some(surface);
-            state.path = Some(path.clone());
+        match load_surface(path) {
+            Ok(surface) => {
+                state.surface = Some(surface);
+                state.path = Some(path.clone());
+            }
+            // Bad path / undecodable file -> empty window, per upstream
+            // (ADR 0001 user-level failures).
+            Err(LoadError::User(_)) => {}
+            // System-level GDI failure -> fatal (ADR 0001).
+            Err(LoadError::System(msg)) => return Err(msg),
         }
     }
     // SAFETY: process-wide and must run before any window exists (matches the
@@ -527,8 +595,14 @@ fn run(arg_path: Option<OsString>) -> Result<(), String> {
         // SAFETY: standard pump over this thread's queue.
         let r = unsafe { GetMessageW(&mut msg, None, 0, 0) };
         match r.0 {
-            0 => break,     // WM_QUIT
-            -1 => continue, // error: skip dispatching a stale MSG
+            0 => break, // WM_QUIT
+            // Fail loud instead of spinning on a broken pump (ADR 0001); with
+            // filter params (None, 0, 0) this is near-unreachable in practice.
+            -1 => {
+                // SAFETY: reading the thread's last error right after the failed call.
+                let gle = unsafe { GetLastError().0 };
+                return Err(format!("GetMessageW failed (GLE={gle})"));
+            }
             _ => {
                 // SAFETY: msg was filled by GetMessageW just above.
                 unsafe {
