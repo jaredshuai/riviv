@@ -53,5 +53,7 @@ pub(crate) fn load_surface(path: &OsStr) -> Result<Surface, LoadError> {
         return Err(user("empty image".to_string()));
     }
     let mut rgba = img.into_rgba8().into_raw();
-    Surface::from_rgba(w, h, &mut rgba)
+    // Surface failures are purely system-level (GDI allocation); map them
+    // into the fail-loud layer (ADR 0001).
+    Surface::from_rgba(w, h, &mut rgba).map_err(LoadError::System)
 }

@@ -14,7 +14,6 @@ use windows::Win32::Graphics::Gdi::{
     DeleteDC, DeleteObject, HDC, HGDIOBJ, SelectObject,
 };
 
-use crate::loader::LoadError;
 use crate::pixels::rgba8_to_bgra_in_place;
 
 pub(crate) struct Surface {
@@ -26,7 +25,10 @@ pub(crate) struct Surface {
 }
 
 impl Surface {
-    pub(crate) fn from_rgba(width: u32, height: u32, rgba: &mut [u8]) -> Result<Self, LoadError> {
+    /// Errors are plain system-level messages (GDI allocation failures only);
+    /// the loader maps them into its two-layer `LoadError` — keeps this module
+    /// free of loader dependencies (the #4 thread seam owns error taxonomy).
+    pub(crate) fn from_rgba(width: u32, height: u32, rgba: &mut [u8]) -> Result<Self, String> {
         let info = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
                 biSize: size_of::<BITMAPINFOHEADER>() as u32,
@@ -43,14 +45,12 @@ impl Surface {
         // SAFETY: `info` is a valid stack BITMAPINFO outliving the call; we own the
         // returned DIB section (no file mapping, no palette with BI_RGB).
         let bitmap = unsafe { CreateDIBSection(None, &info, DIB_RGB_COLORS, &mut bits, None, 0) }
-            .map_err(|e| LoadError::System(format!("CreateDIBSection failed: {e}")))?;
+            .map_err(|e| format!("CreateDIBSection failed: {e}"))?;
         if bits.is_null() {
             // SAFETY: bitmap was created above and is owned by us; no DC
             // references it yet, so plain DeleteObject is the correct teardown.
             let _ = unsafe { DeleteObject(HGDIOBJ(bitmap.0)) };
-            return Err(LoadError::System(
-                "CreateDIBSection returned NULL bits".into(),
-            ));
+            return Err("CreateDIBSection returned NULL bits".into());
         }
         rgba8_to_bgra_in_place(rgba);
         let byte_len = width as usize * height as usize * 4;
@@ -65,9 +65,7 @@ impl Surface {
             let gle = unsafe { GetLastError().0 };
             // SAFETY: bitmap is owned by us and was never selected into a DC.
             let _ = unsafe { DeleteObject(HGDIOBJ(bitmap.0)) };
-            return Err(LoadError::System(format!(
-                "CreateCompatibleDC failed (GLE={gle})"
-            )));
+            return Err(format!("CreateCompatibleDC failed (GLE={gle})"));
         }
         // SAFETY: `bitmap` is a valid GDI bitmap handle owned by us.
         let old_bitmap = unsafe { SelectObject(memdc, HGDIOBJ(bitmap.0)) };
@@ -78,9 +76,7 @@ impl Surface {
                 let _ = DeleteDC(memdc);
                 let _ = DeleteObject(HGDIOBJ(bitmap.0));
             }
-            return Err(LoadError::System(
-                "SelectObject failed to select the DIB".to_string(),
-            ));
+            return Err("SelectObject failed to select the DIB".to_string());
         }
         Ok(Surface {
             memdc,
