@@ -38,7 +38,8 @@ Drag & drop a file onto the window to switch images (a single dropped file repla
 - Only the first frame of animated images is shown until M2.
 - Transparent areas of PNG/WebP are drawn with their raw RGB values (no alpha compositing) until M2.
 - Large images decode synchronously on the UI thread — the window may briefly freeze while opening them; background decoding lands in M2.
-- Images with a source dimension ≥ 32768 px are not rendered until M2 (upstream stitches tiled stretches, viv.c `_viv_StretchBltStitch`).
+- Images with a source dimension ≥ 32768 px are not rendered until M2 (upstream stitches tiled stretches, viv.c `_viv_StretchBltStitch`); downscaled repainting of large images is not mip-cached until M2 either (upstream `_viv_get_mipmap`).
+- No status bar / toolbar yet (upstream shows them by default) — the status bar lands in M2 (it carries the "Failed to load image." text).
 - Embedded ICC color profiles are not applied (upstream enables GDI+ ICM); non-sRGB images may show slightly inaccurate colors.
 - No single-instance handoff yet: a second launch opens a new window instead of forwarding its command line to the existing viewer (upstream default). Planned for M3 together with Everything IPC.
 - Double-click does not toggle fullscreen yet (upstream default action) — lands with the fullscreen work in M2.
