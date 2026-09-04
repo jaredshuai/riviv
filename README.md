@@ -38,6 +38,9 @@ Drag & drop a file onto the window to switch images (a single dropped file repla
 - Only the first frame of animated images is shown until M2.
 - Transparent areas of PNG/WebP are drawn with their raw RGB values (no alpha compositing) until M2.
 - Large images decode synchronously on the UI thread — the window may briefly freeze while opening them; background decoding lands in M2.
+- Images with a source dimension ≥ 32768 px are not rendered until M2 (upstream stitches tiled stretches, viv.c `_viv_StretchBltStitch`).
+- Embedded ICC color profiles are not applied (upstream enables GDI+ ICM); non-sRGB images may show slightly inaccurate colors.
+- No single-instance handoff yet: a second launch opens a new window instead of forwarding its command line to the existing viewer (upstream default). Planned for M3 together with Everything IPC.
 
 Agent workflow: see [AGENTS.md](AGENTS.md). Decisions: `docs/adr/`.
 
