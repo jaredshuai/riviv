@@ -151,12 +151,10 @@ pub(crate) fn update(hwnd: HWND, snapshot: &StatusSnapshot) {
             if font.0 != 0 {
                 SelectObject(hdc, old);
             }
-            Some(sizes)
+            sizes
         };
         let _ = ReleaseDC(Some(hwnd), hdc);
-        let Some((frame_w, dimension_w)) = sizes else {
-            return;
-        };
+        let (frame_w, dimension_w) = sizes;
 
         let margin = GetSystemMetrics(SM_CXEDGE) * 5;
         let grip = GetSystemMetrics(SM_CXVSCROLL) + GetSystemMetrics(SM_CXBORDER);
@@ -216,8 +214,8 @@ fn set_text(hwnd: HWND, part: usize, text: &str) {
     // SAFETY: hwnd is our live child; the property names are distinct
     // NUL-terminated literals; GetPropW/SetPropW are plain queries on it.
     let current = unsafe { GetPropW(hwnd, PCWSTR(name.as_ptr())) };
-    if current.0 as usize == hash && !text.is_empty() {
-        return; // unchanged — skip the redraw
+    if current.0 as usize == hash {
+        return; // unchanged — skip the redraw (empty text included)
     }
     let new = to_wide(text);
     // SAFETY: `new` is NUL-terminated and outlives the call; SetPropW on a
