@@ -32,12 +32,12 @@ Drag & drop a file onto the window to switch images (a single dropped file repla
 
 ## Differences from upstream (intentional)
 
-- The window opens at image size (upstream: remembered window rect, or 60% auto-fit on first run — restored in M3 with config persistence).
+- The window opens at image size (upstream: remembered window rect, or 60% auto-fit on first run — restored in M3 with config persistence). Under async decoding the window first opens at the default size and resizes when the startup image's first frame arrives.
 - Images are never upscaled beyond 100% (upstream default `fill_window=0`).
 - The window never resizes when switching images via drag & drop (upstream behavior).
 - Default window icon for now (upstream ships its own icon).
 - Animated WebP frames shorter than 10 ms play quantized to the `USER_TIMER_MINIMUM` timer period — a two-frame 5 ms animation advances two frames per tick and can appear frozen. Upstream's primary path additionally drives a 1 ms timer-queue timer (`CreateTimerQueueTimer`, viv.c:9132-9141) for those; GIF delays are 10 ms multiples and never hit this.
-- Large images decode synchronously on the UI thread — the window may briefly freeze while opening them; background decoding lands in M2.
+- A user-level load failure (bad path, undecodable file, decode-budget overflow) keeps the old image and title untouched — nothing seems to happen (no popup, no exit). Once a new image's first frame is already on screen, a later failure of that same load (e.g. a budget overflow mid-animation) cannot roll the old image back and clears to a blank window instead, like upstream's async FAILED handler (viv.c:2832-2840). Upstream blanks in both cases.
 - Images with a source dimension ≥ 32768 px are not rendered until M2 (upstream stitches tiled stretches, viv.c `_viv_StretchBltStitch`); downscaled repainting of large images is not mip-cached until M2 either (upstream `_viv_get_mipmap`).
 - No status bar / toolbar yet (upstream shows them by default) — the status bar lands in M2 (it carries the "Failed to load image." text).
 - Embedded ICC color profiles are not applied (upstream enables GDI+ ICM); non-sRGB images may show slightly inaccurate colors.
