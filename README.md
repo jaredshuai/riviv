@@ -36,6 +36,7 @@ Drag & drop a file onto the window to switch images (a single dropped file repla
 - Images are never upscaled beyond 100% (upstream default `fill_window=0`).
 - The window never resizes when switching images via drag & drop (upstream behavior).
 - Default window icon for now (upstream ships its own icon).
+- Animated WebP frames shorter than 10 ms play quantized to the `USER_TIMER_MINIMUM` timer period — a two-frame 5 ms animation advances two frames per tick and can appear frozen. Upstream's primary path additionally drives a 1 ms timer-queue timer (`CreateTimerQueueTimer`, viv.c:9132-9141) for those; GIF delays are 10 ms multiples and never hit this.
 - Large images decode synchronously on the UI thread — the window may briefly freeze while opening them; background decoding lands in M2.
 - Images with a source dimension ≥ 32768 px are not rendered until M2 (upstream stitches tiled stretches, viv.c `_viv_StretchBltStitch`); downscaled repainting of large images is not mip-cached until M2 either (upstream `_viv_get_mipmap`).
 - No status bar / toolbar yet (upstream shows them by default) — the status bar lands in M2 (it carries the "Failed to load image." text).

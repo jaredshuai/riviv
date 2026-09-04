@@ -148,7 +148,17 @@ fn load_gif(
     let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
     // GIF frame delays arrive as centiseconds × 10 ms from the image crate;
     // the zero/absent fallback to 100 ms is upstream behavior (viv.c:10749).
-    load_frames(decoder.into_frames(), gif_delay_ms, orientation, user)
+    // Every frame costs a full canvas, so the budget gate knows the per-frame
+    // cost up front (decoder dimensions == canvas dimensions).
+    let (w, h) = decoder.dimensions();
+    let per_frame_bytes = w as usize * h as usize * 4;
+    load_frames(
+        decoder.into_frames(),
+        gif_delay_ms,
+        orientation,
+        per_frame_bytes,
+        user,
+    )
 }
 
 fn load_webp(
@@ -169,18 +179,29 @@ fn load_webp(
     let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
     // WebP delays are the decoder's millisecond values, used as-is like
     // upstream's libwebp path (viv.c:10289 — no zero fallback; the scheduler
-    // floors zero to 1 ms instead).
-    load_frames(decoder.into_frames(), |ms| ms, orientation, user)
+    // floors zero to 1 ms instead). Per-frame budget cost as for GIF above.
+    let (w, h) = decoder.dimensions();
+    let per_frame_bytes = w as usize * h as usize * 4;
+    load_frames(
+        decoder.into_frames(),
+        |ms| ms,
+        orientation,
+        per_frame_bytes,
+        user,
+    )
 }
 
 /// Decode every frame of an animation into composited surfaces.
 ///
 /// `normalize_delay` maps the image crate's reported delay (ms) to the delay
 /// we schedule with; it carries the per-format fallback rules.
+/// `per_frame_bytes` is the canvas cost of one frame (`w * h * 4`), known
+/// from the decoder header before any frame is decoded.
 fn load_frames(
     frames: Frames<'_>,
     normalize_delay: fn(u32) -> u32,
     orientation: Orientation,
+    per_frame_bytes: usize,
     user: &impl Fn(String) -> LoadError,
 ) -> Result<LoadedImage, LoadError> {
     let mut frame_surfaces: Vec<Surface> = Vec::new();
@@ -188,6 +209,16 @@ fn load_frames(
     let mut canvas: Option<(u32, u32)> = None;
     let mut total_frame_bytes: usize = 0;
     for frame in frames {
+        // Gate BEFORE pulling the next frame: the iterator allocates the
+        // frame's full canvas before it is handed to us, so checking after
+        // the decode would let a hostile file overshoot the budget by a
+        // canvas (plus the iterator's own compositing canvas) before the
+        // user-level error lands.
+        if frame_surfaces.len() >= MAX_FRAMES
+            || total_frame_bytes + per_frame_bytes > MAX_TOTAL_FRAME_BYTES
+        {
+            return Err(user("animation exceeds the decode budget".to_string()));
+        }
         let frame = frame.map_err(|e| user(e.to_string()))?;
         let (numer, denom) = frame.delay().numer_denom_ms();
         // Both animated formats report whole-millisecond delays (GIF cs × 10,
@@ -203,8 +234,9 @@ fn load_frames(
         if w == 0 || h == 0 {
             return Err(user("empty frame".to_string()));
         }
-        // The iterators deliver full-canvas frames; a size change means a
-        // corrupt stream (defensive — treat it as a bad file, not a crash).
+        // The iterators deliver full-canvas frames matching the decoder's
+        // canvas; a deviation means a corrupt stream (defensive — treat it as
+        // a bad file, not a crash).
         match canvas {
             None => canvas = Some((w, h)),
             Some((cw, ch)) if cw != w || ch != h => {
@@ -213,9 +245,6 @@ fn load_frames(
             Some(_) => {}
         }
         total_frame_bytes += buffer.len();
-        if total_frame_bytes > MAX_TOTAL_FRAME_BYTES || frame_surfaces.len() >= MAX_FRAMES {
-            return Err(user("animation exceeds the decode budget".to_string()));
-        }
         // Resolve transparency against the windowed background before the
         // DIB copy — the render path has no alpha channel of its own.
         composite_over_background_in_place(&mut buffer, WINDOWED_BACKGROUND_RGB);
