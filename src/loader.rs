@@ -59,9 +59,10 @@ pub(crate) enum LoadReply<F = DibFrame> {
     /// The stream ended and every frame has been delivered — the loaded
     /// prefix is the full frame set (unlocks wrap-around).
     Complete,
-    /// User-level failure (bad path / undecodable / over budget): the
-    /// message is unused until the M2 status bar (#5, upstream "Failed to
-    /// load image."); the UI decides keep-vs-clear in `apply_reply`.
+    /// User-level failure (bad path / undecodable / over budget): the UI
+    /// decides keep-vs-clear in `apply_reply`; the status bar shows
+    /// upstream's "Failed to load image." (#5). The message itself is a
+    /// diagnostic detail — carried for the M2 debug-log channel.
     FailedUser(#[allow(dead_code)] String),
     /// System-level failure (GDI exhaustion): fail loud on the UI thread
     /// (ADR 0001) — the reply exists so the modal box never runs on the
@@ -429,6 +430,21 @@ impl<F> LoadedImage<F> {
         self.frames.len() > 1
     }
 
+    /// The 1-based frame position for the status bar's `n / m` counter
+    /// (#5; upstream shows `_viv_frame_position + 1`, viv.c:11204). `0`
+    /// while nothing is displayed so the counter can hide on `total <= 1`.
+    pub(crate) fn frame_position_1based(&self) -> usize {
+        self.position + 1
+    }
+
+    /// Frames delivered so far. The decode streams, so this is the loaded
+    /// prefix until `decode_complete` — the status bar's `m` counts against
+    /// it and grows mid-load (image frame iterators cannot report the
+    /// total up front; see the module header).
+    pub(crate) fn frame_count(&self) -> usize {
+        self.frames.len()
+    }
+
     /// WM_TIMER body: advance by the time elapsed since the last event and
     /// return whether the displayed frame changed (a repaint is due).
     pub(crate) fn advance_on_timer(&mut self, now: u64, freq: u64) -> bool {
@@ -467,6 +483,19 @@ pub(crate) struct ReplyOutcome {
     /// System-level failure to fail loud about (ADR 0001) — the caller
     /// shows the fatal modal AFTER dropping its state borrow.
     pub(crate) fatal: Option<String>,
+    /// This session's load is over — either the stream completed or it
+    /// failed (user-level, before any frame of this session could matter
+    /// for the status). The window layer clears its "Loading..." indicator
+    /// from this: a fresh open that has not replied yet must keep showing
+    /// it, and only the drained session may end what it started (#5;
+    /// upstream keys the indicator off the load thread itself,
+    /// viv.c:11354-11358 — riviv has no per-load thread to observe).
+    pub(crate) load_ended: bool,
+    /// The load failed at user level (bad file / undecodable / over
+    /// budget) — the status bar shows upstream's "Failed to load image."
+    /// (#5) until the next open resets it. Independent of keep-vs-clear:
+    /// the display decision lives in `actions`.
+    pub(crate) load_failed: bool,
 }
 
 /// Apply one load reply to the window's display state — the pure half of
@@ -509,7 +538,7 @@ pub(crate) fn apply_reply<F>(
             }
             ReplyOutcome {
                 actions,
-                fatal: None,
+                ..Default::default()
             }
         }
         LoadReply::AdditionalFrame { frame, delay_ms } => {
@@ -533,7 +562,10 @@ pub(crate) fn apply_reply<F>(
             {
                 img.mark_complete();
             }
-            ReplyOutcome::default()
+            ReplyOutcome {
+                load_ended: true,
+                ..Default::default()
+            }
         }
         LoadReply::FailedUser(_) => {
             if *displayed_from == Some(session_id) {
@@ -544,7 +576,9 @@ pub(crate) fn apply_reply<F>(
                 *displayed_from = None;
                 ReplyOutcome {
                     actions: vec![UiAction::Invalidate, UiAction::SetWindowTitle],
-                    fatal: None,
+                    load_ended: true,
+                    load_failed: true,
+                    ..Default::default()
                 }
             } else {
                 // Nothing of this session ever reached the screen (failure
@@ -558,12 +592,17 @@ pub(crate) fn apply_reply<F>(
                 if let Some(img) = image.as_mut() {
                     img.mark_complete();
                 }
-                ReplyOutcome::default()
+                ReplyOutcome {
+                    load_ended: true,
+                    load_failed: true,
+                    ..Default::default()
+                }
             }
         }
         LoadReply::FatalSystem(msg) => ReplyOutcome {
-            actions: Vec::new(),
             fatal: Some(msg),
+            load_ended: true,
+            ..Default::default()
         },
     }
 }
@@ -885,6 +924,92 @@ mod tests {
         // Same edge after completion: wrap to frame 0.
         assert!(img.advance_on_timer(5_100, FREQ));
         assert_eq!(*img.surface(), 1);
+    }
+
+    #[test]
+    fn terminal_replies_report_load_ended_and_failures_report_load_failed() {
+        // The status bar's Loading indicator is keyed off these protocol
+        // facts (#5): a TERMINAL reply ends the load (Complete/FailedUser/
+        // FatalSystem), only FailedUser marks it failed. FirstFrame never
+        // ends it — the decode is still streaming (a still image ends at
+        // its Complete, one reply later).
+        let mut image = None;
+        let mut displayed_from = None;
+        let mut resize_session = None;
+        let out = apply_reply(
+            &mut image,
+            &mut displayed_from,
+            1,
+            &mut resize_session,
+            0,
+            FREQ,
+            frame(1),
+        );
+        assert!(!out.load_ended, "the first frame is not the stream's end");
+        assert!(!out.load_failed);
+
+        // Mid-stream replies keep Loading up.
+        let out = apply_reply(
+            &mut image,
+            &mut displayed_from,
+            1,
+            &mut resize_session,
+            5,
+            FREQ,
+            additional(2),
+        );
+        assert!(!out.load_ended);
+        assert!(!out.load_failed);
+
+        let out = apply_reply(
+            &mut image,
+            &mut displayed_from,
+            1,
+            &mut resize_session,
+            10,
+            FREQ,
+            Reply::Complete,
+        );
+        assert!(out.load_ended, "the terminal reply ends the load");
+        assert!(!out.load_failed);
+
+        let out = apply_reply(
+            &mut image,
+            &mut displayed_from,
+            1,
+            &mut resize_session,
+            20,
+            FREQ,
+            Reply::FailedUser("bad file".into()),
+        );
+        assert!(out.load_ended);
+        assert!(out.load_failed);
+
+        let out = apply_reply(
+            &mut image,
+            &mut displayed_from,
+            1,
+            &mut resize_session,
+            30,
+            FREQ,
+            Reply::FatalSystem("GDI gone".into()),
+        );
+        assert!(out.load_ended);
+        assert!(!out.load_failed, "system failures fail loud, not status");
+    }
+
+    #[test]
+    fn frame_position_is_reported_one_based_for_the_status_counter() {
+        let mut img = Img::first_frame(1, 100, 0);
+        assert_eq!(img.frame_position_1based(), 1);
+        assert_eq!(img.frame_count(), 1);
+        img.push_frame(2, 100);
+        img.push_frame(3, 100);
+        assert_eq!(img.frame_count(), 3);
+        assert!(img.advance_on_timer(100, FREQ));
+        assert_eq!(img.frame_position_1based(), 2);
+        assert!(img.advance_on_timer(200, FREQ));
+        assert_eq!(img.frame_position_1based(), 3);
     }
 
     #[test]

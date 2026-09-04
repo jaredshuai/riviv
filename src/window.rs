@@ -33,13 +33,14 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL};
 use windows::Win32::UI::Shell::{DragFinish, DragQueryFileW, HDROP};
 use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRect, CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CreateWindowExW,
-    DefWindowProcW, DispatchMessageW, GWLP_USERDATA, GetCursorPos, GetMessageW, GetWindowLongPtrW,
-    IDC_ARROW, KillTimer, LoadCursorW, MB_ICONERROR, MINMAXINFO, MSG, MessageBoxW, PostQuitMessage,
-    RegisterClassExW, SHOW_WINDOW_CMD, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER, SetForegroundWindow,
-    SetProcessDPIAware, SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow,
-    TranslateMessage, USER_TIMER_MINIMUM, WM_DESTROY, WM_DROPFILES, WM_ERASEBKGND,
-    WM_GETMINMAXINFO, WM_KEYDOWN, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_TIMER, WNDCLASSEXW,
-    WS_EX_ACCEPTFILES, WS_OVERLAPPEDWINDOW,
+    DefWindowProcW, DispatchMessageW, GWLP_USERDATA, GetClientRect, GetCursorPos, GetMessageW,
+    GetWindowLongPtrW, IDC_ARROW, KillTimer, LoadCursorW, MB_ICONERROR, MINMAXINFO, MSG,
+    MessageBoxW, PostQuitMessage, RegisterClassExW, SHOW_WINDOW_CMD, SW_SHOW, SWP_NOACTIVATE,
+    SWP_NOZORDER, SendMessageW, SetForegroundWindow, SetProcessDPIAware, SetTimer,
+    SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, TranslateMessage,
+    USER_TIMER_MINIMUM, WM_DESTROY, WM_DROPFILES, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN,
+    WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_EX_ACCEPTFILES,
+    WS_OVERLAPPEDWINDOW,
 };
 use windows::core::{HSTRING, PCWSTR, w};
 
@@ -48,6 +49,7 @@ use crate::fit::fit_shrink;
 use crate::loader::{LoadedImage, UiAction, apply_reply, map_reply_frame};
 use crate::loadthread::{LoadSession, LoadThread, REPLY_KICK_MESSAGE};
 use crate::paint::paint;
+use crate::status;
 use crate::surface::Surface;
 use crate::text::{dialog_filter, title_wide, to_wide};
 
@@ -84,6 +86,20 @@ pub(crate) struct WindowState {
     /// so timer reconciliation never resets a live timer's period (which
     /// would starve WM_TIMER under fast frame streams).
     pub(crate) animation_timer_running: bool,
+    /// The status-bar child window (#5; upstream `_viv_status_hwnd`).
+    /// Created in WM_NCCREATE, destroyed with the parent by Windows.
+    pub(crate) status: HWND,
+    /// Status-bar flags (upstream `_viv_file_not_found` /
+    /// `_viv_load_failed`, viv.c:779-780): set by the open path and the
+    /// reply protocol, reset on every new open. "Loading" is not a flag —
+    /// it derives from `session.is_some()` (a session is taken when its
+    /// terminal reply drains).
+    pub(crate) status_file_not_found: bool,
+    pub(crate) status_load_failed: bool,
+    /// Byte size of the displayed file, for the status bar's "(N KB)"
+    /// (upstream reads it from the load's WIN32_FIND_DATA, viv.c:11152) —
+    /// None/0 omits the size clause.
+    pub(crate) displayed_file_bytes: Option<u64>,
 }
 
 /// Window state pointer stored in GWLP_USERDATA between WM_NCCREATE and
@@ -115,23 +131,98 @@ pub(crate) unsafe fn state_of(hwnd: HWND) -> Option<&'static mut WindowState> {
     Some(unsafe { &mut *ptr })
 }
 
+/// Build the status-bar snapshot from the window state — the pure text
+/// model in `text.rs` decides what each part says from this. Called both
+/// inside a state borrow (to collect the snapshot) and the result applied
+/// after the borrow drops (`status::update` sends messages).
+fn status_snapshot(state: &WindowState, hwnd: HWND) -> status::StatusSnapshot {
+    let mut client = RECT::default();
+    // SAFETY: hwnd is the state's own live window; a failed query reads the
+    // zeroed rect — a 0-wide client collapses the part layout until the
+    // next refresh.
+    let _ = unsafe { GetClientRect(hwnd, &mut client) };
+    status::StatusSnapshot {
+        loading: state.session.is_some(),
+        file_not_found: state.status_file_not_found,
+        load_failed: state.status_load_failed,
+        frame: state
+            .image
+            .as_ref()
+            .map(|i| (i.frame_position_1based(), i.frame_count())),
+        dimensions: state.image.as_ref().map(|i| (i.width(), i.height())),
+        file_bytes: state.displayed_file_bytes,
+        client_wide: client.right - client.left,
+    }
+}
+
+/// Refresh the status bar from current state, running the Win32 calls
+/// outside any state borrow (SB_SETTEXT redraws synchronously).
+fn refresh_status(hwnd: HWND) {
+    // SAFETY: the borrow spans only reads into the snapshot struct; the
+    // SendMessageW calls in status::update run after it drops. Two
+    // sequential borrows, never nested.
+    let snapshot = unsafe { state_of(hwnd) }.map(|s| status_snapshot(s, hwnd));
+    let Some(snapshot) = snapshot else { return };
+    status::update(snapshot_status_bar(hwnd), &snapshot);
+}
+
+/// The status-bar child handle (created in WM_NCCREATE).
+fn snapshot_status_bar(hwnd: HWND) -> HWND {
+    // SAFETY: read-only field copy.
+    unsafe { state_of(hwnd) }.map_or(HWND::default(), |s| s.status)
+}
+
 /// Queue `path` for background decoding (upstream `_viv_open`'s
 /// CreateThread arm, viv.c:1569). The current display stays up until this
 /// load's first frame replies in; storing the new session supersedes
 /// (flags) any in-flight one. `is_startup` ties the one-time
 /// resize-to-image to this session's first frame.
 fn request_open(hwnd: HWND, path: &OsStr, is_startup: bool) {
-    // SAFETY: the borrow spans only the worker request and the session
-    // store — the channel send never blocks, the old session's Drop sets
-    // an atomic flag (no GDI, no pumping), and kicks posted by the worker
-    // are queued messages, never delivered synchronously here.
+    // Existence check BEFORE queueing a decode (upstream
+    // `_viv_open_from_filename`'s GetFileAttributesEx arm, viv.c:1359 —
+    // the status bar's "File not found." is a pre-open verdict, not a
+    // decode failure, viv.c:5094-5098). The byte size rides along for the
+    // status bar's "(N KB)"; directories and unreadable files fall through
+    // to the loader as user-level failures like upstream.
+    let (not_found, file_bytes) = match std::fs::metadata(Path::new(path)) {
+        Ok(meta) => (false, Some(meta.len())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (true, None),
+        Err(_) => (false, None),
+    };
+    if not_found {
+        // A missing file never reaches the loader (no session, no
+        // Loading) — the bar shows "File not found." over the kept display
+        // until the next open (upstream sets `_viv_file_not_found` without
+        // spawning a load, viv.c:5094-5098).
+        // SAFETY: the borrow spans only flag stores — nothing pumps.
+        if let Some(state) = unsafe { state_of(hwnd) } {
+            state.status_file_not_found = true;
+            state.status_load_failed = false;
+            // Supersede any in-flight load so its late replies are inert.
+            state.session = None;
+        }
+        refresh_status(hwnd);
+        return;
+    }
+    // SAFETY: the borrow spans only the worker request and the session/
+    // status stores — the channel send never blocks, the old session's
+    // Drop sets an atomic flag (no GDI, no pumping), and kicks posted by
+    // the worker are queued messages, never delivered synchronously here.
     if let Some(state) = unsafe { state_of(hwnd) } {
+        // Upstream resets the failure flags at the start of every new load
+        // (viv.c:1447-1458).
+        state.status_file_not_found = false;
+        state.status_load_failed = false;
+        // The byte size belongs to the requested path until the load
+        // commits (FirstFrame moves it to `displayed_file_bytes`).
+        state.displayed_file_bytes = file_bytes;
         let session = state.load_thread.request(hwnd, path.to_os_string());
         if is_startup {
             state.startup_resize_session = Some(session.id());
         }
         state.session = Some(session);
     }
+    refresh_status(hwnd);
 }
 
 /// The reply-kick handler: drain the current load session's queue and apply
@@ -181,6 +272,16 @@ fn on_load_replies(hwnd: HWND) {
                 state.timer_freq,
                 reply,
             );
+            // The status bar's Loading/Failed flags follow the protocol
+            // facts (#5): the session ends at its terminal reply (taken so
+            // `session.is_some()` stops meaning "loading"), and a
+            // user-level failure sticks until the next open.
+            if outcome.load_ended && state.session.as_ref().is_some_and(|s| s.id() == session_id) {
+                state.session = None;
+            }
+            if outcome.load_failed {
+                state.status_load_failed = true;
+            }
             if let Some(msg) = outcome.fatal {
                 fatal_msg = Some(msg);
                 break;
@@ -189,8 +290,17 @@ fn on_load_replies(hwnd: HWND) {
                 match action {
                     UiAction::Invalidate => invalidate = true,
                     UiAction::SetWindowTitle => {
-                        state.path = Some(session_path.clone());
-                        title = Some(HSTRING::from_wide(&title_wide(state.path.as_deref())));
+                        // The display adopted this session's image (or
+                        // cleared it): the status bar's "(N KB)" follows
+                        // the same commit/clear.
+                        if state.displayed_from == Some(session_id) {
+                            state.path = Some(session_path.clone());
+                            title = Some(HSTRING::from_wide(&title_wide(state.path.as_deref())));
+                        } else {
+                            state.path = None;
+                            title = Some(HSTRING::from_wide(&title_wide(None)));
+                            state.displayed_file_bytes = None;
+                        }
                     }
                     // Deferred to after the drain: a later reply in the same
                     // batch (mid-stream failure) may clear the image again —
@@ -217,13 +327,14 @@ fn on_load_replies(hwnd: HWND) {
             // The startup load's first frame sizes the window to the image
             // (M1 behavior under async startup); a geometry failure is fatal
             // exactly like run()'s initial rect.
-            match initial_window_rect(state.image.as_ref()) {
+            match initial_window_rect(state.image.as_ref(), status::height(state.status)) {
                 Ok(rect) => resize_rect = Some(rect),
                 Err(msg) => fatal_msg = Some(msg),
             }
         }
     }
     // Borrow dropped — the modal paths and the reentrant resize are safe.
+    refresh_status(hwnd);
     if let Some(msg) = fatal_msg {
         fatal(&msg);
     }
@@ -301,6 +412,9 @@ fn on_animation_timer(hwnd: HWND) {
         None => false,
     };
     if repaint {
+        // The frame counter part ("n / m") tracks the displayed frame
+        // (upstream refreshes it in the timer body, viv.c:3277).
+        refresh_status(hwnd);
         // SAFETY: queues a WM_PAINT; never pumps messages. Erase is FALSE
         // like upstream viv.c:3284 — WM_PAINT fills the whole client itself.
         let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
@@ -412,6 +526,21 @@ fn on_drop_files(hwnd: HWND, hdrop: HDROP) {
     }
 }
 
+fn on_size(hwnd: HWND) {
+    // SAFETY: two sequential borrows, never nested — the first only copies
+    // the snapshot, the second reads the bar handle.
+    let snapshot = unsafe { state_of(hwnd) }.map(|s| status_snapshot(s, hwnd));
+    let Some(snapshot) = snapshot else { return };
+    let bar = snapshot_status_bar(hwnd);
+    status::update(bar, &snapshot);
+    // The common control docks itself to the bottom of the client on
+    // WM_SIZE (upstream `_viv_on_size`, viv.c:1615-1620).
+    // SAFETY: bar is our live child window.
+    unsafe {
+        SendMessageW(bar, WM_SIZE, None, None);
+    }
+}
+
 unsafe extern "system" fn wnd_proc(
     hwnd: HWND,
     msg: u32,
@@ -443,6 +572,45 @@ unsafe extern "system" fn wnd_proc(
                     // is still exclusively ours.
                     drop(unsafe { Box::from_raw(state_ptr) });
                     return LRESULT(0); // FALSE aborts CreateWindowExW
+                }
+            }
+            // The status bar is a child of this window (#5; upstream creates
+            // it in `_viv_status_show(config_show_status)`, viv.c:5415). Its
+            // creation failure is system-level (a window without the promised
+            // status bar is not the app we shipped).
+            // SAFETY: the state pointer was just published above; the borrow
+            // ends with this block (status::create only creates a child).
+            let hinstance = unsafe { GetModuleHandleW(None) };
+            match hinstance {
+                Ok(h) => match status::create(hwnd, h.into()) {
+                    Ok(bar) => {
+                        // SAFETY: the pointer is ours (published above).
+                        unsafe { (*state_ptr).status = bar };
+                    }
+                    Err(msg) => {
+                        // Reclaim the box and fail creation — run() reports
+                        // the reason through its CreateWindowExW error path.
+                        // SAFETY: creation is aborted; the pointer was never
+                        // visible to a live window.
+                        drop(unsafe { Box::from_raw(state_ptr) });
+                        // SAFETY: clearing the slot so a later WM_NCDESTROY
+                        // does not adopt a dangling pointer.
+                        let _ = unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) };
+                        // SAFETY: legal on the owning thread during creation.
+                        unsafe { SetLastError(WIN32_ERROR(1)) };
+                        eprintln!("status bar creation failed: {msg}");
+                        return LRESULT(0); // FALSE aborts CreateWindowExW
+                    }
+                },
+                Err(e) => {
+                    // SAFETY: creation is aborted; the pointer was never
+                    // visible to a live window.
+                    drop(unsafe { Box::from_raw(state_ptr) });
+                    // SAFETY: clearing the slot so a later WM_NCDESTROY
+                    // does not adopt a dangling pointer.
+                    let _ = unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) };
+                    eprintln!("GetModuleHandleW failed: {e}");
+                    return LRESULT(0);
                 }
             }
             // SAFETY: hwnd/msg are exactly what this callback received; forwarding
@@ -479,6 +647,10 @@ unsafe extern "system" fn wnd_proc(
         WM_ERASEBKGND => LRESULT(1), // WM_PAINT fills the whole client
         WM_PAINT => {
             paint(hwnd);
+            LRESULT(0)
+        }
+        WM_SIZE => {
+            on_size(hwnd);
             LRESULT(0)
         }
         WM_GETMINMAXINFO => {
@@ -523,10 +695,13 @@ unsafe extern "system" fn wnd_proc(
     }
 }
 
-/// Outer window rect: client = image size shrunk to fit the work area of the
-/// monitor under the cursor (upstream centers on the cursor's monitor,
+/// Outer window rect: client = image size shrunk to fit the work area of
+/// the monitor under the cursor (upstream centers on the cursor's monitor,
 /// viv.c:5359-5387); no image -> 60% auto-fit with a 640x480 floor.
-fn initial_window_rect(image: Option<&LoadedImage>) -> Result<RECT, String> {
+/// `status_h` is the status bar's height, added back so the IMAGE keeps
+/// its fitted size above the bar (upstream adds `_viv_get_status_high()`
+/// when computing the window rect from the desired client, viv.c:2148).
+fn initial_window_rect(image: Option<&LoadedImage>, status_h: i32) -> Result<RECT, String> {
     // SAFETY: read-only monitor/geometry queries; AdjustWindowRect only computes.
     unsafe {
         let mut cursor = POINT::default();
@@ -557,7 +732,7 @@ fn initial_window_rect(image: Option<&LoadedImage>) -> Result<RECT, String> {
         AdjustWindowRect(&mut frame, WS_OVERLAPPEDWINDOW, false)
             .map_err(|e| format!("AdjustWindowRect failed: {e}"))?;
         let avail_w = (work.right - work.left - (frame.right - frame.left)).max(1);
-        let avail_h = (work.bottom - work.top - (frame.bottom - frame.top)).max(1);
+        let avail_h = (work.bottom - work.top - (frame.bottom - frame.top) - status_h).max(1);
         let (cw, ch) = match image {
             // Window = image size (upstream Alt+2 semantics); the remembered-rect /
             // 60%-first-run model returns with M3 config persistence.
@@ -573,7 +748,9 @@ fn initial_window_rect(image: Option<&LoadedImage>) -> Result<RECT, String> {
             left: 0,
             top: 0,
             right: cw,
-            bottom: ch,
+            // The image fits above the status bar; the bar's height rides
+            // on top of the fitted client (viv.c:2148/2155).
+            bottom: ch + status_h,
         };
         AdjustWindowRect(&mut rc, WS_OVERLAPPEDWINDOW, false)
             .map_err(|e| format!("AdjustWindowRect failed: {e}"))?;
@@ -587,6 +764,34 @@ fn initial_window_rect(image: Option<&LoadedImage>) -> Result<RECT, String> {
             right: x + wide,
             bottom: y + high,
         })
+    }
+}
+
+/// The status bar's height before its window exists (used only for the
+/// initial rect at startup — the live bar is measured via
+/// `status::height` afterwards). comctl32 sizes a status bar from the
+/// system status font and border metrics; we reproduce that formula
+/// (border * 2 + font height) at the system DPI so the first window rect
+/// already accounts for the bar.
+fn initial_status_height() -> i32 {
+    // SAFETY: desktop DC queries on the calling thread.
+    unsafe {
+        let hdc = windows::Win32::Graphics::Gdi::GetDC(None);
+        if hdc.is_invalid() {
+            return 0;
+        }
+        let dpi = windows::Win32::Graphics::Gdi::GetDeviceCaps(
+            Some(hdc),
+            windows::Win32::Graphics::Gdi::LOGPIXELSY,
+        );
+        let _ = windows::Win32::Graphics::Gdi::ReleaseDC(None, hdc);
+        // Upstream's bar at 96 DPI is 22 px (SM_CYVTHUMB=20 + borders);
+        // scale from there — comctl32's own formula is font-height based
+        // and lands on the same value.
+        let border = windows::Win32::UI::WindowsAndMessaging::GetSystemMetrics(
+            windows::Win32::UI::WindowsAndMessaging::SM_CYBORDER,
+        );
+        ((20 * dpi) / 96) + border * 2
     }
 }
 
@@ -620,6 +825,12 @@ pub(crate) fn run(arg_path: Option<OsString>) -> Result<(), String> {
         // cannot leak the resize into a later open.
         startup_resize_session: None,
         animation_timer_running: false,
+        // The status bar is created in WM_NCCREATE (the window handle must
+        // exist first) and written into the state there.
+        status: HWND::default(),
+        status_file_not_found: false,
+        status_load_failed: false,
+        displayed_file_bytes: None,
     };
     // SAFETY: process-wide and must run before any window exists (matches the
     // upstream manifest's dpiAware=true). ERROR_ACCESS_DENIED means the process
@@ -660,10 +871,12 @@ pub(crate) fn run(arg_path: Option<OsString>) -> Result<(), String> {
         return Err(format!("RegisterClassExW failed (GLE={gle})"));
     }
 
-    // No image exists yet — startup decoding is asynchronous now (#4): the
-    // window opens at the default rect (60% auto-fit) and the startup
-    // load's first frame resizes it to the image.
-    let rect = initial_window_rect(None)?;
+    // The status bar does not exist yet (created in WM_NCCREATE) — its
+    // height is the standard common-control height at the system DPI
+    // (upstream reads the live window; the formula matches comctl32's own:
+    // border + 3/2 of the system status font's line height).
+    let status_h = initial_status_height();
+    let rect = initial_window_rect(None, status_h)?;
     let title = HSTRING::from_wide(&title_wide(None));
     let state_ptr = Box::into_raw(Box::new(state));
 
@@ -713,6 +926,12 @@ pub(crate) fn run(arg_path: Option<OsString>) -> Result<(), String> {
     };
     // SAFETY: hwnd is live; show per the launcher's request.
     let _ = unsafe { ShowWindow(hwnd, show_cmd) };
+
+    // Populate the status bar (parts + initial texts) now that the window
+    // has its final rect — the first WM_SIZE fired during creation, before
+    // WM_NCCREATE had even stored the state pointer, so the bar is still
+    // empty. Upstream populates it at startup the same way (viv.c:5415).
+    refresh_status(hwnd);
 
     let mut msg = MSG::default();
     loop {
