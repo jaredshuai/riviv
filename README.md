@@ -32,7 +32,7 @@ Drag & drop a file onto the window to switch images (a single dropped file repla
 
 ## Differences from upstream (intentional)
 
-- The window opens at image size (upstream: remembered window rect, or 60% auto-fit on first run — restored in M3 with config persistence). Under async decoding the window first opens at the default size and resizes when the startup image's first frame arrives.
+- The window opens at the default size and resizes to the image when the startup image's first frame arrives (upstream: remembered window rect, or 60% auto-fit on first run — restored in M3 with config persistence).
 - Images are never upscaled beyond 100% (upstream default `fill_window=0`).
 - The window never resizes when switching images via drag & drop (upstream behavior).
 - Default window icon for now (upstream ships its own icon).

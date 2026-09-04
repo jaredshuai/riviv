@@ -178,6 +178,7 @@ fn on_load_replies(hwnd: HWND) {
                 session_id,
                 &mut state.startup_resize_session,
                 now,
+                state.timer_freq,
                 reply,
             );
             if let Some(msg) = outcome.fatal {
