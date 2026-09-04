@@ -1,18 +1,20 @@
 //! WM_PAINT rendering: fill the client area, center the fitted image,
-//! HALFTONE StretchBlt from the surface's memory DC.
+//! HALFTONE StretchBlt from the current frame's memory DC.
 //!
-//! M2 seam: alpha-composited transparent drawing (#3), the 32768-px stitch
-//! path and mipmap selection (#9), and zoom/pan-aware source rectangles (#7)
-//! land here.
+//! M2 seams left: the 32768-px stitch path and mipmap selection (#9), and
+//! zoom/pan-aware source rectangles (#7). Alpha compositing (#3) is landed —
+//! transparent pixels are resolved against the windowed background at decode
+//! time, so this path blits opaque pixels only.
 
-use windows::Win32::Foundation::{GetLastError, HWND, RECT};
+use windows::Win32::Foundation::{COLORREF, GetLastError, HWND, RECT};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, EndPaint, FillRect, GetStockObject, HALFTONE, HBRUSH, PAINTSTRUCT, SRCCOPY,
-    SetBrushOrgEx, SetStretchBltMode, StretchBlt, WHITE_BRUSH,
+    BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, FillRect, HALFTONE, HGDIOBJ, PAINTSTRUCT,
+    SRCCOPY, SetBrushOrgEx, SetStretchBltMode, StretchBlt,
 };
 use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 
 use crate::fit::fit_shrink;
+use crate::pixels::WINDOWED_BACKGROUND_RGB;
 use crate::window::{fatal, state_of};
 
 pub(crate) fn paint(hwnd: HWND) {
@@ -36,13 +38,28 @@ pub(crate) fn paint(hwnd: HWND) {
         let _ = GetClientRect(hwnd, &mut client);
         let cw = (client.right - client.left).max(1);
         let ch = (client.bottom - client.top).max(1);
-        // Windowed background default is white (config.c:65-67).
-        let _ = FillRect(hdc, &client, HBRUSH(GetStockObject(WHITE_BRUSH).0));
+        // Windowed background fill: a solid brush from the same constant the
+        // decode path composites transparent pixels against — the two must
+        // never diverge or composited images show a fringe. Upstream creates
+        // and deletes this brush per paint too (viv.c:4396-4407).
+        let [bg_r, bg_g, bg_b] = WINDOWED_BACKGROUND_RGB;
+        // Already inside this function's outer unsafe block.
+        let brush = CreateSolidBrush(COLORREF(
+            (u32::from(bg_b) << 16) | (u32::from(bg_g) << 8) | u32::from(bg_r),
+        ));
+        if !brush.is_invalid() {
+            let _ = FillRect(hdc, &client, brush);
+            // Already inside this function's outer unsafe block; the brush
+            // was created above and FillRect does not retain it, so plain
+            // DeleteObject is the documented teardown.
+            let _ = DeleteObject(HGDIOBJ(brush.0));
+        }
         // SAFETY (for state_of, nested in this fn's outer unsafe block): the
         // borrow lives only across the GDI draw calls below — none pump
         // messages, so no second `state_of` borrow can be taken while this
         // one is live.
-        if let Some(surface) = state_of(hwnd).and_then(|s| s.surface.as_ref()) {
+        if let Some(image) = state_of(hwnd).and_then(|s| s.image.as_ref()) {
+            let surface = image.surface();
             let (dw, dh) = fit_shrink(surface.width(), surface.height(), cw, ch);
             let dx = client.left + (cw - dw) / 2;
             let dy = client.top + (ch - dh) / 2;

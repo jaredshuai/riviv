@@ -2,8 +2,11 @@
 //! selected into a private memory DC — the same render path as upstream
 //! (CreateCompatibleBitmap + SetDIBits -> mem DC -> StretchBlt, viv.c:10263-10271, 4273).
 //!
-//! M2 seam: per-frame surfaces for animation (#3) and mipmap surfaces (#9)
-//! land here beside the single-frame surface.
+//! The animation work (#3, landed) holds one surface per decoded frame —
+//! each costs a DC + a DIB, which is why the loader caps the frame count.
+//! M2 seam: mipmap surfaces (#9) land here. The #4 background decode thread
+//! may later share one DC across frame bitmaps (upstream selects each frame
+//! into a single mem DC at paint time) if the object budget ever gets tight.
 
 use std::ffi::c_void;
 use std::mem::size_of;
