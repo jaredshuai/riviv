@@ -29,11 +29,19 @@ pub(crate) fn paint(hwnd: HWND) {
             fatal(&format!("BeginPaint failed (GLE={gle})"));
         }
         let mut client = RECT::default();
+        // Fail-soft on purpose: upstream viv.c:4070/4098 also ignores
+        // GetClientRect's return and reads the (zeroed) rect — a failed query
+        // yields a degenerate paint, not a dead window (ADR 0001 leaves
+        // paint-path diagnostics to the debug-log channel landing in M2).
         let _ = GetClientRect(hwnd, &mut client);
         let cw = (client.right - client.left).max(1);
         let ch = (client.bottom - client.top).max(1);
         // Windowed background default is white (config.c:65-67).
         let _ = FillRect(hdc, &client, HBRUSH(GetStockObject(WHITE_BRUSH).0));
+        // SAFETY (for state_of, nested in this fn's outer unsafe block): the
+        // borrow lives only across the GDI draw calls below — none pump
+        // messages, so no second `state_of` borrow can be taken while this
+        // one is live.
         if let Some(surface) = state_of(hwnd).and_then(|s| s.surface.as_ref()) {
             let (dw, dh) = fit_shrink(surface.width(), surface.height(), cw, ch);
             let dx = client.left + (cw - dw) / 2;

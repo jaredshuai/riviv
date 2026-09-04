@@ -58,21 +58,39 @@ pub(crate) struct WindowState {
 /// Window state pointer stored in GWLP_USERDATA between WM_NCCREATE and
 /// WM_NCDESTROY — for this single-window M1 skeleton the borrow effectively
 /// lives as long as the window itself.
-pub(crate) fn state_of(hwnd: HWND) -> Option<&'static mut WindowState> {
+///
+/// # Safety
+///
+/// The returned `&'static mut` is an exclusive borrow of the window's state
+/// box. Callers must not hold it across anything that pumps messages
+/// (modal dialogs, `GetMessageW`, nested `DispatchMessageW`) or call
+/// `state_of` again while a previous borrow is still live — that would alias
+/// `&mut WindowState` (undefined behavior). Acquire, act, drop.
+///
+/// (Kept as an explicit `unsafe` contract rather than a safe aliasable API:
+/// M2 adds reentry surfaces — animation timers, thread replies — and the
+/// compiler cannot see the single-threaded message discipline.)
+pub(crate) unsafe fn state_of(hwnd: HWND) -> Option<&'static mut WindowState> {
     // SAFETY: between WM_NCCREATE and WM_NCDESTROY the slot holds a live Box
     // pointer; before/after it is zero and we return None. Callers run on the
-    // window's own thread inside message handlers, so no aliasing occurs.
+    // window's own thread inside message handlers, so no aliasing occurs
+    // under the contract above.
     let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut WindowState;
     if ptr.is_null() {
         return None;
     }
     // SAFETY: pointer was stored once by WM_NCCREATE and only cleared in
-    // WM_NCDESTROY, so it is exclusively reachable from this window's handlers.
+    // WM_NCDESTROY; exclusivity is the caller's obligation per the contract.
     Some(unsafe { &mut *ptr })
 }
 
 fn open_image(hwnd: HWND, path: &OsStr) {
-    let Some(state) = state_of(hwnd) else { return };
+    // SAFETY: the borrow lives only across non-pumping calls (decode, set
+    // caption, invalidate) — none reenter wnd_proc, so no second borrow can
+    // be taken while this one is live.
+    let Some(state) = (unsafe { state_of(hwnd) }) else {
+        return;
+    };
     match load_surface(path) {
         Ok(surface) => {
             state.surface = Some(surface); // replacing drops the old surface
@@ -141,7 +159,10 @@ fn on_keydown(hwnd: HWND, wparam: WPARAM) {
     if unsafe { GetKeyState(i32::from(VK_CONTROL.0)) } >= 0 {
         return;
     }
-    let initial_dir = state_of(hwnd)
+    // SAFETY: the borrow ends at the end of this statement (the path is
+    // cloned out); the modal dialog below pumps messages but no borrow is
+    // live by then.
+    let initial_dir = (unsafe { state_of(hwnd) })
         .and_then(|s| s.path.clone())
         .and_then(|p| Path::new(&p).parent().map(|d| d.as_os_str().to_os_string()));
     if let Some(path) = open_file_dialog(hwnd, initial_dir.as_deref()) {
