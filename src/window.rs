@@ -45,9 +45,10 @@ use windows::core::{HSTRING, PCWSTR, w};
 
 use crate::anim::ANIMATION_TIMER_ID;
 use crate::fit::fit_shrink;
-use crate::loader::{LoadedImage, UiAction, apply_reply};
-use crate::loadthread::{LoadSession, REPLY_KICK_MESSAGE};
+use crate::loader::{LoadedImage, UiAction, apply_reply, map_reply_frame};
+use crate::loadthread::{LoadSession, LoadThread, REPLY_KICK_MESSAGE};
 use crate::paint::paint;
+use crate::surface::Surface;
 use crate::text::{dialog_filter, title_wide, to_wide};
 
 /// Window class name. Deliberately different from upstream's `VOIDIMAGEVIEWER`
@@ -63,17 +64,26 @@ pub(crate) struct WindowState {
     /// Performance-counter frequency (ticks per second) — the unit of the
     /// animation timeline. Constant for the process lifetime.
     pub(crate) timer_freq: u64,
-    /// The in-flight background load; `None` while idle. Storing a new
-    /// session drops the old one, which flags its worker to stop at the
-    /// next frame boundary (upstream `_viv_load_image_terminate`).
+    /// The process-wide decode worker (at most one decode is ever active;
+    /// see `loadthread.rs`). Quit+joined at window teardown.
+    pub(crate) load_thread: LoadThread,
+    /// The in-flight load; `None` while idle. Storing a new session drops
+    /// the old one, which flags its job — the worker skips it at the next
+    /// check (upstream `_viv_load_image_terminate` chaining).
     pub(crate) session: Option<LoadSession>,
     /// Which load session produced the currently displayed image (`None`
     /// when blank) — the staleness guard for replies and failure handling.
     pub(crate) displayed_from: Option<u64>,
-    /// The startup load's first frame resizes the window to the image
+    /// The session whose first frame resizes the window to the image
     /// (M1's image-sized window preserved under async startup — the window
-    /// is created before anything is decoded). Cleared once consumed.
-    pub(crate) startup_resize_pending: bool,
+    /// is created before anything is decoded). Tied to the session id so a
+    /// superseded or failed startup load cannot leak the resize into a
+    /// later open (image switches never resize).
+    pub(crate) startup_resize_session: Option<u64>,
+    /// Whether the animation timer is currently running — edge bookkeeping
+    /// so timer reconciliation never resets a live timer's period (which
+    /// would starve WM_TIMER under fast frame streams).
+    pub(crate) animation_timer_running: bool,
 }
 
 /// Window state pointer stored in GWLP_USERDATA between WM_NCCREATE and
@@ -105,22 +115,21 @@ pub(crate) unsafe fn state_of(hwnd: HWND) -> Option<&'static mut WindowState> {
     Some(unsafe { &mut *ptr })
 }
 
-/// Start loading `path` on the background decode thread (upstream
-/// `_viv_open`'s CreateThread arm, viv.c:1569). The current display stays
-/// up until this load's first frame replies in; storing the new session
-/// supersedes (terminates) any in-flight one.
-fn request_open(hwnd: HWND, path: &OsStr) {
-    // Spawn before any borrow: a spawn failure is system-level and fatal's
-    // modal pumps messages — it must not run across a state borrow (the
-    // PR #10 P1 lesson).
-    let session = match LoadSession::spawn(hwnd, path.to_os_string()) {
-        Ok(session) => session,
-        Err(msg) => fatal(&msg),
-    };
-    // SAFETY: the borrow spans only the session store. The old session's
-    // Drop sets an atomic flag (no GDI, no pumping); kicks posted by the
-    // worker are queued messages, never delivered synchronously here.
+/// Queue `path` for background decoding (upstream `_viv_open`'s
+/// CreateThread arm, viv.c:1569). The current display stays up until this
+/// load's first frame replies in; storing the new session supersedes
+/// (flags) any in-flight one. `is_startup` ties the one-time
+/// resize-to-image to this session's first frame.
+fn request_open(hwnd: HWND, path: &OsStr, is_startup: bool) {
+    // SAFETY: the borrow spans only the worker request and the session
+    // store — the channel send never blocks, the old session's Drop sets
+    // an atomic flag (no GDI, no pumping), and kicks posted by the worker
+    // are queued messages, never delivered synchronously here.
     if let Some(state) = unsafe { state_of(hwnd) } {
+        let session = state.load_thread.request(hwnd, path.to_os_string());
+        if is_startup {
+            state.startup_resize_session = Some(session.id());
+        }
         state.session = Some(session);
     }
 }
@@ -136,8 +145,8 @@ fn on_load_replies(hwnd: HWND) {
     // _viv_start_first_frame running inside the reply handler.
     let now = qpc_now();
     let mut fatal_msg: Option<String> = None;
-    let mut start_timer = false;
-    let mut stop_timer = false;
+    let start_timer;
+    let stop_timer;
     let mut invalidate = false;
     let mut title: Option<HSTRING> = None;
     let mut resize_to_image = false;
@@ -158,11 +167,16 @@ fn on_load_replies(hwnd: HWND) {
         let session_id = session.id();
         let session_path = session.path().to_os_string();
         for reply in replies {
+            // Frames cross the thread boundary as bare DIBs; the DC-carrying
+            // Surface is built here, on the UI thread that renders with it
+            // (memory DCs belong to their creating thread). A wrap failure
+            // is GDI exhaustion — system-level, fail loud (ADR 0001).
+            let reply = map_reply_frame(reply, Surface::from_frame);
             let outcome = apply_reply(
                 &mut state.image,
                 &mut state.displayed_from,
                 session_id,
-                &mut state.startup_resize_pending,
+                &mut state.startup_resize_session,
                 now,
                 reply,
             );
@@ -172,8 +186,6 @@ fn on_load_replies(hwnd: HWND) {
             }
             for action in outcome.actions {
                 match action {
-                    UiAction::StartAnimationTimer => start_timer = true,
-                    UiAction::StopAnimationTimer => stop_timer = true,
                     UiAction::Invalidate => invalidate = true,
                     UiAction::SetWindowTitle => {
                         state.path = Some(session_path.clone());
@@ -190,6 +202,16 @@ fn on_load_replies(hwnd: HWND) {
                 break;
             }
         }
+        // Timer reconciliation from the drain's NET effect — deriving from
+        // the final image state cannot disagree with the protocol (a batch
+        // that both starts an animation and clears it again must end with
+        // the timer stopped). Edge-managed against the running flag so a
+        // live timer is never re-Set (which would reset its period and
+        // starve WM_TIMER under fast frame streams).
+        let want_timer = state.image.as_ref().is_some_and(LoadedImage::is_animated);
+        start_timer = want_timer && !state.animation_timer_running;
+        stop_timer = !want_timer && state.animation_timer_running;
+        state.animation_timer_running = want_timer;
         if resize_to_image && state.image.is_some() {
             // The startup load's first frame sizes the window to the image
             // (M1 behavior under async startup); a geometry failure is fatal
@@ -204,9 +226,8 @@ fn on_load_replies(hwnd: HWND) {
     if let Some(msg) = fatal_msg {
         fatal(&msg);
     }
-    // Stop before start: one drain may both retire the old image's
-    // animation (first frame) and start a new one (second frame) — the
-    // timer must end up running.
+    // Edge-managed timer reconciliation (mutually exclusive flags — see
+    // the drain loop above).
     if stop_timer {
         // SAFETY: hwnd is live; a failed kill leaves a stale timer that the
         // WM_TIMER guard no-ops on.
@@ -224,7 +245,7 @@ fn on_load_replies(hwnd: HWND) {
         // handle neither), and no state borrow is live out here.
         // SWP_NOZORDER | SWP_NOACTIVATE: resize/move only, like the initial
         // create.
-        let _ = unsafe {
+        let placed = unsafe {
             SetWindowPos(
                 hwnd,
                 None,
@@ -235,6 +256,13 @@ fn on_load_replies(hwnd: HWND) {
                 SWP_NOZORDER | SWP_NOACTIVATE,
             )
         };
+        if let Err(e) = placed {
+            // System-level (ADR 0001): this is the one-time startup resize
+            // of a live window — a silent failure would strand the window
+            // at the default size with no retry path. Fail loud instead of
+            // discarding the error.
+            fatal(&format!("SetWindowPos failed: {e}"));
+        }
     }
     if let Some(title) = title.as_ref() {
         // SAFETY: hwnd is live; the HSTRING outlives the call. Fail-soft on
@@ -355,7 +383,7 @@ fn on_keydown(hwnd: HWND, wparam: WPARAM) {
         .and_then(|s| s.path.clone())
         .and_then(|p| Path::new(&p).parent().map(|d| d.as_os_str().to_os_string()));
     if let Some(path) = open_file_dialog(hwnd, initial_dir.as_deref()) {
-        request_open(hwnd, &path);
+        request_open(hwnd, &path, false);
     }
 }
 
@@ -371,7 +399,7 @@ fn on_drop_files(hwnd: HWND, hdrop: HDROP) {
                 let mut buf = vec![0u16; len + 1];
                 if DragQueryFileW(hdrop, 0, Some(&mut buf)) as usize == len {
                     let path = OsString::from_wide(&buf[..len]);
-                    request_open(hwnd, &path);
+                    request_open(hwnd, &path, false);
                 }
             }
         }
@@ -424,19 +452,20 @@ unsafe extern "system" fn wnd_proc(
             // Stop the background decode and wait for it before the state
             // box is freed — upstream waits INFINITE for the same reason
             // ("it's critical we wait for load image to finish before we
-            // kill the main window", viv.c:5470-5479); the terminate flag
-            // bounds the wait to the frame already decoding.
-            // SAFETY: the borrow spans only terminate/join on the session;
-            // join blocks but never pumps messages.
-            if let Some(state) = unsafe { state_of(hwnd) }
-                && let Some(session) = state.session.as_mut()
-            {
-                session.terminate();
-                session.join();
+            // kill the main window", viv.c:5470-5479). The session's flag
+            // (set by Drop below or here) bounds the wait to the frame
+            // currently decoding.
+            // SAFETY: the borrow spans only terminate/quit bookkeeping;
+            // quit joins the worker, which blocks but never pumps messages.
+            if let Some(state) = unsafe { state_of(hwnd) } {
+                if let Some(session) = state.session.as_ref() {
+                    session.terminate();
+                }
+                state.load_thread.quit();
             }
             // SAFETY: the slot holds a live Box pointer set in WM_NCCREATE;
-            // take it back, clear the slot, then free (dropping any session
-            // that somehow remains — its Drop flags a detached worker).
+            // take it back, clear the slot, then free (the box's Drop flags
+            // any remaining session's job — the worker is already gone).
             unsafe {
                 let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut WindowState;
                 if !ptr.is_null() {
@@ -572,16 +601,24 @@ pub(crate) fn run(arg_path: Option<OsString>) -> Result<(), String> {
     // The animation clock's unit, read once (constant for the process
     // lifetime). Read before any window exists: failure is fatal (ADR 0001).
     let timer_freq = qpc_frequency()?;
+    // The decode worker, started once per process before any load is
+    // requested (at most one decode is ever active — see `loadthread.rs`).
+    // A spawn failure is system-level: fail loud (ADR 0001) via run's Err.
+    let load_thread = LoadThread::start()?;
     let state = WindowState {
         image: None,
         path: None,
         timer_freq,
+        load_thread,
         session: None,
         displayed_from: None,
-        // The startup load's first frame resizes the window to the image
-        // (M1's image-sized window, preserved under async startup — the
-        // window must exist before decoding starts).
-        startup_resize_pending: arg_path.is_some(),
+        // Bound to the startup session's id when it is queued below: its
+        // first frame resizes the window to the image (M1's image-sized
+        // window, preserved under async startup — the window must exist
+        // before decoding starts); a superseded or failed startup load
+        // cannot leak the resize into a later open.
+        startup_resize_session: None,
+        animation_timer_running: false,
     };
     // SAFETY: process-wide and must run before any window exists (matches the
     // upstream manifest's dpiAware=true). ERROR_ACCESS_DENIED means the process
@@ -656,7 +693,7 @@ pub(crate) fn run(arg_path: Option<OsString>) -> Result<(), String> {
     // (first frame, animation frames, terminal) arrive on the kick message
     // and drive everything from there.
     if let Some(path) = arg_path.as_ref() {
-        request_open(hwnd, path);
+        request_open(hwnd, path, true);
     }
 
     // Honor the launcher's requested show state ("run maximized/minimized"

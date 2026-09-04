@@ -1,29 +1,31 @@
-//! Background decode session: the thread, the reply queue, and the kick
-//! message (issue #4's port of upstream's load-thread plumbing).
+//! Background decode: one worker thread, a job channel, per-load reply
+//! queues (issue #4's port of upstream's load-thread plumbing).
 //!
-//! Upstream model (viv.c): `_viv_open` spawns `_viv_load_image_thread_proc`,
-//! which decodes one frame at a time and posts replies through
-//! `_viv_reply_add` — a linked list under a critical section, with a
-//! `PostMessage` kick only when the queue transitions empty -> non-empty
-//! (viv.c:10869-10905). The UI drains the whole queue per kick
-//! (`_VIV_WM_REPLY`, viv.c:2762-3060). A new open while a load is in
-//! flight sets `_viv_load_image_terminate` and the thread exits at its
-//! next per-frame check (viv.c:10610); at quit the UI *waits* for it
-//! ("it's critical we wait for load image to finish", viv.c:5470-5479).
+//! Upstream model (viv.c): `_viv_open` hands the file to a single load
+//! thread; if one is already running, the request is chained
+//! (`_viv_load_image_next_fd`) and picked up only when the previous load
+//! exits at its next per-frame terminate check (viv.c:1520-1572, 10610) —
+//! so at most one decode is ever active. The thread decodes frame by frame
+//! and posts replies through `_viv_reply_add` — a linked list under a
+//! critical section (viv.c:10869-10905) — and the UI drains the whole
+//! queue per kick message (`_VIV_WM_REPLY`, viv.c:2762-3060). At quit the
+//! UI *waits* for the thread ("it's critical we wait for load image to
+//! finish", viv.c:5470-5479).
 //!
-//! Riviv translation: one session per open, each with its own queue
-//! (superseded sessions' replies are simply never drained — no global
-//! terminate flag needed for correctness, though we still set one so a
-//! superseded worker stops wasting CPU). The queue — not the message —
-//! owns the replies, so a kick lost to window teardown cannot leak.
-//! GDI note: `Surface` handles are created on the worker and consumed on
-//! the UI thread; GDI objects are process-global with no thread
-//! affinity, the same cross-thread handoff upstream does with frame
-//! HBITMAPs (first-frame/additional-frame replies, viv.c:2900/2989).
+//! Riviv translation: one persistent worker reading jobs from a channel
+//! (the chain, minus the churn). Each open creates a session with its own
+//! reply queue; superseding a session flags its job, and the worker skips
+//! it at the next check (instantly if the job was still queued, between
+//! frames if decoding — a still image's single decode cannot be
+//! interrupted, the same granularity upstream has). The queue — not the
+//! posted message — owns the replies, so a kick lost to window teardown
+//! cannot leak. Frames cross the boundary as bare DIBs (`DibFrame`); the
+//! UI thread wraps them in DC-carrying Surfaces (see `surface.rs`).
 
 use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
@@ -31,11 +33,15 @@ use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
 
 use crate::loader::{LoadReply, decode_to_sink};
+use crate::surface::DibFrame;
 
-/// Kick message: posted when the reply queue goes empty -> non-empty, so
-/// at most one message is in flight per drain cycle (upstream
+/// Kick message, posted whenever the worker queues a reply (upstream
 /// `_VIV_WM_REPLY`; `WM_APP + n` is the reserved range for private
-/// window-class messages).
+/// window-class messages). Unlike upstream — which posts only on the
+/// queue's empty -> non-empty transition — every push posts: a lost kick
+/// (e.g. the destination queue momentarily at its quota) is then healed
+/// by the next push instead of stranding a non-empty queue forever. The
+/// extra messages are bounded by the reply count and drain to no-ops.
 pub(crate) const REPLY_KICK_MESSAGE: u32 = WM_APP + 1;
 
 /// Session ids, so the UI can tell which load produced the displayed
@@ -46,84 +52,131 @@ static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 /// consider it `Send`.
 #[derive(Clone, Copy)]
 struct SendHwnd(HWND);
-// SAFETY: moving the handle into the worker is sound — the worker only
-// posts messages to it, and a post to a dead window just fails. Same
+// SAFETY: moving the handle into the job is sound — the worker only posts
+// messages to it, and a post to a dead window just fails. Same
 // cross-thread handoff as upstream's `_viv_reply_add` posting to
 // `_viv_hwnd` (viv.c:10902).
 unsafe impl Send for SendHwnd {}
 
+/// One queued decode request; crossing the channel requires `Send`
+/// (DibFrame and the Arcs are, HWND via the wrapper above).
+struct Job {
+    path: OsString,
+    hwnd: SendHwnd,
+    terminate: Arc<AtomicBool>,
+    queue: Arc<Mutex<VecDeque<LoadReply<DibFrame>>>>,
+}
+
+/// The process-wide decode worker handle. Jobs are processed strictly in
+/// order (upstream chains the same way, viv.c:1520-1572), so at most one
+/// decode is active no matter how fast the user switches images.
+pub(crate) struct LoadThread {
+    sender: Option<Sender<Job>>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl LoadThread {
+    /// Start the worker (once per process, before any load is requested).
+    /// A spawn failure is system-level (ADR 0001): the caller fails loud.
+    pub(crate) fn start() -> Result<Self, String> {
+        let (sender, receiver) = channel();
+        let handle = std::thread::Builder::new()
+            .name("riviv-load".into())
+            .spawn(move || worker(receiver))
+            .map_err(|e| format!("load thread spawn failed: {e}"))?;
+        Ok(LoadThread {
+            sender: Some(sender),
+            handle: Some(handle),
+        })
+    }
+
+    /// Queue `path` for decoding and return the session that owns its
+    /// replies. The old session (if any) must be dropped by the caller —
+    /// its Drop flags the job, and the worker skips it at the next check.
+    pub(crate) fn request(&self, hwnd: HWND, path: OsString) -> LoadSession {
+        let id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
+        let terminate = Arc::new(AtomicBool::new(false));
+        let queue = Arc::new(Mutex::new(VecDeque::new()));
+        // The worker consumes its own copy; the session keeps the
+        // original for the UI (window title / Ctrl+O initial dir).
+        let worker_path = path.clone();
+        let job = Job {
+            path: worker_path,
+            hwnd: SendHwnd(hwnd),
+            terminate: Arc::clone(&terminate),
+            queue: Arc::clone(&queue),
+        };
+        // Unbounded channel: never blocks the UI thread. A send can only
+        // fail if the worker already exited — impossible short of the
+        // spawn failure ADR 0001 already failed loud on.
+        let _ = self.sender.as_ref().expect("sender dropped").send(job);
+        LoadSession {
+            id,
+            path,
+            terminate,
+            queue,
+        }
+    }
+
+    /// Stop the worker and wait for it. Closing the channel ends the
+    /// recv() loop; the active job is abandoned at its terminate check
+    /// (the session's Drop already set the flag — bounded by the frame
+    /// currently decoding), queued jobs are skipped, then the thread
+    /// exits. Upstream waits INFINITE for the same reason ("it's critical
+    /// we wait for load image to finish before we kill the main window",
+    /// viv.c:5476).
+    pub(crate) fn quit(&mut self) {
+        // Drop the sender first — a live sender would keep recv() (and
+        // therefore join) waiting forever.
+        self.sender = None;
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn worker(receiver: Receiver<Job>) {
+    while let Ok(job) = receiver.recv() {
+        let Job {
+            path,
+            hwnd: SendHwnd(hwnd),
+            terminate,
+            queue,
+        } = job;
+        // Superseded while still queued: nothing was decoded, nothing to
+        // reply — skip before touching the file.
+        if terminate.load(Ordering::Relaxed) {
+            continue;
+        }
+        let mut sink = move |reply: LoadReply<DibFrame>| {
+            // unwrap: a poisoned lock means some thread panicked while
+            // holding the queue — an undefined state we fail loud on
+            // (ADR 0001) rather than limp past.
+            queue.lock().unwrap().push_back(reply);
+            // SAFETY: `hwnd` is a valid handle captured for this job;
+            // PostMessageW never dereferences it on this thread and
+            // validates it on the owning thread's queue, failing cleanly
+            // if the window is gone (the queue — not the kick — owns the
+            // replies, so a lost post costs drain latency, never data;
+            // the next push posts again).
+            let _ = unsafe { PostMessageW(Some(hwnd), REPLY_KICK_MESSAGE, WPARAM(0), LPARAM(0)) };
+        };
+        decode_to_sink(&path, &terminate, &mut sink);
+    }
+}
+
+/// The in-flight (or queued) load the UI is interested in. Dropping it
+/// flags the worker to abandon the job at its next terminate check.
 pub(crate) struct LoadSession {
     id: u64,
     /// The file being loaded — the UI adopts it as the window title/path
     /// when this session's first frame takes the display.
     path: OsString,
-    /// Set when this session is superseded or the window is closing; the
-    /// worker checks it between frames (upstream `_viv_load_image_terminate`).
     terminate: Arc<AtomicBool>,
-    queue: Arc<Mutex<VecDeque<LoadReply>>>,
-    /// Taken by [`LoadSession::join`]; dropping without joining detaches
-    /// (fine — see Drop below).
-    handle: Option<JoinHandle<()>>,
+    queue: Arc<Mutex<VecDeque<LoadReply<DibFrame>>>>,
 }
 
 impl LoadSession {
-    /// Start decoding `path` on a worker thread (upstream: the CreateThread
-    /// arm of `_viv_open`, viv.c:1569). A spawn failure is system-level
-    /// (ADR 0001): the caller fails loud.
-    pub(crate) fn spawn(hwnd: HWND, path: OsString) -> Result<Self, String> {
-        let id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
-        let terminate = Arc::new(AtomicBool::new(false));
-        let queue = Arc::new(Mutex::new(VecDeque::new()));
-        let worker_terminate = Arc::clone(&terminate);
-        // The queue — not the posted message — owns the replies, so the
-        // worker can safely outlive a kick that never gets dispatched.
-        let worker_queue = Arc::clone(&queue);
-        // The worker consumes its own copy; the session keeps the original
-        // for the UI (window title / Ctrl+O initial dir on first frame).
-        let worker_path = path.clone();
-        let send_hwnd = SendHwnd(hwnd);
-        let handle = std::thread::Builder::new()
-            .name("riviv-load".into())
-            .spawn(move || {
-                // Mention the wrapper as a whole before destructuring:
-                // precise closure capture would otherwise move only the raw
-                // HWND field (edition 2021+ captures minimal paths, even
-                // through patterns), and the field alone is not Send.
-                let send_hwnd = send_hwnd;
-                let SendHwnd(hwnd) = send_hwnd;
-                let mut sink = move |reply: LoadReply| {
-                    // unwrap: a poisoned lock means some thread panicked
-                    // while holding the queue — an undefined state we fail
-                    // loud on (ADR 0001) rather than limp past.
-                    let mut q = worker_queue.lock().unwrap();
-                    let was_empty = q.is_empty();
-                    q.push_back(reply);
-                    drop(q);
-                    if was_empty {
-                        // Posted outside the lock like upstream (viv.c:10898-
-                        // 10903). A failed post (window gone) is not an
-                        // error: the queue is freed when the session is.
-                        // SAFETY: `hwnd` is a valid handle captured for this
-                        // worker; PostMessageW never dereferences it on this
-                        // thread and validates it on the owning thread's
-                        // queue, failing cleanly if the window is gone.
-                        let _ = unsafe {
-                            PostMessageW(Some(hwnd), REPLY_KICK_MESSAGE, WPARAM(0), LPARAM(0))
-                        };
-                    }
-                };
-                decode_to_sink(&worker_path, &worker_terminate, &mut sink);
-            })
-            .map_err(|e| format!("load thread spawn failed: {e}"))?;
-        Ok(LoadSession {
-            id,
-            path,
-            terminate,
-            queue,
-            handle: Some(handle),
-        })
-    }
-
     pub(crate) fn id(&self) -> u64 {
         self.id
     }
@@ -132,39 +185,27 @@ impl LoadSession {
         &self.path
     }
 
-    /// Ask the worker to stop at its next frame boundary. Never blocks:
-    /// the image crate cannot interrupt a frame mid-decode, so a frame
-    /// already in flight still completes (upstream granularity, viv.c:10610).
+    /// Ask the worker to abandon this job at its next check (immediately
+    /// for queued jobs, between frames for animations, after the single
+    /// decode for stills — upstream granularity, viv.c:10610).
     pub(crate) fn terminate(&self) {
         self.terminate.store(true, Ordering::Release);
     }
 
     /// Take every queued reply, in delivery order (upstream's handler
     /// drains the whole list per kick, viv.c:2770).
-    pub(crate) fn drain(&self) -> Vec<LoadReply> {
+    pub(crate) fn drain(&self) -> Vec<LoadReply<DibFrame>> {
         // unwrap on poisoning, as in the sink.
         let mut q = self.queue.lock().unwrap();
         q.drain(..).collect()
-    }
-
-    /// Wait for the worker to exit. Called at window teardown — upstream
-    /// waits INFINITE for the same reason ("it's critical we wait for load
-    /// image to finish before we kill the main window", viv.c:5476); the
-    /// terminate flag bounds the wait to the in-flight frame.
-    pub(crate) fn join(&mut self) {
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
     }
 }
 
 impl Drop for LoadSession {
     fn drop(&mut self) {
-        // Supersession or window teardown without an explicit join: flag
-        // the worker (it exits within a frame) and detach it. Its Arcs keep
-        // the queue alive until the worker's last push, so replies never
-        // outlive their allocation and GDI teardown happens on whichever
-        // thread drops the last reference — both legal for GDI.
+        // Supersession or window teardown: flag the job; the worker skips
+        // or abandons it, and the queue's Arc frees any undrained replies
+        // when the last holder drops.
         self.terminate();
     }
 }
