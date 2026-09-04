@@ -1,0 +1,6 @@
+#!/bin/sh
+# 质量门(安装: git config core.hooksPath .githooks)
+# fmt 格式 / clippy lint(警告即错)/ 纯逻辑单元测试
+cargo fmt --check || exit 1
+cargo clippy --all-targets -- -D warnings || exit 1
+cargo test --quiet || exit 1
