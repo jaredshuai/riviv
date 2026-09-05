@@ -293,18 +293,18 @@ mod tests {
     }
 
     #[test]
-    fn part_edges_never_go_negative_on_a_cramped_window() {
+    fn a_cramped_window_starves_the_frame_counter_not_the_dimension_part() {
         // frame: 500+10 floored at 72 -> 510; dimension: 510+17 = 527 —
         // both far beyond a 100 px client. Part 0 floors at 0 (viv.c:11308);
         // the frame boundary continues from the UNCLAMPED remainder
-        // (client - dimension, viv.c:11331-11336), so a cramped window
-        // starves the frame counter, never the trailing dimension part.
+        // (client - dimension, viv.c:11331-11336) and may go negative (a
+        // collapsed part) — the dimension part keeps its width instead.
         let edges = status_part_edges(100, 500, 500, 10, 17, 72);
         assert_eq!(edges[0], 0, "main part floored at 0 (viv.c:11308)");
         assert_eq!(
             edges[1],
             100 - 527,
-            "frame boundary = client - dimension (upstream unclamped accumulation)"
+            "frame boundary = client - dimension, negative = collapsed"
         );
         assert_eq!(edges[2], -1);
     }
