@@ -130,7 +130,11 @@ pub(crate) fn min_status_part_wide(dpi: u32) -> i32 {
 /// gets a `SM_CXEDGE * 5` text margin and is floored at `min_wide`; the
 /// dimension part additionally reserves the size-grip strip
 /// (SM_CXVSCROLL + SM_CXBORDER, viv.c:11292). The main part takes what is
-/// left (floor 0); the dimension part runs to the right edge (-1).
+/// left (floor 0); the dimension part runs to the right edge (-1). When
+/// the window is too cramped, the trailing dimension part keeps its width
+/// and the LEADING parts collapse first — upstream accumulates from the
+/// unclamped remainder (viv.c:11306-11341), which makes the frame boundary
+/// `client_w - dimension_w` (possibly negative = a collapsed part).
 pub(crate) fn status_part_edges(
     client_w: i32,
     frame_text_w: i32,
@@ -152,7 +156,12 @@ pub(crate) fn status_part_edges(
         0
     };
     let main_edge = (client_w - frame_w - dimension_w).max(0);
-    [main_edge, main_edge + frame_w, -1]
+    // Upstream's unclamped accumulation: part_wide (after max(0) for part
+    // 0) continues from the raw remainder, so the frame boundary is
+    // client_w - dimension_w regardless of the floor above — a cramped
+    // window starves the frame counter, never the dimension part
+    // (Codex PR #13 round 3).
+    [main_edge, client_w - dimension_w, -1]
 }
 
 #[cfg(test)]
@@ -285,10 +294,30 @@ mod tests {
 
     #[test]
     fn part_edges_never_go_negative_on_a_cramped_window() {
+        // frame: 500+10 floored at 72 -> 510; dimension: 510+17 = 527 —
+        // both far beyond a 100 px client. Part 0 floors at 0 (viv.c:11308);
+        // the frame boundary continues from the UNCLAMPED remainder
+        // (client - dimension, viv.c:11331-11336), so a cramped window
+        // starves the frame counter, never the trailing dimension part.
         let edges = status_part_edges(100, 500, 500, 10, 17, 72);
         assert_eq!(edges[0], 0, "main part floored at 0 (viv.c:11308)");
-        assert!(edges[1] >= edges[0], "edges stay ordered");
+        assert_eq!(
+            edges[1],
+            100 - 527,
+            "frame boundary = client - dimension (upstream unclamped accumulation)"
+        );
         assert_eq!(edges[2], -1);
+    }
+
+    #[test]
+    fn a_cramped_window_keeps_the_dimension_part_the_priority() {
+        // client 150, frame needs 72, dimension needs 89: the dimension
+        // part keeps its 89 px; the frame counter is squeezed to 61 and the
+        // main part to 0 — the trailing dimension text stays readable.
+        assert_eq!(status_part_edges(150, 5, 60, 10, 17, 72), [0, 61, -1]);
+        // Comfortable case unchanged: main fills the remainder, frame gets
+        // its full width, dimension runs to the right edge.
+        assert_eq!(status_part_edges(500, 5, 60, 10, 17, 72), [339, 411, -1]);
     }
 
     #[test]
