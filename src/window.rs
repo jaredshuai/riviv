@@ -29,6 +29,10 @@ use windows::Win32::UI::Controls::Dialogs::{
     CommDlgExtendedError, GetOpenFileNameW, OFN_FILEMUSTEXIST, OFN_HIDEREADONLY, OFN_NOCHANGEDIR,
     OFN_PATHMUSTEXIST, OPENFILENAMEW,
 };
+use windows::Win32::UI::Controls::{
+    ICC_BAR_CLASSES, ICC_STANDARD_CLASSES, ICC_WIN95_CLASSES, INITCOMMONCONTROLSEX,
+    InitCommonControlsEx,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL};
 use windows::Win32::UI::Shell::{DragFinish, DragQueryFileW, HDROP};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -586,45 +590,6 @@ unsafe extern "system" fn wnd_proc(
                     return LRESULT(0); // FALSE aborts CreateWindowExW
                 }
             }
-            // The status bar is a child of this window (#5; upstream creates
-            // it in `_viv_status_show(config_show_status)`, viv.c:5415). Its
-            // creation failure is system-level (a window without the promised
-            // status bar is not the app we shipped).
-            // SAFETY: the state pointer was just published above; the borrow
-            // ends with this block (status::create only creates a child).
-            let hinstance = unsafe { GetModuleHandleW(None) };
-            match hinstance {
-                Ok(h) => match status::create(hwnd, h.into()) {
-                    Ok(bar) => {
-                        // SAFETY: the pointer is ours (published above).
-                        unsafe { (*state_ptr).status = bar };
-                    }
-                    Err(msg) => {
-                        // Reclaim the box and fail creation — run() reports
-                        // the reason through its CreateWindowExW error path.
-                        // SAFETY: creation is aborted; the pointer was never
-                        // visible to a live window.
-                        drop(unsafe { Box::from_raw(state_ptr) });
-                        // SAFETY: clearing the slot so a later WM_NCDESTROY
-                        // does not adopt a dangling pointer.
-                        let _ = unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) };
-                        // SAFETY: legal on the owning thread during creation.
-                        unsafe { SetLastError(WIN32_ERROR(1)) };
-                        eprintln!("status bar creation failed: {msg}");
-                        return LRESULT(0); // FALSE aborts CreateWindowExW
-                    }
-                },
-                Err(e) => {
-                    // SAFETY: creation is aborted; the pointer was never
-                    // visible to a live window.
-                    drop(unsafe { Box::from_raw(state_ptr) });
-                    // SAFETY: clearing the slot so a later WM_NCDESTROY
-                    // does not adopt a dangling pointer.
-                    let _ = unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) };
-                    eprintln!("GetModuleHandleW failed: {e}");
-                    return LRESULT(0);
-                }
-            }
             // SAFETY: hwnd/msg are exactly what this callback received; forwarding
             // to the default procedure must return its verdict untouched.
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
@@ -819,6 +784,18 @@ pub(crate) fn run(arg_path: Option<OsString>) -> Result<(), String> {
     // The animation clock's unit, read once (constant for the process
     // lifetime). Read before any window exists: failure is fatal (ADR 0001).
     let timer_freq = qpc_frequency()?;
+    // Register the common-control classes before any window exists — the
+    // status bar's `msctls_statusbar32` is only guaranteed registered after
+    // this (upstream init does the same, viv.c:5236-5242). Fail-soft like
+    // upstream, which ignores the BOOL return: without the classes the
+    // status bar degrades away (creation failure handled below), while the
+    // viewer itself keeps working.
+    let icex = INITCOMMONCONTROLSEX {
+        dwSize: size_of::<INITCOMMONCONTROLSEX>() as u32,
+        dwICC: ICC_STANDARD_CLASSES | ICC_BAR_CLASSES | ICC_WIN95_CLASSES,
+    };
+    // SAFETY: `icex` outlives the call; a pure registration query.
+    let _ = unsafe { InitCommonControlsEx(&icex) };
     // The decode worker, started once per process before any load is
     // requested (at most one decode is ever active — see `loadthread.rs`).
     // A spawn failure is system-level: fail loud (ADR 0001) via run's Err.
@@ -884,10 +861,11 @@ pub(crate) fn run(arg_path: Option<OsString>) -> Result<(), String> {
         return Err(format!("RegisterClassExW failed (GLE={gle})"));
     }
 
-    // The status bar does not exist yet (created in WM_NCCREATE) — its
-    // height is the standard common-control height at the system DPI
-    // (upstream reads the live window; the formula matches comctl32's own:
-    // border + 3/2 of the system status font's line height).
+    // The status bar does not exist yet (created below, after the main
+    // window) — its height is the standard common-control height at the
+    // system DPI (upstream reads the live window; the formula matches
+    // comctl32's own: border + 3/2 of the system status font's line
+    // height).
     let status_h = initial_status_height();
     let rect = initial_window_rect(None, status_h)?;
     let title = HSTRING::from_wide(&title_wide(None));
@@ -914,6 +892,24 @@ pub(crate) fn run(arg_path: Option<OsString>) -> Result<(), String> {
         )
     }
     .map_err(|e| format!("CreateWindowExW failed: {e}"))?;
+
+    // Create the status bar child now that the parent window exists (#5;
+    // upstream `_viv_status_show(config_show_status)` at init, viv.c:5415).
+    // Creation failure degrades gracefully like upstream — its `_viv_status_hwnd`
+    // stays NULL and `_viv_status_update` no-ops — the viewer must keep
+    // working; the handle stays invalid and every status call guards on it.
+    let bar = match status::create(hwnd, hinstance.into()) {
+        Ok(bar) => bar,
+        Err(msg) => {
+            eprintln!("status bar unavailable: {msg}");
+            HWND::default()
+        }
+    };
+    // SAFETY: the borrow spans only the field store; the window is created
+    // and owned by this thread, nothing below pumps messages.
+    if let Some(state) = unsafe { state_of(hwnd) } {
+        state.status = bar;
+    }
 
     // Kick the startup load off the UI thread: a huge argument file must
     // not freeze the window before it is even shown (issue #4). Replies

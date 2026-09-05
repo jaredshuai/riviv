@@ -53,11 +53,11 @@ pub(crate) struct StatusSnapshot {
 /// `_viv_status_show(1)`, viv.c:10932-10963). `WS_EX_COMPOSITED` and the
 /// clip styles are upstream's; `SBARS_SIZEGRIP` requests the grip (the
 /// common control itself paints it only while the parent is resizable and
-/// not maximized).
+/// not maximized). The caller must have registered the common-control
+/// classes first (upstream init's `InitCommonControlsEx`, viv.c:5236-5242).
 pub(crate) fn create(parent: HWND, hinstance: HINSTANCE) -> Result<HWND, String> {
-    // SAFETY: parent/hinstance are live; the class is the system's status
-    // bar (comctl32 — upstream registers no ICC classes either,
-    // viv.c:10939-10947).
+    // SAFETY: parent/hinstance are live; the class is comctl32's status
+    // bar, registered by the caller's InitCommonControlsEx.
     unsafe {
         CreateWindowExW(
             WS_EX_COMPOSITED,
@@ -80,9 +80,13 @@ pub(crate) fn create(parent: HWND, hinstance: HINSTANCE) -> Result<HWND, String>
 }
 
 /// The bar's current height in pixels, 0 without a bar (upstream
-/// `_viv_get_status_high`, viv.c:11427-11440) — subtracted from the render
-/// area at paint time and added back when sizing the window to an image.
+/// `_viv_get_status_high` on a NULL `_viv_status_hwnd`, viv.c:11427-11440)
+/// — subtracted from the render area at paint time and added back when
+/// sizing the window to an image.
 pub(crate) fn height(hwnd: HWND) -> i32 {
+    if hwnd.is_invalid() {
+        return 0;
+    }
     let mut rect = RECT::default();
     // SAFETY: hwnd is our live child window; a failed query reads the
     // zeroed rect — height 0 degrades paint, never crashes (same fail-soft
@@ -92,10 +96,14 @@ pub(crate) fn height(hwnd: HWND) -> i32 {
 }
 
 /// Recompute part widths and refresh all texts (upstream
-/// `_viv_status_update`). Texts are only SET when they differ from what
-/// the control already shows (upstream `_viv_status_set`'s GETTEXT
-/// compare, viv.c:11415-11425) so a steady state never redraws.
+/// `_viv_status_update`, which no-ops on a NULL bar). Texts are only SET
+/// when they differ from what the control already shows (upstream
+/// `_viv_status_set`'s GETTEXT compare, viv.c:11415-11425) so a steady
+/// state never redraws.
 pub(crate) fn update(hwnd: HWND, snapshot: &StatusSnapshot) {
+    if hwnd.is_invalid() {
+        return; // no bar (creation failed / not yet created)
+    }
     let main = status_main_text(
         snapshot.loading,
         snapshot.file_not_found,
@@ -218,20 +226,29 @@ fn set_text(hwnd: HWND, part: usize, text: &str) {
         return; // unchanged — skip the redraw (empty text included)
     }
     let new = to_wide(text);
-    // SAFETY: `new` is NUL-terminated and outlives the call; SetPropW on a
-    // hash-valued property never fails for a live child window (fail-soft:
-    // a dropped cache write just re-sends the text next refresh).
-    unsafe {
+    // SAFETY: `new` is NUL-terminated and outlives the call.
+    let ok = unsafe {
         SendMessageW(
             hwnd,
             SB_SETTEXTW,
             Some(WPARAM(part)),
             Some(LPARAM(new.as_ptr() as isize)),
-        );
-        let _ = SetPropW(
-            hwnd,
-            PCWSTR(name.as_ptr()),
-            Some(windows::Win32::Foundation::HANDLE(hash as *mut _)),
-        );
+        )
+        .0 != 0
+    };
+    // Cache the hash ONLY on success: a failed SET leaves the old text on
+    // screen, and caching anyway would suppress every retry of this text
+    // (a stale bar forever — cubic/Codex PR #13). A dropped cache write
+    // just re-sends the text next refresh, which is harmless.
+    if ok {
+        // SAFETY: hwnd is our live child; SetPropW on a hash-valued
+        // property cannot fail for it (fail-soft as above).
+        unsafe {
+            let _ = SetPropW(
+                hwnd,
+                PCWSTR(name.as_ptr()),
+                Some(windows::Win32::Foundation::HANDLE(hash as *mut _)),
+            );
+        }
     }
 }
