@@ -1,21 +1,25 @@
-//! WM_PAINT rendering: fill the client area, center the fitted image,
-//! HALFTONE StretchBlt from the current frame's memory DC.
+//! WM_PAINT rendering: fill the client area, draw the current frame's view
+//! (zoom level + pan offset) from `zoom::View`'s render-size math.
 //!
-//! M2 seams left: the 32768-px stitch path and mipmap selection (#9), and
-//! zoom/pan-aware source rectangles (#7). Alpha compositing (#3) is landed —
-//! transparent pixels are resolved against the windowed background at decode
-//! time, so this path blits opaque pixels only.
+//! The blit path follows upstream's paint (viv.c:4133-4236): destination
+//! size == source size → BitBlt (the pixel-exact 1:1 path); shrinking →
+//! HALFTONE + brush-org realignment; magnifying → COLORONCOLOR (the default
+//! `config_mag_filter`). Alpha compositing (#3) is landed — transparent
+//! pixels are resolved against the windowed background at decode time, so
+//! this path blits opaque pixels only.
+//!
+//! M2 seams left: the 32768-px stitch path and mipmap selection (#9).
 
 use windows::Win32::Foundation::{COLORREF, GetLastError, HWND, RECT};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, FillRect, HALFTONE, HGDIOBJ, PAINTSTRUCT,
-    SRCCOPY, SetBrushOrgEx, SetStretchBltMode, StretchBlt,
+    BeginPaint, BitBlt, COLORONCOLOR, CreateSolidBrush, DeleteObject, EndPaint, FillRect, HALFTONE,
+    HGDIOBJ, PAINTSTRUCT, SRCCOPY, SetBrushOrgEx, SetStretchBltMode, StretchBlt,
 };
 use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 
-use crate::fit::fit_shrink;
 use crate::pixels::WINDOWED_BACKGROUND_RGB;
 use crate::window::{fatal, state_of};
+use crate::zoom::Viewport;
 
 pub(crate) fn paint(hwnd: HWND) {
     // SAFETY: all GDI calls are bracketed by BeginPaint/EndPaint on the WM_PAINT
@@ -65,32 +69,56 @@ pub(crate) fn paint(hwnd: HWND) {
         // borrow lives only across the GDI draw calls below — none pump
         // messages, so no second `state_of` borrow can be taken while this
         // one is live.
-        if let Some(image) = state_of(hwnd).and_then(|s| s.image.as_ref()) {
+        if let Some(state) = state_of(hwnd)
+            && let Some(image) = state.image.as_ref()
+        {
             let surface = image.surface();
-            let (dw, dh) = fit_shrink(surface.width(), surface.height(), cw, ch);
-            let dx = client.left + (cw - dw) / 2;
-            let dy = client.top + (ch - dh) / 2;
-            // Upstream shrink path: HALFTONE + brush-org realignment anchored to
-            // the destination image (viv.c:4205-4209 uses -rx,-ry) so the dither
-            // pattern does not drift as the centered image moves on resize.
-            let _ = SetStretchBltMode(hdc, HALFTONE);
-            let _ = SetBrushOrgEx(hdc, -dx, -dy, None);
-            // Fail-soft by design: upstream viv.c:4278 also continues past a failed
-            // StretchBlt (debug_printf only) — one bad frame must not kill the
-            // window. M2 adds a debug-log channel to surface GLE.
-            let _ = StretchBlt(
-                hdc,
-                dx,
-                dy,
-                dw,
-                dh,
-                Some(surface.memdc()),
-                0,
-                0,
-                surface.width(),
-                surface.height(),
-                SRCCOPY,
-            );
+            let (sw, sh) = (surface.width(), surface.height());
+            // The zoom/pan view decides the destination rect (upstream
+            // `_viv_get_render_size` + `rx = wide/2 - rw/2 - _viv_view_x`,
+            // viv.c:4136-4149); GDI clips whatever pans off-window.
+            let (rw, rh) = state
+                .view
+                .render_size(sw, sh, Viewport { wide: cw, high: ch });
+            let dx = client.left + cw / 2 - rw / 2 - state.view.view_x;
+            let dy = client.top + ch / 2 - rh / 2 - state.view.view_y;
+            if rw > 0 && rh > 0 {
+                if rw == sw && rh == sh {
+                    // Pixel-exact 1:1 — BitBlt, no resampling (upstream's
+                    // equal-size arm, viv.c:4164-4173).
+                    let _ = BitBlt(hdc, dx, dy, rw, rh, Some(surface.memdc()), 0, 0, SRCCOPY);
+                } else {
+                    if rw < sw || rh < sh {
+                        // Upstream shrink path: HALFTONE + brush-org
+                        // realignment anchored to the destination image
+                        // (viv.c:4205-4209 uses -rx,-ry) so the dither
+                        // pattern does not drift as the image moves.
+                        let _ = SetStretchBltMode(hdc, HALFTONE);
+                        let _ = SetBrushOrgEx(hdc, -dx, -dy, None);
+                    } else {
+                        // Upstream magnify default: COLORONCOLOR
+                        // (`config_mag_filter`, config.c:42).
+                        let _ = SetStretchBltMode(hdc, COLORONCOLOR);
+                    }
+                    // Fail-soft by design: upstream viv.c:4278 also continues
+                    // past a failed StretchBlt (debug_printf only) — one bad
+                    // frame must not kill the window. M2 adds a debug-log
+                    // channel to surface GLE.
+                    let _ = StretchBlt(
+                        hdc,
+                        dx,
+                        dy,
+                        rw,
+                        rh,
+                        Some(surface.memdc()),
+                        0,
+                        0,
+                        sw,
+                        sh,
+                        SRCCOPY,
+                    );
+                }
+            }
         }
         let _ = EndPaint(hwnd, &ps);
     }
