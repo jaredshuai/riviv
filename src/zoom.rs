@@ -16,7 +16,11 @@
 //!   (viv.c:1643-1651 + 6497-6520);
 //! - a wheel notch / zoom key steps one level and re-anchors so the
 //!   source pixel under the cursor stays under the cursor
-//!   (`_viv_do_mousewheel_action` action 0, viv.c:13932-14097).
+//!   (`_viv_do_mousewheel_action` action 0, viv.c:13932-14097);
+//! - the fullscreen toggle's zoom offset (which level to show on the
+//!   monitor, `_viv_fullscreen_zoom_offset`, viv.c:6719-6778) is a pure
+//!   function over a size sweep — #8; riviv wires both fill modes off, so
+//!   the level is preserved across the toggle.
 
 use crate::fit::fit_shrink;
 
@@ -110,30 +114,48 @@ impl View {
         src_h: i32,
         vp: Viewport,
     ) -> (i32, i32) {
-        if src_w <= 0 || src_h <= 0 || vp.wide <= 0 || vp.high <= 0 {
-            return (0, 0);
+        render_size_at(pos, one_to_one, src_w, src_h, vp)
+    }
+
+    /// Current zoom level 0..=15 (upstream reads `_viv_zoom_pos` directly;
+    /// the fullscreen toggle's offset math does, viv.c:6719-6778).
+    pub(crate) fn level(&self) -> i32 {
+        self.pos
+    }
+
+    /// `_viv_zoom_pos = _viv_clamp_zoom_pos(_viv_zoom_pos + delta)` — the
+    /// fullscreen toggle's level adjustment (enter subtracts the offset,
+    /// exit adds it back, viv.c:6657/6777). No 1:1 special case: upstream
+    /// does the plain arithmetic whatever the mode.
+    pub(crate) fn shift_level(&mut self, delta: i32) {
+        self.pos = (self.pos + delta).clamp(0, ZOOM_LIMIT - 1);
+    }
+
+    /// The `_viv_1to1 = 0` that opens `_viv_toggle_fullscreen` (viv.c:6617):
+    /// leave 1:1 WITHOUT restoring `saved_pos` — upstream's `_viv_zoom_pos`
+    /// is already 0 in 1:1 and stays 0, so the toggle lands on fit (the
+    /// stale `_viv_old_zoom_pos` is simply overwritten by the next 1:1
+    /// entry, viv.c:9334-9339).
+    pub(crate) fn leave_one_to_one(&mut self) {
+        self.one_to_one = false;
+    }
+
+    /// The render size at every level, computed in one sweep — upstream's
+    /// zoom_wide/high_array precalculation in `_viv_toggle_fullscreen`
+    /// (viv.c:6590-6608). The 1:1 quirk is inherited: the sweep runs BEFORE
+    /// the toggle's `_viv_1to1 = 0`, so while in 1:1 every entry is the
+    /// source size verbatim.
+    pub(crate) fn sizes_all_levels(
+        &self,
+        src_w: i32,
+        src_h: i32,
+        vp: Viewport,
+    ) -> [(i32, i32); ZOOM_LEVEL_COUNT] {
+        let mut sizes = [(0, 0); ZOOM_LEVEL_COUNT];
+        for (pos, slot) in sizes.iter_mut().enumerate() {
+            *slot = self.size_at(pos as i32, self.one_to_one, src_w, src_h, vp);
         }
-        if one_to_one {
-            return (src_w, src_h);
-        }
-        let (fw, fh) = fit_shrink(src_w, src_h, vp.wide, vp.high);
-        if pos <= 0 {
-            return (fw, fh);
-        }
-        let idx = pos.min(ZOOM_LIMIT - 1) as usize;
-        // Upstream: rw = rw + (int)((max_zoom_wide - rw) * preset) — float
-        // multiply, int truncation, per axis independently (aspect drifts a
-        // little between levels; that is the upstream curve, viv.c:7012-7016).
-        // The max term stays in i64: 16 * src overflows i32 for pathological
-        // aspect ratios (a 2^31/16-wide strip) that still fit the decode
-        // budget.
-        let rw = fw
-            + ((i64::from(ZOOM_LIMIT) * i64::from(src_w) - i64::from(fw)) as f32
-                * ZOOM_PRESETS[idx]) as i32;
-        let rh = fh
-            + ((i64::from(ZOOM_LIMIT) * i64::from(src_h) - i64::from(fh)) as f32
-                * ZOOM_PRESETS[idx]) as i32;
-        (rw, rh)
+        sizes
     }
 
     /// Commit a candidate pan offset, clamped, and refresh the center anchor
@@ -284,6 +306,88 @@ impl View {
         self.one_to_one = false;
         self.pos = 0;
         self.set_view(self.view_x, self.view_y, src_w, src_h, vp);
+    }
+}
+
+/// The number of zoom levels (upstream `_VIV_ZOOM_MAX`, viv.c:684).
+pub(crate) const ZOOM_LEVEL_COUNT: usize = 16;
+
+/// The preset-curve render size at `pos` under the default config
+/// (keep-aspect, allow-shrinking, no fill) — the body of upstream
+/// `_viv_get_render_size` (viv.c:6853-7017): 1:1 is the source size
+/// verbatim, level 0 is fit-shrink, and higher levels lerp toward the 16x
+/// per-axis maximum with float math truncated per axis.
+fn render_size_at(pos: i32, one_to_one: bool, src_w: i32, src_h: i32, vp: Viewport) -> (i32, i32) {
+    if src_w <= 0 || src_h <= 0 || vp.wide <= 0 || vp.high <= 0 {
+        return (0, 0);
+    }
+    if one_to_one {
+        return (src_w, src_h);
+    }
+    let (fw, fh) = fit_shrink(src_w, src_h, vp.wide, vp.high);
+    if pos <= 0 {
+        return (fw, fh);
+    }
+    let idx = pos.min(ZOOM_LIMIT - 1) as usize;
+    // Upstream: rw = rw + (int)((max_zoom_wide - rw) * preset) — float
+    // multiply, int truncation, per axis independently (aspect drifts a
+    // little between levels; that is the upstream curve, viv.c:7012-7016).
+    // The max term stays in i64: 16 * src overflows i32 for pathological
+    // aspect ratios (a 2^31/16-wide strip) that still fit the decode
+    // budget.
+    let rw = fw
+        + ((i64::from(ZOOM_LIMIT) * i64::from(src_w) - i64::from(fw)) as f32 * ZOOM_PRESETS[idx])
+            as i32;
+    let rh = fh
+        + ((i64::from(ZOOM_LIMIT) * i64::from(src_h) - i64::from(fh)) as f32 * ZOOM_PRESETS[idx])
+            as i32;
+    (rw, rh)
+}
+
+/// The fullscreen zoom offset (upstream `_viv_toggle_fullscreen`'s offset
+/// block, viv.c:6719-6778). The caller passes `sizes` — the render size at
+/// every level computed at the OLD viewport — plus the fullscreen monitor
+/// size and the CURRENT render size/level. Semantics:
+/// - `fullscreen_fill_window` (upstream default 1): the largest level whose
+///   old-viewport render still fits the monitor, capped at the current
+///   level; entering fullscreen SUBTRACTS it (drop to the biggest filling
+///   view), exit adds it back.
+/// - else `fill_window` (windowed fill, default 0): a NEGATIVE offset —
+///   the largest level whose render does not exceed the current one, so
+///   entering keeps the window filled; clamped to `-(15 - level)`.
+/// - both off: 0 — the level is preserved across the toggle. That is
+///   riviv's wiring (no config yet); see README Differences.
+///
+/// riviv wires `false, false`; the function stays parameterized and tested
+/// so the M3 config hookup is a call-site change.
+pub(crate) fn fullscreen_zoom_offset(
+    fullscreen_fill_window: bool,
+    fill_window: bool,
+    sizes: &[(i32, i32); ZOOM_LEVEL_COUNT],
+    monitor: Viewport,
+    old_render: (i32, i32),
+    zoom_pos: i32,
+) -> i32 {
+    if fullscreen_fill_window {
+        let mut offset = 0;
+        for (level, &(w, h)) in sizes.iter().enumerate() {
+            if w > monitor.wide || h > monitor.high {
+                break;
+            }
+            offset = level as i32;
+        }
+        offset.min(zoom_pos)
+    } else if fill_window {
+        let mut offset = 0;
+        for (level, &(w, h)) in sizes.iter().enumerate() {
+            if w > old_render.0 || h > old_render.1 {
+                break;
+            }
+            offset = -(level as i32);
+        }
+        offset.max(-(ZOOM_LEVEL_COUNT as i32 - 1 - zoom_pos))
+    } else {
+        0
     }
 }
 
@@ -792,5 +896,158 @@ mod tests {
         assert_eq!(clip_blit(right, 0, 0, VP), None);
         assert_eq!(clip_blit(left, 0, 0, VP), None);
         assert_eq!(clip_blit(above, 0, 0, VP), None);
+    }
+
+    #[test]
+    fn fullscreen_offset_is_zero_with_both_fill_modes_off() {
+        // riviv's wiring (no config yet): the level survives the toggle.
+        let sizes = [(1920, 1080); ZOOM_LEVEL_COUNT];
+        assert_eq!(
+            fullscreen_zoom_offset(
+                false,
+                false,
+                &sizes,
+                Viewport {
+                    wide: 1920,
+                    high: 1080
+                },
+                (400, 300),
+                5
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn fullscreen_offset_picks_the_largest_level_fitting_the_monitor() {
+        // fullscreen_fill_window branch (viv.c:6723-6742): levels 0..=4 fit a
+        // 1000-wide monitor, level 5 is the first that overflows.
+        let mut sizes = [(0, 0); ZOOM_LEVEL_COUNT];
+        for (i, slot) in sizes.iter_mut().enumerate() {
+            *slot = (i as i32 * 200 + 100, i as i32 * 100 + 50);
+        }
+        assert!(sizes[4].0 <= 1000 && sizes[5].0 > 1000);
+        let offset = fullscreen_zoom_offset(
+            true,
+            false,
+            &sizes,
+            Viewport {
+                wide: 1000,
+                high: 800,
+            },
+            (0, 0),
+            9,
+        );
+        assert_eq!(offset, 4);
+    }
+
+    #[test]
+    fn fullscreen_offset_never_exceeds_the_current_level() {
+        // The cap (viv.c:6734-6738): every level fits the monitor but the
+        // viewer is only at level 2 — the offset cannot pull below fit.
+        let sizes = [(100, 50); ZOOM_LEVEL_COUNT];
+        let offset = fullscreen_zoom_offset(
+            true,
+            false,
+            &sizes,
+            Viewport {
+                wide: 4000,
+                high: 3000,
+            },
+            (0, 0),
+            2,
+        );
+        assert_eq!(offset, 2);
+    }
+
+    #[test]
+    fn windowed_fill_offset_is_negative_and_clamped_by_headroom() {
+        // fill_window branch (viv.c:6743-6771): levels whose render does not
+        // exceed the current one contribute -level. The clamp keeps the
+        // enter/exit pair REVERSIBLE: pos - offset must not exceed the top,
+        // so offset is raised to -(15 - pos) — at pos 14 the raw -4 becomes
+        // -1 (enter 15, exit 15-1 = 14), and at pos 15 it is 0.
+        let mut sizes = [(0, 0); ZOOM_LEVEL_COUNT];
+        for (i, slot) in sizes.iter_mut().enumerate() {
+            *slot = (i as i32 * 100, i as i32 * 60);
+        }
+        let args = |pos: i32| {
+            fullscreen_zoom_offset(
+                false,
+                true,
+                &sizes,
+                Viewport {
+                    wide: 9999,
+                    high: 9999,
+                },
+                (450, 270),
+                pos,
+            )
+        };
+        // old render 450x270 -> levels 0..=4 stay under it; level 5 (500)
+        // breaks. Mid-curve the headroom (15-1-9 = 5) admits the raw -4...
+        assert_eq!(args(9), -4);
+        // ...and so does the headroom at 2 (12)...
+        assert_eq!(args(2), -4);
+        // ...but at 14 the headroom is 1: the clamp raises -4 to -1.
+        assert_eq!(args(14), -1);
+        // ...and at 15 the headroom is 0: the offset clamps to 0.
+        assert_eq!(args(15), 0);
+    }
+
+    #[test]
+    fn shift_level_clamps_to_the_curve_ends() {
+        let mut v = View {
+            pos: 14,
+            ..View::new()
+        };
+        v.shift_level(10);
+        assert_eq!(v.pos, 15);
+        v.shift_level(-100);
+        assert_eq!(v.pos, 0);
+    }
+
+    #[test]
+    fn sizes_all_levels_sweeps_the_preset_curve() {
+        let v = View::new();
+        let sizes = v.sizes_all_levels(100, 60, VP);
+        for pos in 0..ZOOM_LEVEL_COUNT as i32 {
+            assert_eq!(sizes[pos as usize], v.size_at(pos, false, 100, 60, VP));
+        }
+        assert_eq!(sizes[0], (100, 60)); // fit keeps the small image
+        assert_eq!(sizes[15], (1600, 960)); // top = 16x
+    }
+
+    #[test]
+    fn sizes_all_levels_in_one_to_one_are_all_the_source_size() {
+        // The precalc quirk (viv.c:6590-6608 runs BEFORE the toggle's
+        // `_viv_1to1 = 0` at 6617): in 1:1 every array entry is the source.
+        let v = View {
+            one_to_one: true,
+            ..View::new()
+        };
+        assert_eq!(
+            v.sizes_all_levels(800, 600, VP),
+            [(800, 600); ZOOM_LEVEL_COUNT]
+        );
+    }
+
+    #[test]
+    fn leave_one_to_one_keeps_the_level_without_restoring_saved() {
+        // The toggle's `_viv_1to1 = 0` (viv.c:6617): level stays 0 (it was
+        // forced there on entry) and the saved level is NOT restored — the
+        // next 1:1 entry overwrites it (viv.c:9334-9339).
+        let mut v = View {
+            pos: 0,
+            one_to_one: true,
+            saved_pos: 7,
+            ..View::new()
+        };
+        v.leave_one_to_one();
+        assert!(!v.one_to_one);
+        assert_eq!(v.pos, 0);
+        assert_eq!(v.saved_pos, 7); // stale on purpose, like upstream
+        v.toggle_one_to_one(100, 60, VP); // re-entry saves the CURRENT level
+        assert_eq!(v.saved_pos, 0);
     }
 }
