@@ -38,9 +38,12 @@
 //! - `pixels` — BGRA conversion + alpha compositing (#3, landed); M2: mip math (#9)
 //! - `fit` — fit-to-window math (the zoom curve's level 0)
 //! - `zoom` — 16-step zoom presets, wheel/cursor anchoring, pan clamping,
-//!   the temporary 1:1 mode and the resize re-anchor (#7, landed)
+//!   the temporary 1:1 mode, the resize re-anchor and the fullscreen
+//!   toggle's zoom-offset math (#7/#8, landed)
 //! - `text` — title & wide-string construction + the status-bar text and
 //!   part-width model (#5, landed)
+//! - `cursor` — the fullscreen cursor-hide state machine, pure
+//!   show/timer/effects decisions (#8, landed)
 //! - `surface` — DIB section + memory DC; one per decoded frame (#3, landed);
 //!   M2: mipmap surfaces (#9)
 //! - `loader` — streaming decode pipeline + the load reply state machine
@@ -54,12 +57,14 @@
 //! - `status` — the status-bar common control: creation, height, and the
 //!   measure → parts → texts update over `text`'s pure model (#5, landed)
 //! - `window` — wnd_proc shell, pump, input/open actions, animation timer,
-//!   reply handler, playlist wiring, zoom/pan mouse+key wiring
-//!   (#3/#4/#5/#6/#7, landed); M2: fullscreen (#8)
+//!   reply handler, playlist wiring, zoom/pan mouse+key wiring, the
+//!   fullscreen toggle and the cursor-hide timers
+//!   (#3/#4/#5/#6/#7/#8, landed); M2: stitch/mip (#9)
 
 #![windows_subsystem = "windows"]
 
 mod anim;
+mod cursor;
 mod fit;
 mod loader;
 mod loadthread;
