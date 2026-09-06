@@ -1,7 +1,7 @@
 //! Cursor visibility state machine (pure logic, unit-tested) — issue #8.
 //!
 //! Mirrors upstream's cursor globals (`_viv_is_cursor_shown` /
-//! `_viv_is_hide_cursor_timer`, viv.c:786-787) and the four functions over
+//! `_viv_is_hide_cursor_timer`, viv.c:709/713) and the four functions over
 //! them (viv.c:14559-14640) plus the WM_TIMER arm (viv.c:3161-3169) and the
 //! mouse-move dedupe (`_viv_mousemove`, viv.c:9151-9170):
 //! - the cursor hides after 2 s idle (`_VIV_HIDE_CURSOR_DELAY`, viv.c:337)
@@ -131,7 +131,7 @@ impl CursorVisibility {
         e
     }
 
-    /// `_viv_start_hide_cursor_timer` (viv.c:14630-14640): arm once.
+    /// `_viv_start_hide_cursor_timer` (viv.c:14633-14641): arm once.
     fn start_hide_timer(&mut self) -> CursorEffects {
         let mut e = CursorEffects::default();
         if !self.hide_timer {
@@ -195,7 +195,7 @@ mod tests {
 
     #[test]
     fn fresh_state_is_shown_with_no_timer() {
-        // _viv_is_cursor_shown = 1, _viv_is_hide_cursor_timer = 0 (viv.c:786-787).
+        // _viv_is_cursor_shown = 1, _viv_is_hide_cursor_timer = 0 (viv.c:709/713).
         assert_eq!(
             CursorVisibility::new(),
             CursorVisibility {
