@@ -27,6 +27,8 @@ Drag & drop works the same way (upstream `WM_DROPFILES` semantics): a single dro
 
 Zoom & pan (upstream preset semantics): the mouse wheel and `+`/`-` step through the 16-level zoom curve (level 0 = fit, top level = 1600%) anchored at the cursor; drag with the left button to pan while the image exceeds the window; Ctrl+0 returns to fit; Ctrl+Alt+0 toggles a temporary pixel-exact 1:1 view.
 
+Fullscreen (upstream semantics): double-click or Alt+Enter toggles a borderless cover of the current monitor (Esc also leaves it) — the pre-toggle window rect (and its maximized state) is restored on exit, the status bar is hidden for the cover, and an idle cursor hides after 2 s, reappearing on any movement.
+
 ## Roadmap
 
 - [x] M1 — skeleton: Win32 window + GDI rendering + static image display
@@ -34,6 +36,7 @@ Zoom & pan (upstream preset semantics): the mouse wheel and `+`/`-` step through
   - [x] animation + transparency compositing
   - [x] playlist + keyboard navigation
   - [x] zoom & pan: 16-level presets + wheel + drag + temporary 1:1
+  - [x] fullscreen: double-click / Alt+Enter / Esc + idle cursor hide
 - [ ] M3 — settings & custom shortcuts, Everything IPC, file associations, localization, installer
 
 ## Differences from upstream (intentional)
@@ -49,7 +52,8 @@ Zoom & pan (upstream preset semantics): the mouse wheel and `+`/`-` step through
 - No toolbar yet (upstream shows it by default) — lands in M2.
 - Embedded ICC color profiles are not applied (upstream enables GDI+ ICM); non-sRGB images may show slightly inaccurate colors.
 - No single-instance handoff yet: a second launch opens a new window instead of forwarding its command line to the existing viewer (upstream default). Planned for M3 together with Everything IPC.
-- Double-click does not toggle fullscreen yet (upstream default action) — lands with the fullscreen work in M2.
+- The cursor does not hide while idle in WINDOWED mode (upstream defaults `windowed_hide_cursor=1`, hiding it there too; riviv hides it in fullscreen only, per issue #8's scope). The fullscreen background also stays the windowed background color — upstream separates `fullscreen_background_color`.
+- The fullscreen toggle's zoom-offset is implemented but inert: both `fill_window` and `fullscreen_fill_window` are off (no config yet), so the zoom level is preserved entering/leaving fullscreen. Upstream defaults `fullscreen_fill_window=1`, which drops to the largest level that still covers the monitor on entry.
 - No menu bar yet (upstream shows File/View/Navigate by default) — planned for M2+.
 - Command-line switches are ignored (upstream parses config switches like `/sort` and shows a usage dialog for unknown ones; riviv has no config yet — M3). Switch detection matches upstream's quirk of treating dotted words like `-foo.png` as filenames; quoted switches cannot be distinguished from unquoted ones through `args_os` and are skipped either way.
 - Upstream's default-on decode-ahead (preload next image) and last-image caches are not implemented — every open, including navigation back to a just-seen image, decodes from disk.
