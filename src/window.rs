@@ -13,8 +13,11 @@
 //! (#7): the wheel and the +/- keys step the 16-level preset curve
 //! anchored at the cursor or the viewport center, left-drag pans with edge
 //! clamping, Ctrl+0 resets to fit and Ctrl+Alt+0 toggles the temporary
-//! 1:1 mode (`zoom.rs`).
-//! M2 seams left: fullscreen toggle + cursor-hide timers (#8).
+//! 1:1 mode (`zoom.rs`). Fullscreen (#8): double-click, Alt+Return or Esc
+//! toggles a borderless cover of the current monitor with the pre-toggle
+//! rect (and zoomed state) restored on exit; the status bar is destroyed
+//! for the cover and recreated after; and an idle cursor hides after 2 s
+//! in fullscreen, reappearing on movement (`cursor.rs`).
 
 use std::ffi::{OsStr, OsString, c_void};
 use std::mem::size_of;
@@ -26,8 +29,9 @@ use windows::Win32::Foundation::{
     WIN32_ERROR, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
-    COLOR_BTNFACE, GetMonitorInfoW, HBRUSH, InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO,
-    MonitorFromPoint, ScreenToClient,
+    COLOR_BTNFACE, GetMonitorInfoW, HBRUSH, InvalidateRect, MONITOR_DEFAULTTONEAREST,
+    MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint, MonitorFromWindow, PtInRect,
+    ScreenToClient,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
@@ -38,28 +42,32 @@ use windows::Win32::UI::Controls::Dialogs::{
 };
 use windows::Win32::UI::Controls::{
     ICC_BAR_CLASSES, ICC_STANDARD_CLASSES, ICC_WIN95_CLASSES, INITCOMMONCONTROLSEX,
-    InitCommonControlsEx,
+    InitCommonControlsEx, WM_MOUSELEAVE,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, ReleaseCapture, SetCapture, VK_ADD, VK_CONTROL, VK_END, VK_ESCAPE, VK_HOME,
-    VK_LEFT, VK_MENU, VK_NEXT, VK_OEM_MINUS, VK_OEM_PLUS, VK_PRIOR, VK_RIGHT, VK_SHIFT,
-    VK_SUBTRACT,
+    GetCapture, GetKeyState, ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT,
+    TrackMouseEvent, VK_ADD, VK_CONTROL, VK_END, VK_ESCAPE, VK_HOME, VK_LEFT, VK_MENU, VK_NEXT,
+    VK_OEM_MINUS, VK_OEM_PLUS, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SUBTRACT,
 };
 use windows::Win32::UI::Shell::{DragFinish, DragQueryFileW, HDROP};
 use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRect, CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CreateWindowExW,
-    DefWindowProcW, DispatchMessageW, GWLP_USERDATA, GetClientRect, GetCursorPos, GetMessageW,
-    GetWindowLongPtrW, IDC_ARROW, KillTimer, LoadCursorW, MB_ICONERROR, MINMAXINFO, MSG,
-    MessageBoxW, PostQuitMessage, RegisterClassExW, SHOW_WINDOW_CMD, SW_SHOW, SWP_NOACTIVATE,
-    SWP_NOZORDER, SendMessageW, SetForegroundWindow, SetProcessDPIAware, SetTimer,
-    SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, TranslateMessage,
-    USER_TIMER_MINIMUM, WM_DESTROY, WM_DROPFILES, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_PAINT,
-    WM_SIZE, WM_SYSKEYDOWN, WM_TIMER, WNDCLASSEXW, WS_EX_ACCEPTFILES, WS_OVERLAPPEDWINDOW,
+    DefWindowProcW, DestroyWindow, DispatchMessageW, GWL_STYLE, GWLP_USERDATA, GetClientRect,
+    GetCursorPos, GetForegroundWindow, GetMessageW, GetWindowLongPtrW, GetWindowRect, HWND_TOP,
+    IDC_ARROW, IsZoomed, KillTimer, LoadCursorW, MB_ICONERROR, MINMAXINFO, MSG, MessageBoxW,
+    PostQuitMessage, RegisterClassExW, SHOW_WINDOW_CMD, SW_MAXIMIZE, SW_SHOW, SW_SHOWNORMAL,
+    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOZORDER, SendMessageW,
+    SetForegroundWindow, SetProcessDPIAware, SetTimer, SetWindowLongPtrW, SetWindowPos,
+    SetWindowTextW, ShowCursor, ShowWindow, TranslateMessage, USER_TIMER_MINIMUM, WINDOW_EX_STYLE,
+    WM_ACTIVATE, WM_DESTROY, WM_DROPFILES, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN,
+    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE,
+    WM_NCDESTROY, WM_PAINT, WM_SIZE, WM_SYSKEYDOWN, WM_TIMER, WNDCLASSEXW, WS_CAPTION,
+    WS_EX_ACCEPTFILES, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_THICKFRAME, WS_VISIBLE, WindowFromPoint,
 };
 use windows::core::{HSTRING, PCWSTR, w};
 
 use crate::anim::ANIMATION_TIMER_ID;
+use crate::cursor::{self, CursorVisibility};
 use crate::fit::fit_shrink;
 use crate::loader::{LoadedImage, UiAction, apply_reply, map_reply_frame};
 use crate::loadthread::{LoadSession, LoadThread, REPLY_KICK_MESSAGE};
@@ -147,6 +155,35 @@ pub(crate) struct WindowState {
     /// (upstream `_viv_doing == _VIV_DOING_SCROLL` + `_viv_doing_x/y`,
     /// viv.c:14682-14693). `None` = not dragging.
     pub(crate) drag: Option<(i32, i32)>,
+    /// Fullscreen state (#8; upstream `_viv_is_fullscreen`,
+    /// `_viv_fullscreen_is_maxed`, `_viv_fullscreen_rect`,
+    /// `_viv_fullscreen_zoom_offset`, viv.c:780-783). The rect is the
+    /// pre-fullscreen normal placement (captured AFTER un-maximizing), so
+    /// exit restores onto it — re-maximizing first when the toggle began
+    /// from a zoomed window.
+    pub(crate) fullscreen: bool,
+    pub(crate) fullscreen_was_maxed: bool,
+    pub(crate) fullscreen_restore_rect: RECT,
+    pub(crate) fullscreen_zoom_offset: i32,
+    /// Cursor visibility state machine (#8; upstream `_viv_is_cursor_shown`
+    /// + `_viv_is_hide_cursor_timer`, viv.c:786-787) — see `cursor.rs`.
+    pub(crate) cursor: CursorVisibility,
+    /// Mouse-leave tracking is armed (upstream `_viv_is_tracking_mouse`,
+    /// viv.c:781) and the mouse is currently over the window
+    /// (`_viv_is_mouseover`, viv.c:782) — the hide-cursor conditions read
+    /// the latter.
+    pub(crate) tracking_mouse: bool,
+    pub(crate) is_mouseover: bool,
+    /// The last seen cursor position (upstream `_viv_mousemove_x/y`,
+    /// viv.c:788-789) — the movement dedupe behind the cursor
+    /// show/restart cycle; (-1, -1) while the mouse is away (reset by
+    /// WM_MOUSELEAVE).
+    pub(crate) last_cursor_pt: POINT,
+    /// Suppress the WM_ACTIVATE deactivate-show during the fullscreen
+    /// dummy-window dance (upstream `_viv_prevent_on_deactivate`,
+    /// viv.c:784/6712/6780): the momentary deactivate must not force-show
+    /// a cursor the cycle had hidden.
+    pub(crate) prevent_deactivate_show: bool,
 }
 
 /// Window state pointer stored in GWLP_USERDATA between WM_NCCREATE and
@@ -242,6 +279,433 @@ fn viewport_and_src(hwnd: HWND, state: &WindowState) -> (Viewport, (i32, i32)) {
     (vp, src)
 }
 
+/// Gather `_viv_should_show_cursor`'s live inputs (viv.c:14593-14619): a
+/// viewable image is up, we are foreground, the mouse is over us, nothing
+/// holds the capture, and (fullscreen OR the `windowed_hide_cursor`
+/// config). riviv wires that config input to `false` — the cursor only
+/// hides in fullscreen (README deviation; the upstream default is 1).
+fn cursor_conditions(hwnd: HWND, state: &WindowState) -> cursor::CursorConditions {
+    cursor::CursorConditions {
+        has_viewable_image: state.nav_current.is_some()
+            && !state.status_file_not_found
+            && !state.status_load_failed,
+        // SAFETY: read-only query of the foreground window.
+        foreground: unsafe { GetForegroundWindow() } == hwnd,
+        mouseover: state.is_mouseover,
+        // SAFETY: read-only query of this thread's capture window.
+        captured: !unsafe { GetCapture() }.is_invalid(),
+        fullscreen: state.fullscreen,
+        hide_when_windowed: false,
+    }
+}
+
+/// Perform one cursor-step's Win32 effects — always OUTSIDE any state
+/// borrow, in upstream's order (timer dies, polarity flips, a fresh timer
+/// may arm; viv.c:14559-14640).
+fn apply_cursor(hwnd: HWND, effects: cursor::CursorEffects) {
+    if effects.kill_timer {
+        // SAFETY: hwnd is live; a failed kill leaves a stale timer whose
+        // WM_TIMER guard no-ops.
+        let _ = unsafe { KillTimer(Some(hwnd), cursor::HIDE_CURSOR_TIMER_ID) };
+    }
+    if let Some(show) = effects.show_cursor {
+        // SAFETY: adjusts this thread's cursor display count by exactly one.
+        unsafe { ShowCursor(show) };
+    }
+    if effects.start_timer {
+        // SAFETY: hwnd is live and owned by this thread. Fail-soft like
+        // upstream's unchecked SetTimer (viv.c:14637): a failed timer
+        // merely keeps the cursor visible.
+        let _ = unsafe {
+            SetTimer(
+                Some(hwnd),
+                cursor::HIDE_CURSOR_TIMER_ID,
+                cursor::HIDE_CURSOR_DELAY_MS,
+                None,
+            )
+        };
+    }
+}
+
+/// `_viv_update_show_cursor` (viv.c:14621-14628): reconcile the cursor
+/// with the current conditions — show it, or (re)arm the hide cycle.
+fn update_cursor(hwnd: HWND) {
+    // SAFETY: the borrow spans the condition gather and the pure state
+    // machine; the effects run after it drops.
+    let effects = (unsafe { state_of(hwnd) }).map(|state| {
+        let conditions = cursor_conditions(hwnd, state);
+        state.cursor.update(&conditions)
+    });
+    if let Some(effects) = effects {
+        apply_cursor(hwnd, effects);
+    }
+}
+
+/// `_viv_show_cursor` (viv.c:14559-14571): force the cursor visible and
+/// stop the hide cycle.
+fn show_cursor(hwnd: HWND) {
+    // SAFETY: the borrow spans the pure state machine.
+    let effects = (unsafe { state_of(hwnd) }).map(|state| state.cursor.show());
+    if let Some(effects) = effects {
+        apply_cursor(hwnd, effects);
+    }
+}
+
+/// `_viv_show_cursor(); _viv_update_show_cursor();` — the button-press
+/// pairing (viv.c:3300-3301/3322-3323).
+fn show_and_update_cursor(hwnd: HWND) {
+    show_cursor(hwnd);
+    update_cursor(hwnd);
+}
+
+/// The WM_TIMER hide-cursor arm (upstream viv.c:3161-3169).
+fn on_hide_cursor_timer(hwnd: HWND) {
+    // SAFETY: the borrow spans the condition gather and the pure machine.
+    let effects = (unsafe { state_of(hwnd) }).map(|state| {
+        let conditions = cursor_conditions(hwnd, state);
+        state.cursor.timer_fired(&conditions)
+    });
+    if let Some(effects) = effects {
+        apply_cursor(hwnd, effects);
+    }
+}
+
+/// WM_MOUSELEAVE (upstream viv.c:3562-3588): the TME_LEAVE tracking
+/// expired — the mouse left the window. Clear the mouseover verdict and
+/// the movement dedupe, and make sure the cursor is visible (the hide
+/// conditions can no longer hold). The src-pixel part of upstream's
+/// handler belongs to the unimplemented pixel-info feature.
+fn on_mouse_leave(hwnd: HWND) {
+    // SAFETY: the borrow spans the flag resets and the pure cursor step.
+    let effects = (unsafe { state_of(hwnd) }).map(|state| {
+        state.tracking_mouse = false;
+        state.is_mouseover = false;
+        state.last_cursor_pt = POINT { x: -1, y: -1 };
+        state.cursor.show()
+    });
+    if let Some(effects) = effects {
+        apply_cursor(hwnd, effects);
+    }
+}
+
+/// The fullscreen dummy window's class — upstream registers
+/// "_VIV_FULLSCREEN" per toggle (viv.c:6698-6712); riviv names its own so
+/// both viewers coexist like with the main class.
+const FULLSCREEN_DUMMY_CLASS: PCWSTR = w!("riviv_fullscreen");
+
+/// The dummy's wnd_proc: the window is created, foregrounded and destroyed
+/// within one sweep with no message dispatch in between, so default
+/// handling is all it can ever see (upstream `_viv_fullscreen_proc`,
+/// viv.c:11701-11731, is only richer against a WM_PAINT that cannot arrive).
+unsafe extern "system" fn fullscreen_dummy_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    // SAFETY: hwnd/msg are exactly what this callback received; the default
+    // procedure handles everything.
+    unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+}
+
+/// WM_LBUTTONDBLCLK (upstream viv.c:3298-3318): the default left-click
+/// action's double-click arm is the fullscreen toggle (action 0 is one of
+/// the toggling actions; 3/4 would run the click action instead). The
+/// first click of the pair started a drag, but the intervening
+/// WM_LBUTTONUP already ended it — the drag is over by the time the DBLCLK
+/// arrives. The cursor reappears first, like on every button message.
+fn on_double_click(hwnd: HWND) {
+    show_and_update_cursor(hwnd);
+    toggle_fullscreen(hwnd);
+}
+
+/// `_viv_toggle_fullscreen` (viv.c:6574-6821). Enter: strip caption +
+/// thick frame, un-maximize (remembering it), save the window rect,
+/// destroy the status bar, cover the current monitor, and run the
+/// dummy-window dance so the shell takes the taskbar away. Exit: restore
+/// every piece onto the saved rect, re-maximizing when the toggle began
+/// zoomed. The zoom level rides the `_viv_fullscreen_zoom_offset` math
+/// (both fill modes are off in riviv, so the level is preserved); 1:1 mode
+/// is dropped without restoring its saved level (viv.c:6617). WM_SIZE
+/// fires naturally through the dance and the #7 re-anchor converges on the
+/// final geometry — where upstream's suppressed-then-final `_viv_on_size`
+/// lands too (viv.c:6611/6779-6783).
+fn toggle_fullscreen(hwnd: HWND) {
+    // The offset inputs are gathered at the OLD viewport before anything
+    // moves (viv.c:6586-6608) — the size sweep inherits the current 1:1
+    // flag, so a toggle from 1:1 measures every level as the source size.
+    // SAFETY: the borrow spans the pure geometry gather.
+    let gathered = (unsafe { state_of(hwnd) }).map(|state| {
+        let (vp, src) = viewport_and_src(hwnd, state);
+        let old_render = state.view.render_size(src.0, src.1, vp);
+        let sizes = state.view.sizes_all_levels(src.0, src.1, vp);
+        (state.fullscreen, state.view.level(), old_render, sizes)
+    });
+    let Some((was_fullscreen, level, old_render, sizes)) = gathered else {
+        return;
+    };
+    // The monitor is chosen from the WINDOWED position — upstream calls
+    // os_MonitorRectFromWindow(hwnd, 1) before any move (viv.c:6667): the
+    // FULL rcMonitor (not the work area) of the monitor holding the window,
+    // falling back to the primary (os.c:249-276).
+    // SAFETY: read-only monitor queries on the live window.
+    let monitor_rect = unsafe {
+        let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY);
+        let mut mi = MONITORINFO {
+            cbSize: size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        // Fail-soft like upstream's os_MonitorRectFromWindow, which never
+        // checks GetMonitorInfo either; with DEFAULTTOPRIMARY the handle is
+        // never null, so the zeroed rect is theoretical.
+        let _ = GetMonitorInfoW(monitor, &mut mi);
+        mi.rcMonitor
+    };
+    {
+        // SAFETY: the borrow spans only the flag flips and the pure level
+        // moves.
+        let Some(state) = (unsafe { state_of(hwnd) }) else {
+            return;
+        };
+        // Before any resize, like upstream (viv.c:6623/6661) — the cursor
+        // conditions read it.
+        state.fullscreen = !was_fullscreen;
+        // viv.c:6617: 1:1 dies here WITHOUT restoring its saved level.
+        state.view.leave_one_to_one();
+    }
+    if was_fullscreen {
+        // ---- exit (viv.c:6617-6659) ----
+        // SAFETY: read-modify-write of the style on the owning thread.
+        let style = unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) } as u32;
+        // SAFETY: hwnd is live; riviv always shows caption + thick frame
+        // (upstream restores per config, whose defaults are both on —
+        // config.c:85-86).
+        unsafe {
+            SetWindowLongPtrW(
+                hwnd,
+                GWL_STYLE,
+                (style | WS_CAPTION.0 | WS_THICKFRAME.0) as isize,
+            );
+        }
+        // The bar is RECREATED (upstream `_viv_status_show(1)` destroys and
+        // recreates rather than hiding, viv.c:10932-10963).
+        // SAFETY: returns this exe's module handle; no side effects.
+        if let Ok(hinstance) = unsafe { GetModuleHandleW(None) } {
+            let bar = match status::create(hwnd, hinstance.into()) {
+                Ok(bar) => bar,
+                Err(msg) => {
+                    // Same graceful degradation as startup: a NULL bar
+                    // no-ops everywhere.
+                    eprintln!("status bar unavailable: {msg}");
+                    HWND::default()
+                }
+            };
+            // SAFETY: the borrow spans only the field store.
+            if let Some(state) = unsafe { state_of(hwnd) } {
+                state.status = bar;
+            }
+        }
+        // SAFETY: the borrow spans only the copies out.
+        let (rect, offset) = (unsafe { state_of(hwnd) })
+            .map(|state| (state.fullscreen_restore_rect, state.fullscreen_zoom_offset))
+            .unwrap_or_default();
+        // The level moves BEFORE the resize so the WM_SIZE re-anchor sees
+        // the final level — upstream suppresses on-size through the dance
+        // and runs one `_viv_on_size` after this very shift (viv.c:6657-
+        // 6660).
+        // SAFETY: the borrow spans the pure level move.
+        if let Some(state) = unsafe { state_of(hwnd) } {
+            state.view.shift_level(offset);
+        }
+        // SAFETY: hwnd is live; reenters wnd_proc with WM_SIZE — no borrow
+        // is live out here (on_size takes its own).
+        let _ = unsafe {
+            SetWindowPos(
+                hwnd,
+                Some(HWND_TOP),
+                rect.left,
+                rect.top,
+                rect.right - rect.left,
+                rect.bottom - rect.top,
+                SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_NOCOPYBITS,
+            )
+        };
+        // SAFETY: the borrow spans only the copy out.
+        let was_maxed = (unsafe { state_of(hwnd) }).is_some_and(|state| state.fullscreen_was_maxed);
+        if was_maxed {
+            // SAFETY: hwnd is live; SW_MAXIMIZE re-zooms onto the placement
+            // restored just above (upstream order, viv.c:6651-6656).
+            let _ = unsafe { ShowWindow(hwnd, SW_MAXIMIZE) };
+        }
+    } else {
+        // ---- enter (viv.c:6660-6779) ----
+        // SAFETY: read-modify-write of the style on the owning thread.
+        let style = unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) } as u32;
+        // SAFETY: hwnd is live.
+        unsafe {
+            SetWindowLongPtrW(
+                hwnd,
+                GWL_STYLE,
+                (style & !(WS_CAPTION.0 | WS_THICKFRAME.0)) as isize,
+            );
+        }
+        // SAFETY: read-only zoomed query.
+        let was_maxed = unsafe { IsZoomed(hwnd) }.as_bool();
+        if was_maxed {
+            // Un-maximize FIRST so the saved rect is the normal placement,
+            // not the zoomed one (upstream order, viv.c:6673-6678).
+            // SAFETY: hwnd is live.
+            let _ = unsafe { ShowWindow(hwnd, SW_SHOWNORMAL) };
+        }
+        let mut rect = RECT::default();
+        // SAFETY: read-only geometry query; fail-soft leaves the zeroed
+        // rect like upstream's unchecked GetWindowRect (viv.c:6680).
+        let _ = unsafe { GetWindowRect(hwnd, &mut rect) };
+        {
+            // SAFETY: the borrow spans only field stores and the child's
+            // teardown; DestroyWindow delivers only the child's own
+            // messages (comctl32's proc) plus a WM_PARENTNOTIFY that
+            // DefWindowProc eats.
+            let Some(state) = (unsafe { state_of(hwnd) }) else {
+                return;
+            };
+            state.fullscreen_was_maxed = was_maxed;
+            state.fullscreen_restore_rect = rect;
+            // The state drops the bar BEFORE the call so any mid-teardown
+            // peek already sees a bar-less viewport.
+            let bar = std::mem::take(&mut state.status);
+            if !bar.is_invalid() {
+                // SAFETY: our live child window, torn down on the owning
+                // thread.
+                let _ = unsafe { DestroyWindow(bar) };
+            }
+        }
+        // The zoom offset (viv.c:6719-6778): both fill modes are off in
+        // riviv, so this is always 0 and the level survives — kept wired
+        // and pure for the M3 config hookup.
+        let offset = crate::zoom::fullscreen_zoom_offset(
+            false,
+            false,
+            &sizes,
+            Viewport {
+                wide: monitor_rect.right - monitor_rect.left,
+                high: monitor_rect.bottom - monitor_rect.top,
+            },
+            old_render,
+            level,
+        );
+        {
+            // SAFETY: the borrow spans field stores and the pure level move.
+            let Some(state) = (unsafe { state_of(hwnd) }) else {
+                return;
+            };
+            state.fullscreen_zoom_offset = offset;
+            state.view.shift_level(-offset);
+        }
+        // SAFETY: hwnd is live; covers the monitor, reentering wnd_proc
+        // with WM_SIZE (no borrow live).
+        let _ = unsafe {
+            SetWindowPos(
+                hwnd,
+                Some(HWND_TOP),
+                monitor_rect.left,
+                monitor_rect.top,
+                monitor_rect.right - monitor_rect.left,
+                monitor_rect.bottom - monitor_rect.top,
+                SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_NOCOPYBITS,
+            )
+        };
+        // The dummy-window dance (viv.c:6682-6717): a borderless window
+        // created fullscreen and immediately destroyed teaches the shell
+        // to drop the taskbar ("without this dummy window, sometimes the
+        // taskbar will not disappear", upstream comment). Its momentary
+        // deactivate must not force-show a hidden cursor (viv.c:6712).
+        // SAFETY: the borrow spans only the flag store.
+        if let Some(state) = unsafe { state_of(hwnd) } {
+            state.prevent_deactivate_show = true;
+        }
+        // SAFETY: returns this exe's module handle; no side effects.
+        if let Ok(hinstance) = unsafe { GetModuleHandleW(None) } {
+            // Upstream re-registers the class on every toggle and ignores
+            // the result — the second registration fails benignly with
+            // ERROR_CLASS_ALREADY_EXISTS.
+            // SAFETY: wc outlives the call; that failure is benign.
+            let _ = unsafe {
+                RegisterClassExW(&WNDCLASSEXW {
+                    cbSize: size_of::<WNDCLASSEXW>() as u32,
+                    lpfnWndProc: Some(fullscreen_dummy_proc),
+                    hInstance: hinstance.into(),
+                    hCursor: {
+                        // SAFETY: IDC_ARROW is a predefined shared resource;
+                        // a failure degrades to a cursorless momentary dummy.
+                        LoadCursorW(None, IDC_ARROW).unwrap_or_default()
+                    },
+                    hbrBackground: HBRUSH((COLOR_BTNFACE.0 as usize + 1) as *mut c_void),
+                    lpszClassName: FULLSCREEN_DUMMY_CLASS,
+                    ..Default::default()
+                })
+            };
+            let title = HSTRING::from_wide(&title_wide(None));
+            // SAFETY: all parameters are valid for the call; the dummy is
+            // created, foregrounded and destroyed in the same sweep.
+            let dummy = unsafe {
+                CreateWindowExW(
+                    WINDOW_EX_STYLE(0),
+                    FULLSCREEN_DUMMY_CLASS,
+                    &title,
+                    WS_POPUP | WS_VISIBLE,
+                    monitor_rect.left,
+                    monitor_rect.top,
+                    monitor_rect.right - monitor_rect.left,
+                    monitor_rect.bottom - monitor_rect.top,
+                    None,
+                    None,
+                    Some(hinstance.into()),
+                    None,
+                )
+            };
+            if let Ok(dummy) = dummy {
+                // SAFETY: dummy is live per its creator; a failed
+                // foreground request only risks the taskbar staying put.
+                let _ = unsafe { SetForegroundWindow(dummy) };
+                // SAFETY: dummy is live and owned by this thread.
+                let _ = unsafe { DestroyWindow(dummy) };
+            }
+        }
+        // SAFETY: the borrow spans only the flag store.
+        if let Some(state) = unsafe { state_of(hwnd) } {
+            state.prevent_deactivate_show = false;
+        }
+    }
+    // Refresh the mouseover verdict from where the cursor actually is now
+    // that the window moved under it (viv.c:6786-6815).
+    let mut pt = POINT::default();
+    // SAFETY: read-only cursor query; fail-soft leaves (0, 0).
+    let _ = unsafe { GetCursorPos(&mut pt) };
+    let mut is_mouseover = false;
+    // SAFETY: read-only hit-test queries on the live window.
+    unsafe {
+        if WindowFromPoint(pt) == hwnd {
+            let _ = ScreenToClient(hwnd, &mut pt);
+            let mut client = RECT::default();
+            let _ = GetClientRect(hwnd, &mut client);
+            is_mouseover = PtInRect(&client, pt).as_bool();
+        }
+    }
+    {
+        // SAFETY: the borrow spans only the field store.
+        if let Some(state) = unsafe { state_of(hwnd) } {
+            state.is_mouseover = is_mouseover;
+        }
+    }
+    update_cursor(hwnd);
+    // The bar changed identity (destroyed/recreated); repopulate it and
+    // queue a repaint (CS_HREDRAW/VREDRAW already cover the resize — this
+    // one is for the level shift and any bar text).
+    refresh_status(hwnd);
+    repaint(hwnd);
+}
+
 /// The signed point packed in a mouse-message LPARAM (GET_X_LPARAM /
 /// GET_Y_LPARAM semantics — each half-word is a signed coordinate).
 fn lparam_point(lparam: LPARAM) -> POINT {
@@ -319,11 +783,14 @@ fn toggle_one_to_one(hwnd: HWND) {
     repaint(hwnd);
 }
 
-/// WM_LBUTTONDOWN — start a drag pan (upstream's default left-click action
-/// 0, viv.c:14682-14693: with a caption present the drag always pans; the
-/// borderless move-window arm is #8's business). No image-size gate —
-/// panning a fitted image simply clamps to nothing.
+/// WM_LBUTTONDOWN — show the cursor, restart its cycle, then start a drag
+/// pan (upstream's default left-click action 0, viv.c:3320-3325 +
+/// 14682-14693: with a caption present the drag always pans; the
+/// borderless move-window arm is not riviv's business while it always has
+/// a caption outside fullscreen). No image-size gate — panning a fitted
+/// image simply clamps to nothing.
 fn on_left_button_down(hwnd: HWND, lparam: LPARAM) {
+    show_and_update_cursor(hwnd);
     let pt = lparam_point(lparam);
     // SAFETY: the borrow spans only the drag-point store.
     if let Some(state) = unsafe { state_of(hwnd) } {
@@ -335,9 +802,51 @@ fn on_left_button_down(hwnd: HWND, lparam: LPARAM) {
     let _ = unsafe { SetCapture(hwnd) };
 }
 
-/// WM_MOUSEMOVE — while dragging, pan by the cursor delta (upstream
-/// `_VIV_DOING_SCROLL`, viv.c:3617-3644: the image follows the mouse).
+/// WM_MOUSEMOVE — mouse-leave tracking, the cursor cycle, then the drag
+/// pan (upstream viv.c:3575-3660 + `_viv_mousemove`, viv.c:9151-9170).
 fn on_mouse_move(hwnd: HWND, lparam: LPARAM) {
+    // Arm TME_LEAVE tracking once. The flag flips BEFORE the call and OUT
+    //SIDE any borrow: TrackMouseEvent can deliver WM_MOUSELEAVE
+    // SYNCHRONOUSLY (upstream's "ui must come first" comment, viv.c:3593),
+    // and that handler takes its own state borrow — ours must be gone.
+    // SAFETY: the borrow spans only the flag read.
+    let arm_tracking = (unsafe { state_of(hwnd) }).is_some_and(|state| !state.tracking_mouse);
+    if arm_tracking {
+        // SAFETY: the borrow spans only the flag store.
+        if let Some(state) = unsafe { state_of(hwnd) } {
+            state.tracking_mouse = true;
+        }
+        let mut tme = TRACKMOUSEEVENT {
+            cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
+            dwFlags: TME_LEAVE,
+            hwndTrack: hwnd,
+            dwHoverTime: 0,
+        };
+        // SAFETY: tme outlives the call; a failed track only costs the
+        // WM_MOUSELEAVE verdict (mouseover then stays true too long,
+        // exactly like upstream's unchecked _TrackMouseEvent).
+        let _ = unsafe { TrackMouseEvent(&mut tme) };
+    }
+    let mut screen_pt = POINT::default();
+    // SAFETY: read-only cursor query; fail-soft leaves (0, 0), which reads
+    // as movement at most once.
+    let _ = unsafe { GetCursorPos(&mut screen_pt) };
+    // SAFETY: the borrow spans the mouseover verdict, the movement dedupe,
+    // the condition gather and the pure cursor step.
+    let effects = (unsafe { state_of(hwnd) }).map(|state| {
+        // Upstream sets mouseover = 1 unconditionally after the tracking
+        // block (viv.c:3609) — even over a synchronous LEAVE — replicated.
+        state.is_mouseover = true;
+        let moved = screen_pt != state.last_cursor_pt;
+        state.last_cursor_pt = screen_pt;
+        let conditions = cursor_conditions(hwnd, state);
+        state.cursor.mouse_moved(moved, &conditions)
+    });
+    if let Some(effects) = effects {
+        apply_cursor(hwnd, effects);
+    }
+    // While dragging, pan by the cursor delta (upstream `_VIV_DOING_SCROLL`,
+    // viv.c:3617-3644: the image follows the mouse).
     let pt = lparam_point(lparam);
     // SAFETY: the borrow spans the drag bookkeeping and the pure pan math.
     let panned = (unsafe { state_of(hwnd) }).is_some_and(|state| match state.drag {
@@ -662,6 +1171,10 @@ fn blank_display(hwnd: HWND) {
         state.animation_timer_running = false;
     }
     refresh_status(hwnd);
+    // A blanked display can never hide the cursor — reconcile it (upstream
+    // `_viv_blank` → `_viv_start_first_frame` → `_viv_update_show_cursor`,
+    // viv.c:7928 + 14338).
+    update_cursor(hwnd);
     if stop_timer {
         // SAFETY: hwnd is live; a failed kill leaves a stale timer that the
         // WM_TIMER guard no-ops on.
@@ -820,6 +1333,10 @@ fn on_load_replies(hwnd: HWND) {
     }
     // Borrow dropped — the modal paths and the reentrant resize are safe.
     refresh_status(hwnd);
+    // The display may have adopted an image (the hide-cursor conditions
+    // just became satisfiable) — reconcile (upstream
+    // `_viv_start_first_frame` → `_viv_update_show_cursor`, viv.c:14338).
+    update_cursor(hwnd);
     if let Some(msg) = fatal_msg {
         fatal(&msg);
     }
@@ -1034,9 +1551,11 @@ fn on_keydown(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
         )
     };
     let vk = wparam.0 as u16;
-    // ESC cancels an in-progress drag (upstream viv.c:6367-6378: an
-    // unmodified ESC with a mouse action active releases the capture; the
-    // fullscreen-exit arm lands with #8).
+    // ESC cancels an in-progress drag, or leaves fullscreen (upstream
+    // viv.c:6367-6382: an unmodified ESC with a mouse action active
+    // releases the capture FIRST; only otherwise does it exit fullscreen —
+    // the slideshow pause arm of that block lands with the slideshow
+    // work).
     if vk == VK_ESCAPE.0 && !ctrl && !shift && !alt {
         // SAFETY: the borrow spans only the Option take.
         let was_dragging =
@@ -1045,7 +1564,20 @@ fn on_keydown(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
             // SAFETY: the capture was taken on this thread in
             // WM_LBUTTONDOWN.
             let _ = unsafe { ReleaseCapture() };
+            return;
         }
+        // SAFETY: the read-only borrow ends inside is_some_and.
+        let fullscreen = (unsafe { state_of(hwnd) }).is_some_and(|state| state.fullscreen);
+        if fullscreen {
+            toggle_fullscreen(hwnd);
+        }
+        return;
+    }
+    // Alt+Return toggles fullscreen (upstream default keymap, viv.c:995 —
+    // an Alt-modified key, so it arrives as WM_SYSKEYDOWN; the exact-mask
+    // rule means Ctrl+Alt+Return is NOT the toggle).
+    if vk == VK_RETURN.0 && alt && !ctrl && !shift {
+        toggle_fullscreen(hwnd);
         return;
     }
     if (vk == VK_OEM_PLUS.0 && !ctrl && !shift && !alt) || (vk == VK_ADD.0 && !shift && !alt) {
@@ -1169,10 +1701,14 @@ fn on_size(hwnd: HWND) {
     let bar = snapshot_status_bar(hwnd);
     status::update(bar, &snapshot);
     // The common control docks itself to the bottom of the client on
-    // WM_SIZE (upstream `_viv_on_size`, viv.c:1615-1620).
-    // SAFETY: bar is our live child window.
-    unsafe {
-        SendMessageW(bar, WM_SIZE, None, None);
+    // WM_SIZE (upstream `_viv_on_size`, viv.c:1615-1620). No bar (creation
+    // failed / destroyed for fullscreen): nothing to dock — height()
+    // already reported 0 to the viewport math.
+    if !bar.is_invalid() {
+        // SAFETY: bar is our live child window.
+        unsafe {
+            SendMessageW(bar, WM_SIZE, None, None);
+        }
     }
     // Re-anchor the pan offset for the new viewport (upstream WM_SIZE,
     // viv.c:1643-1651: reproject the center-source anchor onto the new
@@ -1226,6 +1762,10 @@ unsafe extern "system" fn wnd_proc(
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
         WM_NCDESTROY => {
+            // Give the cursor back before anything else (upstream
+            // `_viv_kill`'s first call, viv.c:5459-5461) — the process is
+            // exiting and must not leave the display count decremented.
+            show_cursor(hwnd);
             // Stop the background decode and wait for it before the state
             // box is freed — upstream waits INFINITE for the same reason
             // ("it's critical we wait for load image to finish before we
@@ -1290,12 +1830,38 @@ unsafe extern "system" fn wnd_proc(
             on_left_button_down(hwnd, lparam);
             LRESULT(0)
         }
+        // CS_DBLCLKS folds the second press of a double click into this
+        // message (after DOWN/UP have already run — see on_double_click).
+        WM_LBUTTONDBLCLK => {
+            on_double_click(hwnd);
+            LRESULT(0)
+        }
         WM_MOUSEMOVE => {
             on_mouse_move(hwnd, lparam);
             LRESULT(0)
         }
+        WM_MOUSELEAVE => {
+            on_mouse_leave(hwnd);
+            LRESULT(0)
+        }
         WM_LBUTTONUP => {
             on_left_button_up(hwnd);
+            LRESULT(0)
+        }
+        // Upstream viv.c:3538-3551 — the deactivate arm compares the FULL
+        // wParam against WA_INACTIVE (0); the guard flag swallows the
+        // dummy dance's momentary deactivate so a hidden cursor stays
+        // hidden through it.
+        WM_ACTIVATE => {
+            if wparam.0 == 0 {
+                // SAFETY: the read-only borrow ends inside is_some_and.
+                let show = (unsafe { state_of(hwnd) }).is_some_and(|s| !s.prevent_deactivate_show);
+                if show {
+                    show_cursor(hwnd);
+                }
+            } else {
+                update_cursor(hwnd);
+            }
             LRESULT(0)
         }
         WM_DROPFILES => {
@@ -1306,6 +1872,9 @@ unsafe extern "system" fn wnd_proc(
         WM_TIMER => {
             if wparam.0 == ANIMATION_TIMER_ID {
                 on_animation_timer(hwnd);
+                LRESULT(0)
+            } else if wparam.0 == cursor::HIDE_CURSOR_TIMER_ID {
+                on_hide_cursor_timer(hwnd);
                 LRESULT(0)
             } else {
                 // SAFETY: hwnd/msg are exactly what this callback received;
@@ -1486,6 +2055,15 @@ pub(crate) fn run(args: Vec<OsString>) -> Result<(), String> {
         startup_open_pending: !args.is_empty(),
         view: View::new(),
         drag: None,
+        fullscreen: false,
+        fullscreen_was_maxed: false,
+        fullscreen_restore_rect: RECT::default(),
+        fullscreen_zoom_offset: 0,
+        cursor: CursorVisibility::new(),
+        tracking_mouse: false,
+        is_mouseover: false,
+        last_cursor_pt: POINT { x: -1, y: -1 },
+        prevent_deactivate_show: false,
     };
     // SAFETY: process-wide and must run before any window exists (matches the
     // upstream manifest's dpiAware=true). ERROR_ACCESS_DENIED means the process
