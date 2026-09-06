@@ -157,7 +157,7 @@ pub(crate) struct WindowState {
     pub(crate) drag: Option<(i32, i32)>,
     /// Fullscreen state (#8; upstream `_viv_is_fullscreen`,
     /// `_viv_fullscreen_is_maxed`, `_viv_fullscreen_rect`,
-    /// `_viv_fullscreen_zoom_offset`, viv.c:780-783). The rect is the
+    /// `_viv_fullscreen_zoom_offset`, viv.c:704-707). The rect is the
     /// pre-fullscreen normal placement (captured AFTER un-maximizing), so
     /// exit restores onto it — re-maximizing first when the toggle began
     /// from a zoomed window.
@@ -166,7 +166,7 @@ pub(crate) struct WindowState {
     pub(crate) fullscreen_restore_rect: RECT,
     pub(crate) fullscreen_zoom_offset: i32,
     /// Cursor visibility state machine (#8; upstream `_viv_is_cursor_shown`
-    /// + `_viv_is_hide_cursor_timer`, viv.c:786-787) — see `cursor.rs`.
+    /// + `_viv_is_hide_cursor_timer`, viv.c:709/713) — see `cursor.rs`.
     pub(crate) cursor: CursorVisibility,
     /// Mouse-leave tracking is armed (upstream `_viv_is_tracking_mouse`,
     /// viv.c:781) and the mouse is currently over the window
@@ -175,7 +175,7 @@ pub(crate) struct WindowState {
     pub(crate) tracking_mouse: bool,
     pub(crate) is_mouseover: bool,
     /// The last seen cursor position (upstream `_viv_mousemove_x/y`,
-    /// viv.c:788-789) — the movement dedupe behind the cursor
+    /// viv.c:714-715) — the movement dedupe behind the cursor
     /// show/restart cycle; (-1, -1) while the mouse is away (reset by
     /// WM_MOUSELEAVE).
     pub(crate) last_cursor_pt: POINT,
@@ -395,17 +395,21 @@ const FULLSCREEN_DUMMY_CLASS: PCWSTR = w!("riviv_fullscreen");
 
 /// The dummy's wnd_proc: the window is created, foregrounded and destroyed
 /// within one sweep with no message dispatch in between, so default
-/// handling is all it can ever see (upstream `_viv_fullscreen_proc`,
-/// viv.c:11701-11731, is only richer against a WM_PAINT that cannot arrive).
+/// handling is all it can ever see — except the background ERASE, which
+/// upstream suppresses (return 1, viv.c:11730-11731) so the momentary
+/// dummy does not flash a gray fill over the screen.
 unsafe extern "system" fn fullscreen_dummy_proc(
     hwnd: HWND,
     msg: u32,
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    // SAFETY: hwnd/msg are exactly what this callback received; the default
-    // procedure handles everything.
-    unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+    match msg {
+        WM_ERASEBKGND => LRESULT(1),
+        // SAFETY: hwnd/msg are exactly what this callback received; the
+        // default procedure handles everything else.
+        _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+    }
 }
 
 /// WM_LBUTTONDBLCLK (upstream viv.c:3298-3318): the default left-click
@@ -426,22 +430,22 @@ fn on_double_click(hwnd: HWND) {
 /// every piece onto the saved rect, re-maximizing when the toggle began
 /// zoomed. The zoom level rides the `_viv_fullscreen_zoom_offset` math
 /// (both fill modes are off in riviv, so the level is preserved); 1:1 mode
-/// is dropped without restoring its saved level (viv.c:6617). WM_SIZE
-/// fires naturally through the dance and the #7 re-anchor converges on the
-/// final geometry — where upstream's suppressed-then-final `_viv_on_size`
-/// lands too (viv.c:6611/6779-6783).
+/// is dropped without restoring its saved level (viv.c:6610). WM_SIZE
+/// fires naturally through the dance; the explicit `on_size` at the end
+/// re-anchors at the FINAL geometry + level — exactly upstream's
+/// suppressed-then-manual `_viv_on_size` (viv.c:6604/6783-6785).
 fn toggle_fullscreen(hwnd: HWND) {
     // The offset inputs are gathered at the OLD viewport before anything
-    // moves (viv.c:6586-6608) — the size sweep inherits the current 1:1
+    // moves (viv.c:6584-6601) — the size sweep inherits the current 1:1
     // flag, so a toggle from 1:1 measures every level as the source size.
     // SAFETY: the borrow spans the pure geometry gather.
     let gathered = (unsafe { state_of(hwnd) }).map(|state| {
         let (vp, src) = viewport_and_src(hwnd, state);
         let old_render = state.view.render_size(src.0, src.1, vp);
         let sizes = state.view.sizes_all_levels(src.0, src.1, vp);
-        (state.fullscreen, state.view.level(), old_render, sizes)
+        (state.fullscreen, state.view.level(), old_render, sizes, src)
     });
-    let Some((was_fullscreen, level, old_render, sizes)) = gathered else {
+    let Some((was_fullscreen, level, old_render, sizes, src)) = gathered else {
         return;
     };
     // The monitor is chosen from the WINDOWED position — upstream calls
@@ -462,19 +466,40 @@ fn toggle_fullscreen(hwnd: HWND) {
         mi.rcMonitor
     };
     {
-        // SAFETY: the borrow spans only the flag flips and the pure level
-        // moves.
+        // SAFETY: the borrow spans only the flag flips.
         let Some(state) = (unsafe { state_of(hwnd) }) else {
             return;
         };
-        // Before any resize, like upstream (viv.c:6623/6661) — the cursor
+        // Before any resize, like upstream (viv.c:6616/6665) — the cursor
         // conditions read it.
         state.fullscreen = !was_fullscreen;
-        // viv.c:6617: 1:1 dies here WITHOUT restoring its saved level.
+        // viv.c:6610: 1:1 dies here WITHOUT restoring its saved level.
         state.view.leave_one_to_one();
     }
     if was_fullscreen {
-        // ---- exit (viv.c:6617-6659) ----
+        // ---- exit (viv.c:6616-6658) ----
+        // The bar is RECREATED first (upstream `_viv_status_show(1)` at
+        // 6645 precedes the style commit at 6648; it destroys and recreates
+        // rather than hiding, viv.c:10932-10963).
+        // SAFETY: returns this exe's module handle; no side effects.
+        match unsafe { GetModuleHandleW(None) } {
+            Ok(hinstance) => {
+                let bar = match status::create(hwnd, hinstance.into()) {
+                    Ok(bar) => bar,
+                    Err(msg) => {
+                        // Same graceful degradation as startup: a NULL bar
+                        // no-ops everywhere.
+                        eprintln!("status bar unavailable: {msg}");
+                        HWND::default()
+                    }
+                };
+                // SAFETY: the borrow spans only the field store.
+                if let Some(state) = unsafe { state_of(hwnd) } {
+                    state.status = bar;
+                }
+            }
+            Err(e) => eprintln!("GetModuleHandleW failed: {e} (no status bar)"),
+        }
         // SAFETY: read-modify-write of the style on the owning thread.
         let style = unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) } as u32;
         // SAFETY: hwnd is live; riviv always shows caption + thick frame
@@ -487,39 +512,15 @@ fn toggle_fullscreen(hwnd: HWND) {
                 (style | WS_CAPTION.0 | WS_THICKFRAME.0) as isize,
             );
         }
-        // The bar is RECREATED (upstream `_viv_status_show(1)` destroys and
-        // recreates rather than hiding, viv.c:10932-10963).
-        // SAFETY: returns this exe's module handle; no side effects.
-        if let Ok(hinstance) = unsafe { GetModuleHandleW(None) } {
-            let bar = match status::create(hwnd, hinstance.into()) {
-                Ok(bar) => bar,
-                Err(msg) => {
-                    // Same graceful degradation as startup: a NULL bar
-                    // no-ops everywhere.
-                    eprintln!("status bar unavailable: {msg}");
-                    HWND::default()
-                }
-            };
-            // SAFETY: the borrow spans only the field store.
-            if let Some(state) = unsafe { state_of(hwnd) } {
-                state.status = bar;
-            }
-        }
         // SAFETY: the borrow spans only the copies out.
         let (rect, offset) = (unsafe { state_of(hwnd) })
             .map(|state| (state.fullscreen_restore_rect, state.fullscreen_zoom_offset))
             .unwrap_or_default();
-        // The level moves BEFORE the resize so the WM_SIZE re-anchor sees
-        // the final level — upstream suppresses on-size through the dance
-        // and runs one `_viv_on_size` after this very shift (viv.c:6657-
-        // 6660).
-        // SAFETY: the borrow spans the pure level move.
-        if let Some(state) = unsafe { state_of(hwnd) } {
-            state.view.shift_level(offset);
-        }
         // SAFETY: hwnd is live; reenters wnd_proc with WM_SIZE — no borrow
-        // is live out here (on_size takes its own).
-        let _ = unsafe {
+        // is live out here (on_size takes its own). A failure leaves the
+        // state flag ahead of the real window shape; diagnose, then the
+        // next toggle resyncs (upstream viv.c:6650 ignores the result too).
+        if let Err(e) = unsafe {
             SetWindowPos(
                 hwnd,
                 Some(HWND_TOP),
@@ -529,16 +530,27 @@ fn toggle_fullscreen(hwnd: HWND) {
                 rect.bottom - rect.top,
                 SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_NOCOPYBITS,
             )
-        };
+        } {
+            eprintln!("fullscreen restore SetWindowPos failed: {e}");
+        }
         // SAFETY: the borrow spans only the copy out.
         let was_maxed = (unsafe { state_of(hwnd) }).is_some_and(|state| state.fullscreen_was_maxed);
         if was_maxed {
             // SAFETY: hwnd is live; SW_MAXIMIZE re-zooms onto the placement
-            // restored just above (upstream order, viv.c:6651-6656).
-            let _ = unsafe { ShowWindow(hwnd, SW_MAXIMIZE) };
+            // restored just above (upstream order, viv.c:6652-6655).
+            if !unsafe { ShowWindow(hwnd, SW_MAXIMIZE) }.as_bool() {
+                eprintln!("SW_MAXIMIZE after fullscreen failed");
+            }
+        }
+        // The level rides the stored offset back up, AFTER the resize —
+        // the final on_size below re-anchors at the final level, like
+        // upstream's manual `_viv_on_size` after viv.c:6657-6658.
+        // SAFETY: the borrow spans the pure level move.
+        if let Some(state) = unsafe { state_of(hwnd) } {
+            state.view.shift_level(offset);
         }
     } else {
-        // ---- enter (viv.c:6660-6779) ----
+        // ---- enter (viv.c:6659-6781) ----
         // SAFETY: read-modify-write of the style on the owning thread.
         let style = unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) } as u32;
         // SAFETY: hwnd is live.
@@ -553,58 +565,37 @@ fn toggle_fullscreen(hwnd: HWND) {
         let was_maxed = unsafe { IsZoomed(hwnd) }.as_bool();
         if was_maxed {
             // Un-maximize FIRST so the saved rect is the normal placement,
-            // not the zoomed one (upstream order, viv.c:6673-6678).
+            // not the zoomed one (upstream order, viv.c:6671-6675).
             // SAFETY: hwnd is live.
-            let _ = unsafe { ShowWindow(hwnd, SW_SHOWNORMAL) };
+            if !unsafe { ShowWindow(hwnd, SW_SHOWNORMAL) }.as_bool() {
+                eprintln!("SW_SHOWNORMAL before fullscreen failed");
+            }
         }
         let mut rect = RECT::default();
         // SAFETY: read-only geometry query; fail-soft leaves the zeroed
-        // rect like upstream's unchecked GetWindowRect (viv.c:6680).
+        // rect like upstream's unchecked GetWindowRect (viv.c:6677).
         let _ = unsafe { GetWindowRect(hwnd, &mut rect) };
-        {
-            // SAFETY: the borrow spans only field stores and the child's
-            // teardown; DestroyWindow delivers only the child's own
-            // messages (comctl32's proc) plus a WM_PARENTNOTIFY that
-            // DefWindowProc eats.
+        // Take the bar out of the state inside the borrow, tear it down
+        // OUTSIDE: DestroyWindow delivers messages (the child's teardown
+        // plus a WM_PARENTNOTIFY here) and any future handler arm on those
+        // must not alias this borrow.
+        let bar = {
+            // SAFETY: the borrow spans only field stores.
             let Some(state) = (unsafe { state_of(hwnd) }) else {
                 return;
             };
             state.fullscreen_was_maxed = was_maxed;
             state.fullscreen_restore_rect = rect;
-            // The state drops the bar BEFORE the call so any mid-teardown
-            // peek already sees a bar-less viewport.
-            let bar = std::mem::take(&mut state.status);
-            if !bar.is_invalid() {
-                // SAFETY: our live child window, torn down on the owning
-                // thread.
-                let _ = unsafe { DestroyWindow(bar) };
-            }
-        }
-        // The zoom offset (viv.c:6719-6778): both fill modes are off in
-        // riviv, so this is always 0 and the level survives — kept wired
-        // and pure for the M3 config hookup.
-        let offset = crate::zoom::fullscreen_zoom_offset(
-            false,
-            false,
-            &sizes,
-            Viewport {
-                wide: monitor_rect.right - monitor_rect.left,
-                high: monitor_rect.bottom - monitor_rect.top,
-            },
-            old_render,
-            level,
-        );
-        {
-            // SAFETY: the borrow spans field stores and the pure level move.
-            let Some(state) = (unsafe { state_of(hwnd) }) else {
-                return;
-            };
-            state.fullscreen_zoom_offset = offset;
-            state.view.shift_level(-offset);
+            std::mem::take(&mut state.status)
+        };
+        if !bar.is_invalid() {
+            // SAFETY: our live child window, torn down on the owning thread.
+            let _ = unsafe { DestroyWindow(bar) };
         }
         // SAFETY: hwnd is live; covers the monitor, reentering wnd_proc
-        // with WM_SIZE (no borrow live).
-        let _ = unsafe {
+        // with WM_SIZE (no borrow live). Failure diagnosed like the restore
+        // path (upstream viv.c:6683 ignores the result too).
+        if let Err(e) = unsafe {
             SetWindowPos(
                 hwnd,
                 Some(HWND_TOP),
@@ -614,12 +605,14 @@ fn toggle_fullscreen(hwnd: HWND) {
                 monitor_rect.bottom - monitor_rect.top,
                 SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_NOCOPYBITS,
             )
-        };
-        // The dummy-window dance (viv.c:6682-6717): a borderless window
+        } {
+            eprintln!("fullscreen cover SetWindowPos failed: {e}");
+        }
+        // The dummy-window dance (viv.c:6685-6715): a borderless window
         // created fullscreen and immediately destroyed teaches the shell
         // to drop the taskbar ("without this dummy window, sometimes the
         // taskbar will not disappear", upstream comment). Its momentary
-        // deactivate must not force-show a hidden cursor (viv.c:6712).
+        // deactivate must not force-show a hidden cursor (viv.c:6685).
         // SAFETY: the borrow spans only the flag store.
         if let Some(state) = unsafe { state_of(hwnd) } {
             state.prevent_deactivate_show = true;
@@ -676,9 +669,46 @@ fn toggle_fullscreen(hwnd: HWND) {
         if let Some(state) = unsafe { state_of(hwnd) } {
             state.prevent_deactivate_show = false;
         }
+        // The zoom offset (viv.c:6718-6778), computed AFTER the cover like
+        // upstream: the fill_window branch reads sizes LIVE at the
+        // fullscreen viewport with 1:1 already cleared — a fresh sweep now,
+        // while the fullscreen_fill branch keeps the pre-toggle sweep from
+        // the gather above. Both fill modes are off in riviv, so the offset
+        // is always 0 and the level survives — kept wired and pure for the
+        // M3 config hookup.
+        // SAFETY: the borrow spans the fullscreen-viewport sweep and the
+        // pure offset math; nothing here pumps messages.
+        let offset = (unsafe { state_of(hwnd) })
+            .map(|state| {
+                let (fs_vp, _) = viewport_and_src(hwnd, state);
+                let sizes_fs = state.view.sizes_all_levels(src.0, src.1, fs_vp);
+                crate::zoom::fullscreen_zoom_offset(
+                    false,
+                    false,
+                    &sizes,
+                    &sizes_fs,
+                    Viewport {
+                        wide: monitor_rect.right - monitor_rect.left,
+                        high: monitor_rect.bottom - monitor_rect.top,
+                    },
+                    old_render,
+                    level,
+                )
+            })
+            .unwrap_or(0);
+        // SAFETY: the borrow spans field stores and the pure level move
+        // (viv.c:6777-6778).
+        if let Some(state) = unsafe { state_of(hwnd) } {
+            state.fullscreen_zoom_offset = offset;
+            state.view.shift_level(-offset);
+        }
     }
+    // The deferred on-size, at the FINAL geometry + level (upstream's
+    // manual `_viv_on_size`, viv.c:6785): re-anchors the pan and re-docks
+    // the (possibly recreated) bar.
+    on_size(hwnd);
     // Refresh the mouseover verdict from where the cursor actually is now
-    // that the window moved under it (viv.c:6786-6815).
+    // that the window moved under it (viv.c:6789-6815).
     let mut pt = POINT::default();
     // SAFETY: read-only cursor query; fail-soft leaves (0, 0).
     let _ = unsafe { GetCursorPos(&mut pt) };
@@ -699,10 +729,9 @@ fn toggle_fullscreen(hwnd: HWND) {
         }
     }
     update_cursor(hwnd);
-    // The bar changed identity (destroyed/recreated); repopulate it and
-    // queue a repaint (CS_HREDRAW/VREDRAW already cover the resize — this
-    // one is for the level shift and any bar text).
-    refresh_status(hwnd);
+    // A level shift can change the render size without moving the pan
+    // offset — always queue the repaint (CS_HREDRAW/VREDRAW already cover
+    // the resize itself).
     repaint(hwnd);
 }
 
@@ -1323,11 +1352,18 @@ fn on_load_replies(hwnd: HWND) {
         state.animation_timer_running = want_timer;
         if resize_to_image && state.image.is_some() {
             // The startup load's first frame sizes the window to the image
-            // (M1 behavior under async startup); a geometry failure is fatal
-            // exactly like run()'s initial rect.
-            match initial_window_rect(state.image.as_ref(), status::height(state.status)) {
-                Ok(rect) => resize_rect = Some(rect),
-                Err(msg) => fatal_msg = Some(msg),
+            // (M1 behavior under async startup) — but NOT while fullscreen:
+            // this resize is riviv's own deviation (upstream never resizes
+            // on load), and shrinking the borderless monitor cover to an
+            // image-sized rect would visibly break it (cubic PR #16 P1).
+            // Skipping is safe: the pending flag is consumed either way.
+            if !state.fullscreen {
+                // A geometry failure is fatal exactly like run()'s initial
+                // rect.
+                match initial_window_rect(state.image.as_ref(), status::height(state.status)) {
+                    Ok(rect) => resize_rect = Some(rect),
+                    Err(msg) => fatal_msg = Some(msg),
+                }
             }
         }
     }
@@ -1848,7 +1884,7 @@ unsafe extern "system" fn wnd_proc(
             on_left_button_up(hwnd);
             LRESULT(0)
         }
-        // Upstream viv.c:3538-3551 — the deactivate arm compares the FULL
+        // Upstream viv.c:3547-3555 — the deactivate arm compares the FULL
         // wParam against WA_INACTIVE (0); the guard flag swallows the
         // dummy dance's momentary deactivate so a hidden cursor stays
         // hidden through it.

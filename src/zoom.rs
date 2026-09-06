@@ -131,7 +131,7 @@ impl View {
         self.pos = (self.pos + delta).clamp(0, ZOOM_LIMIT - 1);
     }
 
-    /// The `_viv_1to1 = 0` that opens `_viv_toggle_fullscreen` (viv.c:6617):
+    /// The `_viv_1to1 = 0` that opens `_viv_toggle_fullscreen` (viv.c:6610):
     /// leave 1:1 WITHOUT restoring `saved_pos` — upstream's `_viv_zoom_pos`
     /// is already 0 in 1:1 and stays 0, so the toggle lands on fit (the
     /// stale `_viv_old_zoom_pos` is simply overwritten by the next 1:1
@@ -142,7 +142,7 @@ impl View {
 
     /// The render size at every level, computed in one sweep — upstream's
     /// zoom_wide/high_array precalculation in `_viv_toggle_fullscreen`
-    /// (viv.c:6590-6608). The 1:1 quirk is inherited: the sweep runs BEFORE
+    /// (viv.c:6584-6601). The 1:1 quirk is inherited: the sweep runs BEFORE
     /// the toggle's `_viv_1to1 = 0`, so while in 1:1 every entry is the
     /// source size verbatim.
     pub(crate) fn sizes_all_levels(
@@ -345,16 +345,20 @@ fn render_size_at(pos: i32, one_to_one: bool, src_w: i32, src_h: i32, vp: Viewpo
 }
 
 /// The fullscreen zoom offset (upstream `_viv_toggle_fullscreen`'s offset
-/// block, viv.c:6719-6778). The caller passes `sizes` — the render size at
-/// every level computed at the OLD viewport — plus the fullscreen monitor
-/// size and the CURRENT render size/level. Semantics:
-/// - `fullscreen_fill_window` (upstream default 1): the largest level whose
-///   old-viewport render still fits the monitor, capped at the current
-///   level; entering fullscreen SUBTRACTS it (drop to the biggest filling
-///   view), exit adds it back.
-/// - else `fill_window` (windowed fill, default 0): a NEGATIVE offset —
-///   the largest level whose render does not exceed the current one, so
-///   entering keeps the window filled; clamped to `-(15 - level)`.
+/// block, viv.c:6718-6778). The two branches read DIFFERENT size sweeps —
+/// both audited against upstream (cubic/PR16 + dual-agent review):
+/// - `fullscreen_fill_window` (upstream default 1): scans `sizes_windowed`
+///   — the sweep from BEFORE the toggle (viv.c:6584-6601, inheriting the
+///   1:1 flag) — against the fullscreen monitor size; the largest level
+///   that still fits, capped at the current level. Entering SUBTRACTS it
+///   (drop to the biggest filling view), exit adds it back.
+/// - else `fill_window` (windowed fill, default 0): a NEGATIVE offset.
+///   Upstream's loop calls `_viv_get_render_size` LIVE (viv.c:6749-6754) —
+///   by then the window is already the fullscreen cover, the bar is gone
+///   and `_viv_1to1` was cleared (6610), so this branch scans
+///   `sizes_fullscreen` (a post-cover, non-1:1 sweep) against the
+///   pre-toggle `old_render`. Clamped to `-(15 - level)` so the
+///   enter/exit pair is reversible.
 /// - both off: 0 — the level is preserved across the toggle. That is
 ///   riviv's wiring (no config yet); see README Differences.
 ///
@@ -363,14 +367,15 @@ fn render_size_at(pos: i32, one_to_one: bool, src_w: i32, src_h: i32, vp: Viewpo
 pub(crate) fn fullscreen_zoom_offset(
     fullscreen_fill_window: bool,
     fill_window: bool,
-    sizes: &[(i32, i32); ZOOM_LEVEL_COUNT],
+    sizes_windowed: &[(i32, i32); ZOOM_LEVEL_COUNT],
+    sizes_fullscreen: &[(i32, i32); ZOOM_LEVEL_COUNT],
     monitor: Viewport,
     old_render: (i32, i32),
     zoom_pos: i32,
 ) -> i32 {
     if fullscreen_fill_window {
         let mut offset = 0;
-        for (level, &(w, h)) in sizes.iter().enumerate() {
+        for (level, &(w, h)) in sizes_windowed.iter().enumerate() {
             if w > monitor.wide || h > monitor.high {
                 break;
             }
@@ -379,7 +384,7 @@ pub(crate) fn fullscreen_zoom_offset(
         offset.min(zoom_pos)
     } else if fill_window {
         let mut offset = 0;
-        for (level, &(w, h)) in sizes.iter().enumerate() {
+        for (level, &(w, h)) in sizes_fullscreen.iter().enumerate() {
             if w > old_render.0 || h > old_render.1 {
                 break;
             }
@@ -907,6 +912,7 @@ mod tests {
                 false,
                 false,
                 &sizes,
+                &sizes,
                 Viewport {
                     wide: 1920,
                     high: 1080
@@ -931,6 +937,7 @@ mod tests {
             true,
             false,
             &sizes,
+            &sizes,
             Viewport {
                 wide: 1000,
                 high: 800,
@@ -942,6 +949,31 @@ mod tests {
     }
 
     #[test]
+    fn fullscreen_offset_level_zero_overflowing_the_monitor_stays_zero() {
+        // Even the fit level exceeds the monitor (a tiny viewport into a
+        // huge sweep): the loop breaks at 0 and the offset stays 0.
+        let mut sizes = [(0, 0); ZOOM_LEVEL_COUNT];
+        for (i, slot) in sizes.iter_mut().enumerate() {
+            *slot = (i as i32 * 500 + 600, i as i32 * 300);
+        }
+        assert_eq!(
+            fullscreen_zoom_offset(
+                true,
+                false,
+                &sizes,
+                &sizes,
+                Viewport {
+                    wide: 500,
+                    high: 400
+                },
+                (0, 0),
+                7
+            ),
+            0
+        );
+    }
+
+    #[test]
     fn fullscreen_offset_never_exceeds_the_current_level() {
         // The cap (viv.c:6734-6738): every level fits the monitor but the
         // viewer is only at level 2 — the offset cannot pull below fit.
@@ -949,6 +981,7 @@ mod tests {
         let offset = fullscreen_zoom_offset(
             true,
             false,
+            &sizes,
             &sizes,
             Viewport {
                 wide: 4000,
@@ -958,6 +991,46 @@ mod tests {
             2,
         );
         assert_eq!(offset, 2);
+    }
+
+    #[test]
+    fn fullscreen_offset_no_image_sweep_collapses_to_the_top() {
+        // The blank sweep (all (0,0), `_viv_get_render_size`'s no-image
+        // early-out) never exceeds anything: the fullscreen_fill scan runs
+        // to the top and the min() cap leaves the level alone, and the
+        // fill scan clamps to -(15 - pos) — the same inert results as a
+        // normal image whose every level fits.
+        let sizes = [(0, 0); ZOOM_LEVEL_COUNT];
+        assert_eq!(
+            fullscreen_zoom_offset(
+                true,
+                false,
+                &sizes,
+                &sizes,
+                Viewport {
+                    wide: 100,
+                    high: 100
+                },
+                (0, 0),
+                6
+            ),
+            6
+        );
+        assert_eq!(
+            fullscreen_zoom_offset(
+                false,
+                true,
+                &sizes,
+                &sizes,
+                Viewport {
+                    wide: 100,
+                    high: 100
+                },
+                (0, 0),
+                6
+            ),
+            -9
+        );
     }
 
     #[test]
@@ -976,6 +1049,7 @@ mod tests {
                 false,
                 true,
                 &sizes,
+                &sizes,
                 Viewport {
                     wide: 9999,
                     high: 9999,
@@ -993,6 +1067,57 @@ mod tests {
         assert_eq!(args(14), -1);
         // ...and at 15 the headroom is 0: the offset clamps to 0.
         assert_eq!(args(15), 0);
+    }
+
+    #[test]
+    fn fill_branch_reads_the_fullscreen_sweep_not_the_windowed_one() {
+        // Upstream's fill loop reads sizes LIVE at the covered viewport with
+        // 1:1 cleared (viv.c:6749-6754 + 6610), while the fullscreen_fill
+        // branch keeps the pre-toggle sweep — the two inputs are genuinely
+        // different arrays (PR #16 audit: dual-agent + cubic).
+        let mut win = [(0, 0); ZOOM_LEVEL_COUNT];
+        for (i, slot) in win.iter_mut().enumerate() {
+            *slot = (i as i32 * 100, i as i32 * 60); // small sweep
+        }
+        let mut fs = [(0, 0); ZOOM_LEVEL_COUNT];
+        for (i, slot) in fs.iter_mut().enumerate() {
+            *slot = (i as i32 * 400 + 300, i as i32 * 200 + 100); // huge sweep
+        }
+        // fill branch against old_render (1000, 600): the WINDOWED sweep
+        // would admit levels 0..=10 (-10); the FULLSCREEN sweep breaks at
+        // level 2 (1100 > 1000) -> only 0..=1 pass -> -1.
+        assert_eq!(
+            fullscreen_zoom_offset(
+                false,
+                true,
+                &win,
+                &fs,
+                Viewport {
+                    wide: 9999,
+                    high: 9999
+                },
+                (1000, 600),
+                12
+            ),
+            -1
+        );
+        // ...and the fullscreen_fill branch against a 1500-wide monitor
+        // still reads the WINDOWED sweep (admits 0..=14, capped at pos).
+        assert_eq!(
+            fullscreen_zoom_offset(
+                true,
+                false,
+                &win,
+                &fs,
+                Viewport {
+                    wide: 1500,
+                    high: 900
+                },
+                (0, 0),
+                12
+            ),
+            12
+        );
     }
 
     #[test]
@@ -1020,8 +1145,8 @@ mod tests {
 
     #[test]
     fn sizes_all_levels_in_one_to_one_are_all_the_source_size() {
-        // The precalc quirk (viv.c:6590-6608 runs BEFORE the toggle's
-        // `_viv_1to1 = 0` at 6617): in 1:1 every array entry is the source.
+        // The precalc quirk (viv.c:6584-6601 runs BEFORE the toggle's
+        // `_viv_1to1 = 0` at 6610): in 1:1 every array entry is the source.
         let v = View {
             one_to_one: true,
             ..View::new()
@@ -1034,7 +1159,7 @@ mod tests {
 
     #[test]
     fn leave_one_to_one_keeps_the_level_without_restoring_saved() {
-        // The toggle's `_viv_1to1 = 0` (viv.c:6617): level stays 0 (it was
+        // The toggle's `_viv_1to1 = 0` (viv.c:6610): level stays 0 (it was
         // forced there on entry) and the saved level is NOT restored — the
         // next 1:1 entry overwrites it (viv.c:9334-9339).
         let mut v = View {
