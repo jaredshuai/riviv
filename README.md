@@ -55,6 +55,7 @@ Zoom & pan (upstream preset semantics): the mouse wheel and `+`/`-` step through
 - Upstream's default-on decode-ahead (preload next image) and last-image caches are not implemented — every open, including navigation back to a just-seen image, decodes from disk.
 - Navigation always navigates by the default upstream sort (date modified, newest first). The sort-mode/ascending menu options and shuffle are M3 config work.
 - The NUMPAD panscan commands are not implemented (size/width/height steps and move/center, upstream `VIV_ID_VIEW_PANSCAN_*`): zoom/pan uses the 16-level preset curve, the wheel and left-drag only. Middle-button drag-to-scroll (upstream `_VIV_DOING_MSCROLL`) is not implemented either.
+- The mouse back/forward buttons (X buttons) do not navigate yet — upstream maps them to next/prev by default (`config_xbutton_action = 2`); lands with the slideshow/input work.
 
 Agent workflow: see [AGENTS.md](AGENTS.md). Decisions: `docs/adr/`.
 

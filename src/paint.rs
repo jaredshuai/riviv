@@ -87,19 +87,16 @@ pub(crate) fn paint(hwnd: HWND) {
                     // Pixel-exact 1:1 — BitBlt, no resampling (upstream's
                     // equal-size arm, viv.c:4164-4173).
                     let _ = BitBlt(hdc, dx, dy, rw, rh, Some(surface.memdc()), 0, 0, SRCCOPY);
-                } else {
-                    if rw < sw || rh < sh {
-                        // Upstream shrink path: HALFTONE + brush-org
-                        // realignment anchored to the destination image
-                        // (viv.c:4205-4209 uses -rx,-ry) so the dither
-                        // pattern does not drift as the image moves.
-                        let _ = SetStretchBltMode(hdc, HALFTONE);
-                        let _ = SetBrushOrgEx(hdc, -dx, -dy, None);
-                    } else {
-                        // Upstream magnify default: COLORONCOLOR
-                        // (`config_mag_filter`, config.c:42).
-                        let _ = SetStretchBltMode(hdc, COLORONCOLOR);
-                    }
+                } else if rw < sw || rh < sh {
+                    // Upstream shrink path: HALFTONE + brush-org
+                    // realignment anchored to the destination image
+                    // (viv.c:4205-4209 uses -rx,-ry) so the dither
+                    // pattern does not drift as the image moves. The full
+                    // rect is stretched on purpose: GDI honors the DC clip
+                    // for shrinks (viv.c:4056-4062), and cutting the rect
+                    // would realign the HALFTONE filter taps.
+                    let _ = SetStretchBltMode(hdc, HALFTONE);
+                    let _ = SetBrushOrgEx(hdc, -dx, -dy, None);
                     // Fail-soft by design: upstream viv.c:4278 also continues
                     // past a failed StretchBlt (debug_printf only) — one bad
                     // frame must not kill the window. M2 adds a debug-log
@@ -117,6 +114,47 @@ pub(crate) fn paint(hwnd: HWND) {
                         sh,
                         SRCCOPY,
                     );
+                } else {
+                    // Upstream magnify default: COLORONCOLOR
+                    // (`config_mag_filter`, config.c:42), clipped to the
+                    // viewport with the cut mapped back to source coords —
+                    // GDI walks the whole dest extent of a StretchBlt no
+                    // matter the clip region (viv.c:4056-4062), so an
+                    // unclipped 16x blit stretches a rect tens of thousands
+                    // of pixels wide on every paint (upstream's tiled
+                    // stretch exists for exactly this, viv.c:14929-14936).
+                    let _ = SetStretchBltMode(hdc, COLORONCOLOR);
+                    let whole = crate::zoom::BlitRect {
+                        dx,
+                        dy,
+                        dw: rw,
+                        dh: rh,
+                        sx: 0,
+                        sy: 0,
+                        sw,
+                        sh,
+                    };
+                    if let Some(b) = crate::zoom::clip_blit(
+                        whole,
+                        client.left,
+                        client.top,
+                        Viewport { wide: cw, high: ch },
+                    ) {
+                        // Fail-soft like the shrink path (viv.c:4278).
+                        let _ = StretchBlt(
+                            hdc,
+                            b.dx,
+                            b.dy,
+                            b.dw,
+                            b.dh,
+                            Some(surface.memdc()),
+                            b.sx,
+                            b.sy,
+                            b.sw,
+                            b.sh,
+                            SRCCOPY,
+                        );
+                    }
                 }
             }
         }

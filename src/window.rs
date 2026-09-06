@@ -41,8 +41,9 @@ use windows::Win32::UI::Controls::{
     InitCommonControlsEx,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, ReleaseCapture, SetCapture, VK_ADD, VK_CONTROL, VK_END, VK_HOME, VK_LEFT, VK_MENU,
-    VK_NEXT, VK_OEM_MINUS, VK_OEM_PLUS, VK_PRIOR, VK_RIGHT, VK_SHIFT, VK_SUBTRACT,
+    GetKeyState, ReleaseCapture, SetCapture, VK_ADD, VK_CONTROL, VK_END, VK_ESCAPE, VK_HOME,
+    VK_LEFT, VK_MENU, VK_NEXT, VK_OEM_MINUS, VK_OEM_PLUS, VK_PRIOR, VK_RIGHT, VK_SHIFT,
+    VK_SUBTRACT,
 };
 use windows::Win32::UI::Shell::{DragFinish, DragQueryFileW, HDROP};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -54,7 +55,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, TranslateMessage,
     USER_TIMER_MINIMUM, WM_DESTROY, WM_DROPFILES, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_PAINT,
-    WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_EX_ACCEPTFILES, WS_OVERLAPPEDWINDOW,
+    WM_SIZE, WM_SYSKEYDOWN, WM_TIMER, WNDCLASSEXW, WS_EX_ACCEPTFILES, WS_OVERLAPPEDWINDOW,
 };
 use windows::core::{HSTRING, PCWSTR, w};
 
@@ -1033,6 +1034,20 @@ fn on_keydown(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
         )
     };
     let vk = wparam.0 as u16;
+    // ESC cancels an in-progress drag (upstream viv.c:6367-6378: an
+    // unmodified ESC with a mouse action active releases the capture; the
+    // fullscreen-exit arm lands with #8).
+    if vk == VK_ESCAPE.0 && !ctrl && !shift && !alt {
+        // SAFETY: the borrow spans only the Option take.
+        let was_dragging =
+            (unsafe { state_of(hwnd) }).is_some_and(|state| state.drag.take().is_some());
+        if was_dragging {
+            // SAFETY: the capture was taken on this thread in
+            // WM_LBUTTONDOWN.
+            let _ = unsafe { ReleaseCapture() };
+        }
+        return;
+    }
     if (vk == VK_OEM_PLUS.0 && !ctrl && !shift && !alt) || (vk == VK_ADD.0 && !shift && !alt) {
         zoom_step_centered(hwnd, false);
         return;
@@ -1255,6 +1270,17 @@ unsafe extern "system" fn wnd_proc(
         WM_KEYDOWN => {
             on_keydown(hwnd, wparam, lparam);
             LRESULT(0)
+        }
+        // Alt-modified keys arrive as WM_SYSKEYDOWN, not WM_KEYDOWN —
+        // upstream dispatches both through the same keymap (viv.c:6347-6348),
+        // which is what makes Ctrl+Alt+0 (temporary 1:1) reachable from a
+        // real keyboard. Always fall through to DefWindowProc afterwards:
+        // it owns Alt+F4 / Alt+Space / F10 even for keys on_keydown used.
+        WM_SYSKEYDOWN => {
+            on_keydown(hwnd, wparam, lparam);
+            // SAFETY: hwnd/msg are exactly what this callback received; the
+            // default procedure handles everything we do not.
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
         WM_MOUSEWHEEL => {
             on_mousewheel(hwnd, wparam, lparam);
