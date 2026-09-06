@@ -67,7 +67,8 @@ impl Playlist {
     }
 
     /// Upstream `_viv_playlist_clearall` — also resets the id counter
-    /// (viv.c:9380), so ids restart at 1 after a replace-drop.
+    /// (viv.c:9380), so ids restart at 0 after a replace-drop (the first
+    /// entry post-clear is id 0, the id a direct open carries).
     pub(crate) fn clear(&mut self) {
         self.entries.clear();
         self.next_id = 0;
@@ -281,15 +282,18 @@ pub(crate) fn home(entries: &[PlaylistEntry], end: bool) -> Option<&PlaylistEntr
     best
 }
 
-/// mtime in 100 ns ticks — FILETIME granularity without caring about the
-/// epoch (every caller reads through `std::fs`).
+/// mtime in 100 ns ticks, signed like the raw FILETIME upstream compares
+/// (viv.c:5757-5771): pre-1970 timestamps (zeroed/invalid FILETIMEs read
+/// as 1601) stay NEGATIVE instead of collapsing to a tie at 0, keeping the
+/// date-modified order intact.
 pub(crate) fn modified_ticks(metadata: &Metadata) -> i64 {
     metadata
         .modified()
         .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_nanos() as i64 / 100)
-        .unwrap_or(0)
+        .map_or(0, |t| match t.duration_since(std::time::UNIX_EPOCH) {
+            Ok(d) => d.as_nanos() as i64 / 100,
+            Err(e) => -(e.duration().as_nanos() as i64 / 100),
+        })
 }
 
 /// Recursively add a folder's images (upstream `_viv_playlist_add_path`,
@@ -695,6 +699,51 @@ mod tests {
             .find(|e| e.path == deep.join("e.webp").into_os_string())
             .unwrap();
         assert_eq!(e_webp.modified, 10_004_i64 * 10_000_000);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    // Pre-1970 mtimes (zeroed/invalid FILETIMEs read as 1601) stay
+    // NEGATIVE ticks — the date-modified order survives instead of every
+    // pre-epoch file collapsing into one tie at 0 (cubic PR #14).
+    #[test]
+    fn pre_epoch_mtimes_keep_their_order() {
+        use std::time::{Duration, SystemTime};
+        let root = std::env::temp_dir().join(format!("riviv-plp-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let ancient = root.join("ancient.png");
+        let modern = root.join("modern.png");
+        for (file, when) in [
+            (
+                &ancient,
+                SystemTime::UNIX_EPOCH - Duration::from_secs(63_072_000),
+            ), // 1968
+            (
+                &modern,
+                SystemTime::UNIX_EPOCH + Duration::from_secs(63_072_000),
+            ), // 1972
+        ] {
+            std::fs::write(file, b"x").unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(file)
+                .unwrap()
+                .set_modified(when)
+                .unwrap();
+        }
+        let mut playlist = Playlist::new();
+        add_filename(&mut playlist, &ancient);
+        add_filename(&mut playlist, &modern);
+        let entries = playlist.entries();
+        let ancient = entries
+            .iter()
+            .find(|e| e.path == root.join("ancient.png"))
+            .unwrap();
+        let modern = entries
+            .iter()
+            .find(|e| e.path == root.join("modern.png"))
+            .unwrap();
+        assert!(ancient.modified < 0, "pre-epoch ticks must be negative");
+        assert_eq!(fd_compare(modern, ancient), Ordering::Less); // newer sorts first
         std::fs::remove_dir_all(&root).ok();
     }
 
