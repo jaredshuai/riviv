@@ -9,7 +9,11 @@
 //! stalled prefix waits for the decode (see `loader::apply_reply` and
 //! `loadthread.rs`). Drops build playlists (multi-file/folder/Shift,
 //! viv.c:3076-3128) and Right/Left/PgUp/PgDn/Home/End navigate them — or,
-//! with no playlist, the current file's folder (`playlist.rs`).
+//! with no playlist, the current file's folder (`playlist.rs`). Zoom & pan
+//! (#7): the wheel and the +/- keys step the 16-level preset curve
+//! anchored at the cursor or the viewport center, left-drag pans with edge
+//! clamping, Ctrl+0 resets to fit and Ctrl+Alt+0 toggles the temporary
+//! 1:1 mode (`zoom.rs`).
 //! M2 seams left: fullscreen toggle + cursor-hide timers (#8).
 
 use std::ffi::{OsStr, OsString, c_void};
@@ -23,7 +27,7 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Graphics::Gdi::{
     COLOR_BTNFACE, GetMonitorInfoW, HBRUSH, InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO,
-    MonitorFromPoint,
+    MonitorFromPoint, ScreenToClient,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
@@ -37,8 +41,8 @@ use windows::Win32::UI::Controls::{
     InitCommonControlsEx,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, VK_CONTROL, VK_END, VK_HOME, VK_LEFT, VK_MENU, VK_NEXT, VK_PRIOR, VK_RIGHT,
-    VK_SHIFT,
+    GetKeyState, ReleaseCapture, SetCapture, VK_ADD, VK_CONTROL, VK_END, VK_HOME, VK_LEFT, VK_MENU,
+    VK_NEXT, VK_OEM_MINUS, VK_OEM_PLUS, VK_PRIOR, VK_RIGHT, VK_SHIFT, VK_SUBTRACT,
 };
 use windows::Win32::UI::Shell::{DragFinish, DragQueryFileW, HDROP};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -49,8 +53,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SWP_NOZORDER, SendMessageW, SetForegroundWindow, SetProcessDPIAware, SetTimer,
     SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, TranslateMessage,
     USER_TIMER_MINIMUM, WM_DESTROY, WM_DROPFILES, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN,
-    WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_EX_ACCEPTFILES,
-    WS_OVERLAPPEDWINDOW,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_PAINT,
+    WM_SIZE, WM_TIMER, WNDCLASSEXW, WS_EX_ACCEPTFILES, WS_OVERLAPPEDWINDOW,
 };
 use windows::core::{HSTRING, PCWSTR, w};
 
@@ -63,6 +67,7 @@ use crate::playlist::{self, Playlist, PlaylistEntry};
 use crate::status;
 use crate::surface::Surface;
 use crate::text::{dialog_filter, title_wide, to_wide};
+use crate::zoom::{View, Viewport};
 
 /// Window class name. Deliberately different from upstream's `VOIDIMAGEVIEWER`
 /// (class + mutex) so both viewers can coexist on one machine.
@@ -132,6 +137,15 @@ pub(crate) struct WindowState {
     /// wildcard home); consumed by the first `request_open`, and cleared
     /// without opening when the command line resolves to nothing.
     pub(crate) startup_open_pending: bool,
+    /// Zoom/pan view of the displayed image (#7; upstream's
+    /// `_viv_zoom_pos`/`_viv_view_*` globals, viv.c:677-683). Reset on
+    /// every display swap and blank, exactly where upstream runs
+    /// `_viv_clear` (viv.c:1282-1288).
+    pub(crate) view: View,
+    /// In-progress left-drag pan: the last cursor point in client pixels
+    /// (upstream `_viv_doing == _VIV_DOING_SCROLL` + `_viv_doing_x/y`,
+    /// viv.c:14682-14693). `None` = not dragging.
+    pub(crate) drag: Option<(i32, i32)>,
 }
 
 /// Window state pointer stored in GWLP_USERDATA between WM_NCCREATE and
@@ -202,6 +216,156 @@ fn refresh_status(hwnd: HWND) {
 fn snapshot_status_bar(hwnd: HWND) -> HWND {
     // SAFETY: read-only field copy.
     unsafe { state_of(hwnd) }.map_or(HWND::default(), |s| s.status)
+}
+
+/// The zoom/pan geometry inputs from the current state: the render viewport
+/// (client area minus the status bar — upstream's `wide`/`high`, e.g.
+/// viv.c:13954-13957) and the displayed image's source size. A blank
+/// display yields (0, 0), against which the zoom model is inert like
+/// upstream's `_viv_get_render_size` no-image early-out (viv.c:6867).
+fn viewport_and_src(hwnd: HWND, state: &WindowState) -> (Viewport, (i32, i32)) {
+    let mut client = RECT::default();
+    // SAFETY: read-only query on the live window; a failed read leaves the
+    // zeroed rect and collapses the viewport (the zoom math no-ops).
+    let _ = unsafe { GetClientRect(hwnd, &mut client) };
+    let status_h = crate::status::height(state.status);
+    let vp = Viewport {
+        wide: (client.right - client.left).max(0),
+        high: (client.bottom - client.top - status_h).max(0),
+    };
+    let src = state
+        .image
+        .as_ref()
+        .map(|img| (img.width(), img.height()))
+        .unwrap_or((0, 0));
+    (vp, src)
+}
+
+/// The signed point packed in a mouse-message LPARAM (GET_X_LPARAM /
+/// GET_Y_LPARAM semantics — each half-word is a signed coordinate).
+fn lparam_point(lparam: LPARAM) -> POINT {
+    POINT {
+        x: (lparam.0 & 0xffff) as u16 as i16 as i32,
+        y: ((lparam.0 >> 16) & 0xffff) as u16 as i16 as i32,
+    }
+}
+
+/// Queue a WM_PAINT (erase FALSE — WM_PAINT fills the whole client itself,
+/// upstream viv.c:3284).
+fn repaint(hwnd: HWND) {
+    // SAFETY: queues a WM_PAINT; never pumps messages.
+    let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+}
+
+/// WM_MOUSEWHEEL (upstream viv.c:3673-3677 → `_viv_do_mousewheel_action`
+/// action 0: the default config maps BOTH the plain and the Ctrl wheel to
+/// zoom). One level per message, anchored at the cursor — upstream keys
+/// off the delta's sign only, so a zero delta counts as zoom-out.
+fn on_mousewheel(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
+    let delta = ((wparam.0 >> 16) & 0xffff) as u16 as i16;
+    // Unlike other mouse messages, the wheel's lParam holds SCREEN coords.
+    let mut pt = lparam_point(lparam);
+    // SAFETY: in-place conversion on the live window; a failure leaves the
+    // screen point, which merely anchors elsewhere.
+    let _ = unsafe { ScreenToClient(hwnd, &mut pt) };
+    // SAFETY: the borrow spans only the pure zoom math — nothing pumps.
+    let changed = (unsafe { state_of(hwnd) }).is_some_and(|state| {
+        let (vp, src) = viewport_and_src(hwnd, state);
+        state
+            .view
+            .zoom_step(delta <= 0, (pt.x, pt.y), src.0, src.1, vp)
+    });
+    if changed {
+        repaint(hwnd);
+    }
+}
+
+/// A `+`/`-` keypress zoom step — anchored at the viewport center (upstream
+/// `_viv_zoom_in` with have_xy=0 feeds the client-area center through the
+/// same wheel action, viv.c:11803-11821).
+fn zoom_step_centered(hwnd: HWND, out: bool) {
+    // SAFETY: the borrow spans only the pure zoom math.
+    let changed = (unsafe { state_of(hwnd) }).is_some_and(|state| {
+        let (vp, src) = viewport_and_src(hwnd, state);
+        state
+            .view
+            .zoom_step(out, (vp.wide / 2, vp.high / 2), src.0, src.1, vp)
+    });
+    if changed {
+        repaint(hwnd);
+    }
+}
+
+/// Ctrl+0 — back to fit (upstream `VIV_ID_VIEW_ZOOM_RESET`, viv.c:1676-1681;
+/// always repaints).
+fn zoom_reset(hwnd: HWND) {
+    // SAFETY: the borrow spans the pure reset math.
+    if let Some(state) = unsafe { state_of(hwnd) } {
+        let (vp, src) = viewport_and_src(hwnd, state);
+        state.view.reset_zoom(src.0, src.1, vp);
+    }
+    repaint(hwnd);
+}
+
+/// Ctrl+Alt+0 — toggle the temporary 1:1 pixel-exact mode (upstream
+/// `_viv_view_1to1`, viv.c:9318-9339; always repaints).
+fn toggle_one_to_one(hwnd: HWND) {
+    // SAFETY: the borrow spans the pure toggle math.
+    if let Some(state) = unsafe { state_of(hwnd) } {
+        let (vp, src) = viewport_and_src(hwnd, state);
+        state.view.toggle_one_to_one(src.0, src.1, vp);
+    }
+    repaint(hwnd);
+}
+
+/// WM_LBUTTONDOWN — start a drag pan (upstream's default left-click action
+/// 0, viv.c:14682-14693: with a caption present the drag always pans; the
+/// borderless move-window arm is #8's business). No image-size gate —
+/// panning a fitted image simply clamps to nothing.
+fn on_left_button_down(hwnd: HWND, lparam: LPARAM) {
+    let pt = lparam_point(lparam);
+    // SAFETY: the borrow spans only the drag-point store.
+    if let Some(state) = unsafe { state_of(hwnd) } {
+        state.drag = Some((pt.x, pt.y));
+    }
+    // SAFETY: hwnd is live and owned by this thread. Capture is released in
+    // WM_LBUTTONUP; a capture stolen elsewhere just freezes the drag until
+    // the next click — upstream never handles WM_CAPTURECHANGED here either.
+    let _ = unsafe { SetCapture(hwnd) };
+}
+
+/// WM_MOUSEMOVE — while dragging, pan by the cursor delta (upstream
+/// `_VIV_DOING_SCROLL`, viv.c:3617-3644: the image follows the mouse).
+fn on_mouse_move(hwnd: HWND, lparam: LPARAM) {
+    let pt = lparam_point(lparam);
+    // SAFETY: the borrow spans the drag bookkeeping and the pure pan math.
+    let panned = (unsafe { state_of(hwnd) }).is_some_and(|state| match state.drag {
+        Some((lx, ly)) => {
+            state.drag = Some((pt.x, pt.y));
+            if pt.x == lx && pt.y == ly {
+                false
+            } else {
+                let (vp, src) = viewport_and_src(hwnd, state);
+                state.view.scroll_by(pt.x - lx, pt.y - ly, src.0, src.1, vp);
+                true
+            }
+        }
+        None => false,
+    });
+    if panned {
+        repaint(hwnd);
+    }
+}
+
+/// WM_LBUTTONUP — end the drag (upstream `_viv_doing_cancel`,
+/// viv.c:7850-7871: the capture is released iff something was in progress).
+fn on_left_button_up(hwnd: HWND) {
+    // SAFETY: the borrow spans only the Option take.
+    let was_dragging = (unsafe { state_of(hwnd) }).is_some_and(|state| state.drag.take().is_some());
+    if was_dragging {
+        // SAFETY: we took the capture in WM_LBUTTONDOWN on this thread.
+        let _ = unsafe { ReleaseCapture() };
+    }
 }
 
 /// How an open request came about — whether the navigation reference
@@ -490,6 +654,9 @@ fn blank_display(hwnd: HWND) {
         state.pending_file_bytes = None;
         state.session = None;
         state.startup_open_pending = false;
+        // The zoom/pan view dies with the display (upstream `_viv_blank` →
+        // `_viv_clear`, viv.c:7910 + 1282-1288).
+        state.view.reset();
         stop_timer = state.animation_timer_running;
         state.animation_timer_running = false;
     }
@@ -601,8 +768,11 @@ fn on_load_replies(hwnd: HWND) {
                     UiAction::Invalidate => invalidate = true,
                     UiAction::SetWindowTitle => {
                         // The display adopted this session's image (or
-                        // cleared it): the status bar's "(N KB)" follows
-                        // the same commit/clear.
+                        // cleared it): the zoom/pan view resets with it
+                        // (upstream `_viv_clear` runs at exactly these
+                        // points, viv.c:2804/2835/7910) and the status
+                        // bar's "(N KB)" follows the same commit/clear.
+                        state.view.reset();
                         if state.displayed_from == Some(session_id) {
                             state.path = Some(session_path.clone());
                             title = Some(HSTRING::from_wide(&title_wide(state.path.as_deref())));
@@ -849,22 +1019,46 @@ fn on_keydown(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
         }
         return;
     }
+    // The zoom keys bind with upstream's exact modifier masks (viv.c:1017-
+    // 1024): '+'/'=' and numpad '+' zoom in, '-'/numpad '-' out — Ctrl
+    // accelerates ONLY the numpad variants; Ctrl+'0' resets to fit;
+    // Ctrl+Alt+'0' toggles temporary 1:1. Key repeat intentionally steps
+    // repeatedly (upstream has no repeat gating on zoom commands).
+    // SAFETY: GetKeyState reads thread-local async key state; the VKs are valid.
+    let (ctrl, shift, alt) = unsafe {
+        (
+            GetKeyState(i32::from(VK_CONTROL.0)) < 0,
+            GetKeyState(i32::from(VK_SHIFT.0)) < 0,
+            GetKeyState(i32::from(VK_MENU.0)) < 0,
+        )
+    };
+    let vk = wparam.0 as u16;
+    if (vk == VK_OEM_PLUS.0 && !ctrl && !shift && !alt) || (vk == VK_ADD.0 && !shift && !alt) {
+        zoom_step_centered(hwnd, false);
+        return;
+    }
+    if (vk == VK_OEM_MINUS.0 && !ctrl && !shift && !alt) || (vk == VK_SUBTRACT.0 && !shift && !alt)
+    {
+        zoom_step_centered(hwnd, true);
+        return;
+    }
+    if vk == u16::from(b'0') && ctrl && !shift {
+        if alt {
+            toggle_one_to_one(hwnd);
+        } else {
+            zoom_reset(hwnd);
+        }
+        return;
+    }
     // The navigation keys bind with no modifiers at all — Ctrl+Left etc.
     // are the animation frame-step commands (M2 later), so any held
     // ctrl/shift/alt disqualifies the key.
-    // SAFETY: GetKeyState reads thread-local async key state; the VKs are valid.
-    let mods = unsafe {
-        GetKeyState(i32::from(VK_CONTROL.0)) < 0
-            || GetKeyState(i32::from(VK_SHIFT.0)) < 0
-            || GetKeyState(i32::from(VK_MENU.0)) < 0
-    };
-    if mods {
+    if ctrl || shift || alt {
         return;
     }
     // Auto-repeat (lParam bit 30, upstream viv.c:6403): a repeated
     // next/prev waits for the in-flight load instead of stacking opens.
     let is_repeat = (lparam.0 & 0x4000_0000) != 0;
-    let vk = wparam.0 as u16;
     let repeat_waits = || {
         // SAFETY: the read-only borrow ends inside is_some_and.
         (unsafe { state_of(hwnd) }).is_some_and(|s| nav_repeat_waits_for_load(s))
@@ -965,6 +1159,18 @@ fn on_size(hwnd: HWND) {
     unsafe {
         SendMessageW(bar, WM_SIZE, None, None);
     }
+    // Re-anchor the pan offset for the new viewport (upstream WM_SIZE,
+    // viv.c:1643-1651: reproject the center-source anchor onto the new
+    // render size and re-clamp). CS_HREDRAW/CS_VREDRAW already repaint
+    // resizes; the invalidate only matters for a re-clamped offset.
+    // SAFETY: the borrow spans the pure re-anchor math.
+    let reclamped = (unsafe { state_of(hwnd) }).is_some_and(|state| {
+        let (vp, src) = viewport_and_src(hwnd, state);
+        state.view.on_resize(src.0, src.1, vp)
+    });
+    if reclamped {
+        repaint(hwnd);
+    }
 }
 
 unsafe extern "system" fn wnd_proc(
@@ -1048,6 +1254,22 @@ unsafe extern "system" fn wnd_proc(
         }
         WM_KEYDOWN => {
             on_keydown(hwnd, wparam, lparam);
+            LRESULT(0)
+        }
+        WM_MOUSEWHEEL => {
+            on_mousewheel(hwnd, wparam, lparam);
+            LRESULT(0)
+        }
+        WM_LBUTTONDOWN => {
+            on_left_button_down(hwnd, lparam);
+            LRESULT(0)
+        }
+        WM_MOUSEMOVE => {
+            on_mouse_move(hwnd, lparam);
+            LRESULT(0)
+        }
+        WM_LBUTTONUP => {
+            on_left_button_up(hwnd);
             LRESULT(0)
         }
         WM_DROPFILES => {
@@ -1236,6 +1458,8 @@ pub(crate) fn run(args: Vec<OsString>) -> Result<(), String> {
         // The startup resize belongs to the CLI's open only; no file
         // arguments (or none that resolve) leave the default-size window.
         startup_open_pending: !args.is_empty(),
+        view: View::new(),
+        drag: None,
     };
     // SAFETY: process-wide and must run before any window exists (matches the
     // upstream manifest's dpiAware=true). ERROR_ACCESS_DENIED means the process

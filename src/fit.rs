@@ -1,7 +1,7 @@
 //! Render-fit math (pure logic, unit-tested).
 //!
-//! M2 seam: the 16-step zoom presets, pan clamping and wheel-anchor math (#7)
-//! land here beside the fit-to-window computation (zoom level 0 IS fit).
+//! This is the zoom curve's level 0; the 16-step presets, wheel anchoring
+//! and pan clamping (#7) landed in `zoom.rs` on top of `fit_shrink`.
 
 /// Fit `(src_w, src_h)` inside `(max_w, max_h)` keeping aspect ratio,
 /// never upscaling (upstream `fill_window = 0`). The derived side rounds UP
