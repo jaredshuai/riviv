@@ -36,7 +36,9 @@
 //! - `anim` — animation frame scheduling + delay fallbacks + the streamed-loading
 //!   stall branch (#3/#4, landed); M2 seams left: the rate table
 //! - `pixels` — BGRA conversion + alpha compositing (#3, landed); M2: mip math (#9)
-//! - `fit` — fit-to-window math; M2: zoom presets / pan clamp (#7)
+//! - `fit` — fit-to-window math (the zoom curve's level 0)
+//! - `zoom` — 16-step zoom presets, wheel/cursor anchoring, pan clamping,
+//!   the temporary 1:1 mode and the resize re-anchor (#7, landed)
 //! - `text` — title & wide-string construction + the status-bar text and
 //!   part-width model (#5, landed)
 //! - `surface` — DIB section + memory DC; one per decoded frame (#3, landed);
@@ -45,13 +47,15 @@
 //!   (#3/#4, landed)
 //! - `loadthread` — background decode session: worker thread, reply queue,
 //!   kick message (#4, landed)
-//! - `paint` — WM_PAINT render; M2: stitch/mip (#9), zoom (#7)
+//! - `paint` — WM_PAINT render; M2: stitch/mip (#9); zoom/pan offsets,
+//!   the BitBlt 1:1 path and the COLORONCOLOR magnify filter landed (#7)
 //! - `playlist` — playlist model + navigation math + recursive folder/wildcard
 //!   entry construction (#6, landed)
 //! - `status` — the status-bar common control: creation, height, and the
 //!   measure → parts → texts update over `text`'s pure model (#5, landed)
 //! - `window` — wnd_proc shell, pump, input/open actions, animation timer,
-//!   reply handler, playlist wiring (#3/#4/#5/#6, landed); M2: fullscreen (#8)
+//!   reply handler, playlist wiring, zoom/pan mouse+key wiring
+//!   (#3/#4/#5/#6/#7, landed); M2: fullscreen (#8)
 
 #![windows_subsystem = "windows"]
 
@@ -66,6 +70,7 @@ mod status;
 mod surface;
 mod text;
 mod window;
+mod zoom;
 
 use std::ffi::{OsStr, OsString};
 use std::os::windows::ffi::OsStrExt;
