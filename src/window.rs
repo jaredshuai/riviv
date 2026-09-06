@@ -468,8 +468,12 @@ fn nav_next(hwnd: HWND, prev: bool) {
 
 /// Upstream `_viv_blank` (viv.c:7908-7930): clear the display, the
 /// navigation reference AND the playlist; the title falls back to the app
-/// name and the status bar to its idle parts. Any in-flight load is
-/// superseded (upstream `_viv_clear` stops the load thread).
+/// name. Any in-flight load is superseded (upstream `_viv_clear` stops the
+/// load thread). The failure flags are NOT reset — upstream's
+/// `_viv_clear`/`_viv_blank` leave `_viv_file_not_found`/`_viv_load_failed`
+/// alone (viv.c:1268-1293), so a stale verdict survives the blank until the
+/// next open resets it (viv.c:1447-1458). An unresolved startup open also
+/// dies here: it must not leak the startup resize into a later user open.
 fn blank_display(hwnd: HWND) {
     let stop_timer;
     {
@@ -484,9 +488,8 @@ fn blank_display(hwnd: HWND) {
         state.nav_current = None;
         state.displayed_file_bytes = None;
         state.pending_file_bytes = None;
-        state.status_file_not_found = false;
-        state.status_load_failed = false;
         state.session = None;
+        state.startup_open_pending = false;
         stop_timer = state.animation_timer_running;
         state.animation_timer_running = false;
     }
@@ -802,7 +805,11 @@ fn on_keydown(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
     if wparam.0 == usize::from(b'O') {
         // SAFETY: GetKeyState reads thread-local async key state; the VKs are valid.
         let ctrl = unsafe { GetKeyState(i32::from(VK_CONTROL.0)) } < 0;
-        if ctrl {
+        // Upstream matches the full modifier mask (viv.c:6396-6402) —
+        // Ctrl+Alt+O is NOT Open File.
+        // SAFETY: GetKeyState reads thread-local async key state; VK_MENU is valid.
+        let alt = unsafe { GetKeyState(i32::from(VK_MENU.0)) } < 0;
+        if ctrl && !alt {
             // SAFETY: GetKeyState reads thread-local async key state; VK_SHIFT is valid.
             let shift = unsafe { GetKeyState(i32::from(VK_SHIFT.0)) } < 0;
             // SAFETY: the borrow ends at the end of this statement (the path is
