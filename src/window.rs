@@ -1,13 +1,16 @@
 //! Window shell: window state, the message pump, class registration, and the
 //! input/open-action handlers hung off the single wnd_proc.
 //!
-//! The animation timer wiring (#3) and the background decode protocol (#4)
-//! are landed: opens spawn a load session whose replies arrive on a private
-//! `WM_APP+1` kick and are applied by `on_load_replies` — the display swaps
-//! when the first frame replies in, animation frames append while playing,
-//! and a stalled prefix waits for the decode (see `loader::apply_reply` and
-//! `loadthread.rs`). M2 seams left: fullscreen toggle + cursor-hide timers
-//! (#8) and drop→playlist / navigation key wiring (#6).
+//! The animation timer wiring (#3), the background decode protocol (#4),
+//! the status bar (#5) and the playlist/navigation wiring (#6) are landed:
+//! opens spawn a load session whose replies arrive on a private `WM_APP+1`
+//! kick and are applied by `on_load_replies` — the display swaps when the
+//! first frame replies in, animation frames append while playing, and a
+//! stalled prefix waits for the decode (see `loader::apply_reply` and
+//! `loadthread.rs`). Drops build playlists (multi-file/folder/Shift,
+//! viv.c:3076-3128) and Right/Left/PgUp/PgDn/Home/End navigate them — or,
+//! with no playlist, the current file's folder (`playlist.rs`).
+//! M2 seams left: fullscreen toggle + cursor-hide timers (#8).
 
 use std::ffi::{OsStr, OsString, c_void};
 use std::mem::size_of;
@@ -33,7 +36,10 @@ use windows::Win32::UI::Controls::{
     ICC_BAR_CLASSES, ICC_STANDARD_CLASSES, ICC_WIN95_CLASSES, INITCOMMONCONTROLSEX,
     InitCommonControlsEx,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetKeyState, VK_CONTROL, VK_END, VK_HOME, VK_LEFT, VK_MENU, VK_NEXT, VK_PRIOR, VK_RIGHT,
+    VK_SHIFT,
+};
 use windows::Win32::UI::Shell::{DragFinish, DragQueryFileW, HDROP};
 use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRect, CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CreateWindowExW,
@@ -53,6 +59,7 @@ use crate::fit::fit_shrink;
 use crate::loader::{LoadedImage, UiAction, apply_reply, map_reply_frame};
 use crate::loadthread::{LoadSession, LoadThread, REPLY_KICK_MESSAGE};
 use crate::paint::paint;
+use crate::playlist::{self, Playlist, PlaylistEntry};
 use crate::status;
 use crate::surface::Surface;
 use crate::text::{dialog_filter, title_wide, to_wide};
@@ -109,6 +116,22 @@ pub(crate) struct WindowState {
     /// the display — a failed replacement must not clobber the old image's
     /// size in the status bar (cubic PR #13).
     pub(crate) pending_file_bytes: Option<u64>,
+    /// The navigation playlist (#6; upstream `_viv_playlist_*` globals,
+    /// viv.c:656-661). Insertion order; navigation sorts on the fly.
+    pub(crate) playlist: Playlist,
+    /// The last REQUESTED open — the navigation reference point (upstream
+    /// `_viv_current_fd`, set synchronously in `_viv_open` at request time,
+    /// viv.c:1574-1579, so it can trail what is on screen while a load is
+    /// in flight; a direct open that never got as far as `_viv_open` —
+    /// unstatable path — leaves it untouched).
+    pub(crate) nav_current: Option<PlaylistEntry>,
+    /// Whether the NEXT resolved open is the process's startup open — its
+    /// first frame resizes the window to the image (M1's image-sized
+    /// window under async startup). Set while parsing the command line's
+    /// file arguments (any of their open flavors — direct, folder home,
+    /// wildcard home); consumed by the first `request_open`, and cleared
+    /// without opening when the command line resolves to nothing.
+    pub(crate) startup_open_pending: bool,
 }
 
 /// Window state pointer stored in GWLP_USERDATA between WM_NCCREATE and
@@ -181,22 +204,41 @@ fn snapshot_status_bar(hwnd: HWND) -> HWND {
     unsafe { state_of(hwnd) }.map_or(HWND::default(), |s| s.status)
 }
 
+/// How an open request came about — whether the navigation reference
+/// (`nav_current`) follows it (upstream `_viv_open` copies `_viv_current_fd`
+/// synchronously, viv.c:1574-1579).
+enum OpenOrigin<'a> {
+    /// A direct pick (drop of one file, dialog, CLI argument): the
+    /// reference becomes a fresh id-0 entry (upstream zeroes dwReserved for
+    /// direct opens, viv.c:1375-1376).
+    Direct,
+    /// A navigation target: the reference is the entry itself, id and all
+    /// (upstream opens the playlist fd including its ids).
+    Nav(&'a PlaylistEntry),
+}
+
 /// Queue `path` for background decoding (upstream `_viv_open`'s
 /// CreateThread arm, viv.c:1569). The current display stays up until this
-/// load's first frame replies in; storing the new session supersedes
-/// (flags) any in-flight one. `is_startup` ties the one-time
-/// resize-to-image to this session's first frame.
-fn request_open(hwnd: HWND, path: &OsStr, is_startup: bool) {
+/// load's first frame replies in; storing a new session supersedes
+/// (flags) any in-flight one. The startup flag (see WindowState) ties the
+/// one-time resize-to-image to this session's first frame when this is
+/// the process's startup open.
+fn request_open(hwnd: HWND, path: &OsStr, origin: OpenOrigin<'_>) {
     // Existence check BEFORE queueing a decode (upstream
     // `_viv_open_from_filename`'s GetFileAttributesEx arm, viv.c:1359 —
     // the status bar's "File not found." is a pre-open verdict, not a
-    // decode failure, viv.c:5094-5098). The byte size rides along for the
-    // status bar's "(N KB)"; directories and unreadable files fall through
-    // to the loader as user-level failures like upstream.
-    let (not_found, file_bytes) = match std::fs::metadata(Path::new(path)) {
-        Ok(meta) => (false, Some(meta.len())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (true, None),
-        Err(_) => (false, None),
+    // decode failure, viv.c:5094-5098). The byte size and mtime ride along
+    // for the status bar and the navigation reference; directories and
+    // unreadable files fall through to the loader as user-level failures
+    // like upstream.
+    let (not_found, file_bytes, modified) = match std::fs::metadata(Path::new(path)) {
+        Ok(meta) => (
+            false,
+            Some(meta.len()),
+            Some(playlist::modified_ticks(&meta)),
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (true, None, None),
+        Err(_) => (false, None, None),
     };
     if not_found {
         // A missing file never reaches the loader (no session, no
@@ -205,10 +247,19 @@ fn request_open(hwnd: HWND, path: &OsStr, is_startup: bool) {
         // spawning a load, viv.c:5094-5098).
         // SAFETY: the borrow spans only flag stores — nothing pumps.
         if let Some(state) = unsafe { state_of(hwnd) } {
+            if let OpenOrigin::Nav(entry) = origin {
+                // Navigation opens the fd as-is — the reference follows it
+                // even when the file has vanished since the scan (upstream
+                // `_viv_open` sets current_fd without an existence check).
+                state.nav_current = Some(entry.clone());
+            }
             state.status_file_not_found = true;
             state.status_load_failed = false;
             // Supersede any in-flight load so its late replies are inert.
             state.session = None;
+            // The not-opened startup verdict must not leak the resize to a
+            // later user open.
+            state.startup_open_pending = false;
         }
         refresh_status(hwnd);
         return;
@@ -222,6 +273,19 @@ fn request_open(hwnd: HWND, path: &OsStr, is_startup: bool) {
         // (viv.c:1447-1458).
         state.status_file_not_found = false;
         state.status_load_failed = false;
+        // The navigation reference follows the request (viv.c:1574-1579) —
+        // the entry for a navigation, a fresh id-0 entry for a direct pick
+        // (mtime 0 in the unstatable corner, where upstream would not have
+        // opened at all and riviv's established #5 model proceeds to the
+        // loader).
+        state.nav_current = Some(match origin {
+            OpenOrigin::Nav(entry) => entry.clone(),
+            OpenOrigin::Direct => PlaylistEntry {
+                path: path.to_os_string(),
+                modified: modified.unwrap_or(0),
+                id: 0,
+            },
+        });
         // The byte size is STAGED, not committed: a replacement load that
         // fails before its first frame keeps the old image on screen, and
         // the status bar must keep showing the OLD file's size with it
@@ -229,10 +293,241 @@ fn request_open(hwnd: HWND, path: &OsStr, is_startup: bool) {
         // session's first frame takes the display.
         state.pending_file_bytes = file_bytes;
         let session = state.load_thread.request(hwnd, path.to_os_string());
-        if is_startup {
+        if state.startup_open_pending {
             state.startup_resize_session = Some(session.id());
         }
+        state.startup_open_pending = false;
         state.session = Some(session);
+    }
+    refresh_status(hwnd);
+}
+
+/// Upstream `_viv_open_from_filename` (viv.c:1359-1432) minus the cwd
+/// combine — every caller passes an absolute path (drops and the dialog
+/// natively; CLI arguments are absolutized at parse). Folders recurse into
+/// the playlist and home; plain files open directly. ANY attributes
+/// failure falls into the FindFirstFile arm (viv.c:1394-1428), which is
+/// also the wildcard expander — note Win32 reports a `*`/`?` path as
+/// ERROR_INVALID_NAME, not not-found, so gating on io::ErrorKind::NotFound
+/// would miss it. Returns whether the path resolved to anything
+/// (upstream's ret FALSE; callers turn it into the File-not-found status
+/// or ignore it, like the drop path).
+fn open_from_filename(hwnd: HWND, path: &OsStr) -> bool {
+    let p = Path::new(path);
+    match std::fs::metadata(p) {
+        // "add subfolders and subsubfolders..." then home (viv.c:1380-1386).
+        Ok(md) if md.is_dir() => {
+            // SAFETY: the borrow spans the playlist FS scan — read_dir and
+            // metadata never pump messages.
+            if let Some(state) = unsafe { state_of(hwnd) } {
+                playlist::add_path(&mut state.playlist, p);
+            }
+            home_open(hwnd, false);
+            true
+        }
+        Ok(_) => {
+            request_open(hwnd, path, OpenOrigin::Direct);
+            true
+        }
+        // The FindFirstFile fallback: expands wildcards (files added
+        // UNFILTERED, viv.c:1413-1417) and, for a plain missing path,
+        // matches nothing — both end with an empty playlist arm deciding
+        // the return. A matched-but-unreadable file lands in the loader as
+        // a user-level failure from there (riviv's established model).
+        Err(_) => {
+            // SAFETY: the borrow spans the expansion + unfiltered adds.
+            let found = (unsafe { state_of(hwnd) })
+                .map(|state| playlist::add_expanded(&mut state.playlist, p))
+                .unwrap_or(false);
+            if found {
+                home_open(hwnd, false);
+            }
+            found
+        }
+    }
+}
+
+/// The folder-scan entry set (upstream `_viv_next`/`_viv_home`'s
+/// FindFirstFile arm, viv.c:5999-6076/6184-6238): the valid images of ONE
+/// directory (not recursive), every entry id 0 — the scan arm has no node
+/// identity, which is why `next` must be called with `from_playlist`
+/// false on these.
+fn scan_entries(dir: &Path) -> Vec<PlaylistEntry> {
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return Vec::new(); // INVALID_HANDLE_VALUE: an empty scan
+    };
+    let mut entries = Vec::new();
+    for entry in read.flatten() {
+        // Find-data attributes and mtime, no extra syscall (see add_path).
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if metadata.is_dir() {
+            continue; // is_valid_filename's directory gate
+        }
+        let path = entry.path();
+        if playlist::is_valid_path(path.as_os_str()) {
+            entries.push(PlaylistEntry {
+                path: path.into_os_string(),
+                modified: playlist::modified_ticks(&metadata),
+                id: 0,
+            });
+        }
+    }
+    entries
+}
+
+/// The directory a folder-scan navigates: the current file's parent, or
+/// the process working directory with no current (upstream
+/// `string_get_path_part` / GetCurrentDirectory, viv.c:5999/6189-6196).
+fn scan_dir(hwnd: HWND) -> std::path::PathBuf {
+    // SAFETY: the borrow ends at the end of this statement (the path is
+    // cloned out); nothing below pumps.
+    let current =
+        (unsafe { state_of(hwnd) }).and_then(|s| s.nav_current.as_ref().map(|e| e.path.clone()));
+    match current {
+        Some(path) => Path::new(&path)
+            .parent()
+            .map(|d| d.to_path_buf())
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_default(),
+        None => std::env::current_dir().unwrap_or_default(),
+    }
+}
+
+/// Home/End (upstream `_viv_home`, viv.c:6120-6263): over the playlist,
+/// the sort extreme (current included — re-opening it is allowed); with no
+/// playlist, the folder scan of `scan_dir` — and a scan that finds
+/// NOTHING blanks the display (`_viv_blank`, viv.c:6245-6253; unreachable
+/// while the playlist is non-empty, its first node always qualifies).
+fn home_open(hwnd: HWND, end: bool) {
+    // SAFETY: the borrow ends at the end of this statement (the entry is
+    // cloned out); nothing below pumps.
+    let playlist_target = (unsafe { state_of(hwnd) }).and_then(|s| {
+        if s.playlist.is_empty() {
+            None
+        } else {
+            playlist::home(s.playlist.entries(), end).cloned()
+        }
+    });
+    if let Some(entry) = playlist_target {
+        request_open(hwnd, &entry.path, OpenOrigin::Nav(&entry));
+        return;
+    }
+    let entries = scan_entries(&scan_dir(hwnd));
+    match playlist::home(&entries, end) {
+        Some(entry) => request_open(hwnd, &entry.path, OpenOrigin::Nav(entry)),
+        None => blank_display(hwnd),
+    }
+}
+
+/// Next/Prev for the navigation keys (upstream `_viv_next`,
+/// viv.c:5817-6118): playlist arm when a playlist exists (node exclusion
+/// by id), folder-scan arm over the current file's parent otherwise, and
+/// no current at all becomes home(0) — for prev too (viv.c:6101-6104).
+/// next/prev NEVER blanks: no candidate is a no-op (viv.c:6093-6099).
+fn nav_next(hwnd: HWND, prev: bool) {
+    enum Mode {
+        Home,
+        Playlist,
+        Scan,
+    }
+    // SAFETY: the borrow ends at the end of this statement (only the mode
+    // is taken out); nothing below pumps.
+    let mode = match unsafe { state_of(hwnd) } {
+        Some(state) => match state.nav_current.as_ref() {
+            None => Mode::Home,
+            Some(_) if state.playlist.is_empty() => Mode::Scan,
+            Some(_) => Mode::Playlist,
+        },
+        None => return,
+    };
+    match mode {
+        Mode::Home => home_open(hwnd, false),
+        Mode::Playlist => {
+            // SAFETY: the borrow ends at the end of this statement (the
+            // entry is cloned out).
+            let target = (unsafe { state_of(hwnd) }).and_then(|s| {
+                playlist::next(s.playlist.entries(), s.nav_current.as_ref(), prev, true).cloned()
+            });
+            if let Some(entry) = target {
+                request_open(hwnd, &entry.path, OpenOrigin::Nav(&entry));
+            }
+        }
+        Mode::Scan => {
+            let entries = scan_entries(&scan_dir(hwnd));
+            // SAFETY: the borrow ends at the end of this statement (the
+            // entry is cloned out).
+            let current = (unsafe { state_of(hwnd) }).and_then(|s| s.nav_current.clone());
+            if let Some(entry) = playlist::next(&entries, current.as_ref(), prev, false) {
+                request_open(hwnd, &entry.path, OpenOrigin::Nav(entry));
+            }
+        }
+    }
+}
+
+/// Upstream `_viv_blank` (viv.c:7908-7930): clear the display, the
+/// navigation reference AND the playlist; the title falls back to the app
+/// name and the status bar to its idle parts. Any in-flight load is
+/// superseded (upstream `_viv_clear` stops the load thread).
+fn blank_display(hwnd: HWND) {
+    let stop_timer;
+    {
+        // SAFETY: the borrow spans only plain field stores — nothing pumps.
+        let Some(state) = (unsafe { state_of(hwnd) }) else {
+            return;
+        };
+        state.image = None;
+        state.displayed_from = None;
+        state.path = None;
+        state.playlist.clear();
+        state.nav_current = None;
+        state.displayed_file_bytes = None;
+        state.pending_file_bytes = None;
+        state.status_file_not_found = false;
+        state.status_load_failed = false;
+        state.session = None;
+        stop_timer = state.animation_timer_running;
+        state.animation_timer_running = false;
+    }
+    refresh_status(hwnd);
+    if stop_timer {
+        // SAFETY: hwnd is live; a failed kill leaves a stale timer that the
+        // WM_TIMER guard no-ops on.
+        let _ = unsafe { KillTimer(Some(hwnd), ANIMATION_TIMER_ID) };
+    }
+    // SAFETY: hwnd is live; the HSTRING outlives the call. Fail-soft like
+    // every other title update (upstream viv.c:1249 ignores it too).
+    let _ = unsafe { SetWindowTextW(hwnd, &HSTRING::from_wide(&title_wide(None))) };
+    // SAFETY: queues a WM_PAINT; never pumps messages.
+    let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+}
+
+/// Whether an auto-repeated navigation key must wait for the in-flight
+/// load (upstream viv.c:5846-5853: load thread active AND still before
+/// the streaming phase — its second disjunct is a terminate already
+/// pending, which in riviv is the atomic supersede itself and has no
+/// observable window). The first press is never blocked: it supersedes,
+/// exactly like upstream's terminate-and-chain.
+fn nav_repeat_waits_for_load(state: &WindowState) -> bool {
+    state.session.as_ref().is_some_and(|session| {
+        !(state.displayed_from == Some(session.id())
+            && state
+                .image
+                .as_ref()
+                .is_some_and(|i| i.is_animated() && i.frame_count() >= 2))
+    })
+}
+
+/// The command line's not-found verdict (upstream viv.c:5094-5098): the
+/// bar shows "File not found." over the blank window; nothing was queued,
+/// nothing loads, and the startup resize must not leak to a later open.
+fn mark_startup_not_found(hwnd: HWND) {
+    // SAFETY: the borrow spans only flag stores — nothing pumps.
+    if let Some(state) = unsafe { state_of(hwnd) } {
+        state.status_file_not_found = true;
+        state.status_load_failed = false;
+        state.startup_open_pending = false;
     }
     refresh_status(hwnd);
 }
@@ -498,39 +793,147 @@ fn open_file_dialog(hwnd: HWND, initial_dir: Option<&OsStr>) -> Option<OsString>
     Some(OsString::from_wide(&file_buf[..len]))
 }
 
-fn on_keydown(hwnd: HWND, wparam: WPARAM) {
-    // Upstream default keymap: Ctrl+O = open file (viv.c:972). The only M1 hotkey.
-    if wparam.0 != usize::from(b'O') {
+fn on_keydown(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
+    // Upstream default keymap (viv.c:970-1049): Ctrl+O = open file and
+    // Ctrl+Shift+O = add file (viv.c:975); the navigation keys are
+    // UNMODIFIED Right/PgDn (next), Left/PgUp (prev), Home/End
+    // (viv.c:1040-1045). Up/Down are slideshow rate, not navigation — they
+    // stay unwired until the slideshow work.
+    if wparam.0 == usize::from(b'O') {
+        // SAFETY: GetKeyState reads thread-local async key state; the VKs are valid.
+        let ctrl = unsafe { GetKeyState(i32::from(VK_CONTROL.0)) } < 0;
+        if ctrl {
+            // SAFETY: GetKeyState reads thread-local async key state; VK_SHIFT is valid.
+            let shift = unsafe { GetKeyState(i32::from(VK_SHIFT.0)) } < 0;
+            // SAFETY: the borrow ends at the end of this statement (the path is
+            // cloned out); the modal dialog below pumps messages but no borrow is
+            // live by then.
+            let initial_dir = (unsafe { state_of(hwnd) })
+                .and_then(|s| s.path.clone())
+                .and_then(|p| Path::new(&p).parent().map(|d| d.as_os_str().to_os_string()));
+            if let Some(path) = open_file_dialog(hwnd, initial_dir.as_deref()) {
+                // SAFETY: the borrow spans only the playlist mutation —
+                // nothing pumps.
+                if let Some(state) = unsafe { state_of(hwnd) } {
+                    if shift {
+                        // Add File appends (viv.c:2396-2402): the current
+                        // file becomes the first entry when the list is
+                        // empty, then the pick — no clear, no home, the
+                        // display stays.
+                        if state.playlist.is_empty()
+                            && let Some(current) = state.nav_current.as_ref()
+                        {
+                            let current = current.clone();
+                            state.playlist.add(current.path, current.modified);
+                        }
+                        playlist::add_filename(&mut state.playlist, Path::new(&path));
+                    } else {
+                        // Open File clears the playlist before opening
+                        // (viv.c:2390-2394) — the picked file starts fresh,
+                        // and navigation falls back to its folder.
+                        state.playlist.clear();
+                    }
+                }
+                if !shift {
+                    let _ = open_from_filename(hwnd, &path);
+                }
+            }
+            return;
+        }
         return;
     }
-    // SAFETY: GetKeyState reads thread-local async key state; VK_CONTROL is valid.
-    if unsafe { GetKeyState(i32::from(VK_CONTROL.0)) } >= 0 {
+    // The navigation keys bind with no modifiers at all — Ctrl+Left etc.
+    // are the animation frame-step commands (M2 later), so any held
+    // ctrl/shift/alt disqualifies the key.
+    // SAFETY: GetKeyState reads thread-local async key state; the VKs are valid.
+    let mods = unsafe {
+        GetKeyState(i32::from(VK_CONTROL.0)) < 0
+            || GetKeyState(i32::from(VK_SHIFT.0)) < 0
+            || GetKeyState(i32::from(VK_MENU.0)) < 0
+    };
+    if mods {
         return;
     }
-    // SAFETY: the borrow ends at the end of this statement (the path is
-    // cloned out); the modal dialog below pumps messages but no borrow is
-    // live by then.
-    let initial_dir = (unsafe { state_of(hwnd) })
-        .and_then(|s| s.path.clone())
-        .and_then(|p| Path::new(&p).parent().map(|d| d.as_os_str().to_os_string()));
-    if let Some(path) = open_file_dialog(hwnd, initial_dir.as_deref()) {
-        request_open(hwnd, &path, false);
+    // Auto-repeat (lParam bit 30, upstream viv.c:6403): a repeated
+    // next/prev waits for the in-flight load instead of stacking opens.
+    let is_repeat = (lparam.0 & 0x4000_0000) != 0;
+    let vk = wparam.0 as u16;
+    let repeat_waits = || {
+        // SAFETY: the read-only borrow ends inside is_some_and.
+        (unsafe { state_of(hwnd) }).is_some_and(|s| nav_repeat_waits_for_load(s))
+    };
+    if vk == VK_RIGHT.0 || vk == VK_NEXT.0 {
+        if is_repeat && repeat_waits() {
+            return;
+        }
+        nav_next(hwnd, false);
+    } else if vk == VK_LEFT.0 || vk == VK_PRIOR.0 {
+        if is_repeat && repeat_waits() {
+            return;
+        }
+        nav_next(hwnd, true);
+    } else if vk == VK_HOME.0 {
+        home_open(hwnd, false);
+    } else if vk == VK_END.0 {
+        home_open(hwnd, true);
     }
 }
 
+/// WM_DROPFILES (upstream viv.c:3076-3128).
 fn on_drop_files(hwnd: HWND, hdrop: HDROP) {
-    // SAFETY: `hdrop` is owned by this message; DragFinish is called exactly once
-    // on every path below.
+    // SAFETY: `hdrop` is owned by this message; DragFinish is called exactly
+    // once on every path below, and nothing here pumps messages (the FS
+    // scans and metadata reads inside the playlist helpers cannot).
     unsafe {
-        // Upstream: single file replaces the current image (viv.c:3119-3124);
-        // multi-file / shift-drop build a playlist (M2) — we take the first file.
-        if DragQueryFileW(hdrop, u32::MAX, None) > 0 {
+        // Upstream branches on shift BEFORE anything else: shift means
+        // append (`add_current_if_empty`, viv.c:3090-3094 — the current
+        // file becomes the first playlist entry with a FRESH id when the
+        // list is empty), no shift means replace (`clearall` runs even for
+        // a single dropped file, viv.c:3095-3098).
+        let is_shift = GetKeyState(i32::from(VK_SHIFT.0)) < 0;
+        // SAFETY: the borrow spans only the playlist mutation.
+        if let Some(state) = state_of(hwnd) {
+            if is_shift && state.playlist.is_empty() {
+                if let Some(current) = state.nav_current.as_ref() {
+                    let current = current.clone();
+                    state.playlist.add(current.path, current.modified);
+                }
+            } else if !is_shift {
+                state.playlist.clear();
+            }
+        }
+        let count = DragQueryFileW(hdrop, u32::MAX, None);
+        // A single unshifted drop keeps the M1 replace semantics — but the
+        // playlist was still cleared above, exactly like upstream; a
+        // dropped FOLDER still builds its playlist through
+        // `open_from_filename` (viv.c:3118-3124).
+        if count >= 2 || is_shift {
+            for i in 0..count {
+                let len = DragQueryFileW(hdrop, i, None) as usize;
+                if len == 0 || len >= 32768 {
+                    continue;
+                }
+                let mut buf = vec![0u16; len + 1];
+                if DragQueryFileW(hdrop, i, Some(&mut buf)) as usize == len {
+                    let path = OsString::from_wide(&buf[..len]);
+                    // SAFETY: the borrow spans the add's metadata read.
+                    if let Some(state) = state_of(hwnd) {
+                        playlist::add_filename(&mut state.playlist, Path::new(&path));
+                    }
+                }
+            }
+            // Only the replace flavor homes (viv.c:3113-3116); a shift-append
+            // leaves the current image up.
+            if !is_shift {
+                home_open(hwnd, false);
+            }
+        } else if count == 1 {
             let len = DragQueryFileW(hdrop, 0, None) as usize;
             if len > 0 && len < 32768 {
                 let mut buf = vec![0u16; len + 1];
                 if DragQueryFileW(hdrop, 0, Some(&mut buf)) as usize == len {
                     let path = OsString::from_wide(&buf[..len]);
-                    request_open(hwnd, &path, false);
+                    let _ = open_from_filename(hwnd, &path);
                 }
             }
         }
@@ -637,7 +1040,7 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         WM_KEYDOWN => {
-            on_keydown(hwnd, wparam);
+            on_keydown(hwnd, wparam, lparam);
             LRESULT(0)
         }
         WM_DROPFILES => {
@@ -780,7 +1183,7 @@ pub(crate) fn fatal(message: &str) -> ! {
     std::process::exit(1)
 }
 
-pub(crate) fn run(arg_path: Option<OsString>) -> Result<(), String> {
+pub(crate) fn run(args: Vec<OsString>) -> Result<(), String> {
     // The animation clock's unit, read once (constant for the process
     // lifetime). Read before any window exists: failure is fatal (ADR 0001).
     let timer_freq = qpc_frequency()?;
@@ -821,6 +1224,11 @@ pub(crate) fn run(arg_path: Option<OsString>) -> Result<(), String> {
         status_load_failed: false,
         displayed_file_bytes: None,
         pending_file_bytes: None,
+        playlist: Playlist::new(),
+        nav_current: None,
+        // The startup resize belongs to the CLI's open only; no file
+        // arguments (or none that resolve) leave the default-size window.
+        startup_open_pending: !args.is_empty(),
     };
     // SAFETY: process-wide and must run before any window exists (matches the
     // upstream manifest's dpiAware=true). ERROR_ACCESS_DENIED means the process
@@ -911,12 +1319,34 @@ pub(crate) fn run(arg_path: Option<OsString>) -> Result<(), String> {
         state.status = bar;
     }
 
-    // Kick the startup load off the UI thread: a huge argument file must
-    // not freeze the window before it is even shown (issue #4). Replies
-    // (first frame, animation frames, terminal) arrive on the kick message
-    // and drive everything from there.
-    if let Some(path) = arg_path.as_ref() {
-        request_open(hwnd, path, true);
+    // The command line's file arguments (upstream viv.c:4990-5100; main.rs
+    // has already skipped switch-shaped words and absolutized the rest):
+    // ONE argument keeps single-file semantics (a folder recurses into a
+    // playlist, a wildcard expands, a file opens directly); a SECOND
+    // argument pulls the first into the playlist too — everything added in
+    // argument order — and the first-inserted entry is what opens. When
+    // nothing resolves, the startup "File not found." verdict shows over
+    // the blank window (upstream viv.c:5090-5098).
+    if !args.is_empty() {
+        if args.len() == 1 {
+            if !open_from_filename(hwnd, &args[0]) {
+                mark_startup_not_found(hwnd);
+            }
+        } else {
+            for arg in &args {
+                // SAFETY: the borrow spans the add's metadata reads.
+                if let Some(state) = unsafe { state_of(hwnd) } {
+                    playlist::add_filename(&mut state.playlist, Path::new(arg));
+                }
+            }
+            // SAFETY: the borrow ends at the end of this statement (the
+            // entry is cloned out).
+            let first = (unsafe { state_of(hwnd) }).and_then(|s| s.playlist.first().cloned());
+            let resolved = first.is_some_and(|entry| open_from_filename(hwnd, &entry.path));
+            if !resolved {
+                mark_startup_not_found(hwnd);
+            }
+        }
     }
 
     // Honor the launcher's requested show state ("run maximized/minimized"
