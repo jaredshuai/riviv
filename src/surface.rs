@@ -27,18 +27,41 @@
 
 use std::ffi::c_void;
 use std::mem::size_of;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use windows::Win32::Foundation::GetLastError;
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleBitmap, CreateCompatibleDC,
-    CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, HALFTONE, HBITMAP, HDC,
-    HGDIOBJ, ReleaseDC, SRCCOPY, STRETCH_BLT_MODE, SelectObject, SetStretchBltMode, StretchBlt,
+    CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetCurrentObject, GetDC, HALFTONE,
+    HBITMAP, HDC, HGDIOBJ, OBJ_BITMAP, ReleaseDC, SRCCOPY, STRETCH_BLT_MODE, SelectObject,
+    SetStretchBltMode, StretchBlt,
 };
 
 use crate::mip;
 use crate::pixels::rgba8_to_bgra_in_place;
 use crate::stitch::stitch_tiles;
 use crate::zoom::BlitRect;
+
+/// Process-wide cap on live mip GDI objects (one DDB per level, plus each
+/// mip-carrying surface's paint-time scratch DC), shared by the worker's
+/// pre-generation AND the UI thread's lazy fills. Without a shared cap the
+/// lazy path would bypass the loader's worker-side gate: every displayed
+/// animation frame extends its own resident chain and a long big-frame
+/// animation could push the process past the default 10000-object GDI
+/// quota, after which even `CreateDIBSection` fails and the next open dies
+/// through FatalSystem (review PR #18, engineering F1). The loader's
+/// worker-side gate stays as a waste-avoidance early-out; THIS counter is
+/// the real bound. Transient generation DCs (created and deleted within
+/// one call) are not counted — the overshoot is at most a couple of
+/// short-lived objects and their creation failure degrades, never crashes.
+pub(crate) const MIP_GDI_OBJECT_BUDGET: usize = 1000;
+
+static LIVE_MIP_GDI_OBJECTS: AtomicUsize = AtomicUsize::new(0);
+
+/// Whether `needed` more mip objects fit under the shared budget.
+fn mip_budget_allows(needed: usize) -> bool {
+    LIVE_MIP_GDI_OBJECTS.load(Ordering::Relaxed) + needed <= MIP_GDI_OBJECT_BUDGET
+}
 
 /// One mipmap level: a screen-compatible DDB plus its dimensions
 /// (upstream `_viv_mipmap_t`, viv.c:365-373 — upstream derives sizes from
@@ -67,6 +90,7 @@ impl Drop for RawMip {
         unsafe {
             let _ = DeleteObject(HGDIOBJ(self.bitmap.0));
         };
+        LIVE_MIP_GDI_OBJECTS.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -177,8 +201,15 @@ impl DibFrame {
                     // SAFETY: the just-created level bitmap is owned by us
                     // and selected nowhere; re-selecting it as the source
                     // for the next level replaces the previous selection.
-                    unsafe {
-                        let _ = SelectObject(src_dc, HGDIOBJ(mip_level.bitmap.0));
+                    // A failed re-selection must stop the chain: the next
+                    // iteration would stretch against the DC's stale
+                    // (larger) bitmap using this level's source rect
+                    // (review PR #18 F3).
+                    // SAFETY (the SelectObject itself): src_dc is valid.
+                    let reselected = unsafe { SelectObject(src_dc, HGDIOBJ(mip_level.bitmap.0)) };
+                    if reselected.is_invalid() {
+                        self.mips.push(mip_level);
+                        break;
                     }
                     self.mips.push(mip_level);
                 }
@@ -226,6 +257,12 @@ fn generate_mip(
     dst_w: i32,
     dst_h: i32,
 ) -> Result<RawMip, String> {
+    // Shared process budget first: the DDB this creates is a live mip
+    // object until the level drops (review PR #18 F1 — lazy fills must
+    // contend with pre-generation for the same cap).
+    if !mip_budget_allows(1) {
+        return Err("mip GDI object budget exhausted".into());
+    }
     // The bitmap MUST be created against the SCREEN DC: a memory DC fresh
     // from CreateCompatibleDC has the 1x1 MONOCHROME stock bitmap selected,
     // and CreateCompatibleBitmap then yields a 1-bit mono bitmap — every
@@ -315,6 +352,7 @@ fn generate_mip(
         let _ = SelectObject(dst_dc, dst_stock);
         let _ = DeleteDC(dst_dc);
     }
+    LIVE_MIP_GDI_OBJECTS.fetch_add(1, Ordering::Relaxed);
     Ok(RawMip {
         bitmap,
         wide: dst_w,
@@ -404,10 +442,14 @@ impl Surface {
     /// inside WM_PAINT under the window-state borrow, where the fatal
     /// modal's message pump would alias `&mut` state (PR #10 P1).
     ///
-    /// Cost bound: extending to level k reads level k-1, whose width is
-    /// at most `2 * size(k) ≤ 2 * max(render edges)` — the pre-generation
-    /// viewport bound plus one step (see `mip.rs` docs) — so a UI-thread
-    /// extension is always a small-image stretch.
+    /// Cost bound: extending by one level reads the current tail, whose
+    /// width is at most twice the target level's (the pre-generation
+    /// viewport bound plus one step, see `mip.rs` docs) — a cheap stretch
+    /// WHEN the chain already starts near the target. A chain built from
+    /// empty here (the worker skipped it, or the window shrank a lot)
+    /// starts from the full-resolution frame and can take a slow
+    /// full-chain pass on the UI thread — same as upstream, which also
+    /// generates inside `_viv_get_mipmap` during paint (viv.c:14200-14258).
     pub(crate) fn ensure_mips(&mut self, image_w: i32, image_h: i32, target: u32) -> u32 {
         // 1. Extend the chain if short (and not already failed) — the
         //    early returns below must never skip step 2: a pre-generated
@@ -417,9 +459,15 @@ impl Surface {
         }
         // 2. Any level > 0 is only paintable through the scratch DC —
         //    create it lazily here, once mips are actually in play
-        //    (mip-less frames never pay for it). Failure drops the whole
-        //    chain: the frame still renders from level 0.
+        //    (mip-less frames never pay for it), under the shared object
+        //    budget. Failure drops the whole chain: the frame still
+        //    renders from level 0.
         if target > 0 && !self.mips.is_empty() && self.mip_scratch.is_invalid() {
+            if !mip_budget_allows(1) {
+                self.mips.clear();
+                self.mips_stuck = Some(1);
+                return 0;
+            }
             // SAFETY: None gives a screen-compatible DC; owned by this
             // (UI) thread for the surface's lifetime.
             let scratch = unsafe { CreateCompatibleDC(None) };
@@ -428,7 +476,16 @@ impl Surface {
                 self.mips_stuck = Some(1);
                 return 0;
             }
+            // Capture the stock bitmap NOW: `SelectObject(.., NULL)` does
+            // not restore anything (review PR #18 F2) — without a real
+            // handle, with_mip_source's deselect would leave the level
+            // selected into the DC until teardown, resting on
+            // undocumented delete-while-selected behavior.
+            // SAFETY: scratch is valid and holds its stock bitmap; the
+            // returned handle stays owned by the DC (never deleted).
+            self.mip_stock = unsafe { GetCurrentObject(scratch, OBJ_BITMAP) };
             self.mip_scratch = scratch;
+            LIVE_MIP_GDI_OBJECTS.fetch_add(1, Ordering::Relaxed);
         }
         self.mips.len().min(target as usize) as u32
     }
@@ -471,9 +528,13 @@ impl Surface {
                 let (dc, _) = temp_src.expect("created or broke above");
                 // SAFETY: `prev` is a valid owned bitmap; re-selecting it
                 // here replaces the previous level's selection (each level
-                // is source exactly once, in order).
-                unsafe {
-                    let _ = SelectObject(dc, HGDIOBJ(prev.bitmap.0));
+                // is source exactly once, in order). A failed re-selection
+                // must stop the chain — the stale selection would feed the
+                // next level a wrong-sized source (review PR #18 F3).
+                let reselected = unsafe { SelectObject(dc, HGDIOBJ(prev.bitmap.0)) };
+                if reselected.is_invalid() {
+                    self.mips_stuck = Some(level);
+                    break;
                 }
                 (dc, prev.wide, prev.high)
             };
@@ -530,12 +591,14 @@ impl Drop for Surface {
         // SAFETY: we exclusively own memdc/bitmap; restoring the old bitmap before
         // deleting the DC and letting the DibFrame delete the bitmap is the
         // documented GDI teardown order. The scratch DC (if created) is
-        // restored to its stock bitmap first for the same reason; the mip
-        // DDBs drop themselves afterwards, selected into nothing.
+        // restored to its captured stock bitmap first for the same reason;
+        // the mip DDBs drop themselves afterwards, selected into nothing
+        // (each also releasing its slot in the shared object budget).
         unsafe {
             if !self.mip_scratch.is_invalid() {
                 let _ = SelectObject(self.mip_scratch, self.mip_stock);
                 let _ = DeleteDC(self.mip_scratch);
+                LIVE_MIP_GDI_OBJECTS.fetch_sub(1, Ordering::Relaxed);
             }
             let _ = SelectObject(self.memdc, self.old_bitmap);
             let _ = DeleteDC(self.memdc);

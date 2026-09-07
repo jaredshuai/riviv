@@ -39,16 +39,16 @@ const MAX_TOTAL_FRAME_BYTES: usize = 512 * 1024 * 1024;
 /// roughly 1800 objects of headroom for the window itself.
 const MAX_FRAMES: usize = 4096;
 
-/// GDI-object budget for mipmaps ACROSS one animation's frames (the DDB
-/// per level plus the paint-time scratch DC per mip-carrying frame).
-/// MAX_FRAMES' headroom math above leaves no room for mips at the frame
-/// cap, so pre-generation is gated: long small-frame animations skip mips
-/// (they re-HALFTONE from the original at deep zoom-out — the pre-#9
-/// behavior), and the displayed frame can still lazily extend its own
-/// chain on the UI thread (`Surface::ensure_mips`, one frame's worth).
-/// Worst case total: 4096*2 base + 1000 here + ~200 window < 10000.
-const MIP_GDI_OBJECT_BUDGET: usize = 1000;
-
+/// GDI-object budget for mipmap pre-generation on the worker (the DDB per
+/// level plus the paint-time scratch DC per mip-carrying frame). This is
+/// the worker-side early-out that avoids generating levels the process
+/// cannot afford; the REAL shared bound — also covering the UI thread's
+/// lazy fills in `Surface::ensure_mips` — is the process-level counter in
+/// `surface.rs` (`MIP_GDI_OBJECT_BUDGET` there, checked inside
+/// `generate_mip` itself, review PR #18 F1). Long small-frame animations
+/// skip mips past the budget (they re-HALFTONE from the original at deep
+/// zoom-out — the pre-#9 behavior).
+///
 /// GDI objects a frame's pre-generated mip chain will hold: one DDB per
 /// level plus the paint-time scratch DC (created lazily once a frame has
 /// any level). A zero-level frame generates nothing and needs no DC.
@@ -59,7 +59,7 @@ fn mip_pregen_cost(target: u32) -> usize {
 /// Whether a frame may pre-generate `target` mips given `used` objects
 /// already committed to earlier frames of this animation.
 fn mip_pregen_allows(used: usize, target: u32) -> bool {
-    used + mip_pregen_cost(target) <= MIP_GDI_OBJECT_BUDGET
+    used + mip_pregen_cost(target) <= crate::surface::MIP_GDI_OBJECT_BUDGET
 }
 
 // ---------------------------------------------------------------------------
@@ -220,7 +220,7 @@ fn produce(
 ///
 /// `render_viewport` drives per-frame mip pre-generation (halved, like
 /// upstream's `_viv_load_render_wide/2` at viv.c:10302/10316), gated by
-/// the animation-wide GDI object budget — see [`MIP_GDI_OBJECT_BUDGET`].
+/// the animation-wide GDI object budget (see loader.rs's mip gate docs).
 fn stream_animation(
     mut frames: Frames<'_>,
     normalize_delay: fn(u32) -> u32,
@@ -1287,7 +1287,7 @@ mod mip_budget_tests {
     fn a_zero_level_frame_costs_nothing_and_is_always_allowed() {
         // No levels -> no DDBs, and the scratch DC never materializes.
         assert_eq!(mip_pregen_cost(0), 0);
-        assert!(mip_pregen_allows(MIP_GDI_OBJECT_BUDGET, 0));
+        assert!(mip_pregen_allows(crate::surface::MIP_GDI_OBJECT_BUDGET, 0));
     }
 
     #[test]
@@ -1298,16 +1298,18 @@ mod mip_budget_tests {
 
     #[test]
     fn long_animations_stop_pre_generating_once_the_budget_spends() {
-        // The F1 guard (review PR #18): a 2500-frame one-level animation
-        // must not push GDI past the 10000-object process quota. Budget
-        // 1000: the 500th frame (index 499, 998 used) still fits; the
-        // 501st (1000 used) does not.
+        // The worker-side F1 guard (review PR #18): a 2500-frame one-level
+        // animation must not PRE-GENERATE past the budget. Budget 1000: the
+        // 500th frame (index 499, 998 used) still fits; the 501st (1000
+        // used) does not. (The UI thread's lazy fills are bounded by the
+        // process-level counter in surface.rs, checked inside generate_mip
+        // itself — together the mip-side objects stay ≤ 1000 and the
+        // pregen-side base math below holds.)
         let used = 499 * mip_pregen_cost(1);
         assert!(mip_pregen_allows(used, 1));
         assert!(!mip_pregen_allows(used + mip_pregen_cost(1), 1));
-        // And the worst-case total stays under the 10k GDI quota even at
-        // the 4096-frame cap: 4096*2 base + 1000 mip-side < 10000 (a const
+        // Pre-generation math: 4096*2 base + 1000 mip-side < 10000 (a const
         // assert, so the budget constants can never drift past the quota).
-        const _: () = assert!(MAX_FRAMES * 2 + MIP_GDI_OBJECT_BUDGET < 10000);
+        const _: () = assert!(MAX_FRAMES * 2 + crate::surface::MIP_GDI_OBJECT_BUDGET < 10000);
     }
 }
