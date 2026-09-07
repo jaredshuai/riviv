@@ -1005,7 +1005,14 @@ fn request_open(hwnd: HWND, path: &OsStr, origin: OpenOrigin<'_>) {
         // SAFETY: a pure window query on the live hwnd — no pumping, safe
         // inside this borrow like the stores around it.
         let _ = unsafe { GetClientRect(hwnd, &mut client) };
-        let bar_h = status::height(state.status);
+        // The startup request can race the bar's first layout (it is
+        // created 0x0 and self-sizes) — a zero measured height would make
+        // the pre-generation viewport too tall; fall back to the same
+        // formula run() sized the initial window with (cubic, PR #18).
+        let bar_h = match status::height(state.status) {
+            0 => initial_status_height(),
+            h => h,
+        };
         let render_viewport = (
             client.right - client.left,
             (client.bottom - client.top - bar_h).max(0),
