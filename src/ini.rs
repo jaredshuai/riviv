@@ -3,10 +3,10 @@
 //! - UTF-8 with an optional BOM, skipped on read and never written.
 //! - Only the one named `[section]` exists for the reader; everything
 //!   before it, other sections, and `#`/`;` comment lines are ignored.
-//! - A section-header line that matches may carry a key on the same line
-//!   (`[riviv]x=1` reads x — the upstream scanner continues mid-line,
-//!   ini.c:109-153); a mismatching `[` line is skipped whole and ends any
-//!   previous section match.
+//! - A section-header line's remainder is DISCARDED — `[riviv]x=1` reads
+//!   nothing: upstream's match loop breaks at the `]` and falls into its
+//!   skip-to-next-line scan (ini.c:109-153 + 254-277); a mismatching `[`
+//!   line is skipped whole and ends any previous section match.
 //! - `key=value` keeps its bytes verbatim — no whitespace trimming; the
 //!   value runs to end of line.
 //! - Duplicate keys: the LAST occurrence wins (upstream sorts by key and
@@ -32,20 +32,12 @@ pub(crate) fn parse(text: &str, section: &str) -> Section {
     while let Some(line_end) = line_end(rest) {
         let (line, after) = split_line(rest, line_end);
         if let Some(after_header) = line.strip_prefix('[') {
-            // A section-header attempt always resets the match state; on a
-            // hit the remainder of the same line is still key material.
-            match after_header
+            // A section-header attempt always resets the match state; a
+            // hit leaves the rest of the line discarded (upstream breaks
+            // at the `]` and falls into the skip-to-next-line scan).
+            in_section = after_header
                 .strip_prefix(section)
-                .and_then(|t| t.strip_prefix(']'))
-            {
-                Some(remainder) => {
-                    in_section = true;
-                    if let Some((k, v)) = split_key_value(remainder) {
-                        pairs.insert(k, v);
-                    }
-                }
-                None => in_section = false,
-            }
+                .is_some_and(|t| t.starts_with(']'));
         } else if line.starts_with('#') || line.starts_with(';') {
             // Comment line — ignored wherever it appears (ini.c:156-160).
         } else if in_section && let Some((k, v)) = split_key_value(line) {
@@ -53,17 +45,10 @@ pub(crate) fn parse(text: &str, section: &str) -> Section {
         }
         rest = after;
     }
-    // The final line has no terminator; parse it too. A header that only
-    // fails to match here needs no reset — `in_section` can never be read
-    // again.
-    if let Some(after_header) = rest.strip_prefix('[')
-        && let Some(remainder) = after_header
-            .strip_prefix(section)
-            .and_then(|t| t.strip_prefix(']'))
-        && let Some((k, v)) = split_key_value(remainder)
-    {
-        pairs.insert(k, v);
-    } else if !rest.starts_with('[')
+    // The final line has no terminator; parse it too (a header line here
+    // is moot — `in_section` can never be read again, and the header's
+    // own line is discarded either way).
+    if !rest.starts_with('[')
         && !rest.starts_with('#')
         && !rest.starts_with(';')
         && in_section
@@ -194,12 +179,13 @@ mod tests {
     }
 
     #[test]
-    fn section_header_can_share_its_line_with_a_key() {
-        // The upstream scanner continues mid-line after the `]`
-        // (ini.c:123-128); a near-miss header is skipped whole.
+    fn section_header_rest_of_line_is_discarded() {
+        // The upstream match loop breaks at the `]` and skips the rest of
+        // the line (ini.c:123-128 + 254-277) — a key sharing the header
+        // line is NOT read; a near-miss header is skipped whole.
         let s = parse("[riviv]x=1\ny=2\n", "riviv");
-        assert_eq!(get(&s, "x"), Some("1"));
-        assert_eq!(get(&s, "y"), Some("2"));
+        assert_eq!(get(&s, "x"), None, "header-line remainder discarded");
+        assert_eq!(get(&s, "y"), Some("2"), "the section still opens");
         let s = parse("[riv]x=9\n[riviv]\ny=2\n", "riviv");
         assert_eq!(get(&s, "x"), None);
     }
