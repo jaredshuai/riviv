@@ -29,6 +29,8 @@ Zoom & pan (upstream preset semantics): the mouse wheel and `+`/`-` step through
 
 Fullscreen (upstream semantics): double-click or Alt+Enter toggles a borderless cover of the current monitor (Esc also leaves it) — the pre-toggle window rect (and its maximized state) is restored on exit, the status bar is hidden for the cover, and an idle cursor hides after 2 s, reappearing on any movement.
 
+Giant images (upstream semantics): panoramas ≥ 32768 px render through 512-px stitched stretches during mipmap generation (`_viv_StretchBltStitch`), and zoomed-out repaints blit from the cached mipmap level selected for the render size (`_viv_get_mipmap`), pre-generated on the decode thread against the request-time viewport and extended lazily at paint time.
+
 ## Roadmap
 
 - [x] M1 — skeleton: Win32 window + GDI rendering + static image display
@@ -37,6 +39,7 @@ Fullscreen (upstream semantics): double-click or Alt+Enter toggles a borderless 
   - [x] playlist + keyboard navigation
   - [x] zoom & pan: 16-level presets + wheel + drag + temporary 1:1
   - [x] fullscreen: double-click / Alt+Enter / Esc + idle cursor hide
+  - [x] ≥32768-px giant images: stitched mip generation + per-zoom-level mipmap cache
 - [ ] M3 — settings & custom shortcuts, Everything IPC, file associations, localization, installer
 
 ## Differences from upstream (intentional)
@@ -47,7 +50,9 @@ Fullscreen (upstream semantics): double-click or Alt+Enter toggles a borderless 
 - Default window icon for now (upstream ships its own icon).
 - Animated WebP frames shorter than 10 ms play quantized to the `USER_TIMER_MINIMUM` timer period — a two-frame 5 ms animation advances two frames per tick and can appear frozen. Upstream's primary path additionally drives a 1 ms timer-queue timer (`CreateTimerQueueTimer`, viv.c:9132-9141) for those; GIF delays are 10 ms multiples and never hit this.
 - A user-level load failure (bad path, undecodable file, decode-budget overflow) keeps the old image and title untouched — nothing seems to happen (no popup, no exit). Once a new image's first frame is already on screen, a later failure of that same load (e.g. a budget overflow mid-animation) cannot roll the old image back and clears to a blank window instead, like upstream's async FAILED handler (viv.c:2832-2840). Upstream blanks in both cases. The same family covers navigating to a file deleted after the playlist was built: riviv's pre-open check shows "File not found." (upstream would show "Failed to load image." after blanking).
-- Images with a source dimension ≥ 32768 px are not rendered until M2 (upstream stitches tiled stretches, viv.c `_viv_StretchBltStitch`); downscaled repainting of large images is not mip-cached until M2 either (upstream `_viv_get_mipmap`).
+- Mipmap-chain failures degrade to a shallower level (or the original) and keep rendering; upstream propagates a `NULL` level into not drawing the image at all (viv.c:14226→4167-4169). Mip pre-generation is also capped by a GDI-object budget per animation (upstream has no such cap — riviv's fail-loud wrap of a base-frame DC makes the 10000-object process quota a crash otherwise).
+- A giant-extent HALFTONE shrink (dest or selected level ≥ 32768 px) wraps the full-rect StretchBlt in a single simple clip region = the update paint rect intersected with the viewport. Upstream iterates the update region's rects one by one (viv.c:4262-4284); riviv's coarser clip repaints the whole visible region on every WM_PAINT instead of just the dirty rect.
+- Magnified rendering re-anchors the source sub-rect (`clip_blit`) instead of upstream's full-rect-accurate `_viv_stretch_blt`/stitched stretch — up to ±1 source pixel of sampling phase on very high zooms, and the visible region is re-stretched every paint rather than only the dirty rect's source area (inherited from the #7 zoom work).
 - The status bar is a simplified form of upstream's: it keeps the main text (Loading / File not found. / Failed to load image.), the frame counter, and the `W x H (N KB)` dimension parts, but drops upstream's PRELOAD / pixel POS / RGB parts (riviv has neither feature yet), the temp-text line (upstream's position/zoom readout is tied to the panscan/pixel-info features), and the click-to-toggle-frames-remaining behavior. The frame counter's `m` counts the *loaded* prefix and grows while an animation streams in — image frame iterators cannot report the total up front (GDI+/libwebp can).
 - No toolbar yet (upstream shows it by default) — lands in M2.
 - Embedded ICC color profiles are not applied (upstream enables GDI+ ICM); non-sRGB images may show slightly inaccurate colors.
