@@ -4,7 +4,7 @@ Unofficial Rust rewrite of [voidtools/voidImageViewer](https://github.com/voidto
 
 Based on voidImageViewer by David Carpenter / voidtools. See [LICENSE](LICENSE). The original C implementation is preserved under [`c-original/`](c-original/) as a read-only behavioral reference.
 
-> **Status: early development (M2 in progress).** Current scope: Win32 window + GDI rendering, animated GIF/WebP playback at author timing, alpha-composited transparency for every supported format (PNG, JPEG, BMP, ICO, TIFF, GIF and WebP), drag & drop, a keyboard-navigable playlist, and zoom/pan over the upstream 16-level preset curve. Settings land in M3 — see [Roadmap](#roadmap).
+> **Status: early development (M3 in progress).** Current scope: Win32 window + GDI rendering, animated GIF/WebP playback at author timing, alpha-composited transparency for every supported format (PNG, JPEG, BMP, ICO, TIFF, GIF and WebP), drag & drop, a keyboard-navigable playlist, zoom/pan over the upstream 16-level preset curve, and the settings foundation: the window rect is remembered across runs in a `[riviv]` ini with upstream's 60% first-run auto-fit. Remaining M3: localization, menu, options dialog, custom shortcuts, single instance, Everything IPC, file associations, installer — see [Roadmap](#roadmap).
 
 ## Build
 
@@ -34,17 +34,25 @@ Giant images (upstream semantics): panoramas ≥ 32768 px render through 512-px 
 ## Roadmap
 
 - [x] M1 — skeleton: Win32 window + GDI rendering + static image display
-- [ ] M2 — animated GIF/WebP, playlist, zoom/pan, background decoding
+- [x] M2 — animated GIF/WebP, playlist, zoom/pan, background decoding
   - [x] animation + transparency compositing
   - [x] playlist + keyboard navigation
   - [x] zoom & pan: 16-level presets + wheel + drag + temporary 1:1
   - [x] fullscreen: double-click / Alt+Enter / Esc + idle cursor hide
   - [x] ≥32768-px giant images: stitched mip generation + per-zoom-level mipmap cache
 - [ ] M3 — settings & custom shortcuts, Everything IPC, file associations, localization, installer
+  - [x] config foundation: `[riviv]` ini read/write + remembered window rect + 60% first-run auto-fit (#19)
+  - [ ] localization: en/zh-CN string tables + system language detection (#20)
+  - [ ] single-instance command-line forwarding (#21)
+  - [ ] Everything IPC search (#22)
+  - [ ] menu bar + command table (#23)
+  - [ ] options dialog (General/View/Controls) (#24)
+  - [ ] custom shortcuts (#25)
+  - [ ] file associations + NSIS installer (#26)
 
 ## Differences from upstream (intentional)
 
-- The window opens at the default size and resizes to the image when the startup image's first frame arrives (upstream: remembered window rect, or 60% auto-fit on first run — restored in M3 with config persistence).
+- The settings live in a `riviv.ini` with a `[riviv]` section next to the exe (or `%APPDATA%\riviv\` once switched) — upstream's `voidImageViewer.ini`; the namespaces are separate so both viewers coexist on one machine. The first run centers a 60%-of-monitor window on the cursor's monitor in that monitor's own coordinate frame, exactly like upstream (including the secondary-monitor quirk where the relative rect is re-anchored onto the window's monitor — viv.c:5383-5406); later runs restore the remembered rect/maximized state, saved on exit.
 - Images are never upscaled beyond 100% (upstream default `fill_window=0`).
 - The window never resizes when switching images via drag & drop (upstream behavior).
 - Default window icon for now (upstream ships its own icon).
@@ -54,13 +62,13 @@ Giant images (upstream semantics): panoramas ≥ 32768 px render through 512-px 
 - A giant-extent HALFTONE shrink (dest or selected level ≥ 32768 px) wraps the full-rect StretchBlt in a single simple clip region = the update paint rect intersected with the viewport. Upstream iterates the update region's rects one by one (viv.c:4262-4284); riviv's coarser clip redraws the update bounding box on every WM_PAINT instead of each exact dirty rect. Non-giant shrinks keep the #7 single full-rect blt (pixel-identical to upstream's per-rect loop, performance-only difference on complex update regions).
 - Magnified rendering re-anchors the source sub-rect (`clip_blit`) instead of upstream's full-rect-accurate `_viv_stretch_blt`/stitched stretch — up to ±1 source pixel of sampling phase on very high zooms, and the visible region is re-stretched every paint rather than only the dirty rect's source area (inherited from the #7 zoom work).
 - The status bar is a simplified form of upstream's: it keeps the main text (Loading / File not found. / Failed to load image.), the frame counter, and the `W x H (N KB)` dimension parts, but drops upstream's PRELOAD / pixel POS / RGB parts (riviv has neither feature yet), the temp-text line (upstream's position/zoom readout is tied to the panscan/pixel-info features), and the click-to-toggle-frames-remaining behavior. The frame counter's `m` counts the *loaded* prefix and grows while an animation streams in — image frame iterators cannot report the total up front (GDI+/libwebp can).
-- No toolbar yet (upstream shows it by default) — lands in M2.
+- No toolbar yet (upstream shows it by default) — not in M3's scope either; deferred.
 - Embedded ICC color profiles are not applied (upstream enables GDI+ ICM); non-sRGB images may show slightly inaccurate colors.
 - No single-instance handoff yet: a second launch opens a new window instead of forwarding its command line to the existing viewer (upstream default). Planned for M3 together with Everything IPC.
 - The cursor does not hide while idle in WINDOWED mode (upstream defaults `windowed_hide_cursor=1`, hiding it there too; riviv hides it in fullscreen only, per issue #8's scope). The fullscreen background also stays the windowed background color — upstream separates `fullscreen_background_color`.
 - The fullscreen toggle's zoom-offset is implemented but inert: both `fill_window` and `fullscreen_fill_window` are off (no config yet), so the zoom level is preserved entering/leaving fullscreen. Upstream defaults `fullscreen_fill_window=1`, which drops to the largest level that still covers the monitor on entry.
-- No menu bar yet (upstream shows File/View/Navigate by default) — planned for M2+.
-- Command-line switches are ignored (upstream parses config switches like `/sort` and shows a usage dialog for unknown ones; riviv has no config yet — M3). Switch detection matches upstream's quirk of treating dotted words like `-foo.png` as filenames; quoted switches cannot be distinguished from unquoted ones through `args_os` and are skipped either way.
+- No menu bar yet (upstream shows File/View/Navigate by default) — planned for M3 (#23).
+- Command-line switches are ignored (upstream parses config switches like `/sort` and install switches like `-install`, and shows a usage dialog for unknown ones; riviv parses neither yet — planned with #26). Switch detection matches upstream's quirk of treating dotted words like `-foo.png` as filenames; quoted switches cannot be distinguished from unquoted ones through `args_os` and are skipped either way.
 - Upstream's default-on decode-ahead (preload next image) and last-image caches are not implemented — every open, including navigation back to a just-seen image, decodes from disk.
 - Navigation always navigates by the default upstream sort (date modified, newest first). The sort-mode/ascending menu options and shuffle are M3 config work.
 - The NUMPAD panscan commands are not implemented (size/width/height steps and move/center, upstream `VIV_ID_VIEW_PANSCAN_*`): zoom/pan uses the 16-level preset curve, the wheel and left-drag only. Middle-button drag-to-scroll (upstream `_VIV_DOING_MSCROLL`) is not implemented either.
