@@ -184,9 +184,9 @@ mod tests {
         let tiles = stitch_tiles(blit(40000, 100, 40000, 100), (0, 0, 5000, 40));
         assert!(tiles.iter().all(|t| t.dx < 5000 && t.dy < 40));
         let last = tiles.last().unwrap();
-        // The last tile starts inside the clip but its run crosses the
-        // edge (GDI's DC clip bounds the actual writes, like upstream).
-        assert!(last.dx < 5000 && last.dx + last.dw > 5000 || last.dx + last.dw <= 5000);
+        // The last emitted tile starts inside the clip and its run crosses
+        // the edge (GDI's DC clip bounds the actual writes, like upstream).
+        assert!(last.dx < 5000 && last.dx + last.dw > 5000);
     }
 
     #[test]
