@@ -17,7 +17,10 @@
 //! toggles a borderless cover of the current monitor with the pre-toggle
 //! rect (and zoomed state) restored on exit; the status bar is destroyed
 //! for the cover and recreated after; and an idle cursor hides after 2 s
-//! in fullscreen, reappearing on movement (`cursor.rs`).
+//! in fullscreen, reappearing on movement (`cursor.rs`). Settings (#19):
+//! the window opens at the remembered rect (60% auto-fit on first run)
+//! and the windowed position is tracked into the config on every
+//! WM_SIZE/WM_MOVE, saved to the ini in WM_DESTROY (`config.rs`).
 
 use std::ffi::{OsStr, OsString, c_void};
 use std::mem::size_of;
@@ -29,9 +32,8 @@ use windows::Win32::Foundation::{
     WIN32_ERROR, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
-    COLOR_BTNFACE, GetMonitorInfoW, HBRUSH, InvalidateRect, MONITOR_DEFAULTTONEAREST,
-    MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint, MonitorFromWindow, PtInRect,
-    ScreenToClient,
+    COLOR_BTNFACE, GetMonitorInfoW, HBRUSH, InvalidateRect, MONITOR_DEFAULTTOPRIMARY, MONITORINFO,
+    MonitorFromPoint, MonitorFromRect, MonitorFromWindow, PtInRect, ScreenToClient, UpdateWindow,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
@@ -51,24 +53,24 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::Shell::{DragFinish, DragQueryFileW, HDROP};
 use windows::Win32::UI::WindowsAndMessaging::{
-    AdjustWindowRect, CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CreateWindowExW,
-    DefWindowProcW, DestroyWindow, DispatchMessageW, GWL_STYLE, GWLP_USERDATA, GetClientRect,
-    GetCursorPos, GetForegroundWindow, GetMessageW, GetWindowLongPtrW, GetWindowRect, HWND_TOP,
-    IDC_ARROW, IsZoomed, KillTimer, LoadCursorW, MB_ICONERROR, MINMAXINFO, MSG, MessageBoxW,
+    CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW,
+    DestroyWindow, DispatchMessageW, GWL_STYLE, GWLP_USERDATA, GetClientRect, GetCursorPos,
+    GetForegroundWindow, GetMessageW, GetWindowLongPtrW, GetWindowRect, HWND_TOP, IDC_ARROW,
+    IsIconic, IsZoomed, KillTimer, LoadCursorW, MB_ICONERROR, MINMAXINFO, MSG, MessageBoxW,
     PostQuitMessage, RegisterClassExW, SHOW_WINDOW_CMD, SW_MAXIMIZE, SW_SHOW, SW_SHOWNORMAL,
     SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOZORDER, SendMessageW,
     SetForegroundWindow, SetProcessDPIAware, SetTimer, SetWindowLongPtrW, SetWindowPos,
     SetWindowTextW, ShowCursor, ShowWindow, TranslateMessage, USER_TIMER_MINIMUM, WINDOW_EX_STYLE,
     WM_ACTIVATE, WM_DESTROY, WM_DROPFILES, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN,
-    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE,
-    WM_NCDESTROY, WM_PAINT, WM_SIZE, WM_SYSKEYDOWN, WM_TIMER, WNDCLASSEXW, WS_CAPTION,
+    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_MOVE,
+    WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_SIZE, WM_SYSKEYDOWN, WM_TIMER, WNDCLASSEXW, WS_CAPTION,
     WS_EX_ACCEPTFILES, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_THICKFRAME, WS_VISIBLE, WindowFromPoint,
 };
 use windows::core::{HSTRING, PCWSTR, w};
 
 use crate::anim::ANIMATION_TIMER_ID;
+use crate::config::Config;
 use crate::cursor::{self, CursorVisibility};
-use crate::fit::fit_shrink;
 use crate::loader::{LoadedImage, UiAction, apply_reply, map_reply_frame};
 use crate::loadthread::{LoadSession, LoadThread, REPLY_KICK_MESSAGE};
 use crate::paint::paint;
@@ -101,12 +103,10 @@ pub(crate) struct WindowState {
     /// Which load session produced the currently displayed image (`None`
     /// when blank) — the staleness guard for replies and failure handling.
     pub(crate) displayed_from: Option<u64>,
-    /// The session whose first frame resizes the window to the image
-    /// (M1's image-sized window preserved under async startup — the window
-    /// is created before anything is decoded). Tied to the session id so a
-    /// superseded or failed startup load cannot leak the resize into a
-    /// later open (image switches never resize).
-    pub(crate) startup_resize_session: Option<u64>,
+    /// The persisted settings (#19): loaded before the window exists,
+    /// updated by the position tracking in WM_SIZE/WM_MOVE, saved in
+    /// WM_DESTROY on the way out.
+    pub(crate) config: Config,
     /// Whether the animation timer is currently running — edge bookkeeping
     /// so timer reconciliation never resets a live timer's period (which
     /// would starve WM_TIMER under fast frame streams).
@@ -139,13 +139,6 @@ pub(crate) struct WindowState {
     /// in flight; a direct open that never got as far as `_viv_open` —
     /// unstatable path — leaves it untouched).
     pub(crate) nav_current: Option<PlaylistEntry>,
-    /// Whether the NEXT resolved open is the process's startup open — its
-    /// first frame resizes the window to the image (M1's image-sized
-    /// window under async startup). Set while parsing the command line's
-    /// file arguments (any of their open flavors — direct, folder home,
-    /// wildcard home); consumed by the first `request_open`, and cleared
-    /// without opening when the command line resolves to nothing.
-    pub(crate) startup_open_pending: bool,
     /// Zoom/pan view of the displayed image (#7; upstream's
     /// `_viv_zoom_pos`/`_viv_view_*` globals, viv.c:677-683). Reset on
     /// every display swap and blank, exactly where upstream runs
@@ -960,9 +953,6 @@ fn request_open(hwnd: HWND, path: &OsStr, origin: OpenOrigin<'_>) {
             state.status_load_failed = false;
             // Supersede any in-flight load so its late replies are inert.
             state.session = None;
-            // The not-opened startup verdict must not leak the resize to a
-            // later user open.
-            state.startup_open_pending = false;
         }
         refresh_status(hwnd);
         return;
@@ -1020,10 +1010,6 @@ fn request_open(hwnd: HWND, path: &OsStr, origin: OpenOrigin<'_>) {
         let session = state
             .load_thread
             .request(hwnd, path.to_os_string(), render_viewport);
-        if state.startup_open_pending {
-            state.startup_resize_session = Some(session.id());
-        }
-        state.startup_open_pending = false;
         state.session = Some(session);
     }
     refresh_status(hwnd);
@@ -1199,8 +1185,7 @@ fn nav_next(hwnd: HWND, prev: bool) {
 /// load thread). The failure flags are NOT reset — upstream's
 /// `_viv_clear`/`_viv_blank` leave `_viv_file_not_found`/`_viv_load_failed`
 /// alone (viv.c:1268-1293), so a stale verdict survives the blank until the
-/// next open resets it (viv.c:1447-1458). An unresolved startup open also
-/// dies here: it must not leak the startup resize into a later user open.
+/// next open resets it (viv.c:1447-1458).
 fn blank_display(hwnd: HWND) {
     let stop_timer;
     {
@@ -1216,7 +1201,6 @@ fn blank_display(hwnd: HWND) {
         state.displayed_file_bytes = None;
         state.pending_file_bytes = None;
         state.session = None;
-        state.startup_open_pending = false;
         // The zoom/pan view dies with the display (upstream `_viv_blank` →
         // `_viv_clear`, viv.c:7910 + 1282-1288).
         state.view.reset();
@@ -1258,13 +1242,12 @@ fn nav_repeat_waits_for_load(state: &WindowState) -> bool {
 
 /// The command line's not-found verdict (upstream viv.c:5094-5098): the
 /// bar shows "File not found." over the blank window; nothing was queued,
-/// nothing loads, and the startup resize must not leak to a later open.
+/// nothing loads.
 fn mark_startup_not_found(hwnd: HWND) {
     // SAFETY: the borrow spans only flag stores — nothing pumps.
     if let Some(state) = unsafe { state_of(hwnd) } {
         state.status_file_not_found = true;
         state.status_load_failed = false;
-        state.startup_open_pending = false;
     }
     refresh_status(hwnd);
 }
@@ -1284,8 +1267,6 @@ fn on_load_replies(hwnd: HWND) {
     let stop_timer;
     let mut invalidate = false;
     let mut title: Option<HSTRING> = None;
-    let mut resize_to_image = false;
-    let mut resize_rect: Option<RECT> = None;
     {
         // Copy the session facts out first so the immutable borrow ends
         // before the reply loop mutates the display state.
@@ -1311,7 +1292,6 @@ fn on_load_replies(hwnd: HWND) {
                 &mut state.image,
                 &mut state.displayed_from,
                 session_id,
-                &mut state.startup_resize_session,
                 now,
                 state.timer_freq,
                 reply,
@@ -1353,11 +1333,6 @@ fn on_load_replies(hwnd: HWND) {
                             state.displayed_file_bytes = None;
                         }
                     }
-                    // Deferred to after the drain: a later reply in the same
-                    // batch (mid-stream failure) may clear the image again —
-                    // sizing the window to an image that is no longer shown
-                    // would be nonsense.
-                    UiAction::ResizeWindowToImage => resize_to_image = true,
                 }
             }
             if fatal_msg.is_some() {
@@ -1374,24 +1349,8 @@ fn on_load_replies(hwnd: HWND) {
         start_timer = want_timer && !state.animation_timer_running;
         stop_timer = !want_timer && state.animation_timer_running;
         state.animation_timer_running = want_timer;
-        if resize_to_image && state.image.is_some() {
-            // The startup load's first frame sizes the window to the image
-            // (M1 behavior under async startup) — but NOT while fullscreen:
-            // this resize is riviv's own deviation (upstream never resizes
-            // on load), and shrinking the borderless monitor cover to an
-            // image-sized rect would visibly break it (cubic PR #16 P1).
-            // Skipping is safe: the pending flag is consumed either way.
-            if !state.fullscreen {
-                // A geometry failure is fatal exactly like run()'s initial
-                // rect.
-                match initial_window_rect(state.image.as_ref(), status::height(state.status)) {
-                    Ok(rect) => resize_rect = Some(rect),
-                    Err(msg) => fatal_msg = Some(msg),
-                }
-            }
-        }
     }
-    // Borrow dropped — the modal paths and the reentrant resize are safe.
+    // Borrow dropped — the modal path below is safe.
     refresh_status(hwnd);
     // The display may have adopted an image (the hide-cursor conditions
     // just became satisfiable) — reconcile (upstream
@@ -1412,31 +1371,6 @@ fn on_load_replies(hwnd: HWND) {
         // upstream viv.c:9144 (unchecked SetTimer): a failed timer merely
         // freezes the animation.
         let _ = unsafe { SetTimer(Some(hwnd), ANIMATION_TIMER_ID, USER_TIMER_MINIMUM, None) };
-    }
-    if let Some(rect) = resize_rect {
-        // SAFETY: hwnd is live. SetWindowPos synchronously reenters wnd_proc
-        // with WM_WINDOWPOSCHANGING/WM_SIZE — DefWindowProcW territory (we
-        // handle neither), and no state borrow is live out here.
-        // SWP_NOZORDER | SWP_NOACTIVATE: resize/move only, like the initial
-        // create.
-        let placed = unsafe {
-            SetWindowPos(
-                hwnd,
-                None,
-                rect.left,
-                rect.top,
-                rect.right - rect.left,
-                rect.bottom - rect.top,
-                SWP_NOZORDER | SWP_NOACTIVATE,
-            )
-        };
-        if let Err(e) = placed {
-            // System-level (ADR 0001): this is the one-time startup resize
-            // of a live window — a silent failure would strand the window
-            // at the default size with no retry path. Fail loud instead of
-            // discarding the error.
-            fatal(&format!("SetWindowPos failed: {e}"));
-        }
     }
     if let Some(title) = title.as_ref() {
         // SAFETY: hwnd is live; the HSTRING outlives the call. Fail-soft on
@@ -1754,6 +1688,32 @@ fn on_drop_files(hwnd: HWND, hdrop: HDROP) {
 }
 
 fn on_size(hwnd: HWND) {
+    // Upstream `_viv_on_size`'s first act (viv.c:1583-1615): track the
+    // windowed rect for the config. Never iconic, never fullscreen; a
+    // maximized window only flips the flag so the normal rect survives
+    // for the restore (WM_MOVE below skips maximized, keeping x/y).
+    // SAFETY: read-only iconic query on the live window.
+    let iconic = unsafe { IsIconic(hwnd) }.as_bool();
+    if !iconic
+        // SAFETY: the borrow spans only the config field writes and the
+        // rect read; nothing pumps messages.
+        && let Some(state) = unsafe { state_of(hwnd) }
+        && !state.fullscreen
+    {
+        // Under the !IsIconic guard, upstream's `_viv_is_window_maximized`
+        // (viv.c:9637-9657) reduces to IsZoomed.
+        // SAFETY: read-only zoomed query on the live window.
+        let is_maximized = unsafe { IsZoomed(hwnd) }.as_bool();
+        state.config.maximized = i32::from(is_maximized);
+        if !is_maximized {
+            let mut rect = RECT::default();
+            // SAFETY: read-only rect query; fail-soft like upstream's
+            // unchecked GetWindowRect (viv.c:1606).
+            let _ = unsafe { GetWindowRect(hwnd, &mut rect) };
+            state.config.wide = rect.right - rect.left;
+            state.config.high = rect.bottom - rect.top;
+        }
+    }
     // SAFETY: two sequential borrows, never nested — the first only copies
     // the snapshot, the second reads the bar handle.
     let snapshot = unsafe { state_of(hwnd) }.map(|s| status_snapshot(s, hwnd));
@@ -1861,6 +1821,31 @@ unsafe extern "system" fn wnd_proc(
             on_size(hwnd);
             LRESULT(0)
         }
+        WM_MOVE => {
+            // Track the windowed position for the config (viv.c:3955-3972):
+            // never iconic, never maximized (the restore placement comes
+            // from the normal rect tracked in WM_SIZE), never fullscreen
+            // (the monitor cover is not a window position).
+            // SAFETY: read-only iconic query on the live window.
+            let iconic = unsafe { IsIconic(hwnd) }.as_bool();
+            // SAFETY: read-only zoomed query on the live window.
+            let zoomed = unsafe { IsZoomed(hwnd) }.as_bool();
+            if !iconic
+                && !zoomed
+                // SAFETY: the borrow spans only the config field writes and
+                // the rect read; nothing pumps messages.
+                && let Some(state) = unsafe { state_of(hwnd) }
+                && !state.fullscreen
+            {
+                let mut rect = RECT::default();
+                // SAFETY: read-only rect query; fail-soft like upstream's
+                // unchecked GetWindowRect (viv.c:3965).
+                let _ = unsafe { GetWindowRect(hwnd, &mut rect) };
+                state.config.x = rect.left;
+                state.config.y = rect.top;
+            }
+            LRESULT(0)
+        }
         WM_GETMINMAXINFO => {
             // SAFETY: lparam points to a MINMAXINFO for the duration of the message.
             let mmi = unsafe { &mut *(lparam.0 as *mut MINMAXINFO) };
@@ -1949,6 +1934,16 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         WM_DESTROY => {
+            // Settings go to disk on the way out (upstream `_viv_exit`'s
+            // config_save_settings, viv.c:2577-2580; riviv saves at window
+            // destruction — every normal exit path funnels here). The
+            // window-position tracking in WM_SIZE/WM_MOVE has kept the
+            // config current; save only does file I/O, no messages, so the
+            // borrow is safe. Failures are logged inside, not fatal.
+            // SAFETY: the borrow spans only the save's file I/O.
+            if let Some(state) = unsafe { state_of(hwnd) } {
+                state.config.save();
+            }
             // SAFETY: legal on the owning thread while quitting the message loop.
             unsafe { PostQuitMessage(0) };
             LRESULT(0)
@@ -1959,84 +1954,156 @@ unsafe extern "system" fn wnd_proc(
     }
 }
 
-/// Outer window rect: client = image size shrunk to fit the work area of
-/// the monitor under the cursor (upstream centers on the cursor's monitor,
-/// viv.c:5359-5387); no image -> 60% auto-fit with a 640x480 floor.
-/// `status_h` is the status bar's height, added back so the IMAGE keeps
-/// its fitted size above the bar (upstream adds `_viv_get_status_high()`
-/// when computing the window rect from the desired client, viv.c:2148).
-fn initial_window_rect(image: Option<&LoadedImage>, status_h: i32) -> Result<RECT, String> {
-    // SAFETY: read-only monitor/geometry queries; AdjustWindowRect only computes.
-    unsafe {
-        let mut cursor = POINT::default();
-        // Fail loud: a zero cursor point would silently center on whichever
-        // monitor is nearest (0,0) instead of the user's (ADR 0001).
-        GetCursorPos(&mut cursor).map_err(|e| format!("GetCursorPos failed: {e}"))?;
-        let monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
-        let mut mi = MONITORINFO {
-            cbSize: size_of::<MONITORINFO>() as u32,
-            ..Default::default()
-        };
-        if !GetMonitorInfoW(monitor, &mut mi).as_bool() {
-            // Already inside this function's outer unsafe block.
-            let gle = GetLastError().0;
-            return Err(format!("GetMonitorInfoW failed (GLE={gle})"));
+/// The startup window rect (viv.c:5354-5387): the remembered config rect,
+/// or on first run (wide/high == 0) the auto-fit share of the cursor
+/// monitor's FULL rect (`rcMonitor`, not the work area — the os_ wrapper's
+/// flag is 1 there), centered — in MONITOR-RELATIVE coordinates, an
+/// upstream quirk preserved verbatim: the monitor origin is never added
+/// (viv.c:5383-5386 computes `width/2 - wide/2` without the origin), so on
+/// a secondary monitor the rect lands near the primary's origin and
+/// `make_rect_completely_visible` re-anchors it (a net no-op there — the
+/// window really does open on the primary's analogous spot). The div=0
+/// fallback is the 640x480 default (viv.c:5367-5368).
+fn initial_window_rect(config: &Config) -> Result<RECT, String> {
+    let mut rect = RECT {
+        left: config.x,
+        top: config.y,
+        right: config.x + config.wide,
+        bottom: config.y + config.high,
+    };
+    if config.wide == 0 || config.high == 0 {
+        // SAFETY: read-only cursor + monitor queries.
+        unsafe {
+            let mut cursor = POINT::default();
+            // Fail loud: a zero cursor point would silently center on
+            // whichever monitor is nearest (0,0) instead of the user's
+            // (ADR 0001).
+            GetCursorPos(&mut cursor).map_err(|e| format!("GetCursorPos failed: {e}"))?;
+            let monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTOPRIMARY);
+            let mut mi = MONITORINFO {
+                cbSize: size_of::<MONITORINFO>() as u32,
+                ..Default::default()
+            };
+            let _ = GetMonitorInfoW(monitor, &mut mi);
+            let full = mi.rcMonitor;
+            rect = first_run_window_rect(
+                full,
+                config.auto_fit_wide_mul,
+                config.auto_fit_wide_div,
+                config.auto_fit_high_mul,
+                config.auto_fit_high_div,
+            );
         }
-        let work = mi.rcWork;
-        // Reserve the non-client frame up front so a full-height fit cannot push
-        // the outer window past the work area (portrait images used to clip
-        // under the taskbar). AdjustWindowRect on a zero rect yields the frame
-        // extents; with WS_OVERLAPPEDWINDOW and no menu they are size-independent.
-        let mut frame = RECT {
-            left: 0,
-            top: 0,
-            right: 0,
-            bottom: 0,
-        };
-        AdjustWindowRect(&mut frame, WS_OVERLAPPEDWINDOW, false)
-            .map_err(|e| format!("AdjustWindowRect failed: {e}"))?;
-        let avail_w = (work.right - work.left - (frame.right - frame.left)).max(1);
-        let avail_h = (work.bottom - work.top - (frame.bottom - frame.top) - status_h).max(1);
-        let (cw, ch) = match image {
-            // Window = image size (upstream Alt+2 semantics); the remembered-rect /
-            // 60%-first-run model returns with M3 config persistence.
-            Some(img) => fit_shrink(img.width(), img.height(), avail_w, avail_h),
-            None => (
-                // floor 640x480, but never beyond the available client area
-                // (clamp would panic when min > max on tiny screens/VMs).
-                ((work.right - work.left) * 3 / 5).max(640).min(avail_w),
-                ((work.bottom - work.top) * 3 / 5).max(480).min(avail_h),
-            ),
-        };
-        let mut rc = RECT {
-            left: 0,
-            top: 0,
-            right: cw,
-            // The image fits above the status bar; the bar's height rides
-            // on top of the fitted client (viv.c:2148/2155).
-            bottom: ch + status_h,
-        };
-        AdjustWindowRect(&mut rc, WS_OVERLAPPEDWINDOW, false)
-            .map_err(|e| format!("AdjustWindowRect failed: {e}"))?;
-        let wide = rc.right - rc.left;
-        let high = rc.bottom - rc.top;
-        let x = work.left + ((work.right - work.left) - wide).max(0) / 2;
-        let y = work.top + ((work.bottom - work.top) - high).max(0) / 2;
-        Ok(RECT {
-            left: x,
-            top: y,
-            right: x + wide,
-            bottom: y + high,
-        })
+    }
+    Ok(rect)
+}
+
+/// The first-run centered rect (viv.c:5361-5387) — pure. 60% of the
+/// monitor by default, 640x480 when a div is 0, in the monitor's own
+/// coordinate frame (see `initial_window_rect` for the no-origin quirk).
+fn first_run_window_rect(
+    monitor: RECT,
+    wide_mul: i32,
+    wide_div: i32,
+    high_mul: i32,
+    high_div: i32,
+) -> RECT {
+    let mut wide = 640;
+    let mut high = 480;
+    let mw = monitor.right - monitor.left;
+    let mh = monitor.bottom - monitor.top;
+    if wide_div != 0 {
+        wide = (mw * wide_mul) / wide_div;
+    }
+    if high_div != 0 {
+        high = (mh * high_mul) / high_div;
+    }
+    RECT {
+        left: (mw / 2) - (wide / 2),
+        top: (mh / 2) - (high / 2),
+        right: ((mw / 2) - (wide / 2)) + wide,
+        bottom: ((mh / 2) - (high / 2)) + high,
     }
 }
 
+/// Pull a startup rect onto a visible monitor (os.c:193-248, the shell
+/// gathering the two WORK-area rects — the os_ wrappers' flag 0 — before
+/// the pure core runs). The rect is re-anchored from ITS monitor onto the
+/// WINDOW's monitor, then clamped fully into view.
+fn make_rect_completely_visible(hwnd: HWND, rect: &mut RECT) {
+    // SAFETY: read-only monitor queries; both DEFAULTTOPRIMARY handles are
+    // never null, and GetMonitorInfo's failure leaves a zeroed rect exactly
+    // like upstream's unchecked call (os.c:202-203).
+    unsafe {
+        let mon_of_window = work_area(MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY));
+        let mon_of_rect = work_area(MonitorFromRect(rect, MONITOR_DEFAULTTOPRIMARY));
+        *rect = make_rect_completely_visible_core(*rect, mon_of_window, mon_of_rect);
+    }
+}
+
+/// SAFETY contract helper: fills a MONITORINFO's work area for a live
+/// monitor handle.
+///
+/// # Safety
+///
+/// `monitor` must be a valid HMONITOR (the DEFAULTTOPRIMARY flag above
+/// guarantees non-null).
+unsafe fn work_area(monitor: windows::Win32::Graphics::Gdi::HMONITOR) -> RECT {
+    let mut mi = MONITORINFO {
+        cbSize: size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: `monitor` is live per the fn's safety contract; `mi` is a
+    // valid out-struct for the call, and the unchecked return matches
+    // upstream (a failure leaves the zeroed work rect).
+    unsafe {
+        let _ = GetMonitorInfoW(monitor, &mut mi);
+    }
+    mi.rcWork
+}
+
+/// The os.c:193-248 re-anchor + clamp, pure: offset the rect from its own
+/// monitor's frame into the target monitor's frame, cap the size to the
+/// target, then push each side that sticks out back in.
+fn make_rect_completely_visible_core(rect: RECT, target: RECT, source: RECT) -> RECT {
+    let dx = target.left - source.left;
+    let dy = target.top - source.top;
+    let mut r = RECT {
+        left: rect.left + dx,
+        top: rect.top + dy,
+        right: rect.right + dx,
+        bottom: rect.bottom + dy,
+    };
+    let mut wide = r.right - r.left;
+    let mut high = r.bottom - r.top;
+    let tw = target.right - target.left;
+    let th = target.bottom - target.top;
+    wide = wide.min(tw);
+    high = high.min(th);
+    if r.right > target.right {
+        r.left = target.right - wide;
+        r.right = target.right;
+    }
+    if r.bottom > target.bottom {
+        r.top = target.bottom - high;
+        r.bottom = target.bottom;
+    }
+    if r.left < target.left {
+        r.left = target.left;
+        r.right = target.left + wide;
+    }
+    if r.top < target.top {
+        r.top = target.top;
+        r.bottom = target.top + high;
+    }
+    r
+}
+
 /// The status bar's height before its window exists (used only for the
-/// initial rect at startup — the live bar is measured via
-/// `status::height` afterwards). comctl32 sizes a status bar from the
-/// system status font and border metrics; we reproduce that formula
-/// (border * 2 + font height) at the system DPI so the first window rect
-/// already accounts for the bar.
+/// startup load's pre-generation viewport fallback — the live bar is
+/// measured via `status::height` afterwards). comctl32 sizes a status bar
+/// from the system status font and border metrics; we reproduce that
+/// formula (border * 2 + font height) at the system DPI.
 fn initial_status_height() -> i32 {
     // SAFETY: desktop DC queries on the calling thread.
     unsafe {
@@ -2068,6 +2135,22 @@ pub(crate) fn fatal(message: &str) -> ! {
 }
 
 pub(crate) fn run(args: Vec<OsString>) -> Result<(), String> {
+    // SAFETY: process-wide and must run before ANY DPI-sensitive query —
+    // a GetMonitorInfo/GetCursorPos-scale call while still unaware LOCKS
+    // the process into DPI virtualization and later SetProcessDPIAware
+    // calls fail with ERROR_ACCESS_DENIED (the config work's first-run
+    // rect queries monitors, so this leads everything; upstream gets the
+    // same guarantee from its manifest's dpiAware=true). ERROR_ACCESS_DENIED
+    // means the process is already DPI-aware — a success state; any other
+    // failure undermines the whole 1:1 / work-area geometry model, so fail
+    // loud (ADR 0001).
+    if !unsafe { SetProcessDPIAware() }.as_bool() {
+        // SAFETY: reading the thread's last error immediately after the failed call.
+        let gle = unsafe { GetLastError().0 };
+        if gle != ERROR_ACCESS_DENIED.0 {
+            return Err(format!("SetProcessDPIAware failed (GLE={gle})"));
+        }
+    }
     // The animation clock's unit, read once (constant for the process
     // lifetime). Read before any window exists: failure is fatal (ADR 0001).
     let timer_freq = qpc_frequency()?;
@@ -2087,6 +2170,12 @@ pub(crate) fn run(args: Vec<OsString>) -> Result<(), String> {
     // requested (at most one decode is ever active — see `loadthread.rs`).
     // A spawn failure is system-level: fail loud (ADR 0001) via run's Err.
     let load_thread = LoadThread::start()?;
+    // The settings, loaded before the window exists so the remembered
+    // rect drives creation (upstream config_load_settings before
+    // RegisterClassEx, viv.c:5261-5262 → 5354), and the startup rect
+    // computed from them while `config` is still owned here.
+    let config = Config::load();
+    let mut rect = initial_window_rect(&config)?;
     let state = WindowState {
         image: None,
         path: None,
@@ -2094,12 +2183,7 @@ pub(crate) fn run(args: Vec<OsString>) -> Result<(), String> {
         load_thread,
         session: None,
         displayed_from: None,
-        // Bound to the startup session's id when it is queued below: its
-        // first frame resizes the window to the image (M1's image-sized
-        // window, preserved under async startup — the window must exist
-        // before decoding starts); a superseded or failed startup load
-        // cannot leak the resize into a later open.
-        startup_resize_session: None,
+        config,
         animation_timer_running: false,
         // The status bar is created in WM_NCCREATE (the window handle must
         // exist first) and written into the state there.
@@ -2110,9 +2194,6 @@ pub(crate) fn run(args: Vec<OsString>) -> Result<(), String> {
         pending_file_bytes: None,
         playlist: Playlist::new(),
         nav_current: None,
-        // The startup resize belongs to the CLI's open only; no file
-        // arguments (or none that resolve) leave the default-size window.
-        startup_open_pending: !args.is_empty(),
         view: View::new(),
         drag: None,
         fullscreen: false,
@@ -2125,18 +2206,6 @@ pub(crate) fn run(args: Vec<OsString>) -> Result<(), String> {
         last_cursor_pt: POINT { x: -1, y: -1 },
         prevent_deactivate_show: false,
     };
-    // SAFETY: process-wide and must run before any window exists (matches the
-    // upstream manifest's dpiAware=true). ERROR_ACCESS_DENIED means the process
-    // is already DPI-aware (e.g. a manifest got embedded later) — that is a
-    // success state; any other failure undermines the whole 1:1 / work-area
-    // geometry model, so fail loud (ADR 0001).
-    if !unsafe { SetProcessDPIAware() }.as_bool() {
-        // SAFETY: reading the thread's last error immediately after the failed call.
-        let gle = unsafe { GetLastError().0 };
-        if gle != ERROR_ACCESS_DENIED.0 {
-            return Err(format!("SetProcessDPIAware failed (GLE={gle})"));
-        }
-    }
 
     // SAFETY: returns the module handle of this exe; no side effects.
     let hinstance =
@@ -2164,13 +2233,7 @@ pub(crate) fn run(args: Vec<OsString>) -> Result<(), String> {
         return Err(format!("RegisterClassExW failed (GLE={gle})"));
     }
 
-    // The status bar does not exist yet (created below, after the main
-    // window) — its height is the standard common-control height at the
-    // system DPI (upstream reads the live window; the formula matches
-    // comctl32's own: border + 3/2 of the system status font's line
-    // height).
-    let status_h = initial_status_height();
-    let rect = initial_window_rect(None, status_h)?;
+    // The startup window rect (kept from the load above — viv.c:5354-5387).
     let title = HSTRING::from_wide(&title_wide(None));
     let state_ptr = Box::into_raw(Box::new(state));
 
@@ -2214,6 +2277,62 @@ pub(crate) fn run(args: Vec<OsString>) -> Result<(), String> {
         state.status = bar;
     }
 
+    // Pull the startup rect fully onto a visible monitor and re-seat the
+    // window (upstream viv.c:5404-5406, right after creation): a
+    // remembered rect can sit off-screen after a monitor layout change,
+    // and the first-run rect is monitor-relative (see
+    // `initial_window_rect`). Fail-soft like upstream's unchecked
+    // SetWindowPos there — the window is live either way.
+    make_rect_completely_visible(hwnd, &mut rect);
+    // SAFETY: hwnd is live. SetWindowPos synchronously reenters wnd_proc
+    // with WM_MOVE/WM_SIZE — both handlers take their own borrows, none is
+    // live out here.
+    if let Err(e) = unsafe {
+        SetWindowPos(
+            hwnd,
+            None,
+            rect.left,
+            rect.top,
+            rect.right - rect.left,
+            rect.bottom - rect.top,
+            SWP_NOZORDER | SWP_NOACTIVATE,
+        )
+    } {
+        eprintln!("startup SetWindowPos failed: {e}");
+    }
+
+    // The launcher's requested show state ("run maximized/minimized"
+    // shortcuts) and the remembered maximized flag, in upstream order
+    // (viv.c:5426-5451): anything non-normal shows FIRST, then the
+    // remembered SW_MAXIMIZE, then the command line, then SW_SHOW for the
+    // normal case. riviv has no nCmdShow (no WinMain), so the no-flag
+    // default is SW_SHOW — behaviorally the SHOWNORMAL arm upstream.
+    let mut si = STARTUPINFOW {
+        cb: size_of::<STARTUPINFOW>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: fills this process's STARTUPINFOW; a read-only query.
+    unsafe { GetStartupInfoW(&mut si) };
+    let show_cmd = if (si.dwFlags & STARTF_USESHOWWINDOW).0 != 0 {
+        SHOW_WINDOW_CMD(i32::from(si.wShowWindow))
+    } else {
+        SW_SHOW
+    };
+    if show_cmd != SW_SHOWNORMAL {
+        // SAFETY: hwnd is live; show per the launcher's request.
+        let _ = unsafe { ShowWindow(hwnd, show_cmd) };
+        // SAFETY: hwnd is live; paints now like upstream's UpdateWindow.
+        let _ = unsafe { UpdateWindow(hwnd) };
+    }
+    // The remembered maximized state (config_maximized, saved off before
+    // the normal-window show could overwrite it — viv.c:5264-5266).
+    // SAFETY: the borrow spans only the flag read.
+    let show_maximized = (unsafe { state_of(hwnd) }).is_some_and(|s| s.config.maximized != 0);
+    if show_maximized {
+        // SAFETY: hwnd is live.
+        let _ = unsafe { ShowWindow(hwnd, SW_MAXIMIZE) };
+    }
+
     // The command line's file arguments (upstream viv.c:4990-5100; main.rs
     // has already skipped switch-shaped words and absolutized the rest):
     // ONE argument keeps single-file semantics (a folder recurses into a
@@ -2244,22 +2363,14 @@ pub(crate) fn run(args: Vec<OsString>) -> Result<(), String> {
         }
     }
 
-    // Honor the launcher's requested show state ("run maximized/minimized"
-    // shortcuts) like upstream viv.c:5424-5451; SW_SHOW is the default when
-    // the launcher did not ask for anything specific.
-    let mut si = STARTUPINFOW {
-        cb: size_of::<STARTUPINFOW>() as u32,
-        ..Default::default()
-    };
-    // SAFETY: fills this process's STARTUPINFOW; a read-only query.
-    unsafe { GetStartupInfoW(&mut si) };
-    let show_cmd = if (si.dwFlags & STARTF_USESHOWWINDOW).0 != 0 {
-        SHOW_WINDOW_CMD(i32::from(si.wShowWindow))
-    } else {
-        SW_SHOW
-    };
-    // SAFETY: hwnd is live; show per the launcher's request.
-    let _ = unsafe { ShowWindow(hwnd, show_cmd) };
+    // If we did not show the window above, make sure it is shown now
+    // (upstream viv.c:5444-5451).
+    if show_cmd == SW_SHOWNORMAL {
+        // SAFETY: hwnd is live.
+        let _ = unsafe { ShowWindow(hwnd, SW_SHOW) };
+        // SAFETY: hwnd is live.
+        let _ = unsafe { UpdateWindow(hwnd) };
+    }
 
     // Populate the status bar (parts + initial texts) now that the window
     // has its final rect — the first WM_SIZE fired during creation, before
@@ -2290,4 +2401,135 @@ pub(crate) fn run(args: Vec<OsString>) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn first_run_is_three_fifths_of_the_monitor_centered_in_its_frame() {
+        // 1920x1080 primary at the origin: 60% = 1152x648, centered in
+        // the FULL monitor rect (rcMonitor, taskbar included — the os_
+        // wrapper's flag 1) — and in the monitor's own frame: the origin
+        // is never added (viv.c:5383-5386, the no-origin quirk).
+        let r = first_run_window_rect(
+            RECT {
+                left: 0,
+                top: 0,
+                right: 1920,
+                bottom: 1080,
+            },
+            3,
+            5,
+            3,
+            5,
+        );
+        assert_eq!((r.right - r.left, r.bottom - r.top), (1152, 648));
+        assert_eq!((r.left, r.top), ((1920 - 1152) / 2, (1080 - 648) / 2));
+
+        // A secondary monitor keeps its own relative frame too — verbatim
+        // upstream, which would land this rect near the primary's origin
+        // (see initial_window_rect's doc).
+        let r = first_run_window_rect(
+            RECT {
+                left: 1920,
+                top: 0,
+                right: 3840,
+                bottom: 1080,
+            },
+            3,
+            5,
+            3,
+            5,
+        );
+        assert_eq!((r.left, r.top), (384, 216), "origin never added");
+
+        // div = 0 falls back to 640x480 (viv.c:5367-5368).
+        let r = first_run_window_rect(
+            RECT {
+                left: 0,
+                top: 0,
+                right: 1920,
+                bottom: 1080,
+            },
+            3,
+            0,
+            3,
+            0,
+        );
+        assert_eq!((r.right - r.left, r.bottom - r.top), (640, 480));
+    }
+
+    #[test]
+    fn make_visible_reanchors_between_monitors_and_pushes_each_side_in() {
+        let target = RECT {
+            left: 0,
+            top: 0,
+            right: 1000,
+            bottom: 800,
+        };
+        // Source monitor elsewhere: the rect's position within its own
+        // monitor is preserved onto the target monitor (os.c:205-206).
+        let source = RECT {
+            left: 2000,
+            top: 100,
+            right: 3000,
+            bottom: 900,
+        };
+        let r = make_rect_completely_visible_core(
+            RECT {
+                left: 2100,
+                top: 200,
+                right: 2500,
+                bottom: 600,
+            },
+            target,
+            source,
+        );
+        assert_eq!(
+            r,
+            RECT {
+                left: 100,
+                top: 100,
+                right: 500,
+                bottom: 500
+            }
+        );
+
+        // Sticking out on every side gets pushed fully into view, and an
+        // oversized rect is capped to the monitor (os.c:212-233).
+        let r = make_rect_completely_visible_core(
+            RECT {
+                left: -500,
+                top: -500,
+                right: 2000,
+                bottom: 2000,
+            },
+            target,
+            source,
+        );
+        assert_eq!(r, target);
+
+        // Already-visible rect: only the re-anchor applies.
+        let r = make_rect_completely_visible_core(
+            RECT {
+                left: 2100,
+                top: 200,
+                right: 2300,
+                bottom: 400,
+            },
+            source,
+            source,
+        );
+        assert_eq!(
+            r,
+            RECT {
+                left: 2100,
+                top: 200,
+                right: 2300,
+                bottom: 400
+            }
+        );
+    }
 }

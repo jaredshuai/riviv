@@ -547,8 +547,6 @@ pub(crate) enum UiAction {
     Invalidate,
     /// Adopt the session's path (window title + Ctrl+O initial dir).
     SetWindowTitle,
-    /// Resize the window to the fitted image (startup first frame).
-    ResizeWindowToImage,
 }
 
 #[derive(Default, Debug)]
@@ -578,11 +576,6 @@ pub(crate) struct ReplyOutcome {
 /// `displayed_from` tracks which session produced the currently displayed
 /// image, so replies from a superseded or failed load are inert.
 ///
-/// `startup_resize_session` is the session the startup resize belongs to —
-/// only THAT session's first frame consumes it, so a startup load that is
-/// superseded or fails pre-first-frame cannot make a later open resize
-/// the window.
-///
 /// `now` is the QPC reading taken before any state borrow (the caller's
 /// fatal path must not run across a borrow — PR #10 P1); `freq` is the
 /// same QPC frequency, needed to judge whether a late second frame
@@ -591,7 +584,6 @@ pub(crate) fn apply_reply<F>(
     image: &mut Option<LoadedImage<F>>,
     displayed_from: &mut Option<u64>,
     session_id: u64,
-    startup_resize_session: &mut Option<u64>,
     now: u64,
     freq: u64,
     reply: LoadReply<F>,
@@ -605,13 +597,8 @@ pub(crate) fn apply_reply<F>(
             // handler only ever drains the newest session's queue.
             *image = Some(LoadedImage::first_frame(frame, delay_ms, now));
             *displayed_from = Some(session_id);
-            let mut actions = vec![UiAction::Invalidate, UiAction::SetWindowTitle];
-            if *startup_resize_session == Some(session_id) {
-                *startup_resize_session = None;
-                actions.push(UiAction::ResizeWindowToImage);
-            }
             ReplyOutcome {
-                actions,
+                actions: vec![UiAction::Invalidate, UiAction::SetWindowTitle],
                 ..Default::default()
             }
         }
@@ -712,16 +699,7 @@ mod tests {
         let mut image = Some(Img::first_frame(7, 100, 0));
         image.as_mut().unwrap().push_frame(8, 100); // old image animated
         let mut displayed_from = Some(99);
-        let mut resize_session = None;
-        let out = apply_reply(
-            &mut image,
-            &mut displayed_from,
-            1,
-            &mut resize_session,
-            0,
-            FREQ,
-            frame(1),
-        );
+        let out = apply_reply(&mut image, &mut displayed_from, 1, 0, FREQ, frame(1));
         assert_eq!(
             out.actions,
             vec![UiAction::Invalidate, UiAction::SetWindowTitle]
@@ -733,78 +711,16 @@ mod tests {
     }
 
     #[test]
-    fn the_startup_resize_belongs_to_its_session_only() {
-        let mut image = None;
-        let mut displayed_from = None;
-        let mut resize_session = Some(1);
-        let out = apply_reply(
-            &mut image,
-            &mut displayed_from,
-            1,
-            &mut resize_session,
-            0,
-            FREQ,
-            frame(1),
-        );
-        assert!(out.actions.contains(&UiAction::ResizeWindowToImage));
-        assert_eq!(resize_session, None, "consumed with the action");
-        // A later first frame (another open) must not resize again.
-        let out = apply_reply(
-            &mut image,
-            &mut displayed_from,
-            2,
-            &mut resize_session,
-            10,
-            FREQ,
-            frame(2),
-        );
-        assert!(!out.actions.contains(&UiAction::ResizeWindowToImage));
-
-        // A startup load superseded before its first frame: the pending
-        // resize belongs to the dead session, so the superseding open's
-        // first frame must not consume it (image switches never resize).
-        let mut resize_session = Some(5);
-        let out = apply_reply(
-            &mut image,
-            &mut displayed_from,
-            6,
-            &mut resize_session,
-            20,
-            FREQ,
-            frame(3),
-        );
-        assert!(!out.actions.contains(&UiAction::ResizeWindowToImage));
-        assert_eq!(resize_session, Some(5), "not consumed by another session");
-    }
-
-    #[test]
     fn the_second_frame_arriving_early_keeps_the_first_frame_anchor() {
         let mut image = None;
         let mut displayed_from = None;
-        let mut resize_session = None;
-        apply_reply(
-            &mut image,
-            &mut displayed_from,
-            1,
-            &mut resize_session,
-            0,
-            FREQ,
-            frame(1),
-        );
+        apply_reply(&mut image, &mut displayed_from, 1, 0, FREQ, frame(1));
         // Frame 2 arrives at t=80, before frame 1's 100 ms delay expires:
         // playback must advance on schedule at t=100, not restart the
         // clock at the arrival (upstream runs the timer from the first
         // frame; the stall branch only discards time once the edge is
         // actually reached, viv.c:3233-3240).
-        let out = apply_reply(
-            &mut image,
-            &mut displayed_from,
-            1,
-            &mut resize_session,
-            80,
-            FREQ,
-            additional(2),
-        );
+        let out = apply_reply(&mut image, &mut displayed_from, 1, 80, FREQ, additional(2));
         assert_eq!(out.actions, Vec::<UiAction>::new());
         let mut img = image.unwrap();
         assert!(img.is_animated());
@@ -818,16 +734,7 @@ mod tests {
     fn the_second_frame_arriving_late_reanchors_to_the_arrival() {
         let mut image = None;
         let mut displayed_from = None;
-        let mut resize_session = None;
-        apply_reply(
-            &mut image,
-            &mut displayed_from,
-            1,
-            &mut resize_session,
-            0,
-            FREQ,
-            frame(1),
-        );
+        apply_reply(&mut image, &mut displayed_from, 1, 0, FREQ, frame(1));
         // Frame 2 arrives 5 s after frame 1's display: playback had long
         // reached the loaded edge with no timer running (a one-frame prefix
         // is static), so the anchor resets to the arrival — the decode gap
@@ -839,7 +746,6 @@ mod tests {
             &mut image,
             &mut displayed_from,
             1,
-            &mut resize_session,
             5_000,
             FREQ,
             additional(2),
@@ -864,31 +770,13 @@ mod tests {
         // edge instead of stalling forever.
         let mut image = None;
         let mut displayed_from = None;
-        let mut resize_session = None;
-        apply_reply(
-            &mut image,
-            &mut displayed_from,
-            1,
-            &mut resize_session,
-            0,
-            FREQ,
-            frame(1),
-        );
-        apply_reply(
-            &mut image,
-            &mut displayed_from,
-            1,
-            &mut resize_session,
-            100,
-            FREQ,
-            additional(2),
-        );
+        apply_reply(&mut image, &mut displayed_from, 1, 0, FREQ, frame(1));
+        apply_reply(&mut image, &mut displayed_from, 1, 100, FREQ, additional(2));
         // Session 2 superseded session 1 and failed pre-first-frame.
         apply_reply(
             &mut image,
             &mut displayed_from,
             2,
-            &mut resize_session,
             150,
             FREQ,
             Reply::FailedUser("bad file".into()),
@@ -906,37 +794,12 @@ mod tests {
     fn frames_beyond_the_second_do_not_disturb_the_running_timeline() {
         let mut image = None;
         let mut displayed_from = None;
-        let mut resize_session = None;
-        apply_reply(
-            &mut image,
-            &mut displayed_from,
-            1,
-            &mut resize_session,
-            0,
-            FREQ,
-            frame(1),
-        );
-        apply_reply(
-            &mut image,
-            &mut displayed_from,
-            1,
-            &mut resize_session,
-            100,
-            FREQ,
-            additional(2),
-        );
+        apply_reply(&mut image, &mut displayed_from, 1, 0, FREQ, frame(1));
+        apply_reply(&mut image, &mut displayed_from, 1, 100, FREQ, additional(2));
         // Frame 3 arrives 100 ms later, mid-playback: the anchor stays at
         // the first frame — 350 ms of elapsed playback crosses the delays
         // of frames 1 and 2 (100 + 100) and stops at frame 3's.
-        apply_reply(
-            &mut image,
-            &mut displayed_from,
-            1,
-            &mut resize_session,
-            200,
-            FREQ,
-            additional(3),
-        );
+        apply_reply(&mut image, &mut displayed_from, 1, 200, FREQ, additional(3));
         let mut img = image.unwrap();
         assert!(img.advance_on_timer(350, FREQ));
         assert_eq!(*img.surface(), 3);
@@ -946,20 +809,11 @@ mod tests {
     fn stale_session_frames_are_dropped_without_touching_the_display() {
         let mut image = Some(Img::first_frame(1, 100, 0));
         let mut displayed_from = Some(1);
-        let mut resize_session = None;
         // A frame from any session other than the one that produced the
         // display is dropped. Per-session queues make this unreachable in
         // practice (the handler drains one queue in delivery order); the
         // guard pins the protocol against future plumbing changes.
-        let out = apply_reply(
-            &mut image,
-            &mut displayed_from,
-            2,
-            &mut resize_session,
-            10,
-            FREQ,
-            additional(2),
-        );
+        let out = apply_reply(&mut image, &mut displayed_from, 2, 10, FREQ, additional(2));
         assert_eq!(out.actions, Vec::<UiAction>::new());
         assert_eq!(displayed_from, Some(1));
         assert!(!image.as_ref().unwrap().is_animated(), "frame dropped");
@@ -969,25 +823,8 @@ mod tests {
     fn completion_unlocks_wrapping_at_the_loaded_edge() {
         let mut image = None;
         let mut displayed_from = None;
-        let mut resize_session = None;
-        apply_reply(
-            &mut image,
-            &mut displayed_from,
-            1,
-            &mut resize_session,
-            0,
-            FREQ,
-            frame(1),
-        );
-        apply_reply(
-            &mut image,
-            &mut displayed_from,
-            1,
-            &mut resize_session,
-            0,
-            FREQ,
-            additional(2),
-        );
+        apply_reply(&mut image, &mut displayed_from, 1, 0, FREQ, frame(1));
+        apply_reply(&mut image, &mut displayed_from, 1, 0, FREQ, additional(2));
         let img = image.as_mut().unwrap();
         assert!(img.advance_on_timer(100, FREQ));
         assert_eq!(*img.surface(), 2);
@@ -1009,29 +846,12 @@ mod tests {
         // its Complete, one reply later).
         let mut image = None;
         let mut displayed_from = None;
-        let mut resize_session = None;
-        let out = apply_reply(
-            &mut image,
-            &mut displayed_from,
-            1,
-            &mut resize_session,
-            0,
-            FREQ,
-            frame(1),
-        );
+        let out = apply_reply(&mut image, &mut displayed_from, 1, 0, FREQ, frame(1));
         assert!(!out.load_ended, "the first frame is not the stream's end");
         assert!(!out.load_failed);
 
         // Mid-stream replies keep Loading up.
-        let out = apply_reply(
-            &mut image,
-            &mut displayed_from,
-            1,
-            &mut resize_session,
-            5,
-            FREQ,
-            additional(2),
-        );
+        let out = apply_reply(&mut image, &mut displayed_from, 1, 5, FREQ, additional(2));
         assert!(!out.load_ended);
         assert!(!out.load_failed);
 
@@ -1039,7 +859,6 @@ mod tests {
             &mut image,
             &mut displayed_from,
             1,
-            &mut resize_session,
             10,
             FREQ,
             Reply::Complete,
@@ -1051,7 +870,6 @@ mod tests {
             &mut image,
             &mut displayed_from,
             1,
-            &mut resize_session,
             20,
             FREQ,
             Reply::FailedUser("bad file".into()),
@@ -1063,7 +881,6 @@ mod tests {
             &mut image,
             &mut displayed_from,
             1,
-            &mut resize_session,
             30,
             FREQ,
             Reply::FatalSystem("GDI gone".into()),
@@ -1090,12 +907,10 @@ mod tests {
     fn user_failure_before_our_first_frame_keeps_the_old_display() {
         let mut image = Some(Img::first_frame(1, 100, 0));
         let mut displayed_from = Some(7); // displayed image from another load
-        let mut resize_session = None;
         let out = apply_reply(
             &mut image,
             &mut displayed_from,
             1,
-            &mut resize_session,
             10,
             FREQ,
             Reply::FailedUser("bad file".into()),
@@ -1111,7 +926,6 @@ mod tests {
             &mut image,
             &mut displayed_from,
             1,
-            &mut resize_session,
             10,
             FREQ,
             Reply::FailedUser("bad file".into()),
@@ -1125,21 +939,11 @@ mod tests {
         // Static partial (first frame only).
         let mut image = None;
         let mut displayed_from = None;
-        let mut resize_session = None;
-        apply_reply(
-            &mut image,
-            &mut displayed_from,
-            1,
-            &mut resize_session,
-            0,
-            FREQ,
-            frame(1),
-        );
+        apply_reply(&mut image, &mut displayed_from, 1, 0, FREQ, frame(1));
         let out = apply_reply(
             &mut image,
             &mut displayed_from,
             1,
-            &mut resize_session,
             10,
             FREQ,
             Reply::FailedUser("over budget".into()),
@@ -1155,29 +959,12 @@ mod tests {
         // from the cleared image state).
         let mut image = None;
         let mut displayed_from = None;
-        apply_reply(
-            &mut image,
-            &mut displayed_from,
-            1,
-            &mut resize_session,
-            0,
-            FREQ,
-            frame(1),
-        );
-        apply_reply(
-            &mut image,
-            &mut displayed_from,
-            1,
-            &mut resize_session,
-            0,
-            FREQ,
-            additional(2),
-        );
+        apply_reply(&mut image, &mut displayed_from, 1, 0, FREQ, frame(1));
+        apply_reply(&mut image, &mut displayed_from, 1, 0, FREQ, additional(2));
         let out = apply_reply(
             &mut image,
             &mut displayed_from,
             1,
-            &mut resize_session,
             10,
             FREQ,
             Reply::FailedUser("over budget".into()),
@@ -1193,12 +980,10 @@ mod tests {
     fn system_failure_is_surfaced_for_the_ui_thread_to_fail_loud() {
         let mut image = None;
         let mut displayed_from = None;
-        let mut resize_session = None;
         let out = apply_reply(
             &mut image,
             &mut displayed_from,
             1,
-            &mut resize_session,
             0,
             FREQ,
             Reply::FatalSystem("CreateDIBSection failed".into()),
@@ -1211,35 +996,10 @@ mod tests {
     fn complete_for_a_stale_session_leaves_the_displayed_stream_open() {
         let mut image = None;
         let mut displayed_from = None;
-        let mut resize_session = None;
-        apply_reply(
-            &mut image,
-            &mut displayed_from,
-            1,
-            &mut resize_session,
-            0,
-            FREQ,
-            frame(1),
-        );
-        apply_reply(
-            &mut image,
-            &mut displayed_from,
-            1,
-            &mut resize_session,
-            0,
-            FREQ,
-            additional(2),
-        );
+        apply_reply(&mut image, &mut displayed_from, 1, 0, FREQ, frame(1));
+        apply_reply(&mut image, &mut displayed_from, 1, 0, FREQ, additional(2));
         // Session 2's Complete must not freeze session 1's frame set.
-        apply_reply(
-            &mut image,
-            &mut displayed_from,
-            2,
-            &mut resize_session,
-            0,
-            FREQ,
-            Reply::Complete,
-        );
+        apply_reply(&mut image, &mut displayed_from, 2, 0, FREQ, Reply::Complete);
         let mut img = image.unwrap();
         img.advance_on_timer(100, FREQ);
         // Still open at the edge: holds instead of wrapping.
