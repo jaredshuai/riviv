@@ -10,16 +10,26 @@
 //! pixels are resolved against the windowed background at decode time, so
 //! this path blits opaque pixels only.
 //!
-//! M2 seams left: the 32768-px stitch path and mipmap selection (#9).
+//! #9: the source is the mipmap level selected for the render size
+//! (upstream `_viv_get_mipmap` at viv.c:4167 — the chain extends lazily,
+//! then all three arms measure against the LEVEL's size, not the
+//! original's). The ≥32768 stitch itself lives in mip generation
+//! (`surface.rs` via `stitch.rs`); paint only meets giant extents on the
+//! HALFTONE shrink path, where upstream keeps ONE full-rect StretchBlt
+//! behind a simple clip region (viv.c:4264-4283) — cutting the rect would
+//! realign the filter taps (viv.c:4253-4257).
 
 use windows::Win32::Foundation::{COLORREF, GetLastError, HWND, RECT};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, BitBlt, COLORONCOLOR, CreateSolidBrush, DeleteObject, EndPaint, FillRect, HALFTONE,
-    HGDIOBJ, PAINTSTRUCT, SRCCOPY, SetBrushOrgEx, SetStretchBltMode, StretchBlt,
+    BeginPaint, BitBlt, COLORONCOLOR, CreateRectRgn, CreateSolidBrush, DeleteObject, ERROR,
+    EndPaint, FillRect, HALFTONE, HGDIOBJ, PAINTSTRUCT, SRCCOPY, SelectClipRgn, SetBrushOrgEx,
+    SetStretchBltMode, StretchBlt,
 };
 use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 
+use crate::mip;
 use crate::pixels::WINDOWED_BACKGROUND_RGB;
+use crate::stitch::STRETCH_EXTENT_LIMIT;
 use crate::window::{fatal, state_of};
 use crate::zoom::Viewport;
 
@@ -61,12 +71,14 @@ pub(crate) fn paint(hwnd: HWND) {
         // SAFETY (for state_of, nested in this fn's outer unsafe block): the
         // borrow lives only across the GDI draw calls below — none pump
         // messages, so no second `state_of` borrow can be taken while this
-        // one is live.
+        // one is live. The mip chain extension inside (ensure_mips) is
+        // degrade-not-fatal by design for the same reason: the fatal modal
+        // pumps messages and would alias this borrow (PR #10 P1).
         let mut img = (0, 0, 0, 0); // degenerate: the strips cover everything
         if let Some(state) = state_of(hwnd)
-            && let Some(image) = state.image.as_ref()
+            && let Some(image) = state.image.as_mut()
         {
-            let surface = image.surface();
+            let surface = image.surface_mut();
             let (sw, sh) = (surface.width(), surface.height());
             // The zoom/pan view decides the destination rect (upstream
             // `_viv_get_render_size` + `rx = wide/2 - rw/2 - _viv_view_x`,
@@ -78,79 +90,137 @@ pub(crate) fn paint(hwnd: HWND) {
             let dy = client.top + ch / 2 - rh / 2 - state.view.view_y;
             img = (dx, dy, rw, rh);
             if rw > 0 && rh > 0 {
-                if rw == sw && rh == sh {
-                    // Pixel-exact 1:1 — BitBlt, no resampling (upstream's
-                    // equal-size arm, viv.c:4164-4173).
-                    let _ = BitBlt(hdc, dx, dy, rw, rh, Some(surface.memdc()), 0, 0, SRCCOPY);
-                } else if rw < sw || rh < sh {
-                    // Upstream shrink path: HALFTONE + brush-org
-                    // realignment anchored to the destination image
-                    // (viv.c:4205-4209 uses -rx,-ry) so the dither
-                    // pattern does not drift as the image moves. The full
-                    // rect is stretched on purpose: GDI honors the DC clip
-                    // for shrinks (viv.c:4056-4062), and cutting the rect
-                    // would realign the HALFTONE filter taps.
-                    let _ = SetStretchBltMode(hdc, HALFTONE);
-                    let _ = SetBrushOrgEx(hdc, -dx, -dy, None);
-                    // Fail-soft by design: upstream viv.c:4278 also continues
-                    // past a failed StretchBlt (debug_printf only) — one bad
-                    // frame must not kill the window. M2 adds a debug-log
-                    // channel to surface GLE.
-                    let _ = StretchBlt(
-                        hdc,
-                        dx,
-                        dy,
-                        rw,
-                        rh,
-                        Some(surface.memdc()),
-                        0,
-                        0,
-                        sw,
-                        sh,
-                        SRCCOPY,
-                    );
-                } else {
-                    // Upstream magnify default: COLORONCOLOR
-                    // (`config_mag_filter`, config.c:42), clipped to the
-                    // viewport with the cut mapped back to source coords —
-                    // GDI walks the whole dest extent of a StretchBlt no
-                    // matter the clip region (viv.c:4056-4062), so an
-                    // unclipped 16x blit stretches a rect tens of thousands
-                    // of pixels wide on every paint (upstream's tiled
-                    // stretch exists for exactly this, viv.c:14929-14936).
-                    let _ = SetStretchBltMode(hdc, COLORONCOLOR);
-                    let whole = crate::zoom::BlitRect {
-                        dx,
-                        dy,
-                        dw: rw,
-                        dh: rh,
-                        sx: 0,
-                        sy: 0,
-                        sw,
-                        sh,
-                    };
-                    if let Some(b) = crate::zoom::clip_blit(
-                        whole,
-                        client.left,
-                        client.top,
-                        Viewport { wide: cw, high: ch },
-                    ) {
-                        // Fail-soft like the shrink path (viv.c:4278).
-                        let _ = StretchBlt(
-                            hdc,
-                            b.dx,
-                            b.dy,
-                            b.dw,
-                            b.dh,
-                            Some(surface.memdc()),
-                            b.sx,
-                            b.sy,
-                            b.sw,
-                            b.sh,
-                            SRCCOPY,
-                        );
+                // Mip selection by render size (upstream viv.c:4167): extend
+                // the frame's chain to the selected level on demand, then
+                // paint from the level that is actually usable — a truncated
+                // chain degrades to a shallower source, never a blank image.
+                let target = mip::select_mip_level(sw, sh, rw, rh);
+                let level = surface.ensure_mips(sw, sh, target);
+                surface.with_mip_source(level, |src_dc, mw, mh| {
+                    if rw == mw && rh == mh {
+                        // Pixel-exact 1:1 — BitBlt, no resampling (upstream's
+                        // equal-size arm, viv.c:4164-4173; plain BitBlt even
+                        // for huge extents, GDI clips).
+                        let _ = BitBlt(hdc, dx, dy, rw, rh, Some(src_dc), 0, 0, SRCCOPY);
+                    } else if rw < mw || rh < mh {
+                        // Upstream shrink path: HALFTONE + brush-org
+                        // realignment anchored to the destination image
+                        // (viv.c:4205-4209 uses -rx,-ry) so the dither
+                        // pattern does not drift as the image moves.
+                        let _ = SetStretchBltMode(hdc, HALFTONE);
+                        let _ = SetBrushOrgEx(hdc, -dx, -dy, None);
+                        if mw >= STRETCH_EXTENT_LIMIT
+                            || mh >= STRETCH_EXTENT_LIMIT
+                            || rw >= STRETCH_EXTENT_LIMIT
+                            || rh >= STRETCH_EXTENT_LIMIT
+                        {
+                            // Giant extents (a mid-zoom shrink whose selected
+                            // level is still ≥32768): one full-rect StretchBlt
+                            // behind a simple clip region — upstream's
+                            // halftone pattern (viv.c:4264-4283). The rect
+                            // must NOT be cut (filter alignment), and GDI
+                            // walks a complex clip region slowly, so the DC
+                            // gets a single-rect region instead: the update
+                            // paint rect intersected with the viewport.
+                            let l = ps.rcPaint.left.max(client.left);
+                            let t = ps.rcPaint.top.max(client.top);
+                            let r = ps.rcPaint.right.min(client.right);
+                            let b = ps.rcPaint.bottom.min(client.bottom);
+                            if r > l && b > t {
+                                let clip_rgn = CreateRectRgn(l, t, r, b);
+                                if !clip_rgn.is_invalid() {
+                                    // Upstream blits only when the clip took
+                                    // (SelectClipRgn != ERROR, viv.c:4271) and
+                                    // always restores the region afterwards
+                                    // (viv.c:4361) — the reset below runs on
+                                    // every path out of this block so the
+                                    // letterbox fill is never clipped away.
+                                    if SelectClipRgn(hdc, Some(clip_rgn)).0 != ERROR {
+                                        let _ = StretchBlt(
+                                            hdc,
+                                            dx,
+                                            dy,
+                                            rw,
+                                            rh,
+                                            Some(src_dc),
+                                            0,
+                                            0,
+                                            mw,
+                                            mh,
+                                            SRCCOPY,
+                                        );
+                                    }
+                                    SelectClipRgn(hdc, None);
+                                    let _ = DeleteObject(HGDIOBJ(clip_rgn.0));
+                                }
+                            }
+                        } else {
+                            // Fail-soft by design: upstream viv.c:4278 also
+                            // continues past a failed StretchBlt (debug_printf
+                            // only) — one bad frame must not kill the window.
+                            // The full rect is stretched on purpose: GDI
+                            // honors the DC clip for shrinks (viv.c:4056-4062),
+                            // and cutting the rect would realign the HALFTONE
+                            // filter taps.
+                            let _ = StretchBlt(
+                                hdc,
+                                dx,
+                                dy,
+                                rw,
+                                rh,
+                                Some(src_dc),
+                                0,
+                                0,
+                                mw,
+                                mh,
+                                SRCCOPY,
+                            );
+                        }
+                    } else {
+                        // Upstream magnify default: COLORONCOLOR
+                        // (`config_mag_filter`, config.c:42), clipped to the
+                        // viewport with the cut mapped back to source coords —
+                        // GDI walks the whole dest extent of a StretchBlt no
+                        // matter the clip region (viv.c:4056-4062), so an
+                        // unclipped 16x blit stretches a rect tens of
+                        // thousands of pixels wide on every paint (upstream's
+                        // tiled stretch exists for exactly this,
+                        // viv.c:14929-14936). After the cut both extents stay
+                        // viewport-bounded, so no stitching here.
+                        let _ = SetStretchBltMode(hdc, COLORONCOLOR);
+                        let whole = crate::zoom::BlitRect {
+                            dx,
+                            dy,
+                            dw: rw,
+                            dh: rh,
+                            sx: 0,
+                            sy: 0,
+                            sw: mw,
+                            sh: mh,
+                        };
+                        if let Some(b) = crate::zoom::clip_blit(
+                            whole,
+                            client.left,
+                            client.top,
+                            Viewport { wide: cw, high: ch },
+                        ) {
+                            // Fail-soft like the shrink path (viv.c:4278).
+                            let _ = StretchBlt(
+                                hdc,
+                                b.dx,
+                                b.dy,
+                                b.dw,
+                                b.dh,
+                                Some(src_dc),
+                                b.sx,
+                                b.sy,
+                                b.sw,
+                                b.sh,
+                                SRCCOPY,
+                            );
+                        }
                     }
-                }
+                });
             }
         }
         // The letterbox fill, AFTER the blit and excluding its rect —

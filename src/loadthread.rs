@@ -62,8 +62,12 @@ unsafe impl Send for SendHwnd {}
 
 /// One queued decode request; crossing the channel requires `Send`
 /// (DibFrame and the Arcs are, HWND via the wrapper above).
+/// `render_viewport` is the request-time render area (client minus the
+/// status bar) driving mip pre-generation — upstream stashes the same pair
+/// in `_viv_load_render_wide/high` at request time (viv.c:1557-1558).
 struct Job {
     path: OsString,
+    render_viewport: (i32, i32),
     hwnd: SendHwnd,
     terminate: Arc<AtomicBool>,
     queue: Arc<Mutex<VecDeque<LoadReply<DibFrame>>>>,
@@ -95,7 +99,14 @@ impl LoadThread {
     /// Queue `path` for decoding and return the session that owns its
     /// replies. The old session (if any) must be dropped by the caller —
     /// its Drop flags the job, and the worker skips it at the next check.
-    pub(crate) fn request(&self, hwnd: HWND, path: OsString) -> LoadSession {
+    /// `render_viewport` is the request-time render area (client minus the
+    /// status bar, upstream viv.c:1557-1558).
+    pub(crate) fn request(
+        &self,
+        hwnd: HWND,
+        path: OsString,
+        render_viewport: (i32, i32),
+    ) -> LoadSession {
         let id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
         let terminate = Arc::new(AtomicBool::new(false));
         let queue = Arc::new(Mutex::new(VecDeque::new()));
@@ -104,6 +115,7 @@ impl LoadThread {
         let worker_path = path.clone();
         let job = Job {
             path: worker_path,
+            render_viewport,
             hwnd: SendHwnd(hwnd),
             terminate: Arc::clone(&terminate),
             queue: Arc::clone(&queue),
@@ -141,6 +153,7 @@ fn worker(receiver: Receiver<Job>) {
     while let Ok(job) = receiver.recv() {
         let Job {
             path,
+            render_viewport,
             hwnd: SendHwnd(hwnd),
             terminate,
             queue,
@@ -182,7 +195,7 @@ fn worker(receiver: Receiver<Job>) {
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
         };
-        decode_to_sink(&path, &terminate, &mut sink);
+        decode_to_sink(&path, render_viewport, &terminate, &mut sink);
     }
 }
 
