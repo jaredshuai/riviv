@@ -39,6 +39,29 @@ const MAX_TOTAL_FRAME_BYTES: usize = 512 * 1024 * 1024;
 /// roughly 1800 objects of headroom for the window itself.
 const MAX_FRAMES: usize = 4096;
 
+/// GDI-object budget for mipmaps ACROSS one animation's frames (the DDB
+/// per level plus the paint-time scratch DC per mip-carrying frame).
+/// MAX_FRAMES' headroom math above leaves no room for mips at the frame
+/// cap, so pre-generation is gated: long small-frame animations skip mips
+/// (they re-HALFTONE from the original at deep zoom-out — the pre-#9
+/// behavior), and the displayed frame can still lazily extend its own
+/// chain on the UI thread (`Surface::ensure_mips`, one frame's worth).
+/// Worst case total: 4096*2 base + 1000 here + ~200 window < 10000.
+const MIP_GDI_OBJECT_BUDGET: usize = 1000;
+
+/// GDI objects a frame's pre-generated mip chain will hold: one DDB per
+/// level plus the paint-time scratch DC (created lazily once a frame has
+/// any level). A zero-level frame generates nothing and needs no DC.
+fn mip_pregen_cost(target: u32) -> usize {
+    if target == 0 { 0 } else { target as usize + 1 }
+}
+
+/// Whether a frame may pre-generate `target` mips given `used` objects
+/// already committed to earlier frames of this animation.
+fn mip_pregen_allows(used: usize, target: u32) -> bool {
+    used + mip_pregen_cost(target) <= MIP_GDI_OBJECT_BUDGET
+}
+
 // ---------------------------------------------------------------------------
 // Worker side: the streaming producer
 // ---------------------------------------------------------------------------
@@ -87,12 +110,18 @@ enum Stop {
 /// `sink` as frames materialize. `terminate` is polled between frames;
 /// the image crate cannot interrupt a frame mid-decode, so termination
 /// lands within one frame (upstream is no finer-grained either).
+///
+/// `render_viewport` is the request-time render area (client minus the
+/// status bar, upstream `_viv_load_render_wide/high`, viv.c:1557-1558) —
+/// the worker pre-generates each frame's first mips against its HALF
+/// (upstream passes `/2` into `_viv_get_mipmap`, viv.c:10302 et al.).
 pub(crate) fn decode_to_sink(
     path: &OsStr,
+    render_viewport: (i32, i32),
     terminate: &AtomicBool,
     sink: &mut dyn FnMut(LoadReply),
 ) {
-    match produce(path, terminate, sink) {
+    match produce(path, render_viewport, terminate, sink) {
         Ok(()) => sink(LoadReply::Complete),
         Err(Stop::User(msg)) => sink(LoadReply::FailedUser(msg)),
         Err(Stop::Fatal(msg)) => sink(LoadReply::FatalSystem(msg)),
@@ -102,6 +131,7 @@ pub(crate) fn decode_to_sink(
 
 fn produce(
     path: &OsStr,
+    render_viewport: (i32, i32),
     terminate: &AtomicBool,
     sink: &mut dyn FnMut(LoadReply),
 ) -> Result<(), Stop> {
@@ -139,6 +169,7 @@ fn produce(
                 gif_delay_ms,
                 orientation,
                 per_frame_bytes,
+                render_viewport,
                 terminate,
                 sink,
             )
@@ -153,7 +184,7 @@ fn produce(
             // bitstreams, so still WebP files must take the static decoder or they
             // surface as "no frames decoded" load failures.
             if !decoder.has_animation() {
-                return sink_static(decoder, sink);
+                return sink_static(decoder, render_viewport, sink);
             }
             let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
             // WebP delays are the decoder's millisecond values, used as-is like
@@ -166,12 +197,14 @@ fn produce(
                 |ms| ms,
                 orientation,
                 per_frame_bytes,
+                render_viewport,
                 terminate,
                 sink,
             )
         }
         _ => sink_static(
             reader.into_decoder().map_err(|e| user(e.to_string()))?,
+            render_viewport,
             sink,
         ),
     }
@@ -184,11 +217,16 @@ fn produce(
 /// we schedule with; it carries the per-format fallback rules.
 /// `per_frame_bytes` is the canvas cost of one frame (`w * h * 4`), known
 /// from the decoder header before any frame is decoded.
+///
+/// `render_viewport` drives per-frame mip pre-generation (halved, like
+/// upstream's `_viv_load_render_wide/2` at viv.c:10302/10316), gated by
+/// the animation-wide GDI object budget — see [`MIP_GDI_OBJECT_BUDGET`].
 fn stream_animation(
     mut frames: Frames<'_>,
     normalize_delay: fn(u32) -> u32,
     orientation: Orientation,
     per_frame_bytes: usize,
+    render_viewport: (i32, i32),
     terminate: &AtomicBool,
     sink: &mut dyn FnMut(LoadReply),
 ) -> Result<(), Stop> {
@@ -196,6 +234,7 @@ fn stream_animation(
     let mut emitted = 0usize;
     let mut canvas: Option<(u32, u32)> = None;
     let mut total_frame_bytes: usize = 0;
+    let mut mip_objects_used: usize = 0;
     // Explicit next() loop (not `for`): the budget gate must run BEFORE the
     // iterator is asked for the next frame — Frames::next() decodes and
     // allocates the frame's full canvas before returning it, so a gate that
@@ -245,7 +284,20 @@ fn stream_animation(
         composite_over_background_in_place(&mut buffer, WINDOWED_BACKGROUND_RGB);
         // DIB failures are purely system-level (GDI allocation); fail
         // loud (ADR 0001) through the FatalSystem reply.
-        let frame = DibFrame::from_rgba(w, h, &mut buffer.into_raw()).map_err(Stop::Fatal)?;
+        let mut frame = DibFrame::from_rgba(w, h, &mut buffer.into_raw()).map_err(Stop::Fatal)?;
+        // Pre-generate the frame's mips against the halved request-time
+        // viewport (upstream viv.c:10302/10316), bounded by the object
+        // budget: once spent, later frames skip mips entirely.
+        let target = crate::mip::select_mip_level(
+            w as i32,
+            h as i32,
+            render_viewport.0 / 2,
+            render_viewport.1 / 2,
+        );
+        if mip_pregen_allows(mip_objects_used, target) {
+            frame.pregenerate_mips(target);
+            mip_objects_used += mip_pregen_cost(target);
+        }
         if emitted == 0 {
             sink(LoadReply::FirstFrame { frame, delay_ms });
         } else {
@@ -261,6 +313,7 @@ fn stream_animation(
 
 fn sink_static<D: ImageDecoder>(
     mut decoder: D,
+    render_viewport: (i32, i32),
     sink: &mut dyn FnMut(LoadReply),
 ) -> Result<(), Stop> {
     let user = |msg: String| Stop::User(msg);
@@ -286,7 +339,18 @@ fn sink_static<D: ImageDecoder>(
     // RGB under the alpha channel (upstream composites over
     // config_windowed_background_color; identity for opaque images).
     composite_over_background_in_place(&mut rgba, WINDOWED_BACKGROUND_RGB);
-    let frame = DibFrame::from_rgba(w, h, &mut rgba).map_err(Stop::Fatal)?;
+    let mut frame = DibFrame::from_rgba(w, h, &mut rgba).map_err(Stop::Fatal)?;
+    // A static frame pre-generates un-gated: one frame's chain is at most
+    // ~log2(128M px) ≈ 27 levels + the scratch DC, nowhere near the
+    // budget (upstream pre-generates stills the same way, viv.c:10749 —
+    // GdipImageGetFrameCount reports 1 and the frame loop's i==0 arm
+    // runs the same _viv_get_mipmap call).
+    frame.pregenerate_mips(crate::mip::select_mip_level(
+        w as i32,
+        h as i32,
+        render_viewport.0 / 2,
+        render_viewport.1 / 2,
+    ));
     // A static image is a one-frame stream: first frame, then Complete from
     // decode_to_sink. delay_ms is unused (no second frame ever follows).
     sink(LoadReply::FirstFrame { frame, delay_ms: 0 });
@@ -422,8 +486,18 @@ impl<F> LoadedImage<F> {
     }
 
     /// The frame currently displayed (frame 0 until the timer advances).
+    /// Production paint goes through `surface_mut` (mip extension); the
+    /// immutable read is test-only today.
+    #[cfg(test)]
     pub(crate) fn surface(&self) -> &F {
         &self.frames[self.position]
+    }
+
+    /// Mutable access to the displayed frame's surface — paint extends
+    /// the frame's mip chain lazily through this (#9, upstream fills
+    /// missing levels inside `_viv_get_mipmap` during WM_PAINT).
+    pub(crate) fn surface_mut(&mut self) -> &mut F {
+        &mut self.frames[self.position]
     }
 
     pub(crate) fn is_animated(&self) -> bool {
@@ -1202,5 +1276,38 @@ mod tests {
         assert_eq!(terminal, Reply::Complete);
         let user = map_reply_frame(Reply::FailedUser("x".into()), convert);
         assert_eq!(user, Reply::FailedUser("x".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod mip_budget_tests {
+    use super::*;
+
+    #[test]
+    fn a_zero_level_frame_costs_nothing_and_is_always_allowed() {
+        // No levels -> no DDBs, and the scratch DC never materializes.
+        assert_eq!(mip_pregen_cost(0), 0);
+        assert!(mip_pregen_allows(MIP_GDI_OBJECT_BUDGET, 0));
+    }
+
+    #[test]
+    fn frames_with_levels_cost_levels_plus_the_scratch_dc() {
+        assert_eq!(mip_pregen_cost(1), 2);
+        assert_eq!(mip_pregen_cost(5), 6);
+    }
+
+    #[test]
+    fn long_animations_stop_pre_generating_once_the_budget_spends() {
+        // The F1 guard (review PR #18): a 2500-frame one-level animation
+        // must not push GDI past the 10000-object process quota. Budget
+        // 1000: the 500th frame (index 499, 998 used) still fits; the
+        // 501st (1000 used) does not.
+        let used = 499 * mip_pregen_cost(1);
+        assert!(mip_pregen_allows(used, 1));
+        assert!(!mip_pregen_allows(used + mip_pregen_cost(1), 1));
+        // And the worst-case total stays under the 10k GDI quota even at
+        // the 4096-frame cap: 4096*2 base + 1000 mip-side < 10000 (a const
+        // assert, so the budget constants can never drift past the quota).
+        const _: () = assert!(MAX_FRAMES * 2 + MIP_GDI_OBJECT_BUDGET < 10000);
     }
 }

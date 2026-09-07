@@ -995,7 +995,24 @@ fn request_open(hwnd: HWND, path: &OsStr, origin: OpenOrigin<'_>) {
         // (cubic PR #13). Committed to `displayed_file_bytes` when this
         // session's first frame takes the display.
         state.pending_file_bytes = file_bytes;
-        let session = state.load_thread.request(hwnd, path.to_os_string());
+        // The request-time render area rides the job for the worker's mip
+        // pre-generation (upstream `_viv_load_render_wide/high`,
+        // viv.c:1557-1558): the client WIDTH as-is, the height minus the
+        // status bar — upstream subtracts the bar from the height only.
+        // GetClientRect is a pure window query (no pumping), safe inside
+        // this borrow like the stores around it.
+        let mut client = RECT::default();
+        // SAFETY: a pure window query on the live hwnd — no pumping, safe
+        // inside this borrow like the stores around it.
+        let _ = unsafe { GetClientRect(hwnd, &mut client) };
+        let bar_h = status::height(state.status);
+        let render_viewport = (
+            client.right - client.left,
+            (client.bottom - client.top - bar_h).max(0),
+        );
+        let session = state
+            .load_thread
+            .request(hwnd, path.to_os_string(), render_viewport);
         if state.startup_open_pending {
             state.startup_resize_session = Some(session.id());
         }
