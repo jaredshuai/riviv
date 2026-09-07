@@ -2172,9 +2172,14 @@ pub(crate) fn run(args: Vec<OsString>) -> Result<(), String> {
     let load_thread = LoadThread::start()?;
     // The settings, loaded before the window exists so the remembered
     // rect drives creation (upstream config_load_settings before
-    // RegisterClassEx, viv.c:5261-5262 → 5354), and the startup rect
-    // computed from them while `config` is still owned here.
+    // RegisterClassEx, viv.c:5261-5262 → 5354), the startup rect
+    // computed from them while `config` is still owned here — and the
+    // remembered maximized flag copied off NOW: the WM_SIZE tracking
+    // below overwrites config.maximized with the live zoomed state from
+    // the very first show (upstream saves it off before any window
+    // exists for exactly this reason, viv.c:5264-5266).
     let config = Config::load();
+    let show_maximized = config.maximized != 0;
     let mut rect = initial_window_rect(&config)?;
     let state = WindowState {
         image: None,
@@ -2324,10 +2329,9 @@ pub(crate) fn run(args: Vec<OsString>) -> Result<(), String> {
         // SAFETY: hwnd is live; paints now like upstream's UpdateWindow.
         let _ = unsafe { UpdateWindow(hwnd) };
     }
-    // The remembered maximized state (config_maximized, saved off before
-    // the normal-window show could overwrite it — viv.c:5264-5266).
-    // SAFETY: the borrow spans only the flag read.
-    let show_maximized = (unsafe { state_of(hwnd) }).is_some_and(|s| s.config.maximized != 0);
+    // The remembered maximized state, copied off before the window/show
+    // sequence could overwrite it through the WM_SIZE tracking (see the
+    // config load above; upstream viv.c:5264-5266).
     if show_maximized {
         // SAFETY: hwnd is live.
         let _ = unsafe { ShowWindow(hwnd, SW_MAXIMIZE) };
