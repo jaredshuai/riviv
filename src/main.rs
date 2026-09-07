@@ -1,10 +1,12 @@
 //! riviv — an unofficial Rust rewrite of voidtools/voidImageViewer (MIT).
 //!
-//! M2: Win32 window + GDI rendering + animated GIF/WebP playback with
-//! transparent pixels composited over the windowed background, decoded on
-//! a background thread so the window never freezes on large files, plus a
-//! keyboard-navigable playlist built from multi-file/folder drops and the
-//! command line.
+//! M3: the M2 feature set (Win32 window + GDI rendering, animated
+//! GIF/WebP playback, background decoding, playlist navigation, zoom/pan,
+//! fullscreen, giant-image stitching + mipmaps) plus the settings layer
+//! (#19): the window rect is remembered across runs in a `[riviv]` ini
+//! (`config.rs`/`ini.rs`) with upstream's 60% first-run auto-fit, and the
+//! M1 image-sized startup window is gone — windows never resize on load
+//! (upstream `auto_zoom = 0`).
 //!
 //! Behavior baseline is the upstream C source under `c-original/src/viv.c`
 //! (see c-original/PROVENANCE.md). Key alignments across the modules:
@@ -64,8 +66,10 @@
 #![windows_subsystem = "windows"]
 
 mod anim;
+mod config;
 mod cursor;
 mod fit;
+mod ini;
 mod loader;
 mod loadthread;
 mod mip;
