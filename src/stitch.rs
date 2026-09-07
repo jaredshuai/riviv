@@ -87,7 +87,12 @@ pub(crate) fn stitch_tiles(blit: BlitRect, clip: (i32, i32, i32, i32)) -> Vec<Bl
             break;
         }
         let src_high = src_yrun.min(STITCH_TILE_SIZE);
-        let dst_y2 = (i64::from(src_y + src_high) * i64::from(h_dest) / i64::from(h_src)
+        // The projection maps the source RECT [sy, sy+sh) onto [dy, dy+dh),
+        // so tile edges are measured from the rect origin — upstream's
+        // absolute form (viv.c:14964: (src_y + src_high)*hDest/hSrc) is
+        // identical only because its callers always pass ySrc=0; with a
+        // nonzero origin it would shift every seam (review PR #18, cubic).
+        let dst_y2 = (i64::from(src_y + src_high - sy) * i64::from(h_dest) / i64::from(h_src)
             + i64::from(dy)) as i32;
         if dst_y2 >= clip_y {
             let mut dst_x = dx;
@@ -96,7 +101,8 @@ pub(crate) fn stitch_tiles(blit: BlitRect, clip: (i32, i32, i32, i32)) -> Vec<Bl
             let mut src_xrun = w_src;
             while src_xrun > 0 {
                 let src_wide = src_xrun.min(STITCH_TILE_SIZE);
-                let dst_x2 = (i64::from(src_x + src_wide) * i64::from(w_dest) / i64::from(w_src)
+                let dst_x2 = (i64::from(src_x + src_wide - sx) * i64::from(w_dest)
+                    / i64::from(w_src)
                     + i64::from(dx)) as i32;
                 let dst_wide = dst_x2 - dst_x;
                 if dst_x >= clip_right {
@@ -252,6 +258,47 @@ mod tests {
             prev_src_right = t.sx + t.sw;
         }
         assert_eq!(prev_src_right, 40000);
+    }
+
+    #[test]
+    fn nonzero_source_origins_project_relative_to_the_rect() {
+        // A source rect at a nonzero origin must map onto [dy, dy+dh) the
+        // same way the zero-origin case does — absolute-coordinate
+        // projection (upstream's latent form, viv.c:14964) would shift
+        // every seam by origin*scale (review PR #18, cubic).
+        let whole = BlitRect {
+            dx: 100,
+            dy: 50,
+            dw: 30000,
+            dh: 60,
+            sx: 5000,
+            sy: 700,
+            sw: 40000,
+            sh: 80,
+        };
+        let tiles = stitch_tiles(whole, (0, 0, 99999, 99999));
+        assert!(tiles.len() > 1);
+        // Rows/columns partition the DEST rect exactly...
+        let mut prev_right = 100;
+        for t in &tiles {
+            assert_eq!(t.dx, prev_right);
+            prev_right = t.dx + t.dw;
+        }
+        assert_eq!(prev_right, 100 + 30000);
+        // ...and the first tile starts at the rect's dst origin with the
+        // rect's source origin (not at an offset shifted by sx/sy).
+        assert_eq!(
+            (tiles[0].dx, tiles[0].dy, tiles[0].sx, tiles[0].sy),
+            (100, 50, 5000, 700)
+        );
+        // ...and the source runs partition the source RECT [5000, 45000),
+        // not an absolute band from 0.
+        let mut prev_src_right = 5000;
+        for t in &tiles {
+            assert_eq!(t.sx, prev_src_right);
+            prev_src_right = t.sx + t.sw;
+        }
+        assert_eq!(prev_src_right, 5000 + 40000);
     }
 
     #[test]
