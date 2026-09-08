@@ -57,6 +57,8 @@
 //! - `loc` — bilingual string tables + one-shot system-language detection
 //!   (#20, landed)
 //! - `copydata` — the single-instance handoff payload codec (#21, landed)
+//! - `menu` — the menu command table: WM_COMMAND ids, default keys,
+//!   accelerator labels and the WM_INITMENU check/enable model (#23)
 //! - `paint` — WM_PAINT render; M2: stitch/mip (#9); zoom/pan offsets,
 //!   the BitBlt 1:1 path and the COLORONCOLOR magnify filter landed (#7)
 //! - `playlist` — playlist model + navigation math + recursive folder/wildcard
@@ -79,6 +81,7 @@ mod ini;
 mod loader;
 mod loadthread;
 mod loc;
+mod menu;
 mod mip;
 mod paint;
 mod pixels;
