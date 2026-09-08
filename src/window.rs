@@ -61,10 +61,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOZORDER, SendMessageW,
     SetForegroundWindow, SetProcessDPIAware, SetTimer, SetWindowLongPtrW, SetWindowPos,
     SetWindowTextW, ShowCursor, ShowWindow, TranslateMessage, USER_TIMER_MINIMUM, WINDOW_EX_STYLE,
-    WM_ACTIVATE, WM_DESTROY, WM_DROPFILES, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN,
-    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_MOVE,
-    WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_SIZE, WM_SYSKEYDOWN, WM_TIMER, WNDCLASSEXW, WS_CAPTION,
-    WS_EX_ACCEPTFILES, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_THICKFRAME, WS_VISIBLE, WindowFromPoint,
+    WM_ACTIVATE, WM_DESTROY, WM_DROPFILES, WM_ENDSESSION, WM_ERASEBKGND, WM_GETMINMAXINFO,
+    WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_MOVE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_QUERYENDSESSION, WM_SIZE, WM_SYSKEYDOWN,
+    WM_TIMER, WNDCLASSEXW, WS_CAPTION, WS_EX_ACCEPTFILES, WS_OVERLAPPEDWINDOW, WS_POPUP,
+    WS_THICKFRAME, WS_VISIBLE, WindowFromPoint,
 };
 use windows::core::{HSTRING, PCWSTR, w};
 
@@ -1934,16 +1935,31 @@ unsafe extern "system" fn wnd_proc(
         WM_DESTROY => {
             // Settings go to disk on the way out (upstream `_viv_exit`'s
             // config_save_settings, viv.c:2577-2580; riviv saves at window
-            // destruction — every normal exit path funnels here). The
-            // window-position tracking in WM_SIZE/WM_MOVE has kept the
-            // config current; save only does file I/O, no messages, so the
-            // borrow is safe. Failures are logged inside, not fatal.
+            // destruction — every normal exit path funnels here, and
+            // WM_ENDSESSION below covers the session-shutdown exits that
+            // never reach it). The window-position tracking in
+            // WM_SIZE/WM_MOVE has kept the config current; save only does
+            // file I/O, no messages, so the borrow is safe. Failures are
+            // logged inside, not fatal.
             // SAFETY: the borrow spans only the save's file I/O.
             if let Some(state) = unsafe { state_of(hwnd) } {
                 state.config.save();
             }
             // SAFETY: legal on the owning thread while quitting the message loop.
             unsafe { PostQuitMessage(0) };
+            LRESULT(0)
+        }
+        // Session shutdown (viv.c:2743-2750): agree to end, and persist
+        // the settings on the confirmed end-session — the process may be
+        // terminated without WM_DESTROY ever arriving.
+        WM_QUERYENDSESSION => LRESULT(1),
+        WM_ENDSESSION => {
+            if wparam.0 != 0 {
+                // SAFETY: the borrow spans only the save's file I/O.
+                if let Some(state) = unsafe { state_of(hwnd) } {
+                    state.config.save();
+                }
+            }
             LRESULT(0)
         }
         // SAFETY: hwnd/msg are exactly what this callback received; the default
@@ -2080,37 +2096,38 @@ unsafe fn work_area(monitor: windows::Win32::Graphics::Gdi::HMONITOR) -> RECT {
 
 /// The os.c:193-248 re-anchor + clamp, pure: offset the rect from its own
 /// monitor's frame into the target monitor's frame, cap the size to the
-/// target, then push each side that sticks out back in.
+/// target, then push each side that sticks out back in. Wrapping
+/// arithmetic throughout like the C build — a pathological remembered
+/// rect (any i32 can sit in the ini) must wrap exactly like C, never
+/// panic (cubic PR round 2).
 fn make_rect_completely_visible_core(rect: RECT, target: RECT, source: RECT) -> RECT {
-    let dx = target.left - source.left;
-    let dy = target.top - source.top;
+    let dx = target.left.wrapping_sub(source.left);
+    let dy = target.top.wrapping_sub(source.top);
     let mut r = RECT {
-        left: rect.left + dx,
-        top: rect.top + dy,
-        right: rect.right + dx,
-        bottom: rect.bottom + dy,
+        left: rect.left.wrapping_add(dx),
+        top: rect.top.wrapping_add(dy),
+        right: rect.right.wrapping_add(dx),
+        bottom: rect.bottom.wrapping_add(dy),
     };
-    let mut wide = r.right - r.left;
-    let mut high = r.bottom - r.top;
-    let tw = target.right - target.left;
-    let th = target.bottom - target.top;
-    wide = wide.min(tw);
-    high = high.min(th);
+    let tw = target.right.wrapping_sub(target.left);
+    let th = target.bottom.wrapping_sub(target.top);
+    let wide = r.right.wrapping_sub(r.left).min(tw);
+    let high = r.bottom.wrapping_sub(r.top).min(th);
     if r.right > target.right {
-        r.left = target.right - wide;
+        r.left = target.right.wrapping_sub(wide);
         r.right = target.right;
     }
     if r.bottom > target.bottom {
-        r.top = target.bottom - high;
+        r.top = target.bottom.wrapping_sub(high);
         r.bottom = target.bottom;
     }
     if r.left < target.left {
         r.left = target.left;
-        r.right = target.left + wide;
+        r.right = target.left.wrapping_add(wide);
     }
     if r.top < target.top {
         r.top = target.top;
-        r.bottom = target.top + high;
+        r.bottom = target.top.wrapping_add(high);
     }
     r
 }
@@ -2326,8 +2343,10 @@ pub(crate) fn run(args: Vec<OsString>) -> Result<(), String> {
     // shortcuts) and the remembered maximized flag, in upstream order
     // (viv.c:5426-5451): anything non-normal shows FIRST, then the
     // remembered SW_MAXIMIZE, then the command line, then SW_SHOW for the
-    // normal case. riviv has no nCmdShow (no WinMain), so the no-flag
-    // default is SW_SHOW — behaviorally the SHOWNORMAL arm upstream.
+    // normal case. The no-flag default is SW_SHOWNORMAL — upstream falls
+    // back to nCmdShow, which is SW_SHOWNORMAL for an ordinary launch, so
+    // the early-show branch stays skipped and a remembered-maximized
+    // launch never flashes its normal window first (Codex PR round 2).
     let mut si = STARTUPINFOW {
         cb: size_of::<STARTUPINFOW>() as u32,
         ..Default::default()
@@ -2337,7 +2356,7 @@ pub(crate) fn run(args: Vec<OsString>) -> Result<(), String> {
     let show_cmd = if (si.dwFlags & STARTF_USESHOWWINDOW).0 != 0 {
         SHOW_WINDOW_CMD(i32::from(si.wShowWindow))
     } else {
-        SW_SHOW
+        SW_SHOWNORMAL
     };
     if show_cmd != SW_SHOWNORMAL {
         // SAFETY: hwnd is live; show per the launcher's request.
@@ -2486,7 +2505,9 @@ mod tests {
     fn pathological_ini_values_wrap_instead_of_panicking() {
         // A hand-edited ini can hold any i32 (parse_int mirrors
         // utf8_to_int's silent wrap); the C build wraps where Rust would
-        // panic (debug overflow; `i32::MIN / -1` even in release).
+        // panic (debug overflow; `i32::MIN / -1` even in release). The
+        // make-visible core runs on the remembered rect too — both paths
+        // must survive the same garbage.
         let mon = RECT {
             left: 0,
             top: 0,
@@ -2496,6 +2517,14 @@ mod tests {
         let _ = first_run_window_rect(mon, i32::MAX, 1, i32::MAX, 1);
         let _ = first_run_window_rect(mon, i32::MIN, -1, i32::MIN, -1);
         let _ = first_run_window_rect(mon, -i32::MAX, 1, i32::MIN, 2);
+        let garbage = RECT {
+            left: i32::MAX,
+            top: i32::MIN,
+            right: i32::MIN,
+            bottom: i32::MAX,
+        };
+        let _ = make_rect_completely_visible_core(garbage, mon, mon);
+        let _ = make_rect_completely_visible_core(garbage, garbage, mon);
     }
 
     #[test]

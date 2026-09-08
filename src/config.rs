@@ -22,6 +22,7 @@
 //! the table exists so later M3 issues (#23/#24/#25/#26) wire settings
 //! without re-touching the persistence layer.
 
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 use crate::ini;
@@ -412,9 +413,31 @@ fn exe_dir_ini() -> Option<PathBuf> {
     exe_dir().map(|d| d.join(FILE_NAME))
 }
 
-/// `%APPDATA%\riviv` (upstream `string_get_appdata_path` + directory).
+/// `%APPDATA%\riviv` — resolved through the roaming-AppData KNOWN FOLDER
+/// like upstream (`SHGetSpecialFolderLocation(CSIDL_APPDATA)`,
+/// string.c:637-655), not the `APPDATA` environment variable a launcher
+/// can strip or override while the known folder stays correct.
 fn appdata_dir() -> Option<PathBuf> {
-    std::env::var_os("APPDATA").map(|base| PathBuf::from(base).join(APPDATA_DIR))
+    use std::os::windows::ffi::OsStringExt;
+    let mut buf = [0u16; 260]; // MAX_PATH
+    // SAFETY: `buf` is a valid MAX_PATH-sized out-buffer for the duration
+    // of the call; no ownership is taken of any parameter.
+    let hr = unsafe {
+        windows::Win32::UI::Shell::SHGetFolderPathW(
+            None,
+            windows::Win32::UI::Shell::CSIDL_APPDATA as i32,
+            None,
+            0,
+            &mut buf,
+        )
+    };
+    if hr.is_ok()
+        && let Some(len) = buf.iter().position(|&c| c == 0)
+        && len > 0
+    {
+        return Some(PathBuf::from(OsString::from_wide(&buf[..len])).join(APPDATA_DIR));
+    }
+    None
 }
 
 fn appdata_ini() -> Option<PathBuf> {
