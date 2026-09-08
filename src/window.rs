@@ -916,9 +916,7 @@ enum OpenOrigin<'a> {
 /// Queue `path` for background decoding (upstream `_viv_open`'s
 /// CreateThread arm, viv.c:1569). The current display stays up until this
 /// load's first frame replies in; storing a new session supersedes
-/// (flags) any in-flight one. The startup flag (see WindowState) ties the
-/// one-time resize-to-image to this session's first frame when this is
-/// the process's startup open.
+/// (flags) any in-flight one.
 fn request_open(hwnd: HWND, path: &OsStr, origin: OpenOrigin<'_>) {
     // Existence check BEFORE queueing a decode (upstream
     // `_viv_open_from_filename`'s GetFileAttributesEx arm, viv.c:1359 —
@@ -1968,8 +1966,12 @@ fn initial_window_rect(config: &Config) -> Result<RECT, String> {
     let mut rect = RECT {
         left: config.x,
         top: config.y,
-        right: config.x + config.wide,
-        bottom: config.y + config.high,
+        // Wrapping like the C build: a hand-edited ini can hold any i32
+        // (parse_int mirrors utf8_to_int's silent wrap), and a panicked
+        // startup is worse than upstream's garbage rect handed to
+        // CreateWindowEx, which fails soft.
+        right: config.x.wrapping_add(config.wide),
+        bottom: config.y.wrapping_add(config.high),
     };
     if config.wide == 0 || config.high == 0 {
         // SAFETY: read-only cursor + monitor queries.
@@ -1984,7 +1986,16 @@ fn initial_window_rect(config: &Config) -> Result<RECT, String> {
                 cbSize: size_of::<MONITORINFO>() as u32,
                 ..Default::default()
             };
-            let _ = GetMonitorInfoW(monitor, &mut mi);
+            // Fail loud like the rest of run()'s geometry: a zeroed
+            // monitor rect would silently create a 0x0 window (ADR 0001);
+            // DEFAULTTOPRIMARY makes the failure near-unreachable, but a
+            // stale handle through a display-topology change is exactly
+            // the system-level case worth reporting.
+            if !GetMonitorInfoW(monitor, &mut mi).as_bool() {
+                // Already inside this function's outer unsafe block.
+                let gle = GetLastError().0;
+                return Err(format!("GetMonitorInfoW failed (GLE={gle})"));
+            }
             let full = mi.rcMonitor;
             rect = first_run_window_rect(
                 full,
@@ -2001,6 +2012,9 @@ fn initial_window_rect(config: &Config) -> Result<RECT, String> {
 /// The first-run centered rect (viv.c:5361-5387) — pure. 60% of the
 /// monitor by default, 640x480 when a div is 0, in the monitor's own
 /// coordinate frame (see `initial_window_rect` for the no-origin quirk).
+/// The arithmetic wraps like the C build: the mul/div come from the ini,
+/// where any i32 is possible (`i32::MIN / -1` panics even in release
+/// otherwise).
 fn first_run_window_rect(
     monitor: RECT,
     wide_mul: i32,
@@ -2013,16 +2027,18 @@ fn first_run_window_rect(
     let mw = monitor.right - monitor.left;
     let mh = monitor.bottom - monitor.top;
     if wide_div != 0 {
-        wide = (mw * wide_mul) / wide_div;
+        wide = mw.wrapping_mul(wide_mul).wrapping_div(wide_div);
     }
     if high_div != 0 {
-        high = (mh * high_mul) / high_div;
+        high = mh.wrapping_mul(high_mul).wrapping_div(high_div);
     }
+    let left = (mw / 2).wrapping_sub(wide / 2);
+    let top = (mh / 2).wrapping_sub(high / 2);
     RECT {
-        left: (mw / 2) - (wide / 2),
-        top: (mh / 2) - (high / 2),
-        right: ((mw / 2) - (wide / 2)) + wide,
-        bottom: ((mh / 2) - (high / 2)) + high,
+        left,
+        top,
+        right: left.wrapping_add(wide),
+        bottom: top.wrapping_add(high),
     }
 }
 
@@ -2377,9 +2393,10 @@ pub(crate) fn run(args: Vec<OsString>) -> Result<(), String> {
     }
 
     // Populate the status bar (parts + initial texts) now that the window
-    // has its final rect — the first WM_SIZE fired during creation, before
-    // WM_NCCREATE had even stored the state pointer, so the bar is still
-    // empty. Upstream populates it at startup the same way (viv.c:5415).
+    // has its final rect — a hidden window's creation sends no WM_SIZE
+    // (verified against windows-0.62), so the first one arrives with the
+    // first ShowWindow above and the bar is still empty here. Upstream
+    // populates it at startup the same way (viv.c:5415).
     refresh_status(hwnd);
 
     let mut msg = MSG::default();
@@ -2463,6 +2480,22 @@ mod tests {
             0,
         );
         assert_eq!((r.right - r.left, r.bottom - r.top), (640, 480));
+    }
+
+    #[test]
+    fn pathological_ini_values_wrap_instead_of_panicking() {
+        // A hand-edited ini can hold any i32 (parse_int mirrors
+        // utf8_to_int's silent wrap); the C build wraps where Rust would
+        // panic (debug overflow; `i32::MIN / -1` even in release).
+        let mon = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        };
+        let _ = first_run_window_rect(mon, i32::MAX, 1, i32::MAX, 1);
+        let _ = first_run_window_rect(mon, i32::MIN, -1, i32::MIN, -1);
+        let _ = first_run_window_rect(mon, -i32::MAX, 1, i32::MIN, 2);
     }
 
     #[test]

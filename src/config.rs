@@ -9,8 +9,10 @@
 //!   `%APPDATA%\riviv\riviv.ini`; the exe-dir file then holds ONLY the
 //!   `appdata` marker (so a portable install can still find the switch).
 //!
-//! Load order is exe-dir first, then the appdata file overlays it (the
-//! overlay is complete — the root file's other keys do not participate).
+//! Load order is exe-dir first, then the appdata file overlays it: the
+//! appdata file's keys override, keys it is MISSING keep the values the
+//! exe-dir file already set (upstream `ini_get_int(ini, key, current)` —
+//! config.c:104+).
 //! Save mirrors `_config_save_settings_by_location` key-for-key, in the
 //! upstream order, through a `.tmp` + rename (MOVEFILE_REPLACE_EXISTING
 //! semantics via `std::fs::rename`, with upstream's CopyFile+DeleteFile
@@ -167,20 +169,26 @@ impl Default for Config {
 
 impl Config {
     /// Read the settings (config.c:268-293): the exe-dir file first; if IT
-    /// switched `appdata` on, the appdata file overlays the whole table.
-    /// A missing or unreadable file keeps the defaults — same as upstream,
-    /// whose `ini_open` failure leaves the globals untouched.
+    /// switched `appdata` on, the appdata file's keys overlay (its missing
+    /// keys keep the exe-dir values — upstream `ini_get_int(ini, key,
+    /// current)`). A missing or unreadable file keeps the defaults — same
+    /// as upstream, whose `ini_open` failure leaves the globals untouched.
     pub(crate) fn load() -> Config {
         let mut config = Config::default();
+        // Read as bytes + lossy decode: upstream parses raw bytes (only
+        // ASCII keys matter), so a stray non-UTF-8 byte in a hand-edited
+        // ini must not discard the whole remembered state.
         if let Some(path) = exe_dir_ini()
-            && let Ok(text) = std::fs::read_to_string(&path)
+            && let Ok(bytes) = std::fs::read(&path)
         {
+            let text = String::from_utf8_lossy(&bytes);
             config.apply_section(&ini::parse(&text, SECTION), true);
         }
         if config.appdata != 0
             && let Some(path) = appdata_ini()
-            && let Ok(text) = std::fs::read_to_string(&path)
+            && let Ok(bytes) = std::fs::read(&path)
         {
+            let text = String::from_utf8_lossy(&bytes);
             config.apply_section(&ini::parse(&text, SECTION), false);
         }
         config
@@ -189,16 +197,19 @@ impl Config {
     /// Write the settings to the active location (config.c:404-429): the
     /// appdata dir (created if missing) when switched on, else the exe
     /// dir — whose file degenerates to the `appdata` marker only while
-    /// the switch is ON (the real table then lives in appdata).
-    /// Failures are logged, not fatal: upstream never checks its writes
-    /// either, and a read-only install must still run.
+    /// the switch is ON (the real table then lives in appdata). With the
+    /// switch on but the appdata path unresolvable, upstream has NO
+    /// fallback branch — the save is silently skipped, never redirected
+    /// into the exe dir (which would clobber the root file). Failures are
+    /// logged, not fatal: upstream never checks its writes either, and a
+    /// read-only install must still run.
     pub(crate) fn save(&self) {
-        if self.appdata != 0
-            && let Some(dir) = appdata_dir()
-        {
-            // Upstream CreateDirectory before saving (config.c:416).
-            let _ = std::fs::create_dir_all(&dir);
-            save_by_location(dir.join(FILE_NAME), self.to_pairs(false));
+        if self.appdata != 0 {
+            if let Some(dir) = appdata_dir() {
+                // Upstream CreateDirectory before saving (config.c:416).
+                let _ = std::fs::create_dir_all(&dir);
+                save_by_location(dir.join(FILE_NAME), self.to_pairs(false));
+            }
         } else if let Some(dir) = exe_dir() {
             save_by_location(dir.join(FILE_NAME), self.to_pairs(true));
         }
@@ -212,75 +223,86 @@ impl Config {
         // verbatim for file compatibility with the upstream table
         // (config.c:113-178).
         let v = |key: &str| pairs.get(key).map(|s| ini::parse_int(s));
-        macro_rules! apply {
+        // Most upstream globals are BYTEs (config.c:35-100) — the C
+        // assignment from int TRUNCATES, so `maximized=256` is 0 there,
+        // not a truthy value; mirror that exactly.
+        macro_rules! apply_byte {
+            ($field:ident = $key:literal) => {
+                if let Some(value) = v($key) {
+                    self.$field = (value as u8) as i32;
+                }
+            };
+        }
+        // The int-width globals: coordinates, rates, jumps, fit fractions.
+        macro_rules! apply_int {
             ($field:ident = $key:literal) => {
                 if let Some(value) = v($key) {
                     self.$field = value;
                 }
             };
         }
-        apply!(x = "x");
-        apply!(y = "y");
-        apply!(wide = "wide");
-        apply!(high = "high");
-        apply!(maximized = "maximized");
-        apply!(slideshow_rate = "slideshow_rate");
-        apply!(allow_shrinking = "allow_shrinking");
-        apply!(shrink_blit_mode = "shrink_blit_mode");
-        apply!(mag_filter = "mag_filter");
-        apply!(keep_aspect_ratio = "keep_aspect_ratio");
-        apply!(fill_window = "fill_window");
-        apply!(fullscreen_fill_window = "fullscreen_fill_window");
-        apply!(nav_sort = "sort");
-        apply!(nav_sort_ascending = "sort_ascending");
-        apply!(multiple_instances = "multiple_instances");
-        apply!(show_caption = "show_caption");
-        apply!(show_thickframe = "show_thickframe");
-        apply!(show_menu = "show_menu");
-        apply!(show_status = "show_status");
-        apply!(pixel_info = "statusbar_pixel_info");
-        apply!(show_controls = "show_controls");
-        apply!(auto_zoom = "auto_zoom");
-        apply!(auto_zoom_type = "auto_zoom_type");
-        apply!(auto_fit_wide_mul = "auto_fit_wide_mul");
-        apply!(auto_fit_wide_div = "auto_fit_wide_div");
-        apply!(auto_fit_high_mul = "auto_fit_high_mul");
-        apply!(auto_fit_high_div = "auto_fit_high_div");
-        apply!(frame_minus = "frame_minus");
-        apply!(mouse_wheel_action = "mouse_wheel_action");
-        apply!(ctrl_mouse_wheel_action = "ctrl_mouse_wheel_action");
-        apply!(left_click_action = "left_click_action");
-        apply!(right_click_action = "right_click_action");
-        apply!(xbutton_action = "xbutton_action");
-        apply!(keep_centered = "keep_centered");
-        apply!(windowed_background_color_r = "windowed_background_color_r");
-        apply!(windowed_background_color_g = "windowed_background_color_g");
-        apply!(windowed_background_color_b = "windowed_background_color_b");
-        apply!(windowed_hide_cursor = "windowed_hide_cursor");
-        apply!(fullscreen_background_color_r = "fullscreen_background_color_r");
-        apply!(fullscreen_background_color_g = "fullscreen_background_color_g");
-        apply!(fullscreen_background_color_b = "fullscreen_background_color_b");
-        apply!(options_last_page = "options_last_page");
-        apply!(short_jump = "short_jump");
-        apply!(medium_jump = "medium_jump");
-        apply!(long_jump = "long_jump");
-        apply!(loop_animations_once = "loop_animations_once");
-        apply!(prevent_sleep = "prevent_sleep");
-        apply!(shuffle = "shuffle");
-        apply!(browse_file_open_dialog = "browse_file_open_dialog");
-        apply!(ontop = "ontop");
-        apply!(slideshow_custom_rate = "slideshow_custom_rate");
-        apply!(slideshow_custom_rate_type = "slideshow_custom_rate_type");
-        apply!(scroll_window = "scroll_window");
-        apply!(preload_next = "preload_next");
-        apply!(cache_last = "cache_last");
-        apply!(icm = "icm");
-        apply!(orientation = "orientation");
-        apply!(toolbar_move_window = "toolbar_move_window");
-        apply!(title_bar_format = "title_bar_format");
-        apply!(add_command_line_timeout = "add_command_line_timeout");
+        apply_int!(x = "x");
+        apply_int!(y = "y");
+        apply_int!(wide = "wide");
+        apply_int!(high = "high");
+        apply_byte!(maximized = "maximized");
+        apply_int!(slideshow_rate = "slideshow_rate");
+        apply_byte!(allow_shrinking = "allow_shrinking");
+        apply_byte!(shrink_blit_mode = "shrink_blit_mode");
+        apply_byte!(mag_filter = "mag_filter");
+        apply_byte!(keep_aspect_ratio = "keep_aspect_ratio");
+        apply_byte!(fill_window = "fill_window");
+        apply_byte!(fullscreen_fill_window = "fullscreen_fill_window");
+        apply_byte!(nav_sort = "sort");
+        apply_byte!(nav_sort_ascending = "sort_ascending");
+        apply_byte!(multiple_instances = "multiple_instances");
+        apply_byte!(show_caption = "show_caption");
+        apply_byte!(show_thickframe = "show_thickframe");
+        apply_byte!(show_menu = "show_menu");
+        apply_byte!(show_status = "show_status");
+        apply_byte!(pixel_info = "statusbar_pixel_info");
+        apply_byte!(show_controls = "show_controls");
+        apply_byte!(auto_zoom = "auto_zoom");
+        apply_byte!(auto_zoom_type = "auto_zoom_type");
+        apply_int!(auto_fit_wide_mul = "auto_fit_wide_mul");
+        apply_int!(auto_fit_wide_div = "auto_fit_wide_div");
+        apply_int!(auto_fit_high_mul = "auto_fit_high_mul");
+        apply_int!(auto_fit_high_div = "auto_fit_high_div");
+        apply_byte!(frame_minus = "frame_minus");
+        apply_byte!(mouse_wheel_action = "mouse_wheel_action");
+        apply_byte!(ctrl_mouse_wheel_action = "ctrl_mouse_wheel_action");
+        apply_byte!(left_click_action = "left_click_action");
+        apply_byte!(right_click_action = "right_click_action");
+        apply_byte!(xbutton_action = "xbutton_action");
+        apply_byte!(keep_centered = "keep_centered");
+        apply_byte!(windowed_background_color_r = "windowed_background_color_r");
+        apply_byte!(windowed_background_color_g = "windowed_background_color_g");
+        apply_byte!(windowed_background_color_b = "windowed_background_color_b");
+        apply_byte!(windowed_hide_cursor = "windowed_hide_cursor");
+        apply_byte!(fullscreen_background_color_r = "fullscreen_background_color_r");
+        apply_byte!(fullscreen_background_color_g = "fullscreen_background_color_g");
+        apply_byte!(fullscreen_background_color_b = "fullscreen_background_color_b");
+        apply_byte!(options_last_page = "options_last_page");
+        apply_int!(short_jump = "short_jump");
+        apply_int!(medium_jump = "medium_jump");
+        apply_int!(long_jump = "long_jump");
+        apply_byte!(loop_animations_once = "loop_animations_once");
+        apply_byte!(prevent_sleep = "prevent_sleep");
+        apply_byte!(shuffle = "shuffle");
+        apply_byte!(browse_file_open_dialog = "browse_file_open_dialog");
+        apply_byte!(ontop = "ontop");
+        apply_int!(slideshow_custom_rate = "slideshow_custom_rate");
+        apply_byte!(slideshow_custom_rate_type = "slideshow_custom_rate_type");
+        apply_byte!(scroll_window = "scroll_window");
+        apply_byte!(preload_next = "preload_next");
+        apply_byte!(cache_last = "cache_last");
+        apply_byte!(icm = "icm");
+        apply_byte!(orientation = "orientation");
+        apply_byte!(toolbar_move_window = "toolbar_move_window");
+        apply_byte!(title_bar_format = "title_bar_format");
+        apply_int!(add_command_line_timeout = "add_command_line_timeout");
         if root {
-            apply!(appdata = "appdata");
+            apply_byte!(appdata = "appdata");
         }
     }
 
@@ -483,6 +505,23 @@ mod tests {
         assert_eq!(c.slideshow_rate, 0);
         let c = parse_apply("[riviv]\n", true);
         assert_eq!(c.slideshow_rate, 5000);
+    }
+
+    #[test]
+    fn byte_backed_keys_truncate_like_the_c_assignment() {
+        // Upstream stores these as BYTE globals: `maximized=256` truncates
+        // to 0 (NOT maximized), 257 to 1, -1 to 255; the int-width keys
+        // keep their full value.
+        let c = parse_apply("[riviv]\nmaximized=256\nx=100000\n", true);
+        assert_eq!(c.maximized, 0, "256 truncates to BYTE 0");
+        let c = parse_apply("[riviv]\nmaximized=257\n", true);
+        assert_eq!(c.maximized, 1);
+        let c = parse_apply("[riviv]\nmaximized=-1\n", true);
+        assert_eq!(c.maximized, 255, "(BYTE)(-1) is 255");
+        let c = parse_apply("[riviv]\nappdata=256\n", true);
+        assert_eq!(c.appdata, 0, "appdata=256 must NOT switch locations");
+        let c = parse_apply("[riviv]\nx=100000\n", true);
+        assert_eq!(c.x, 100000, "int-width keys do not truncate");
     }
 
     #[test]
