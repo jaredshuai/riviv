@@ -79,21 +79,22 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRect, AppendMenuW, CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW,
-    CheckMenuItem, CreateMenu, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyWindow,
-    DispatchMessageW, EnableMenuItem, FindWindowA, GWL_STYLE, GWLP_USERDATA, GetClientRect,
-    GetCursorPos, GetForegroundWindow, GetMenu, GetMessageW, GetWindowLongPtrW, GetWindowRect,
-    HMENU, HWND_TOP, IDC_ARROW, IsIconic, IsZoomed, KillTimer, LoadCursorW, MB_ICONERROR, MB_OK,
-    MENU_ITEM_FLAGS, MF_BYCOMMAND, MF_CHECKED, MF_DISABLED, MF_ENABLED, MF_POPUP, MF_SEPARATOR,
-    MF_STRING, MF_UNCHECKED, MINMAXINFO, MSG, MessageBoxW, PostQuitMessage, RegisterClassExW,
-    SHOW_WINDOW_CMD, SW_MAXIMIZE, SW_SHOW, SW_SHOWNORMAL, SWP_FRAMECHANGED, SWP_NOACTIVATE,
-    SWP_NOCOPYBITS, SWP_NOZORDER, SendMessageW, SetForegroundWindow, SetMenu, SetProcessDPIAware,
-    SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowCursor, ShowWindow,
-    TranslateMessage, USER_TIMER_MINIMUM, WINDOW_EX_STYLE, WM_ACTIVATE, WM_COMMAND, WM_COPYDATA,
+    CheckMenuItem, CreateMenu, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
+    DestroyWindow, DispatchMessageW, EnableMenuItem, FindWindowA, GWL_STYLE, GWLP_USERDATA,
+    GetClientRect, GetCursorPos, GetForegroundWindow, GetMenu, GetMessageW, GetWindowLongPtrW,
+    GetWindowRect, HMENU, HWND_TOP, IDC_ARROW, IsIconic, IsZoomed, KillTimer, LoadCursorW,
+    MB_ICONERROR, MB_OK, MENU_ITEM_FLAGS, MF_BYCOMMAND, MF_CHECKED, MF_ENABLED, MF_GRAYED,
+    MF_POPUP, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MINMAXINFO, MSG, MessageBoxW, PostMessageW,
+    PostQuitMessage, RegisterClassExW, SHOW_WINDOW_CMD, SW_MAXIMIZE, SW_SHOW, SW_SHOWNORMAL,
+    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOZORDER, SendMessageW,
+    SetForegroundWindow, SetMenu, SetProcessDPIAware, SetTimer, SetWindowLongPtrW, SetWindowPos,
+    SetWindowTextW, ShowCursor, ShowWindow, TPM_LEFTBUTTON, TrackPopupMenu, TranslateMessage,
+    USER_TIMER_MINIMUM, WINDOW_EX_STYLE, WM_ACTIVATE, WM_COMMAND, WM_CONTEXTMENU, WM_COPYDATA,
     WM_DESTROY, WM_DROPFILES, WM_ENDSESSION, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_INITMENU,
     WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_MOVE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_QUERYENDSESSION, WM_SIZE, WM_SYSKEYDOWN,
-    WM_TIMER, WNDCLASSEXW, WS_CAPTION, WS_EX_ACCEPTFILES, WS_OVERLAPPEDWINDOW, WS_POPUP,
-    WS_THICKFRAME, WS_VISIBLE, WindowFromPoint,
+    WM_MOVE, WM_NCCREATE, WM_NCDESTROY, WM_NULL, WM_PAINT, WM_QUERYENDSESSION, WM_SIZE,
+    WM_SYSKEYDOWN, WM_TIMER, WNDCLASSEXW, WS_CAPTION, WS_EX_ACCEPTFILES, WS_OVERLAPPEDWINDOW,
+    WS_POPUP, WS_THICKFRAME, WS_VISIBLE, WindowFromPoint,
 };
 use windows::core::{HSTRING, PCSTR, PCWSTR, w};
 
@@ -2013,11 +2014,87 @@ fn on_initmenu(hwnd: HWND) {
         let enable: MENU_ITEM_FLAGS = if menu::enabled(cmd) {
             MF_ENABLED | MF_BYCOMMAND
         } else {
-            MF_DISABLED | MF_BYCOMMAND
+            // Grayed, not just disabled: the Options placeholder is a
+            // riviv-specific condition (upstream's MF_DISABLED usage,
+            // viv.c:7098, gates image-dependent commands that do not exist
+            // in riviv's table yet), and the README promises a GREYED
+            // placeholder — MF_DISABLED alone renders normal text and
+            // leaves a clickable-looking no-op (cubic round 1).
+            MF_GRAYED | MF_BYCOMMAND
         };
         // SAFETY: bar is the window's own live menu.
         let _ = unsafe { EnableMenuItem(bar, u32::from(cmd.id()), enable) };
     }
+}
+
+/// WM_CONTEXTMENU's recovery slice (upstream builds its full context menu
+/// here, viv.c:3376-3550 — navigation, slideshow rate, sort modes…; riviv
+/// ships only the one row whose feature exists): upstream puts "Menu" in
+/// the context menu GATED to appear only while the bar is hidden
+/// (viv.c:3427 + `_viv_context_menu_items`, viv.c:1084) — the in-app way
+/// back from View→Menu OFF. Without it the bar could only return by
+/// hand-editing the ini (cubic round 1).
+fn on_contextmenu(hwnd: HWND, lparam: LPARAM) {
+    // -1/-1 is the keyboard invocation (Shift+F10) — upstream re-centers
+    // on the window for it; the mouse-point slice is enough and skips.
+    if lparam.0 == -1 {
+        return;
+    }
+    let x = (lparam.0 as u16) as i16 as i32;
+    let y = ((lparam.0 as u32 >> 16) as u16) as i16 as i32;
+    // SAFETY: the borrow spans only the three reads — nothing pumps.
+    let next = (unsafe { state_of(hwnd) }).and_then(|state| {
+        if state.fullscreen || state.config.show_menu != 0 {
+            return None; // bar visible (or fullscreen): nothing to recover
+        }
+        Some(state.menu)
+    });
+    let Some(menu_bar) = next else {
+        return;
+    };
+    if menu_bar.is_invalid() {
+        return;
+    }
+    // SAFETY: fresh popup creation.
+    let Ok(popup) = (unsafe { CreatePopupMenu() }) else {
+        return;
+    };
+    let text = to_wide(loc::get(loc::Id::MenuMenu));
+    // SAFETY: text outlives the append; the command id routes back through
+    // the shared WM_COMMAND dispatch when picked.
+    let _ = unsafe {
+        AppendMenuW(
+            popup,
+            MF_STRING,
+            usize::from(menu::Cmd::ViewMenu.id()),
+            PCWSTR(text.as_ptr()),
+        )
+    };
+    // The check state the row would carry (unchecked — the bar is hidden;
+    // upstream runs `_viv_check_menus` over the popup, viv.c:3530).
+    // SAFETY: our fresh popup.
+    let _ = unsafe {
+        CheckMenuItem(
+            popup,
+            u32::from(menu::Cmd::ViewMenu.id()),
+            (MF_UNCHECKED | MF_BYCOMMAND).0,
+        )
+    };
+    // Upstream passes tpm_flags = 0 for the mouse path (viv.c:3382) — no
+    // TPM_RIGHTBUTTON; mirror it.
+    let flags = TPM_LEFTBUTTON; // TRACK_POPUP_MENU_FLAGS(0)
+    // The MSDN menu-dismissal pattern: foreground the owner before
+    // TrackPopupMenu and nudge it with WM_NULL after, so the menu closes
+    // when focus leaves (a denial is ignored — the menu still works).
+    // SAFETY: our own live window.
+    let _ = unsafe { SetForegroundWindow(hwnd) };
+    // SAFETY: our popup shown at the message's screen point over our
+    // window; blocks until dismissed and posts WM_COMMAND on pick.
+    let _ = unsafe { TrackPopupMenu(popup, flags, x, y, None, hwnd, None) };
+    // SAFETY: our popup, whose tracking ended above.
+    let _ = unsafe { DestroyMenu(popup) };
+    // SAFETY: our own window; the empty nudge just wakes the pump.
+    let _ = unsafe { PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0)) };
 }
 
 /// WM_COMMAND dispatch (upstream `_viv_command`, viv.c:1658-2580: the
@@ -2060,22 +2137,22 @@ fn on_command(hwnd: HWND, cmd: menu::Cmd) {
 /// View→Menu (upstream `VIV_ID_VIEW_MENU`, viv.c:1975-1978): flip
 /// `config_show_menu` and rebuild the frame around the unchanged client
 /// area. Unreachable while fullscreen (the windowed shell carrying the
-/// bar is hidden there); the flip alone is enough in that case — the bar
-/// re-attaches per the flag on the next windowed frame update.
+/// bar is hidden there and the command has no accelerator) — and a strict
+/// no-op there rather than a bare config flip, so the flag can never
+/// desync from the attached bar (cubic round 1).
 fn toggle_menu(hwnd: HWND) {
-    // SAFETY: the borrow spans the config flip and the two handle copies —
-    // nothing pumps.
-    let next = (unsafe { state_of(hwnd) }).map(|state| {
+    // SAFETY: the borrow spans the fullscreen read, the config flip and
+    // the handle copy — nothing pumps.
+    let next = (unsafe { state_of(hwnd) }).and_then(|state| {
+        if state.fullscreen {
+            return None;
+        }
         state.config.show_menu = i32::from(state.config.show_menu == 0);
-        (state.config.show_menu != 0, state.fullscreen, state.menu)
+        Some((state.config.show_menu != 0, state.menu))
     });
-    let Some((show, fullscreen, menu)) = next else {
-        return;
-    };
-    if fullscreen {
-        return;
+    if let Some((show, menu)) = next {
+        update_menu_frame(hwnd, show, menu);
     }
-    update_menu_frame(hwnd, show, menu);
 }
 
 /// The frame rebuild around a menu attach/detach (upstream
@@ -2543,6 +2620,16 @@ unsafe extern "system" fn wnd_proc(
             on_initmenu(hwnd);
             // SAFETY: hwnd/msg are exactly what this callback received; the
             // default procedure owns the menu-open default handling.
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+        // Right-click: the bar-recovery slice of upstream's context menu
+        // (viv.c:3376-3550 — only its "Menu" row, gated to the hidden
+        // state per viv.c:3427); the full context menu lands with its
+        // features. Breaks to the default procedure like upstream.
+        WM_CONTEXTMENU => {
+            on_contextmenu(hwnd, lparam);
+            // SAFETY: hwnd/msg are exactly what this callback received; the
+            // default procedure handles everything we do not.
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
         // Alt-modified keys arrive as WM_SYSKEYDOWN, not WM_KEYDOWN —
