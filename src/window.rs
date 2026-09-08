@@ -225,6 +225,12 @@ pub(crate) struct WindowState {
     /// forward their command lines in a burst, viv.c:4778-4793). `None` =
     /// no command line processed yet.
     pub(crate) last_cl_tick: Option<u32>,
+    /// The last folder the Open Folder dialog picked (upstream
+    /// `_viv_last_open_folder`, viv.c:2426-2431 — the dialog reopens there
+    /// instead of deriving from the current image, which may sit in a
+    /// subfolder of a recursive scan). `None` = never picked; the dialog
+    /// then falls back to the current image's parent like riviv's Ctrl+O.
+    pub(crate) last_open_folder: Option<OsString>,
 }
 
 /// Window state pointer stored in GWLP_USERDATA between WM_NCCREATE and
@@ -519,6 +525,27 @@ fn toggle_fullscreen(hwnd: HWND) {
     }
     if was_fullscreen {
         // ---- exit (viv.c:6616-6658) ----
+        // The menu bar comes back first, per config (upstream viv.c:6635-
+        // 6643: SetMenu(_viv_hmenu) when config_show_menu else SetMenu(0) —
+        // the enter path below took it off the borderless cover).
+        // SAFETY: the borrow spans only the two reads; SetMenu
+        // synchronously re-enters wnd_proc, so it runs outside.
+        let (show_menu, menu) = (unsafe { state_of(hwnd) })
+            .map_or((false, HMENU::default()), |state| {
+                (state.config.show_menu != 0, state.menu)
+            });
+        // SAFETY: `menu` is the state's own bar; None detaches. The bool
+        // return is ignored like upstream's unchecked SetMenu.
+        let _ = unsafe {
+            SetMenu(
+                hwnd,
+                if show_menu && !menu.is_invalid() {
+                    Some(menu)
+                } else {
+                    None
+                },
+            )
+        };
         // The bar is RECREATED first (upstream `_viv_status_show(1)` at
         // 6645 precedes the style commit at 6648; it destroys and recreates
         // rather than hiding, viv.c:10932-10963).
@@ -633,6 +660,12 @@ fn toggle_fullscreen(hwnd: HWND) {
             // SAFETY: our live child window, torn down on the owning thread.
             let _ = unsafe { DestroyWindow(bar) };
         }
+        // The menu bar leaves with the status bar (upstream viv.c:6679:
+        // SetMenu(hwnd, 0) before the monitor cover — a borderless cover
+        // with a menu bar would donate its strip to non-image UI).
+        // SAFETY: detaching our own bar; the bool return is ignored like
+        // upstream's unchecked SetMenu.
+        let _ = unsafe { SetMenu(hwnd, None) };
         // SAFETY: hwnd is live; covers the monitor, reentering wnd_proc
         // with WM_SIZE (no borrow live). Failure diagnosed like the restore
         // path (upstream viv.c:6683 ignores the result too).
@@ -1775,16 +1808,24 @@ fn open_image_via_dialog(hwnd: HWND, add: bool) {
 fn open_folder_via_dialog(hwnd: HWND) {
     // SAFETY: the borrow ends at the end of the statement (the initial dir
     // is cloned out); the modal dialog below pumps messages with no borrow
-    // live.
-    let initial_dir = (unsafe { state_of(hwnd) })
-        .and_then(|s| s.path.clone())
-        .and_then(|p| Path::new(&p).parent().map(|d| d.as_os_str().to_os_string()));
+    // live. The last picked folder wins (upstream `_viv_last_open_folder`,
+    // viv.c:2418-2431); without one, the current image's parent — riviv's
+    // Ctrl+O convention — is the starting point.
+    let initial_dir = (unsafe { state_of(hwnd) }).and_then(|s| {
+        s.last_open_folder.clone().or_else(|| {
+            s.path
+                .clone()
+                .and_then(|p| Path::new(&p).parent().map(|d| d.as_os_str().to_os_string()))
+        })
+    });
     let Some(folder) = pick_folder(hwnd, initial_dir.as_deref()) else {
         return; // cancelled / unavailable
     };
-    // SAFETY: the borrow spans only the playlist clear — nothing pumps.
+    // SAFETY: the borrow spans the playlist clear and the memory store —
+    // nothing pumps.
     if let Some(state) = unsafe { state_of(hwnd) } {
         state.playlist.clear();
+        state.last_open_folder = Some(folder.clone());
     }
     let _ = open_from_filename(hwnd, &folder);
 }
@@ -2105,6 +2146,7 @@ fn on_command(hwnd: HWND, cmd: menu::Cmd) {
     match cmd {
         menu::Cmd::FileOpenFile => open_image_via_dialog(hwnd, false),
         menu::Cmd::FileOpenFolder => open_folder_via_dialog(hwnd),
+        menu::Cmd::FileAddFile => open_image_via_dialog(hwnd, true),
         menu::Cmd::FileExit => {
             // Upstream `_viv_exit` (viv.c:1883-1888) saves the config and
             // quits the pump; riviv's WM_DESTROY does both on the way out.
@@ -3185,6 +3227,7 @@ pub(crate) fn run(args: Vec<OsString>) -> Result<(), String> {
         last_cursor_pt: POINT { x: -1, y: -1 },
         prevent_deactivate_show: false,
         last_cl_tick: None,
+        last_open_folder: None,
     };
 
     // SAFETY: returns the module handle of this exe; no side effects.
