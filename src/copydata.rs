@@ -9,6 +9,7 @@
 //! to 1023 UTF-16 units (`_viv_get_copydata_string`'s STRING_SIZE buffer,
 //! string.h:28) — encode/decode mirror that split exactly.
 
+use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::core::{PCSTR, s};
 
 /// The single-instance mutex name (upstream `"VOIDIMAGEVIEWER"`,
@@ -30,6 +31,34 @@ pub(crate) const COPYDATA_COMMAND_LINE: usize = 0;
 /// Upstream's `STRING_SIZE` (string.h:28): the receiver's string buffers —
 /// the per-string truncation cap (STRING_SIZE-1 units actually copied).
 pub(crate) const STRING_SIZE: usize = 1024;
+
+/// The single-instance mutex held for the process lifetime (upstream
+/// `_viv_mutex`, closed in `_viv_kill`, viv.c:5526-5529) as RAII: riviv's
+/// fail-loud startup paths (`?` returns after acquisition, ADR 0001) must
+/// release it BEFORE `main`'s fatal modal — a mutex held through the modal
+/// makes every later launch observe ERROR_ALREADY_EXISTS and exit without
+/// a window to receive the handoff (Codex PR #30 P1). Process exit would
+/// reclaim the handle anyway; the explicit Drop is the upstream-kill
+/// mirror for every exit path at once.
+pub(crate) struct OwnedMutex(HANDLE);
+
+impl OwnedMutex {
+    /// Takes ownership of a handle `CreateMutexA` returned (valid even when
+    /// the mutex already existed — the ERROR_ALREADY_EXISTS decision stays
+    /// at the call site, which needs the window lookup before deciding).
+    pub(crate) fn new(handle: HANDLE) -> Self {
+        Self(handle)
+    }
+}
+
+impl Drop for OwnedMutex {
+    fn drop(&mut self) {
+        // SAFETY: the handle was created by this process's CreateMutexA,
+        // stored exactly once here, and closed exactly once on drop; no
+        // other copy exists after construction.
+        let _ = unsafe { CloseHandle(self.0) };
+    }
+}
 
 /// One decoded handoff: the second launch's requested show state, its
 /// original command line, and its working directory (UTF-16 units, the
