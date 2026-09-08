@@ -2278,7 +2278,11 @@ pub(crate) fn run(args: Vec<OsString>) -> Result<(), String> {
     // SAFETY: all parameters are valid for the call; state_ptr ownership moves
     // into the window via WM_NCCREATE. If creation fails BEFORE WM_NCCREATE the
     // pointer leaks into the fatal-exit path (acceptable, ADR 0001); if it fails
-    // after, WM_NCDESTROY already freed it.
+    // after, WM_NCDESTROY already freed it. The size subtraction wraps like C —
+    // the remembered rect can hold any i32 pair (the wrap itself happens in
+    // initial_window_rect), and C hands the wrapped size to CreateWindowEx,
+    // which rejects it gracefully; a debug-build panic must not get there
+    // first (Codex PR #27 round 3).
     let hwnd = unsafe {
         CreateWindowExW(
             WS_EX_ACCEPTFILES,
@@ -2287,8 +2291,8 @@ pub(crate) fn run(args: Vec<OsString>) -> Result<(), String> {
             WS_OVERLAPPEDWINDOW,
             rect.left,
             rect.top,
-            rect.right - rect.left,
-            rect.bottom - rect.top,
+            rect.right.wrapping_sub(rect.left),
+            rect.bottom.wrapping_sub(rect.top),
             None,
             None,
             Some(hinstance.into()),
@@ -2324,15 +2328,16 @@ pub(crate) fn run(args: Vec<OsString>) -> Result<(), String> {
     make_rect_completely_visible(hwnd, &mut rect);
     // SAFETY: hwnd is live. SetWindowPos synchronously reenters wnd_proc
     // with WM_MOVE/WM_SIZE — both handlers take their own borrows, none is
-    // live out here.
+    // live out here. The size subtraction wraps like C (see the
+    // CreateWindowExW call above).
     if let Err(e) = unsafe {
         SetWindowPos(
             hwnd,
             None,
             rect.left,
             rect.top,
-            rect.right - rect.left,
-            rect.bottom - rect.top,
+            rect.right.wrapping_sub(rect.left),
+            rect.bottom.wrapping_sub(rect.top),
             SWP_NOZORDER | SWP_NOACTIVATE,
         )
     } {
