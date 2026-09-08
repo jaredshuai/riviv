@@ -4,7 +4,7 @@ Unofficial Rust rewrite of [voidtools/voidImageViewer](https://github.com/voidto
 
 Based on voidImageViewer by David Carpenter / voidtools. See [LICENSE](LICENSE). The original C implementation is preserved under [`c-original/`](c-original/) as a read-only behavioral reference.
 
-> **Status: early development (M3 in progress).** Current scope: Win32 window + GDI rendering, animated GIF/WebP playback at author timing, alpha-composited transparency for every supported format (PNG, JPEG, BMP, ICO, TIFF, GIF and WebP), drag & drop, a keyboard-navigable playlist, zoom/pan over the upstream 16-level preset curve, the settings foundation (the window rect is remembered across runs in a `[riviv]` ini with upstream's 60% first-run auto-fit), and en/zh-CN localization driven by the system UI language. Remaining M3: menu, options dialog, custom shortcuts, single instance, Everything IPC, file associations, installer — see [Roadmap](#roadmap).
+> **Status: early development (M3 in progress).** Current scope: Win32 window + GDI rendering, animated GIF/WebP playback at author timing, alpha-composited transparency for every supported format (PNG, JPEG, BMP, ICO, TIFF, GIF and WebP), drag & drop, a keyboard-navigable playlist, zoom/pan over the upstream 16-level preset curve, the settings foundation (the window rect is remembered across runs in a `[riviv]` ini with upstream's 60% first-run auto-fit), en/zh-CN localization driven by the system UI language, and single-instance command-line forwarding (a second launch hands its image to the running viewer and exits). Remaining M3: menu, options dialog, custom shortcuts, Everything IPC, file associations, installer — see [Roadmap](#roadmap).
 
 ## Build
 

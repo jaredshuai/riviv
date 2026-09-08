@@ -2139,10 +2139,17 @@ unsafe extern "system" fn wnd_proc(
         // The single-instance handoff receive (#21; upstream viv.c:3688-3719):
         // only the command-line id is ours — anything else (upstream also
         // multiplexes its Everything-search IPC here) goes to the default.
+        // A null lparam is a malformed foreign send no legitimate sender
+        // makes — upstream null-derefs straight into an access violation
+        // here; riviv routes it to the default instead (the PR #27 rule:
+        // where C crashes on pathological input, Rust must degrade
+        // gracefully, never UB).
         WM_COPYDATA => {
             // SAFETY: lparam points at the sender-owned COPYDATASTRUCT for
-            // the duration of the message (the WM_COPYDATA contract).
-            if on_copydata(hwnd, unsafe { &*(lparam.0 as *const COPYDATASTRUCT) }) {
+            // the duration of the message (the WM_COPYDATA contract), and
+            // the null guard keeps hostile sends out of the cast.
+            if lparam.0 != 0 && on_copydata(hwnd, unsafe { &*(lparam.0 as *const COPYDATASTRUCT) })
+            {
                 LRESULT(1)
             } else {
                 // SAFETY: hwnd/msg are exactly what this callback received;
