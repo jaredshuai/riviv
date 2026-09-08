@@ -49,6 +49,8 @@ pub(crate) enum Id {
     MenuOpenFile,
     /// "Open Folder..." (viv.c:803).
     MenuOpenFolder,
+    /// "Add File..." (viv.c:805) — the Ctrl+Shift+O append path.
+    MenuAddFile,
     /// "Exit" (viv.c:821).
     MenuExit,
     /// "&View" top-level caption (viv.c:839).
@@ -110,10 +112,11 @@ const EN_US: [&str; Id::COUNT] = [
     "Open Image", // OpenImageCaption (en_us.h:260)
     "All Image Files", // OpenAllImageFiles (en_us.h:261)
     "All Files",  // OpenAllFiles (en_us.h:262)
-    // Menu block (en_us.h:34/35/36/52/67/70/77/88/89/97-100/115/160-164/177/182).
+    // Menu block (en_us.h:34/35/36/38/52/67/70/77/88/89/97-100/115/160-164/177/182).
     "&File",           // MenuFile
     "&Open File...",   // MenuOpenFile
     "Open &Folder...", // MenuOpenFolder
+    "&Add File...",    // MenuAddFile
     "E&xit",           // MenuExit
     "&View",           // MenuView
     "&Menu",           // MenuMenu
@@ -143,10 +146,11 @@ const ZH_CN: [&str; Id::COUNT] = [
     "打开图像",       // OpenImageCaption (zh_cn.h:261)
     "所有图像文件",   // OpenAllImageFiles (zh_cn.h:262)
     "所有文件",       // OpenAllFiles (zh_cn.h:263)
-    // Menu block (zh_cn.h:34/35/36/52/67/70/77/88/89/97-100/115/160-164/177/182).
+    // Menu block (zh_cn.h:34/35/36/38/52/67/70/77/88/89/97-100/115/160-164/177/182).
     "文件(&F)",          // MenuFile
     "打开文件(&O)...",   // MenuOpenFile
     "打开文件夹(&F)...", // MenuOpenFolder
+    "添加文件(&A)...",   // MenuAddFile
     "退出(&X)",          // MenuExit
     "视图(&V)",          // MenuView
     "菜单(&M)",          // MenuMenu
@@ -295,6 +299,7 @@ mod tests {
         assert_eq!(get_for(en, Id::MenuFile), "&File");
         assert_eq!(get_for(en, Id::MenuOpenFile), "&Open File...");
         assert_eq!(get_for(en, Id::MenuOpenFolder), "Open &Folder...");
+        assert_eq!(get_for(en, Id::MenuAddFile), "&Add File...");
         assert_eq!(get_for(en, Id::MenuExit), "E&xit");
         assert_eq!(get_for(en, Id::MenuView), "&View");
         assert_eq!(get_for(en, Id::MenuMenu), "&Menu");
@@ -317,6 +322,7 @@ mod tests {
         assert_eq!(get_for(zh, Id::MenuFile), "文件(&F)");
         assert_eq!(get_for(zh, Id::MenuOpenFile), "打开文件(&O)...");
         assert_eq!(get_for(zh, Id::MenuOpenFolder), "打开文件夹(&F)...");
+        assert_eq!(get_for(zh, Id::MenuAddFile), "添加文件(&A)...");
         assert_eq!(get_for(zh, Id::MenuExit), "退出(&X)");
         assert_eq!(get_for(zh, Id::MenuView), "视图(&V)");
         assert_eq!(get_for(zh, Id::MenuMenu), "菜单(&M)");

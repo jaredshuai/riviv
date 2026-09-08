@@ -25,6 +25,9 @@ pub(crate) enum Cmd {
     FileOpenFile,
     /// File → Open Folder... (`VIV_ID_FILE_OPEN_FOLDER`).
     FileOpenFolder,
+    /// File → Add File... (`VIV_ID_FILE_ADD_FILE`) — the Ctrl+Shift+O
+    /// append path.
+    FileAddFile,
     /// File → Exit (`VIV_ID_FILE_EXIT`).
     FileExit,
     /// View → Menu toggle (`VIV_ID_VIEW_MENU`).
@@ -85,6 +88,7 @@ impl Cmd {
     pub(crate) const ALL: [Cmd; Cmd::COUNT] = [
         Self::FileOpenFile,
         Self::FileOpenFolder,
+        Self::FileAddFile,
         Self::FileExit,
         Self::ViewMenu,
         Self::ViewFullscreen,
@@ -199,6 +203,19 @@ pub(crate) const ENTRIES: &[Entry] = &[
             alt: false,
             shift: false,
             vk: b'B' as u16,
+        }),
+    },
+    // Upstream slots Add File after the open rows (viv.c:805, after the
+    // Everything row riviv does not ship).
+    Entry::Item {
+        loc: loc::Id::MenuAddFile,
+        parent: Slot::File,
+        cmd: Cmd::FileAddFile,
+        key: Some(KeyDef {
+            ctrl: true,
+            alt: false,
+            shift: true,
+            vk: b'O' as u16,
         }),
     },
     Entry::Separator { parent: Slot::File },
