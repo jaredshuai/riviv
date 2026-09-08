@@ -25,10 +25,15 @@
 //! RIVIV-mutex owner via WM_COPYDATA and exits (`copydata.rs`); the
 //! receiver adopts its cwd, re-runs the command-line open path, and
 //! appends instead of replacing when the handoffs arrive in a burst.
+//! Menu bar (#23): the command table in `menu.rs` walks into a real HMENU
+//! at startup (attached per `config_show_menu`, detached/attached with
+//! client-anchored frame compensation on the View→Menu toggle), WM_COMMAND
+//! dispatches onto the same action functions as the keyboard, and
+//! WM_INITMENU refreshes the check marks.
 
 use std::ffi::{OsStr, OsString, c_void};
 use std::mem::size_of;
-use std::os::windows::ffi::OsStringExt;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::Path;
 
 use windows::Win32::Foundation::{
@@ -39,6 +44,10 @@ use windows::Win32::Graphics::Gdi::{
     COLOR_BTNFACE, GetMonitorInfoW, HBRUSH, InvalidateRect, MONITOR_DEFAULTTOPRIMARY, MONITORINFO,
     MonitorFromPoint, MonitorFromRect, MonitorFromWindow, PtInRect, ScreenToClient, UpdateWindow,
 };
+use windows::Win32::System::Com::{
+    CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoCreateInstance,
+    CoInitializeEx, CoTaskMemFree, IBindCtx,
+};
 use windows::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows::Win32::System::Environment::{
     GetCommandLineW, GetCurrentDirectoryW, SetCurrentDirectoryW,
@@ -47,7 +56,7 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows::Win32::System::SystemInformation::GetTickCount;
 use windows::Win32::System::Threading::{
-    CreateMutexA, GetStartupInfoW, STARTF_USESHOWWINDOW, STARTUPINFOW,
+    CreateMutexA, GetCurrentThreadId, GetStartupInfoW, STARTF_USESHOWWINDOW, STARTUPINFOW,
 };
 use windows::Win32::UI::Controls::Dialogs::{
     CommDlgExtendedError, GetOpenFileNameW, OFN_FILEMUSTEXIST, OFN_HIDEREADONLY, OFN_NOCHANGEDIR,
@@ -58,25 +67,33 @@ use windows::Win32::UI::Controls::{
     InitCommonControlsEx, WM_MOUSELEAVE,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetCapture, GetKeyState, ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT,
-    TrackMouseEvent, VK_ADD, VK_CONTROL, VK_END, VK_ESCAPE, VK_HOME, VK_LEFT, VK_MENU, VK_NEXT,
-    VK_OEM_MINUS, VK_OEM_PLUS, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SUBTRACT,
+    GetCapture, GetKeyNameTextW, GetKeyState, GetKeyboardLayout, MAPVK_VK_TO_VSC, MapVirtualKeyExW,
+    ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_ADD, VK_CONTROL,
+    VK_END, VK_ESCAPE, VK_F1, VK_HOME, VK_LEFT, VK_MENU, VK_NEXT, VK_OEM_MINUS, VK_OEM_PLUS,
+    VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SUBTRACT,
 };
-use windows::Win32::UI::Shell::{CommandLineToArgvW, DragFinish, DragQueryFileW, HDROP};
+use windows::Win32::UI::Shell::{
+    CommandLineToArgvW, DragFinish, DragQueryFileW, FILEOPENDIALOGOPTIONS, FOS_NOCHANGEDIR,
+    FOS_PICKFOLDERS, FileOpenDialog, HDROP, IFileOpenDialog, IShellItem,
+    SHCreateItemFromParsingName, SIGDN_FILESYSPATH,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW,
-    DestroyWindow, DispatchMessageW, FindWindowA, GWL_STYLE, GWLP_USERDATA, GetClientRect,
-    GetCursorPos, GetForegroundWindow, GetMessageW, GetWindowLongPtrW, GetWindowRect, HWND_TOP,
-    IDC_ARROW, IsIconic, IsZoomed, KillTimer, LoadCursorW, MB_ICONERROR, MINMAXINFO, MSG,
-    MessageBoxW, PostQuitMessage, RegisterClassExW, SHOW_WINDOW_CMD, SW_MAXIMIZE, SW_SHOW,
-    SW_SHOWNORMAL, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOZORDER, SendMessageW,
-    SetForegroundWindow, SetProcessDPIAware, SetTimer, SetWindowLongPtrW, SetWindowPos,
-    SetWindowTextW, ShowCursor, ShowWindow, TranslateMessage, USER_TIMER_MINIMUM, WINDOW_EX_STYLE,
-    WM_ACTIVATE, WM_COPYDATA, WM_DESTROY, WM_DROPFILES, WM_ENDSESSION, WM_ERASEBKGND,
-    WM_GETMINMAXINFO, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
-    WM_MOUSEWHEEL, WM_MOVE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_QUERYENDSESSION, WM_SIZE,
-    WM_SYSKEYDOWN, WM_TIMER, WNDCLASSEXW, WS_CAPTION, WS_EX_ACCEPTFILES, WS_OVERLAPPEDWINDOW,
-    WS_POPUP, WS_THICKFRAME, WS_VISIBLE, WindowFromPoint,
+    AdjustWindowRect, AppendMenuW, CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW,
+    CheckMenuItem, CreateMenu, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyWindow,
+    DispatchMessageW, EnableMenuItem, FindWindowA, GWL_STYLE, GWLP_USERDATA, GetClientRect,
+    GetCursorPos, GetForegroundWindow, GetMenu, GetMessageW, GetWindowLongPtrW, GetWindowRect,
+    HMENU, HWND_TOP, IDC_ARROW, IsIconic, IsZoomed, KillTimer, LoadCursorW, MB_ICONERROR, MB_OK,
+    MENU_ITEM_FLAGS, MF_BYCOMMAND, MF_CHECKED, MF_DISABLED, MF_ENABLED, MF_POPUP, MF_SEPARATOR,
+    MF_STRING, MF_UNCHECKED, MINMAXINFO, MSG, MessageBoxW, PostQuitMessage, RegisterClassExW,
+    SHOW_WINDOW_CMD, SW_MAXIMIZE, SW_SHOW, SW_SHOWNORMAL, SWP_FRAMECHANGED, SWP_NOACTIVATE,
+    SWP_NOCOPYBITS, SWP_NOZORDER, SendMessageW, SetForegroundWindow, SetMenu, SetProcessDPIAware,
+    SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowCursor, ShowWindow,
+    TranslateMessage, USER_TIMER_MINIMUM, WINDOW_EX_STYLE, WM_ACTIVATE, WM_COMMAND, WM_COPYDATA,
+    WM_DESTROY, WM_DROPFILES, WM_ENDSESSION, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_INITMENU,
+    WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_MOVE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_QUERYENDSESSION, WM_SIZE, WM_SYSKEYDOWN,
+    WM_TIMER, WNDCLASSEXW, WS_CAPTION, WS_EX_ACCEPTFILES, WS_OVERLAPPEDWINDOW, WS_POPUP,
+    WS_THICKFRAME, WS_VISIBLE, WindowFromPoint,
 };
 use windows::core::{HSTRING, PCSTR, PCWSTR, w};
 
@@ -87,6 +104,7 @@ use crate::cursor::{self, CursorVisibility};
 use crate::loader::{LoadedImage, UiAction, apply_reply, map_reply_frame};
 use crate::loadthread::{LoadSession, LoadThread, REPLY_KICK_MESSAGE};
 use crate::loc;
+use crate::menu;
 use crate::paint::paint;
 use crate::playlist::{self, Playlist, PlaylistEntry};
 use crate::status;
@@ -128,6 +146,13 @@ pub(crate) struct WindowState {
     /// The status-bar child window (#5; upstream `_viv_status_hwnd`).
     /// Created in WM_NCCREATE, destroyed with the parent by Windows.
     pub(crate) status: HWND,
+    /// The menu bar (#23; upstream `_viv_hmenu`, viv.c:718/5352) — built
+    /// once in `run` before the window exists, attached at creation when
+    /// `config_show_menu` is set, and re-attached/detached by the
+    /// View→Menu toggle. `HMENU::default()` = creation failed (every menu
+    /// call guards on it; the viewer keeps working, like a missing status
+    /// bar).
+    pub(crate) menu: HMENU,
     /// Status-bar flags (upstream `_viv_file_not_found` /
     /// `_viv_load_failed`, viv.c:779-780): set by the open path and the
     /// reply protocol, reset on every new open. "Loading" is not a flag —
@@ -1700,6 +1725,445 @@ fn open_file_dialog(hwnd: HWND, initial_dir: Option<&OsStr>) -> Option<OsString>
     Some(OsString::from_wide(&file_buf[..len]))
 }
 
+/// The Open File / Add File action behind both the Ctrl+O /
+/// Ctrl+Shift+O keys and the menu's File→Open File (upstream's
+/// `VIV_ID_FILE_OPEN_FILE`/`_ADD_FILE` arm, viv.c:2278-2402): a modal
+/// pick, then Add appends to the playlist keeping the display while Open
+/// clears the list and opens the pick.
+fn open_image_via_dialog(hwnd: HWND, add: bool) {
+    // SAFETY: the borrow ends at the end of this statement (the path is
+    // cloned out); the modal dialog below pumps messages but no borrow is
+    // live by then.
+    let initial_dir = (unsafe { state_of(hwnd) })
+        .and_then(|s| s.path.clone())
+        .and_then(|p| Path::new(&p).parent().map(|d| d.as_os_str().to_os_string()));
+    let Some(path) = open_file_dialog(hwnd, initial_dir.as_deref()) else {
+        return; // user cancelled
+    };
+    // SAFETY: the borrow spans only the playlist mutation —
+    // nothing pumps.
+    if let Some(state) = unsafe { state_of(hwnd) } {
+        if add {
+            // Add File appends (viv.c:2396-2402): the current
+            // file becomes the first entry when the list is
+            // empty, then the pick — no clear, no home, the
+            // display stays.
+            if state.playlist.is_empty()
+                && let Some(current) = state.nav_current.as_ref()
+            {
+                let current = current.clone();
+                state.playlist.add(current.path, current.modified);
+            }
+            playlist::add_filename(&mut state.playlist, Path::new(&path));
+        } else {
+            // Open File clears the playlist before opening
+            // (viv.c:2390-2394) — the picked file starts fresh,
+            // and navigation falls back to its folder.
+            state.playlist.clear();
+        }
+    }
+    if !add {
+        let _ = open_from_filename(hwnd, &path);
+    }
+}
+
+/// File→Open Folder (upstream `VIV_ID_FILE_OPEN_FOLDER`, viv.c:2404-2437):
+/// pick a folder, clear the playlist (the OPEN arm, viv.c:2412-2416), then
+/// open it — `open_from_filename` scans its images and homes onto the
+/// first (upstream `_viv_playlist_add_path` + `_viv_home(0,0)`).
+fn open_folder_via_dialog(hwnd: HWND) {
+    // SAFETY: the borrow ends at the end of the statement (the initial dir
+    // is cloned out); the modal dialog below pumps messages with no borrow
+    // live.
+    let initial_dir = (unsafe { state_of(hwnd) })
+        .and_then(|s| s.path.clone())
+        .and_then(|p| Path::new(&p).parent().map(|d| d.as_os_str().to_os_string()));
+    let Some(folder) = pick_folder(hwnd, initial_dir.as_deref()) else {
+        return; // cancelled / unavailable
+    };
+    // SAFETY: the borrow spans only the playlist clear — nothing pumps.
+    if let Some(state) = unsafe { state_of(hwnd) } {
+        state.playlist.clear();
+    }
+    let _ = open_from_filename(hwnd, &folder);
+}
+
+/// The folder picker (upstream `os_browse_for_folder`'s IFileOpenDialog
+/// arm, os.c: options 0x2028 = PICKFOLDERS | NOCHANGEDIR | HIDEMRUITEMS,
+/// starting at a remembered folder when one exists — riviv derives it
+/// from the current path like the Ctrl+O dialog's initial dir). None =
+/// cancelled or unavailable; COM itself is initialized once in `run`
+/// (upstream WinMain, viv.c:5228-5229).
+fn pick_folder(hwnd: HWND, initial_dir: Option<&OsStr>) -> Option<OsString> {
+    // SAFETY: CoCreateInstance on the shell's registered FileOpenDialog
+    // class with no outer aggregate; a failure degrades to "no folder
+    // opened" (the viewer keeps working — the status-bar posture).
+    let dialog: IFileOpenDialog =
+        match unsafe { CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER) } {
+            Ok(dialog) => dialog,
+            Err(e) => {
+                eprintln!("folder picker unavailable: {e}");
+                return None;
+            }
+        };
+    // SAFETY: live COM interface pointer; the option flags are plain
+    // values. 0x2028 is upstream's set (os.c: FOS_PICKFOLDERS |
+    // FOS_NOCHANGEDIR | FOS_HIDEMRUITEMS — the last not exposed by
+    // windows-rs 0.62, spelled raw).
+    if let Err(e) = unsafe {
+        dialog.SetOptions(FOS_PICKFOLDERS | FOS_NOCHANGEDIR | FILEOPENDIALOGOPTIONS(0x2000))
+    } {
+        eprintln!("folder picker options failed: {e}");
+        return None;
+    }
+    if let Some(dir) = initial_dir {
+        let mut wide: Vec<u16> = dir.encode_wide().collect();
+        wide.push(0);
+        // SAFETY: NUL-terminated path owned by `wide` for the call; a
+        // failure skips the start folder (the dialog opens at its default,
+        // like upstream's NULL shell item).
+        let item: Result<IShellItem, _> =
+            unsafe { SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None::<&IBindCtx>) };
+        if let Ok(item) = item {
+            // SAFETY: live COM pointers on both sides.
+            let _ = unsafe { dialog.SetFolder(&item) };
+        }
+    }
+    // SAFETY: the modal Show pumps messages — the caller guarantees no
+    // state borrow is live.
+    if unsafe { dialog.Show(Some(hwnd)) }.is_err() {
+        return None; // cancelled
+    }
+    // SAFETY: live COM pointer; the result item is ours.
+    let item: IShellItem = unsafe { dialog.GetResult() }.ok()?;
+    // SAFETY: live COM pointer; the returned buffer is CoTaskMem-allocated
+    // and freed exactly once below.
+    let name = unsafe { item.GetDisplayName(SIGDN_FILESYSPATH) }.ok()?;
+    let mut len = 0usize;
+    // SAFETY: GetDisplayName's contract returns a NUL-terminated string;
+    // the walk reads up to that NUL only.
+    unsafe {
+        while *name.as_ptr().add(len) != 0 {
+            len += 1;
+        }
+    }
+    // SAFETY: the length walk above bounded the readable region.
+    let path = OsString::from_wide(unsafe { core::slice::from_raw_parts(name.as_ptr(), len) });
+    // SAFETY: the buffer was allocated by the shell on the COM task heap
+    // (GetDisplayName's contract); freeing it here releases the only copy.
+    unsafe { CoTaskMemFree(Some(name.as_ptr().cast())) };
+    Some(path)
+}
+
+/// Help→About (upstream `VIV_ID_HELP_ABOUT` → the IDD_ABOUT resource
+/// dialog, viv.c:1696/9728-9800). riviv ships no dialog resources — a
+/// message box carries the same facts (README Differences).
+fn show_about(hwnd: HWND) {
+    let text = format!(
+        "riviv {}\n\nUnofficial Rust rewrite of voidtools void Image Viewer.\nUpstream (MIT): https://www.voidtools.com/voidimageviewer/\nSource: https://github.com/jaredshuai/riviv",
+        env!("CARGO_PKG_VERSION")
+    );
+    let text_wide = to_wide(&text);
+    let caption = to_wide(loc::get(loc::Id::AppName));
+    // SAFETY: both buffers outlive the modal call; hwnd is the live owner.
+    let _ = unsafe {
+        MessageBoxW(
+            Some(hwnd),
+            PCWSTR(text_wide.as_ptr()),
+            PCWSTR(caption.as_ptr()),
+            MB_OK,
+        )
+    };
+}
+
+/// Build the menu bar from the command table (upstream `_viv_create_menu`,
+/// viv.c:12314-12399): walk `menu::ENTRIES`, create each popup on demand
+/// keyed by its slot, append separators/items with their accelerator
+/// labels. Returns an invalid HMENU on failure (callers degrade to a
+/// menu-less window, like a failed status bar).
+fn create_menu_bar() -> HMENU {
+    // SAFETY: pure menu-object construction; no window involvement. A
+    // failure (NULL handle) degrades to a menu-less window.
+    let Ok(bar) = (unsafe { CreateMenu() }) else {
+        return HMENU::default();
+    };
+    let mut slots: [HMENU; menu::Slot::COUNT] = [HMENU::default(); menu::Slot::COUNT];
+    slots[menu::Slot::Root as usize] = bar;
+    for entry in menu::ENTRIES {
+        match *entry {
+            menu::Entry::Separator { parent } => {
+                // SAFETY: the parent slot's menu exists (the table's
+                // popup-before-use invariant, tested in menu.rs).
+                let _ =
+                    unsafe { AppendMenuW(slots[parent as usize], MF_SEPARATOR, 0, PCWSTR::null()) };
+            }
+            menu::Entry::Popup { loc, parent, slot } => {
+                // SAFETY: fresh popup creation; a failure stores the
+                // invalid handle and this popup's rows append nowhere
+                // (degraded menu, like the failed bar).
+                let popup = unsafe { CreatePopupMenu() }.unwrap_or_default();
+                slots[slot as usize] = popup;
+                let text = to_wide(loc::get(loc));
+                // SAFETY: text outlives the append; the popup handle moves
+                // into the parent menu here.
+                let _ = unsafe {
+                    AppendMenuW(
+                        slots[parent as usize],
+                        MF_STRING | MF_POPUP,
+                        popup.0 as usize,
+                        PCWSTR(text.as_ptr()),
+                    )
+                };
+            }
+            menu::Entry::Item {
+                loc,
+                parent,
+                cmd,
+                key,
+            } => {
+                // The accelerator label: the default key's display name
+                // via GetKeyNameTextW (layout-localized like upstream,
+                // `_viv_vk_to_text` viv.c:12221-12261), composed by the
+                // pure `menu::key_label`.
+                let label = key.and_then(|k| vk_text(k.vk).map(|t| menu::key_label(k, &t)));
+                let text = to_wide(&menu::item_text(loc::get(loc), label.as_deref()));
+                // SAFETY: text outlives the append.
+                let _ = unsafe {
+                    AppendMenuW(
+                        slots[parent as usize],
+                        MF_STRING,
+                        usize::from(cmd.id()),
+                        PCWSTR(text.as_ptr()),
+                    )
+                };
+            }
+        }
+    }
+    bar
+}
+
+/// The key-name half of an accelerator label (upstream `_viv_vk_to_text`,
+/// viv.c:12221-12261): scan code from the thread's keyboard layout, then
+/// `GetKeyNameTextW` with the extended-key bit for the navigation keys
+/// riviv registers (upstream's full extended list covers keys riviv has
+/// no default binding for). None = no name (the item then shows no
+/// accelerator).
+fn vk_text(vk: u16) -> Option<String> {
+    // SAFETY: read-only layout query for this thread.
+    let hkl = unsafe { GetKeyboardLayout(GetCurrentThreadId()) };
+    // SAFETY: pure VK→scan-code mapping.
+    let scan = unsafe { MapVirtualKeyExW(u32::from(vk), MAPVK_VK_TO_VSC, Some(hkl)) };
+    if scan == 0 {
+        return None;
+    }
+    let mut lparam = (scan as i32) << 16;
+    // The extended bit (1 << 24) for keys that live only on the extended
+    // cluster (arrows/Home/End) — without it GetKeyNameTextW names the
+    // wrong key or fails (viv.c:12243-12254).
+    if matches!(vk, v if v == VK_HOME.0 || v == VK_END.0 || v == VK_LEFT.0 || v == VK_RIGHT.0) {
+        lparam |= 1 << 24;
+    }
+    let mut buf = [0u16; 64];
+    // SAFETY: buf outlives the call; a zero return means "no name".
+    let len = unsafe { GetKeyNameTextW(lparam, &mut buf) };
+    if len <= 0 {
+        return None;
+    }
+    Some(String::from_utf16_lossy(&buf[..len as usize]))
+}
+
+/// WM_INITMENU (upstream viv.c:3063-3072: `_viv_check_menus` over
+/// `GetMenu(hwnd)` just before the bar opens) — apply the check marks and
+/// grays for the state right now.
+fn on_initmenu(hwnd: HWND) {
+    // The 1:1 check is upstream's render-size == image-size compare
+    // (viv.c:7131); blank displays carry no 1:1 state (upstream's raw
+    // 0 == 0 compare would check the item on an empty window — riviv
+    // guards it, README Differences).
+    // SAFETY: the borrow spans only the snapshot reads (window queries
+    // inside are pump-free); the menu calls below run outside it.
+    let snapshot = (unsafe { state_of(hwnd) }).map(|state| {
+        let one_to_one = state.image.as_ref().is_some_and(|image| {
+            let (vp, src) = viewport_and_src(hwnd, state);
+            let (rw, rh) = state.view.render_size(src.0, src.1, vp);
+            (rw, rh) == (image.width(), image.height())
+        });
+        menu::MenuState {
+            show_menu: state.config.show_menu != 0,
+            fullscreen: state.fullscreen,
+            one_to_one,
+        }
+    });
+    let Some(state) = snapshot else {
+        return;
+    };
+    // SAFETY: read-only query of the window's own menu.
+    let bar = unsafe { GetMenu(hwnd) };
+    if bar.is_invalid() {
+        return;
+    }
+    for cmd in menu::Cmd::ALL {
+        let flags: u32 = if menu::checked(cmd, &state) {
+            (MF_CHECKED | MF_BYCOMMAND).0
+        } else {
+            (MF_UNCHECKED | MF_BYCOMMAND).0
+        };
+        // SAFETY: bar is the window's own live menu.
+        let _ = unsafe { CheckMenuItem(bar, u32::from(cmd.id()), flags) };
+        let enable: MENU_ITEM_FLAGS = if menu::enabled(cmd) {
+            MF_ENABLED | MF_BYCOMMAND
+        } else {
+            MF_DISABLED | MF_BYCOMMAND
+        };
+        // SAFETY: bar is the window's own live menu.
+        let _ = unsafe { EnableMenuItem(bar, u32::from(cmd.id()), enable) };
+    }
+}
+
+/// WM_COMMAND dispatch (upstream `_viv_command`, viv.c:1658-2580: the
+/// switch over command ids onto the same action functions the keys use —
+/// menu triggers are never key repeats, so the repeat-wait gates of the
+/// keyboard path do not apply, matching upstream's is_key_repeat=0).
+fn on_command(hwnd: HWND, cmd: menu::Cmd) {
+    match cmd {
+        menu::Cmd::FileOpenFile => open_image_via_dialog(hwnd, false),
+        menu::Cmd::FileOpenFolder => open_folder_via_dialog(hwnd),
+        menu::Cmd::FileExit => {
+            // Upstream `_viv_exit` (viv.c:1883-1888) saves the config and
+            // quits the pump; riviv's WM_DESTROY does both on the way out.
+            // SAFETY: legal on the owning thread; synchronously runs
+            // WM_DESTROY/WM_NCDESTROY with no borrow live.
+            let _ = unsafe { DestroyWindow(hwnd) };
+        }
+        menu::Cmd::ViewMenu => toggle_menu(hwnd),
+        menu::Cmd::ViewFullscreen => toggle_fullscreen(hwnd),
+        menu::Cmd::ViewOneToOne => toggle_one_to_one(hwnd),
+        // Upstream's two fit commands both collapse the zoom position back
+        // to the fit level (`VIV_ID_VIEW_BESTFIT` zeroes the zoom position
+        // and refits, `VIV_ID_VIEW_ZOOM_RESET` drops 1:1 and the zoom
+        // position — viv.c:1678-1687/2059-2064); riviv's Ctrl+0 reset is
+        // that action.
+        menu::Cmd::ViewBestFit | menu::Cmd::ViewZoomReset => zoom_reset(hwnd),
+        menu::Cmd::ViewZoomIn => zoom_step_centered(hwnd, false),
+        menu::Cmd::ViewZoomOut => zoom_step_centered(hwnd, true),
+        // The Options placeholder — greyed at WM_INITMENU, wired by the
+        // Options dialog issue (#24).
+        menu::Cmd::ViewOptions => {}
+        menu::Cmd::NavNext => nav_next(hwnd, false),
+        menu::Cmd::NavPrev => nav_next(hwnd, true),
+        menu::Cmd::NavHome => home_open(hwnd, false),
+        menu::Cmd::NavEnd => home_open(hwnd, true),
+        menu::Cmd::HelpAbout => show_about(hwnd),
+    }
+}
+
+/// View→Menu (upstream `VIV_ID_VIEW_MENU`, viv.c:1975-1978): flip
+/// `config_show_menu` and rebuild the frame around the unchanged client
+/// area. Unreachable while fullscreen (the windowed shell carrying the
+/// bar is hidden there); the flip alone is enough in that case — the bar
+/// re-attaches per the flag on the next windowed frame update.
+fn toggle_menu(hwnd: HWND) {
+    // SAFETY: the borrow spans the config flip and the two handle copies —
+    // nothing pumps.
+    let next = (unsafe { state_of(hwnd) }).map(|state| {
+        state.config.show_menu = i32::from(state.config.show_menu == 0);
+        (state.config.show_menu != 0, state.fullscreen, state.menu)
+    });
+    let Some((show, fullscreen, menu)) = next else {
+        return;
+    };
+    if fullscreen {
+        return;
+    }
+    update_menu_frame(hwnd, show, menu);
+}
+
+/// The frame rebuild around a menu attach/detach (upstream
+/// `_viv_update_frame`'s menu arm, viv.c:9840-9925 — riviv keeps caption
+/// and thick frame permanently, so only the menu presence changes):
+/// re-seat the menu, then shift the outer rect by the AdjustWindowRect
+/// delta of the SAME client area so the client — the image — stays
+/// exactly where it was when the bar appears or disappears.
+fn update_menu_frame(hwnd: HWND, show: bool, menu: HMENU) {
+    let mut client = RECT::default();
+    // SAFETY: read-only client query on the live window; a failure reads
+    // the zeroed rect and the deltas collapse to a no-op shift.
+    let _ = unsafe { GetClientRect(hwnd, &mut client) };
+    let mut with_menu = client;
+    // SAFETY: in/out rect valid for the call; the BOOL return is ignored
+    // like upstream (a failure leaves the frame delta at zero).
+    let _ = unsafe { AdjustWindowRect(&mut with_menu, WS_OVERLAPPEDWINDOW, true) };
+    let mut without_menu = client;
+    // SAFETY: same call with bMenu false.
+    let _ = unsafe { AdjustWindowRect(&mut without_menu, WS_OVERLAPPEDWINDOW, false) };
+    // Attach/detach FIRST (upstream SetMenu before the rect math,
+    // viv.c:9879-9889) so the SWP_FRAMECHANGED below applies the final
+    // state in one pass.
+    // SAFETY: `menu` is the state's own bar when attaching, None detaches;
+    // the BOOL return is ignored like upstream (a failure keeps the old
+    // attach state, and the rect shift still matches the menu-less frame).
+    let _ = unsafe {
+        SetMenu(
+            hwnd,
+            if show && !menu.is_invalid() {
+                Some(menu)
+            } else {
+                None
+            },
+        )
+    };
+    let mut window = RECT::default();
+    // SAFETY: read-only outer-rect query; fail-soft like upstream's
+    // unchecked GetWindowRect (viv.c:9908).
+    let _ = unsafe { GetWindowRect(hwnd, &mut window) };
+    // Shift by the frame delta — NEW frame minus OLD (viv.c:9910-9913:
+    // windowrect += newrect - oldrect over the same client): attaching
+    // moves the top up by the bar, detaching pulls it back down. Wrapping
+    // like the rest of riviv's rect math so pathological values cannot
+    // panic.
+    let (new_frame, old_frame) = if show {
+        (&with_menu, &without_menu)
+    } else {
+        (&without_menu, &with_menu)
+    };
+    window.left = window
+        .left
+        .wrapping_add(new_frame.left.wrapping_sub(old_frame.left));
+    window.top = window
+        .top
+        .wrapping_add(new_frame.top.wrapping_sub(old_frame.top));
+    window.right = window
+        .right
+        .wrapping_add(new_frame.right.wrapping_sub(old_frame.right));
+    window.bottom = window
+        .bottom
+        .wrapping_add(new_frame.bottom.wrapping_sub(old_frame.bottom));
+    // SAFETY: read-only zoomed query — the restore below needs the
+    // pre-change state.
+    let was_maximized = unsafe { IsZoomed(hwnd) }.as_bool();
+    // SAFETY: live window; re-asserts top like upstream's HWND_TOP
+    // (viv.c:9918-9920) and applies the frame change synchronously —
+    // WM_SIZE re-docks the status bar with no borrow live out here.
+    let _ = unsafe {
+        SetWindowPos(
+            hwnd,
+            Some(HWND_TOP),
+            window.left,
+            window.top,
+            window.right.wrapping_sub(window.left),
+            window.bottom.wrapping_sub(window.top),
+            SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_NOCOPYBITS,
+        )
+    };
+    // A maximized window loses its zoom under the explicit rect — restore
+    // it like upstream (viv.c:9921-9924; its caption/thickframe conditions
+    // are permanently true in riviv).
+    if was_maximized {
+        // SAFETY: live window.
+        let _ = unsafe { ShowWindow(hwnd, SW_MAXIMIZE) };
+    }
+}
+
 fn on_keydown(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
     // Upstream default keymap (viv.c:970-1049): Ctrl+O = open file and
     // Ctrl+Shift+O = add file (viv.c:975); the navigation keys are
@@ -1716,40 +2180,7 @@ fn on_keydown(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
         if ctrl && !alt {
             // SAFETY: GetKeyState reads thread-local async key state; VK_SHIFT is valid.
             let shift = unsafe { GetKeyState(i32::from(VK_SHIFT.0)) } < 0;
-            // SAFETY: the borrow ends at the end of this statement (the path is
-            // cloned out); the modal dialog below pumps messages but no borrow is
-            // live by then.
-            let initial_dir = (unsafe { state_of(hwnd) })
-                .and_then(|s| s.path.clone())
-                .and_then(|p| Path::new(&p).parent().map(|d| d.as_os_str().to_os_string()));
-            if let Some(path) = open_file_dialog(hwnd, initial_dir.as_deref()) {
-                // SAFETY: the borrow spans only the playlist mutation —
-                // nothing pumps.
-                if let Some(state) = unsafe { state_of(hwnd) } {
-                    if shift {
-                        // Add File appends (viv.c:2396-2402): the current
-                        // file becomes the first entry when the list is
-                        // empty, then the pick — no clear, no home, the
-                        // display stays.
-                        if state.playlist.is_empty()
-                            && let Some(current) = state.nav_current.as_ref()
-                        {
-                            let current = current.clone();
-                            state.playlist.add(current.path, current.modified);
-                        }
-                        playlist::add_filename(&mut state.playlist, Path::new(&path));
-                    } else {
-                        // Open File clears the playlist before opening
-                        // (viv.c:2390-2394) — the picked file starts fresh,
-                        // and navigation falls back to its folder.
-                        state.playlist.clear();
-                    }
-                }
-                if !shift {
-                    let _ = open_from_filename(hwnd, &path);
-                }
-            }
-            return;
+            open_image_via_dialog(hwnd, shift);
         }
         return;
     }
@@ -1794,6 +2225,23 @@ fn on_keydown(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
     // rule means Ctrl+Alt+Return is NOT the toggle).
     if vk == VK_RETURN.0 && alt && !ctrl && !shift {
         toggle_fullscreen(hwnd);
+        return;
+    }
+    // The menu-registered command keys the keyboard path also answers
+    // (upstream default keymap, exact masks): Ctrl+B open folder
+    // (viv.c:972), Ctrl+Q exit (viv.c:986), Ctrl+F1 about (viv.c:1074).
+    if vk == u16::from(b'B') && ctrl && !alt && !shift {
+        open_folder_via_dialog(hwnd);
+        return;
+    }
+    if vk == u16::from(b'Q') && ctrl && !alt && !shift {
+        // SAFETY: legal on the owning thread; WM_DESTROY saves the config
+        // and posts the quit (upstream _viv_exit, viv.c:1883-1888).
+        let _ = unsafe { DestroyWindow(hwnd) };
+        return;
+    }
+    if vk == VK_F1.0 && ctrl && !alt && !shift {
+        show_about(hwnd);
         return;
     }
     if (vk == VK_OEM_PLUS.0 && !ctrl && !shift && !alt) || (vk == VK_ADD.0 && !shift && !alt) {
@@ -2077,6 +2525,25 @@ unsafe extern "system" fn wnd_proc(
         WM_KEYDOWN => {
             on_keydown(hwnd, wparam, lparam);
             LRESULT(0)
+        }
+        // Menu dispatch (upstream viv.c:4013-4019: `_viv_command` on the
+        // LOWORD of wParam, then break to the default procedure).
+        WM_COMMAND => {
+            if let Some(cmd) = menu::Cmd::from_id((wparam.0 & 0xffff) as u16) {
+                on_command(hwnd, cmd);
+            }
+            // SAFETY: hwnd/msg are exactly what this callback received; the
+            // default procedure handles everything we do not.
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+        // Refresh the bar's checks/grays just before it opens (upstream
+        // viv.c:3063-3072 — WM_INITMENU over GetMenu(hwnd), not
+        // WM_INITMENUPOPUP), then let the default procedure open it.
+        WM_INITMENU => {
+            on_initmenu(hwnd);
+            // SAFETY: hwnd/msg are exactly what this callback received; the
+            // default procedure owns the menu-open default handling.
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
         // Alt-modified keys arrive as WM_SYSKEYDOWN, not WM_KEYDOWN —
         // upstream dispatches both through the same keymap (viv.c:6347-6348),
@@ -2445,6 +2912,13 @@ pub(crate) fn run(args: Vec<OsString>) -> Result<(), String> {
     // exists so the very first title and status-bar text are in the right
     // language.
     loc::init();
+    // COM for the shell folder picker (upstream WinMain's CoInitializeEx,
+    // viv.c:5228-5229: apartment-threaded, OLE1DDE disabled — and the
+    // return ignored there too; nothing else in riviv needs COM, so a
+    // failure only degrades File→Open Folder).
+    // SAFETY: process-wide init taking no inputs; the result is
+    // deliberately unchecked like upstream.
+    let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) };
     // The animation clock's unit, read once (constant for the process
     // lifetime). Read before any window exists: failure is fatal (ADR 0001).
     let timer_freq = qpc_frequency()?;
@@ -2588,6 +3062,10 @@ pub(crate) fn run(args: Vec<OsString>) -> Result<(), String> {
     // reached only by the instance that keeps the window.
     let load_thread = LoadThread::start()?;
     let show_maximized = config.maximized != 0;
+    // The menu attaches at creation (upstream passes `_viv_hmenu` as
+    // CreateWindowExW's menu param when config_show_menu, viv.c:5395-5400)
+    // — copied off before the state owns the config, like show_maximized.
+    let show_menu = config.show_menu != 0;
     let mut rect = initial_window_rect(&config)?;
     let state = WindowState {
         image: None,
@@ -2601,6 +3079,7 @@ pub(crate) fn run(args: Vec<OsString>) -> Result<(), String> {
         // The status bar is created in WM_NCCREATE (the window handle must
         // exist first) and written into the state there.
         status: HWND::default(),
+        menu: HMENU::default(),
         status_file_not_found: false,
         status_load_failed: false,
         displayed_file_bytes: None,
@@ -2651,12 +3130,22 @@ pub(crate) fn run(args: Vec<OsString>) -> Result<(), String> {
     let title = HSTRING::from_wide(&title_wide(None));
     let state_ptr = Box::into_raw(Box::new(state));
 
+    // The menu bar (upstream `_viv_create_menu` before CreateWindowExW,
+    // viv.c:5352): built once from the command table. A creation failure
+    // degrades to a menu-less window — every menu call guards on the
+    // invalid handle (the status-bar posture).
+    let menu_bar = create_menu_bar();
+    if menu_bar.is_invalid() {
+        eprintln!("menu bar unavailable: CreateMenu failed");
+    }
+
     let (rect_w, rect_h) = rect_size(rect);
     // SAFETY: all parameters are valid for the call; state_ptr ownership moves
     // into the window via WM_NCCREATE. If creation fails BEFORE WM_NCCREATE the
     // pointer leaks into the fatal-exit path (acceptable, ADR 0001); if it fails
     // after, WM_NCDESTROY already freed it. The size derivation wraps like C
-    // (see `rect_size`).
+    // (see `rect_size`). The menu param attaches the bar per config_show_menu
+    // (upstream viv.c:5399).
     let hwnd = unsafe {
         CreateWindowExW(
             WS_EX_ACCEPTFILES,
@@ -2668,7 +3157,11 @@ pub(crate) fn run(args: Vec<OsString>) -> Result<(), String> {
             rect_w,
             rect_h,
             None,
-            None,
+            if show_menu && !menu_bar.is_invalid() {
+                Some(menu_bar)
+            } else {
+                None
+            },
             Some(hinstance.into()),
             Some(state_ptr as *const c_void),
         )
@@ -2691,6 +3184,14 @@ pub(crate) fn run(args: Vec<OsString>) -> Result<(), String> {
     // and owned by this thread, nothing below pumps messages.
     if let Some(state) = unsafe { state_of(hwnd) } {
         state.status = bar;
+    }
+
+    // Hand the bar to the state for the View→Menu toggle (upstream keeps
+    // `_viv_hmenu` in a global, viv.c:718 — the toggle re-attaches this
+    // handle after a detach left GetMenu empty).
+    // SAFETY: the borrow spans only the field store; nothing pumps.
+    if let Some(state) = unsafe { state_of(hwnd) } {
+        state.menu = menu_bar;
     }
 
     // Pull the startup rect fully onto a visible monitor and re-seat the

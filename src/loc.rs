@@ -41,12 +41,57 @@ pub(crate) enum Id {
     OpenAllImageFiles,
     /// Ctrl+O filter label over `*.*` (viv.c:2363).
     OpenAllFiles,
+    /// Menu bar captions and items (#23; upstream's `_viv_commands[]`
+    /// localization ids, viv.c:798-965). Added as a block in upstream table
+    /// order — File menu, View menu, Navigate menu, Help menu.
+    MenuFile,
+    /// "Open File..." (viv.c:802).
+    MenuOpenFile,
+    /// "Open Folder..." (viv.c:803).
+    MenuOpenFolder,
+    /// "Exit" (viv.c:821).
+    MenuExit,
+    /// "&View" top-level caption (viv.c:839).
+    MenuView,
+    /// View → "Menu" toggle (viv.c:842).
+    MenuMenu,
+    /// View → "Fullscreen" (viv.c:853).
+    MenuFullscreen,
+    /// View → "1:1" (viv.c:864).
+    MenuOneToOne,
+    /// View → "Best Fit" (viv.c:865).
+    MenuBestFit,
+    /// View → Zoom popup caption (viv.c:907).
+    MenuZoom,
+    /// Zoom → "Zoom In" (viv.c:908).
+    MenuZoomIn,
+    /// Zoom → "Zoom Out" (viv.c:909).
+    MenuZoomOut,
+    /// Zoom → "Reset" (viv.c:910).
+    MenuZoomReset,
+    /// View → "Options..." (viv.c:935) — the placeholder item the Options
+    /// issue (#24) wires.
+    MenuOptions,
+    /// "&Navigate" top-level caption (viv.c:952).
+    MenuNavigate,
+    /// Navigate → "Next" (viv.c:953).
+    MenuNext,
+    /// Navigate → "Previous" (viv.c:954).
+    MenuPrevious,
+    /// Navigate → "Home" (viv.c:955).
+    MenuHome,
+    /// Navigate → "End" (viv.c:956).
+    MenuEnd,
+    /// "&Help" top-level caption (viv.c:962).
+    MenuHelp,
+    /// Help → "About" (viv.c:965).
+    MenuAbout,
 }
 
 impl Id {
     /// Variant count; array-typing both tables against this keeps them
     /// length-locked to the enum by construction.
-    pub(crate) const COUNT: usize = Self::OpenAllFiles as usize + 1;
+    pub(crate) const COUNT: usize = Self::MenuAbout as usize + 1;
 }
 
 /// Table choice (upstream `LOCALIZATION_LANGUAGE_*`, localization.h:30-32).
@@ -65,6 +110,28 @@ const EN_US: [&str; Id::COUNT] = [
     "Open Image", // OpenImageCaption (en_us.h:260)
     "All Image Files", // OpenAllImageFiles (en_us.h:261)
     "All Files",  // OpenAllFiles (en_us.h:262)
+    // Menu block (en_us.h:34/35/36/52/67/70/77/88/89/97-100/115/160-164/177/182).
+    "&File",           // MenuFile
+    "&Open File...",   // MenuOpenFile
+    "Open &Folder...", // MenuOpenFolder
+    "E&xit",           // MenuExit
+    "&View",           // MenuView
+    "&Menu",           // MenuMenu
+    "F&ullscreen",     // MenuFullscreen
+    "1:1",             // MenuOneToOne
+    "&Best Fit",       // MenuBestFit
+    "&Zoom",           // MenuZoom
+    "Zoom &In",        // MenuZoomIn
+    "Zoom &Out",       // MenuZoomOut
+    "&Reset",          // MenuZoomReset
+    "&Options...",     // MenuOptions
+    "&Navigate",       // MenuNavigate
+    "&Next",           // MenuNext
+    "P&revious",       // MenuPrevious
+    "&Home",           // MenuHome
+    "&End",            // MenuEnd
+    "&Help",           // MenuHelp
+    "&About",          // MenuAbout
 ];
 
 /// zh-CN table — upstream localization_zh_cn.h:31/197-199/261-263.
@@ -76,6 +143,28 @@ const ZH_CN: [&str; Id::COUNT] = [
     "打开图像",       // OpenImageCaption (zh_cn.h:261)
     "所有图像文件",   // OpenAllImageFiles (zh_cn.h:262)
     "所有文件",       // OpenAllFiles (zh_cn.h:263)
+    // Menu block (zh_cn.h:34/35/36/52/67/70/77/88/89/97-100/115/160-164/177/182).
+    "文件(&F)",          // MenuFile
+    "打开文件(&O)...",   // MenuOpenFile
+    "打开文件夹(&F)...", // MenuOpenFolder
+    "退出(&X)",          // MenuExit
+    "视图(&V)",          // MenuView
+    "菜单(&M)",          // MenuMenu
+    "全屏(&F)",          // MenuFullscreen
+    "1:1",               // MenuOneToOne
+    "最佳适应(&B)",      // MenuBestFit
+    "缩放(&Z)",          // MenuZoom
+    "放大(&I)",          // MenuZoomIn
+    "缩小(&O)",          // MenuZoomOut
+    "重置(&R)",          // MenuZoomReset
+    "选项(&O)...",       // MenuOptions
+    "导航(&N)",          // MenuNavigate
+    "下一个(&N)",        // MenuNext
+    "上一个(&P)",        // MenuPrevious
+    "首页(&H)",          // MenuHome
+    "末页(&E)",          // MenuEnd
+    "帮助(&H)",          // MenuHelp
+    "关于(&A)",          // MenuAbout
 ];
 
 /// Map a `GetUserDefaultUILanguage` LANGID onto the table choice
@@ -195,6 +284,57 @@ mod tests {
         assert_eq!(get_for(zh, Id::OpenImageCaption), "打开图像");
         assert_eq!(get_for(zh, Id::OpenAllImageFiles), "所有图像文件");
         assert_eq!(get_for(zh, Id::OpenAllFiles), "所有文件");
+    }
+
+    #[test]
+    fn menu_strings_carry_the_upstream_texts_in_both_languages() {
+        // The #23 menu block — localization_en_us.h /
+        // localization_zh_cn.h verbatim per entry in the table definitions.
+        let en = Language::English;
+        let zh = Language::ChineseSimplified;
+        assert_eq!(get_for(en, Id::MenuFile), "&File");
+        assert_eq!(get_for(en, Id::MenuOpenFile), "&Open File...");
+        assert_eq!(get_for(en, Id::MenuOpenFolder), "Open &Folder...");
+        assert_eq!(get_for(en, Id::MenuExit), "E&xit");
+        assert_eq!(get_for(en, Id::MenuView), "&View");
+        assert_eq!(get_for(en, Id::MenuMenu), "&Menu");
+        assert_eq!(get_for(en, Id::MenuFullscreen), "F&ullscreen");
+        assert_eq!(get_for(en, Id::MenuOneToOne), "1:1");
+        assert_eq!(get_for(en, Id::MenuBestFit), "&Best Fit");
+        assert_eq!(get_for(en, Id::MenuZoom), "&Zoom");
+        assert_eq!(get_for(en, Id::MenuZoomIn), "Zoom &In");
+        assert_eq!(get_for(en, Id::MenuZoomOut), "Zoom &Out");
+        assert_eq!(get_for(en, Id::MenuZoomReset), "&Reset");
+        assert_eq!(get_for(en, Id::MenuOptions), "&Options...");
+        assert_eq!(get_for(en, Id::MenuNavigate), "&Navigate");
+        assert_eq!(get_for(en, Id::MenuNext), "&Next");
+        assert_eq!(get_for(en, Id::MenuPrevious), "P&revious");
+        assert_eq!(get_for(en, Id::MenuHome), "&Home");
+        assert_eq!(get_for(en, Id::MenuEnd), "&End");
+        assert_eq!(get_for(en, Id::MenuHelp), "&Help");
+        assert_eq!(get_for(en, Id::MenuAbout), "&About");
+
+        assert_eq!(get_for(zh, Id::MenuFile), "文件(&F)");
+        assert_eq!(get_for(zh, Id::MenuOpenFile), "打开文件(&O)...");
+        assert_eq!(get_for(zh, Id::MenuOpenFolder), "打开文件夹(&F)...");
+        assert_eq!(get_for(zh, Id::MenuExit), "退出(&X)");
+        assert_eq!(get_for(zh, Id::MenuView), "视图(&V)");
+        assert_eq!(get_for(zh, Id::MenuMenu), "菜单(&M)");
+        assert_eq!(get_for(zh, Id::MenuFullscreen), "全屏(&F)");
+        assert_eq!(get_for(zh, Id::MenuOneToOne), "1:1");
+        assert_eq!(get_for(zh, Id::MenuBestFit), "最佳适应(&B)");
+        assert_eq!(get_for(zh, Id::MenuZoom), "缩放(&Z)");
+        assert_eq!(get_for(zh, Id::MenuZoomIn), "放大(&I)");
+        assert_eq!(get_for(zh, Id::MenuZoomOut), "缩小(&O)");
+        assert_eq!(get_for(zh, Id::MenuZoomReset), "重置(&R)");
+        assert_eq!(get_for(zh, Id::MenuOptions), "选项(&O)...");
+        assert_eq!(get_for(zh, Id::MenuNavigate), "导航(&N)");
+        assert_eq!(get_for(zh, Id::MenuNext), "下一个(&N)");
+        assert_eq!(get_for(zh, Id::MenuPrevious), "上一个(&P)");
+        assert_eq!(get_for(zh, Id::MenuHome), "首页(&H)");
+        assert_eq!(get_for(zh, Id::MenuEnd), "末页(&E)");
+        assert_eq!(get_for(zh, Id::MenuHelp), "帮助(&H)");
+        assert_eq!(get_for(zh, Id::MenuAbout), "关于(&A)");
     }
 
     #[test]

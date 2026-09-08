@@ -4,7 +4,7 @@ Unofficial Rust rewrite of [voidtools/voidImageViewer](https://github.com/voidto
 
 Based on voidImageViewer by David Carpenter / voidtools. See [LICENSE](LICENSE). The original C implementation is preserved under [`c-original/`](c-original/) as a read-only behavioral reference.
 
-> **Status: early development (M3 in progress).** Current scope: Win32 window + GDI rendering, animated GIF/WebP playback at author timing, alpha-composited transparency for every supported format (PNG, JPEG, BMP, ICO, TIFF, GIF and WebP), drag & drop, a keyboard-navigable playlist, zoom/pan over the upstream 16-level preset curve, the settings foundation (the window rect is remembered across runs in a `[riviv]` ini with upstream's 60% first-run auto-fit), en/zh-CN localization driven by the system UI language, and single-instance command-line forwarding (a second launch hands its image to the running viewer and exits). Remaining M3: menu, options dialog, custom shortcuts, Everything IPC, file associations, installer — see [Roadmap](#roadmap).
+> **Status: early development (M3 in progress).** Current scope: Win32 window + GDI rendering, animated GIF/WebP playback at author timing, alpha-composited transparency for every supported format (PNG, JPEG, BMP, ICO, TIFF, GIF and WebP), drag & drop, a keyboard-navigable playlist, zoom/pan over the upstream 16-level preset curve, the settings foundation (the window rect is remembered across runs in a `[riviv]` ini with upstream's 60% first-run auto-fit), en/zh-CN localization driven by the system UI language, single-instance command-line forwarding (a second launch hands its image to the running viewer and exits), and a menu bar over a command table (File/View/Navigate/Help carrying the implemented commands, toggled by `show_menu`). Remaining M3: options dialog, custom shortcuts, Everything IPC, file associations, installer — see [Roadmap](#roadmap).
 
 ## Build
 
@@ -45,7 +45,7 @@ Giant images (upstream semantics): panoramas ≥ 32768 px render through 512-px 
   - [x] localization: en/zh-CN string tables + system language detection (#20)
   - [x] single-instance command-line forwarding (#21)
   - [ ] Everything IPC search (#22)
-  - [ ] menu bar + command table (#23)
+  - [x] menu bar + command table (#23)
   - [ ] options dialog (General/View/Controls) (#24)
   - [ ] custom shortcuts (#25)
   - [ ] file associations + NSIS installer (#26)
@@ -67,7 +67,7 @@ Giant images (upstream semantics): panoramas ≥ 32768 px render through 512-px 
 - The single-instance handoff lives in riviv's own namespace: mutex `RIVIV` + window class `riviv` (upstream: `VOIDIMAGEVIEWER`), so a riviv launch never hands its command line to a running upstream viewer — both coexist. `multiple_instances=1` in the ini skips the mutex entirely and every launch opens its own window, like upstream.
 - The cursor does not hide while idle in WINDOWED mode (upstream defaults `windowed_hide_cursor=1`, hiding it there too; riviv hides it in fullscreen only, per issue #8's scope). The fullscreen background also stays the windowed background color — upstream separates `fullscreen_background_color`.
 - The fullscreen toggle's zoom-offset is implemented but inert: both `fill_window` and `fullscreen_fill_window` are off (no config yet), so the zoom level is preserved entering/leaving fullscreen. Upstream defaults `fullscreen_fill_window=1`, which drops to the largest level that still covers the monitor on entry.
-- No menu bar yet (upstream shows File/View/Navigate by default) — planned for M3 (#23).
+- The menu carries only riviv's implemented commands and grows with each feature (upstream's table registers every command, greyed or not — riviv's Edit/Slideshow/Animation menus appear when their commands do; per issue #23). About is a message box rather than upstream's branded IDD_ABOUT dialog. Menu accelerator labels show the upstream DEFAULT keys only — the keyboard alternates (numpad +/-, PgUp/PgDn) still work but are not labeled (custom-key labels land with the shortcuts issue). The View→Options item is a greyed placeholder until the options dialog lands (#24). A blank window never shows a 1:1 checkmark (upstream's raw render==image size compare degenerates to 0==0 there).
 - Command-line switches are ignored (upstream parses config switches like `/sort` and install switches like `-install`, and shows a usage dialog for unknown ones; riviv parses neither yet — planned with #26). Switch detection matches upstream's quirk of treating dotted words like `-foo.png` as filenames; quoted switches cannot be distinguished from unquoted ones through `args_os` and are skipped either way.
 - Upstream's default-on decode-ahead (preload next image) and last-image caches are not implemented — every open, including navigation back to a just-seen image, decodes from disk.
 - Navigation always navigates by the default upstream sort (date modified, newest first). The sort-mode/ascending menu options and shuffle are M3 config work.
