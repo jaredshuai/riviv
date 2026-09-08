@@ -52,6 +52,8 @@
 //!   (#3/#4, landed)
 //! - `loadthread` — background decode session: worker thread, reply queue,
 //!   kick message (#4, landed)
+//! - `loc` — bilingual string tables + one-shot system-language detection
+//!   (#20, landed)
 //! - `paint` — WM_PAINT render; M2: stitch/mip (#9); zoom/pan offsets,
 //!   the BitBlt 1:1 path and the COLORONCOLOR magnify filter landed (#7)
 //! - `playlist` — playlist model + navigation math + recursive folder/wildcard
@@ -72,6 +74,7 @@ mod fit;
 mod ini;
 mod loader;
 mod loadthread;
+mod loc;
 mod mip;
 mod paint;
 mod pixels;

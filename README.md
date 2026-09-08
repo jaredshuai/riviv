@@ -4,7 +4,7 @@ Unofficial Rust rewrite of [voidtools/voidImageViewer](https://github.com/voidto
 
 Based on voidImageViewer by David Carpenter / voidtools. See [LICENSE](LICENSE). The original C implementation is preserved under [`c-original/`](c-original/) as a read-only behavioral reference.
 
-> **Status: early development (M3 in progress).** Current scope: Win32 window + GDI rendering, animated GIF/WebP playback at author timing, alpha-composited transparency for every supported format (PNG, JPEG, BMP, ICO, TIFF, GIF and WebP), drag & drop, a keyboard-navigable playlist, zoom/pan over the upstream 16-level preset curve, and the settings foundation: the window rect is remembered across runs in a `[riviv]` ini with upstream's 60% first-run auto-fit. Remaining M3: localization, menu, options dialog, custom shortcuts, single instance, Everything IPC, file associations, installer — see [Roadmap](#roadmap).
+> **Status: early development (M3 in progress).** Current scope: Win32 window + GDI rendering, animated GIF/WebP playback at author timing, alpha-composited transparency for every supported format (PNG, JPEG, BMP, ICO, TIFF, GIF and WebP), drag & drop, a keyboard-navigable playlist, zoom/pan over the upstream 16-level preset curve, the settings foundation (the window rect is remembered across runs in a `[riviv]` ini with upstream's 60% first-run auto-fit), and en/zh-CN localization driven by the system UI language. Remaining M3: menu, options dialog, custom shortcuts, single instance, Everything IPC, file associations, installer — see [Roadmap](#roadmap).
 
 ## Build
 
@@ -42,7 +42,7 @@ Giant images (upstream semantics): panoramas ≥ 32768 px render through 512-px 
   - [x] ≥32768-px giant images: stitched mip generation + per-zoom-level mipmap cache
 - [ ] M3 — settings & custom shortcuts, Everything IPC, file associations, localization, installer
   - [x] config foundation: `[riviv]` ini read/write + remembered window rect + 60% first-run auto-fit (#19)
-  - [ ] localization: en/zh-CN string tables + system language detection (#20)
+  - [x] localization: en/zh-CN string tables + system language detection (#20)
   - [ ] single-instance command-line forwarding (#21)
   - [ ] Everything IPC search (#22)
   - [ ] menu bar + command table (#23)
