@@ -74,6 +74,7 @@ use crate::config::Config;
 use crate::cursor::{self, CursorVisibility};
 use crate::loader::{LoadedImage, UiAction, apply_reply, map_reply_frame};
 use crate::loadthread::{LoadSession, LoadThread, REPLY_KICK_MESSAGE};
+use crate::loc;
 use crate::paint::paint;
 use crate::playlist::{self, Playlist, PlaylistEntry};
 use crate::status;
@@ -1442,6 +1443,10 @@ fn qpc_frequency() -> Result<u64, String> {
 
 fn open_file_dialog(hwnd: HWND, initial_dir: Option<&OsStr>) -> Option<OsString> {
     let filter = dialog_filter();
+    // Dialog caption from the loc tables (upstream sets it from
+    // LOCALIZATION_ID_OPEN_IMAGE_CAPTION, viv.c:2365) — riviv previously
+    // left it at the system default ("Open").
+    let title = to_wide(loc::get(loc::Id::OpenImageCaption));
     // 32768 code units: long paths must not trip FNERR_BUFFERTOOSMALL.
     let mut file_buf = vec![0u16; 32768];
     let dir = initial_dir.map(HSTRING::from);
@@ -1449,6 +1454,7 @@ fn open_file_dialog(hwnd: HWND, initial_dir: Option<&OsStr>) -> Option<OsString>
         lStructSize: size_of::<OPENFILENAMEW>() as u32,
         hwndOwner: hwnd,
         lpstrFilter: PCWSTR(filter.as_ptr()),
+        lpstrTitle: PCWSTR(title.as_ptr()),
         lpstrFile: windows::core::PWSTR(file_buf.as_mut_ptr()),
         nMaxFile: file_buf.len() as u32,
         lpstrInitialDir: match &dir {
@@ -1458,8 +1464,8 @@ fn open_file_dialog(hwnd: HWND, initial_dir: Option<&OsStr>) -> Option<OsString>
         Flags: OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY | OFN_NOCHANGEDIR,
         ..Default::default()
     };
-    // SAFETY: `ofn` borrows stack locals (filter/file buffer/dir) that all
-    // outlive this modal call.
+    // SAFETY: `ofn` borrows stack locals (filter/title/file buffer/dir)
+    // that all outlive this modal call.
     if !unsafe { GetOpenFileNameW(&mut ofn) }.as_bool() {
         // SAFETY: pure query of this thread's last common-dialog error; zero
         // means a plain user cancel.
@@ -2196,6 +2202,11 @@ pub(crate) fn run(args: Vec<OsString>) -> Result<(), String> {
             return Err(format!("SetProcessDPIAware failed (GLE={gle})"));
         }
     }
+    // One-shot language detection (upstream `localization_init`, WinMain's
+    // second call after `os_init`, viv.c:5158-5159). Before any window
+    // exists so the very first title and status-bar text are in the right
+    // language.
+    loc::init();
     // The animation clock's unit, read once (constant for the process
     // lifetime). Read before any window exists: failure is fatal (ADR 0001).
     let timer_freq = qpc_frequency()?;

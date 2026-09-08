@@ -11,17 +11,21 @@ use std::iter::once;
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 
+use crate::loc::{self, Id};
+
 /// Upstream title format (`_viv_update_title`): `filename - AppName`,
 /// app name only when no image is loaded. Built from raw wide code units so
 /// filenames containing unpaired UTF-16 surrogates survive verbatim instead
-/// of collapsing into U+FFFD replacement characters.
+/// of collapsing into U+FFFD replacement characters. The app name comes
+/// from the loc tables (viv.c:1247) — an untranslated brand, so the title
+/// itself is language-independent.
 pub(crate) fn title_wide(path: Option<&OsStr>) -> Vec<u16> {
     let mut title: Vec<u16> = Vec::new();
     if let Some(name) = path.and_then(|p| Path::new(p).file_name()) {
         title.extend(name.encode_wide());
         title.extend(" - ".encode_utf16());
     }
-    title.extend("riviv".encode_utf16());
+    title.extend(loc::get(Id::AppName).encode_utf16());
     title
 }
 
@@ -29,35 +33,39 @@ pub(crate) fn to_wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(once(0)).collect()
 }
 
-/// File-dialog filter as a double-null-terminated wide string.
+/// File-dialog filter as a double-null-terminated wide string, upstream's
+/// exact shape (viv.c:2363): `<label> (<patterns>)\0<patterns>\0<all>
+/// (*.*)\0*.*\0` with both labels from the loc tables and the nine
+/// supported extensions in upstream's (alphabetical) order.
 pub(crate) fn dialog_filter() -> Vec<u16> {
-    "Images (*.png;*.jpg;*.jpeg;*.bmp;*.ico;*.tif;*.tiff;*.gif;*.webp)\0\
-     *.png;*.jpg;*.jpeg;*.bmp;*.ico;*.tif;*.tiff;*.gif;*.webp\0\
-     All files (*.*)\0*.*\0"
-        .encode_utf16()
-        .chain(once(0))
-        .collect()
+    const PATTERNS: &str = "*.bmp;*.gif;*.ico;*.jpeg;*.jpg;*.png;*.tif;*.tiff;*.webp";
+    let images = loc::get(Id::OpenAllImageFiles);
+    let all = loc::get(Id::OpenAllFiles);
+    format!(
+        "{} ({})\0{}\0{} (*.*)\0*.*\0",
+        images, PATTERNS, PATTERNS, all
+    )
+    .encode_utf16()
+    .chain(once(0))
+    .collect()
 }
 
 // ---------------------------------------------------------------------------
 // Status bar (#5)
 // ---------------------------------------------------------------------------
 
-/// Exact upstream strings (localization_en_us.h:197-199).
-pub(crate) const STATUS_LOADING: &str = "Loading...";
-pub(crate) const STATUS_FILE_NOT_FOUND: &str = "File not found.";
-pub(crate) const STATUS_LOAD_FAILED: &str = "Failed to load image.";
-
 /// Main-part (part 0) text by priority, first match wins
 /// (viv.c:11346-11380 minus temp text and slideshow, which are later
-/// milestones): Loading > File not found > Failed to load > empty.
+/// milestones): Loading > File not found > Failed to load > empty. The
+/// strings come from the loc tables (viv.c:11358/11364/11370) — English
+/// until `loc::init` detects a Chinese UI language.
 pub(crate) fn status_main_text(loading: bool, not_found: bool, failed: bool) -> &'static str {
     if loading {
-        STATUS_LOADING
+        loc::get(Id::StatusBarLoading)
     } else if not_found {
-        STATUS_FILE_NOT_FOUND
+        loc::get(Id::StatusBarFileNotFound)
     } else if failed {
-        STATUS_LOAD_FAILED
+        loc::get(Id::StatusBarFailedToLoadImage)
     } else {
         ""
     }
@@ -192,6 +200,22 @@ mod tests {
     #[test]
     fn title_without_image_is_app_name_only() {
         assert_eq!(String::from_utf16_lossy(&title_wide(None)), "riviv");
+    }
+
+    #[test]
+    fn dialog_filter_uses_localized_labels_and_upstream_extension_order() {
+        // viv.c:2363 — `<label> (<patterns>)\0<patterns>\0<all> (*.*)\0*.*\0`.
+        // The labels read the loc tables, whose default (pre-init) language
+        // is English, so this pins the en-US shape deterministically.
+        let filter = dialog_filter();
+        let s = String::from_utf16_lossy(&filter[..filter.len() - 1]);
+        assert_eq!(
+            s,
+            "All Image Files (*.bmp;*.gif;*.ico;*.jpeg;*.jpg;*.png;*.tif;*.tiff;*.webp)\0\
+             *.bmp;*.gif;*.ico;*.jpeg;*.jpg;*.png;*.tif;*.tiff;*.webp\0\
+             All Files (*.*)\0*.*\0"
+        );
+        assert_eq!(*filter.last().unwrap(), 0, "double-null terminated");
     }
 
     #[test]
