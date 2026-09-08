@@ -6,7 +6,9 @@
 //! (#19): the window rect is remembered across runs in a `[riviv]` ini
 //! (`config.rs`/`ini.rs`) with upstream's 60% first-run auto-fit, and the
 //! M1 image-sized startup window is gone — windows never resize on load
-//! (upstream `auto_zoom = 0`).
+//! (upstream `auto_zoom = 0`). A second launch hands its command line to
+//! the existing window and exits (#21, `copydata.rs`), unless
+//! `multiple_instances` is set.
 //!
 //! Behavior baseline is the upstream C source under `c-original/src/viv.c`
 //! (see c-original/PROVENANCE.md). Key alignments across the modules:
@@ -54,6 +56,7 @@
 //!   kick message (#4, landed)
 //! - `loc` — bilingual string tables + one-shot system-language detection
 //!   (#20, landed)
+//! - `copydata` — the single-instance handoff payload codec (#21, landed)
 //! - `paint` — WM_PAINT render; M2: stitch/mip (#9); zoom/pan offsets,
 //!   the BitBlt 1:1 path and the COLORONCOLOR magnify filter landed (#7)
 //! - `playlist` — playlist model + navigation math + recursive folder/wildcard
@@ -69,6 +72,7 @@
 
 mod anim;
 mod config;
+mod copydata;
 mod cursor;
 mod fit;
 mod ini;
@@ -107,18 +111,27 @@ fn is_switch(arg: &OsStr) -> bool {
     }
 }
 
-fn main() {
-    // The command line's file words: switches dropped, empties dropped
-    // (upstream skips blank words, viv.c:4993), the rest made absolute —
-    // upstream cwd-combines relative paths the same way (string_path_combine).
-    let args: Vec<OsString> = std::env::args_os()
-        .skip(1)
+/// The command line's file words — shared by the startup parse here and the
+/// single-instance handoff receive (#21): switches dropped, empties dropped
+/// (upstream skips blank words, viv.c:4993), the rest made absolute —
+/// upstream cwd-combines relative paths the same way (string_path_combine);
+/// the handoff path re-runs this AFTER adopting the sender's cwd, so its
+/// relative arguments resolve in ITS working directory (viv.c:3711-3715).
+pub(crate) fn file_args(words: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
+    words
+        .into_iter()
         .filter(|a| !a.is_empty() && !is_switch(a))
         .map(|a| match absolute(&a) {
             Ok(p) => p.into_os_string(),
             Err(_) => a,
         })
-        .collect();
+        .collect()
+}
+
+fn main() {
+    // Parsed once for the startup open; the single-instance handoff receive
+    // re-parses its forwarded string through the same `file_args` (#21).
+    let args = file_args(std::env::args_os().skip(1));
     if let Err(err) = run(args) {
         window::fatal(&format!("riviv: {err}"));
     }

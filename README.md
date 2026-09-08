@@ -43,7 +43,7 @@ Giant images (upstream semantics): panoramas ≥ 32768 px render through 512-px 
 - [ ] M3 — settings & custom shortcuts, Everything IPC, file associations, localization, installer
   - [x] config foundation: `[riviv]` ini read/write + remembered window rect + 60% first-run auto-fit (#19)
   - [x] localization: en/zh-CN string tables + system language detection (#20)
-  - [ ] single-instance command-line forwarding (#21)
+  - [x] single-instance command-line forwarding (#21)
   - [ ] Everything IPC search (#22)
   - [ ] menu bar + command table (#23)
   - [ ] options dialog (General/View/Controls) (#24)
@@ -64,7 +64,7 @@ Giant images (upstream semantics): panoramas ≥ 32768 px render through 512-px 
 - The status bar is a simplified form of upstream's: it keeps the main text (Loading / File not found. / Failed to load image.), the frame counter, and the `W x H (N KB)` dimension parts, but drops upstream's PRELOAD / pixel POS / RGB parts (riviv has neither feature yet), the temp-text line (upstream's position/zoom readout is tied to the panscan/pixel-info features), and the click-to-toggle-frames-remaining behavior. The frame counter's `m` counts the *loaded* prefix and grows while an animation streams in — image frame iterators cannot report the total up front (GDI+/libwebp can).
 - No toolbar yet (upstream shows it by default) — not in M3's scope either; deferred.
 - Embedded ICC color profiles are not applied (upstream enables GDI+ ICM); non-sRGB images may show slightly inaccurate colors.
-- No single-instance handoff yet: a second launch opens a new window instead of forwarding its command line to the existing viewer (upstream default). Planned for M3 together with Everything IPC.
+- The single-instance handoff lives in riviv's own namespace: mutex `RIVIV` + window class `riviv` (upstream: `VOIDIMAGEVIEWER`), so a riviv launch never hands its command line to a running upstream viewer — both coexist. `multiple_instances=1` in the ini skips the mutex entirely and every launch opens its own window, like upstream.
 - The cursor does not hide while idle in WINDOWED mode (upstream defaults `windowed_hide_cursor=1`, hiding it there too; riviv hides it in fullscreen only, per issue #8's scope). The fullscreen background also stays the windowed background color — upstream separates `fullscreen_background_color`.
 - The fullscreen toggle's zoom-offset is implemented but inert: both `fill_window` and `fullscreen_fill_window` are off (no config yet), so the zoom level is preserved entering/leaving fullscreen. Upstream defaults `fullscreen_fill_window=1`, which drops to the largest level that still covers the monitor on entry.
 - No menu bar yet (upstream shows File/View/Navigate by default) — planned for M3 (#23).
