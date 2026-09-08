@@ -1968,6 +1968,18 @@ unsafe extern "system" fn wnd_proc(
     }
 }
 
+/// The outer (width, height) handed to CreateWindowExW / the startup
+/// SetWindowPos — wrapping like C: a remembered rect can hold any i32 pair
+/// (the wrap happens in `initial_window_rect`), and C hands the wrapped
+/// size to Win32, which rejects it gracefully; a debug-build panic must
+/// not get there first (Codex PR #27 round 3).
+fn rect_size(rect: RECT) -> (i32, i32) {
+    (
+        rect.right.wrapping_sub(rect.left),
+        rect.bottom.wrapping_sub(rect.top),
+    )
+}
+
 /// The startup window rect (viv.c:5354-5387): the remembered config rect,
 /// or on first run (wide/high == 0) the auto-fit share of the cursor
 /// monitor's FULL rect (`rcMonitor`, not the work area — the os_ wrapper's
@@ -2275,14 +2287,12 @@ pub(crate) fn run(args: Vec<OsString>) -> Result<(), String> {
     let title = HSTRING::from_wide(&title_wide(None));
     let state_ptr = Box::into_raw(Box::new(state));
 
+    let (rect_w, rect_h) = rect_size(rect);
     // SAFETY: all parameters are valid for the call; state_ptr ownership moves
     // into the window via WM_NCCREATE. If creation fails BEFORE WM_NCCREATE the
     // pointer leaks into the fatal-exit path (acceptable, ADR 0001); if it fails
-    // after, WM_NCDESTROY already freed it. The size subtraction wraps like C —
-    // the remembered rect can hold any i32 pair (the wrap itself happens in
-    // initial_window_rect), and C hands the wrapped size to CreateWindowEx,
-    // which rejects it gracefully; a debug-build panic must not get there
-    // first (Codex PR #27 round 3).
+    // after, WM_NCDESTROY already freed it. The size derivation wraps like C
+    // (see `rect_size`).
     let hwnd = unsafe {
         CreateWindowExW(
             WS_EX_ACCEPTFILES,
@@ -2291,8 +2301,8 @@ pub(crate) fn run(args: Vec<OsString>) -> Result<(), String> {
             WS_OVERLAPPEDWINDOW,
             rect.left,
             rect.top,
-            rect.right.wrapping_sub(rect.left),
-            rect.bottom.wrapping_sub(rect.top),
+            rect_w,
+            rect_h,
             None,
             None,
             Some(hinstance.into()),
@@ -2326,18 +2336,18 @@ pub(crate) fn run(args: Vec<OsString>) -> Result<(), String> {
     // `initial_window_rect`). Fail-soft like upstream's unchecked
     // SetWindowPos there — the window is live either way.
     make_rect_completely_visible(hwnd, &mut rect);
+    let (rect_w, rect_h) = rect_size(rect);
     // SAFETY: hwnd is live. SetWindowPos synchronously reenters wnd_proc
     // with WM_MOVE/WM_SIZE — both handlers take their own borrows, none is
-    // live out here. The size subtraction wraps like C (see the
-    // CreateWindowExW call above).
+    // live out here. The size derivation wraps like C (see `rect_size`).
     if let Err(e) = unsafe {
         SetWindowPos(
             hwnd,
             None,
             rect.left,
             rect.top,
-            rect.right.wrapping_sub(rect.left),
-            rect.bottom.wrapping_sub(rect.top),
+            rect_w,
+            rect_h,
             SWP_NOZORDER | SWP_NOACTIVATE,
         )
     } {
@@ -2530,6 +2540,22 @@ mod tests {
         };
         let _ = make_rect_completely_visible_core(garbage, mon, mon);
         let _ = make_rect_completely_visible_core(garbage, garbage, mon);
+    }
+
+    #[test]
+    fn pathological_remembered_rect_size_wraps_like_c() {
+        // x=i32::MAX, wide=1 wraps right to i32::MIN (initial_window_rect);
+        // C computes the size as MIN - MAX, which wraps back to 1 — exactly
+        // the value CreateWindowEx receives and rejects gracefully. The
+        // call sites feed through this helper, so the derivation is pinned
+        // (a plain subtraction here panics the debug build, Codex PR #28).
+        let rect = RECT {
+            left: i32::MAX,
+            top: i32::MAX,
+            right: i32::MIN,
+            bottom: i32::MIN,
+        };
+        assert_eq!(rect_size(rect), (1, 1));
     }
 
     #[test]
