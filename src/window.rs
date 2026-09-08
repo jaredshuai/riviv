@@ -88,13 +88,13 @@ use windows::Win32::UI::WindowsAndMessaging::{
     PostQuitMessage, RegisterClassExW, SHOW_WINDOW_CMD, SW_MAXIMIZE, SW_SHOW, SW_SHOWNORMAL,
     SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOZORDER, SendMessageW,
     SetForegroundWindow, SetMenu, SetProcessDPIAware, SetTimer, SetWindowLongPtrW, SetWindowPos,
-    SetWindowTextW, ShowCursor, ShowWindow, TPM_LEFTBUTTON, TrackPopupMenu, TranslateMessage,
-    USER_TIMER_MINIMUM, WINDOW_EX_STYLE, WM_ACTIVATE, WM_COMMAND, WM_CONTEXTMENU, WM_COPYDATA,
-    WM_DESTROY, WM_DROPFILES, WM_ENDSESSION, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_INITMENU,
-    WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_MOVE, WM_NCCREATE, WM_NCDESTROY, WM_NULL, WM_PAINT, WM_QUERYENDSESSION, WM_SIZE,
-    WM_SYSKEYDOWN, WM_TIMER, WNDCLASSEXW, WS_CAPTION, WS_EX_ACCEPTFILES, WS_OVERLAPPEDWINDOW,
-    WS_POPUP, WS_THICKFRAME, WS_VISIBLE, WindowFromPoint,
+    SetWindowTextW, ShowCursor, ShowWindow, TPM_CENTERALIGN, TPM_LEFTBUTTON, TPM_VCENTERALIGN,
+    TrackPopupMenu, TranslateMessage, USER_TIMER_MINIMUM, WINDOW_EX_STYLE, WM_ACTIVATE, WM_COMMAND,
+    WM_CONTEXTMENU, WM_COPYDATA, WM_DESTROY, WM_DROPFILES, WM_ENDSESSION, WM_ERASEBKGND,
+    WM_GETMINMAXINFO, WM_INITMENU, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_MOVE, WM_NCCREATE, WM_NCDESTROY, WM_NULL, WM_PAINT,
+    WM_QUERYENDSESSION, WM_SIZE, WM_SYSKEYDOWN, WM_TIMER, WNDCLASSEXW, WS_CAPTION,
+    WS_EX_ACCEPTFILES, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_THICKFRAME, WS_VISIBLE, WindowFromPoint,
 };
 use windows::core::{HSTRING, PCSTR, PCWSTR, w};
 
@@ -1836,6 +1836,11 @@ fn open_folder_via_dialog(hwnd: HWND) {
 /// from the current path like the Ctrl+O dialog's initial dir). None =
 /// cancelled or unavailable; COM itself is initialized once in `run`
 /// (upstream WinMain, viv.c:5228-5229).
+/// `HRESULT_FROM_WIN32(ERROR_CANCELLED)` — the IFileDialog's user-cancel
+/// code, the one Show failure that is a normal no-pick exit rather than a
+/// system failure.
+const HRESULT_FROM_CANCELLED: i32 = 0x8007_0000u32 as i32 | 1223;
+
 fn pick_folder(hwnd: HWND, initial_dir: Option<&OsStr>) -> Option<OsString> {
     // SAFETY: CoCreateInstance on the shell's registered FileOpenDialog
     // class with no outer aggregate; a failure degrades to "no folder
@@ -1873,14 +1878,32 @@ fn pick_folder(hwnd: HWND, initial_dir: Option<&OsStr>) -> Option<OsString> {
     }
     // SAFETY: the modal Show pumps messages — the caller guarantees no
     // state borrow is live.
-    if unsafe { dialog.Show(Some(hwnd)) }.is_err() {
-        return None; // cancelled
+    if let Err(e) = unsafe { dialog.Show(Some(hwnd)) } {
+        // The plain cancel is the normal no-pick exit; anything else is a
+        // system-level failure worth a diagnostic before the degrade to
+        // "nothing happened" (ADR 0001 posture; Codex round 2).
+        if e.code().0 != HRESULT_FROM_CANCELLED {
+            eprintln!("folder picker Show failed: {e}");
+        }
+        return None; // cancelled (or failed)
     }
     // SAFETY: live COM pointer; the result item is ours.
-    let item: IShellItem = unsafe { dialog.GetResult() }.ok()?;
+    let item: IShellItem = match unsafe { dialog.GetResult() } {
+        Ok(item) => item,
+        Err(e) => {
+            eprintln!("folder picker GetResult failed: {e}");
+            return None;
+        }
+    };
     // SAFETY: live COM pointer; the returned buffer is CoTaskMem-allocated
     // and freed exactly once below.
-    let name = unsafe { item.GetDisplayName(SIGDN_FILESYSPATH) }.ok()?;
+    let name = match unsafe { item.GetDisplayName(SIGDN_FILESYSPATH) } {
+        Ok(name) => name,
+        Err(e) => {
+            eprintln!("folder picker GetDisplayName failed: {e}");
+            return None;
+        }
+    };
     let mut len = 0usize;
     // SAFETY: GetDisplayName's contract returns a NUL-terminated string;
     // the walk reads up to that NUL only.
@@ -2076,13 +2099,28 @@ fn on_initmenu(hwnd: HWND) {
 /// back from View→Menu OFF. Without it the bar could only return by
 /// hand-editing the ini (cubic round 1).
 fn on_contextmenu(hwnd: HWND, lparam: LPARAM) {
-    // -1/-1 is the keyboard invocation (Shift+F10) — upstream re-centers
-    // on the window for it; the mouse-point slice is enough and skips.
-    if lparam.0 == -1 {
-        return;
-    }
-    let x = (lparam.0 as u16) as i16 as i32;
-    let y = ((lparam.0 as u32 >> 16) as u16) as i16 as i32;
+    // The keyboard invocation (-1/-1, Shift+F10 / Menu key) centers the
+    // popup on the window instead of skipping (upstream viv.c:3386-3398:
+    // GetWindowRect → center → TPM_CENTERALIGN|TPM_VCENTERALIGN) —
+    // keyboard-only users get the same recovery row (Codex round 2).
+    let (x, y, flags) = if lparam.0 == -1 {
+        let mut r = RECT::default();
+        // SAFETY: read-only rect query on the live window; a failure reads
+        // the zeroed rect and the popup lands at the origin.
+        let _ = unsafe { GetWindowRect(hwnd, &mut r) };
+        (
+            (r.left + r.right) / 2,
+            (r.top + r.bottom) / 2,
+            TPM_CENTERALIGN | TPM_VCENTERALIGN,
+        )
+    } else {
+        (
+            (lparam.0 as u16) as i16 as i32,
+            ((lparam.0 as u32 >> 16) as u16) as i16 as i32,
+            // Upstream passes tpm_flags = 0 for the mouse path (viv.c:3382).
+            TPM_LEFTBUTTON, // TRACK_POPUP_MENU_FLAGS(0)
+        )
+    };
     // SAFETY: the borrow spans only the three reads — nothing pumps.
     let next = (unsafe { state_of(hwnd) }).and_then(|state| {
         if state.fullscreen || state.config.show_menu != 0 {
@@ -2121,9 +2159,6 @@ fn on_contextmenu(hwnd: HWND, lparam: LPARAM) {
             (MF_UNCHECKED | MF_BYCOMMAND).0,
         )
     };
-    // Upstream passes tpm_flags = 0 for the mouse path (viv.c:3382) — no
-    // TPM_RIGHTBUTTON; mirror it.
-    let flags = TPM_LEFTBUTTON; // TRACK_POPUP_MENU_FLAGS(0)
     // The MSDN menu-dismissal pattern: foreground the owner before
     // TrackPopupMenu and nudge it with WM_NULL after, so the menu closes
     // when focus leaves (a denial is ignored — the menu still works).
