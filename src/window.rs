@@ -21,6 +21,10 @@
 //! the window opens at the remembered rect (60% auto-fit on first run)
 //! and the windowed position is tracked into the config on every
 //! WM_SIZE/WM_MOVE, saved to the ini in WM_DESTROY (`config.rs`).
+//! Single instance (#21): a second launch hands its command line to the
+//! RIVIV-mutex owner via WM_COPYDATA and exits (`copydata.rs`); the
+//! receiver adopts its cwd, re-runs the command-line open path, and
+//! appends instead of replacing when the handoffs arrive in a burst.
 
 use std::ffi::{OsStr, OsString, c_void};
 use std::mem::size_of;
@@ -28,16 +32,23 @@ use std::os::windows::ffi::OsStringExt;
 use std::path::Path;
 
 use windows::Win32::Foundation::{
-    ERROR_ACCESS_DENIED, GetLastError, HWND, LPARAM, LRESULT, POINT, RECT, SetLastError,
-    WIN32_ERROR, WPARAM,
+    CloseHandle, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, GetLastError, HLOCAL, HWND, LPARAM,
+    LRESULT, LocalFree, POINT, RECT, SetLastError, WIN32_ERROR, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
     COLOR_BTNFACE, GetMonitorInfoW, HBRUSH, InvalidateRect, MONITOR_DEFAULTTOPRIMARY, MONITORINFO,
     MonitorFromPoint, MonitorFromRect, MonitorFromWindow, PtInRect, ScreenToClient, UpdateWindow,
 };
+use windows::Win32::System::DataExchange::COPYDATASTRUCT;
+use windows::Win32::System::Environment::{
+    GetCommandLineW, GetCurrentDirectoryW, SetCurrentDirectoryW,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
-use windows::Win32::System::Threading::{GetStartupInfoW, STARTF_USESHOWWINDOW, STARTUPINFOW};
+use windows::Win32::System::SystemInformation::GetTickCount;
+use windows::Win32::System::Threading::{
+    CreateMutexA, GetStartupInfoW, STARTF_USESHOWWINDOW, STARTUPINFOW,
+};
 use windows::Win32::UI::Controls::Dialogs::{
     CommDlgExtendedError, GetOpenFileNameW, OFN_FILEMUSTEXIST, OFN_HIDEREADONLY, OFN_NOCHANGEDIR,
     OFN_PATHMUSTEXIST, OPENFILENAMEW,
@@ -51,26 +62,27 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     TrackMouseEvent, VK_ADD, VK_CONTROL, VK_END, VK_ESCAPE, VK_HOME, VK_LEFT, VK_MENU, VK_NEXT,
     VK_OEM_MINUS, VK_OEM_PLUS, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SUBTRACT,
 };
-use windows::Win32::UI::Shell::{DragFinish, DragQueryFileW, HDROP};
+use windows::Win32::UI::Shell::{CommandLineToArgvW, DragFinish, DragQueryFileW, HDROP};
 use windows::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW,
-    DestroyWindow, DispatchMessageW, GWL_STYLE, GWLP_USERDATA, GetClientRect, GetCursorPos,
-    GetForegroundWindow, GetMessageW, GetWindowLongPtrW, GetWindowRect, HWND_TOP, IDC_ARROW,
-    IsIconic, IsZoomed, KillTimer, LoadCursorW, MB_ICONERROR, MINMAXINFO, MSG, MessageBoxW,
-    PostQuitMessage, RegisterClassExW, SHOW_WINDOW_CMD, SW_MAXIMIZE, SW_SHOW, SW_SHOWNORMAL,
-    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOZORDER, SendMessageW,
+    DestroyWindow, DispatchMessageW, FindWindowA, GWL_STYLE, GWLP_USERDATA, GetClientRect,
+    GetCursorPos, GetForegroundWindow, GetMessageW, GetWindowLongPtrW, GetWindowRect, HWND_TOP,
+    IDC_ARROW, IsIconic, IsZoomed, KillTimer, LoadCursorW, MB_ICONERROR, MINMAXINFO, MSG,
+    MessageBoxW, PostQuitMessage, RegisterClassExW, SHOW_WINDOW_CMD, SW_MAXIMIZE, SW_SHOW,
+    SW_SHOWNORMAL, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOZORDER, SendMessageW,
     SetForegroundWindow, SetProcessDPIAware, SetTimer, SetWindowLongPtrW, SetWindowPos,
     SetWindowTextW, ShowCursor, ShowWindow, TranslateMessage, USER_TIMER_MINIMUM, WINDOW_EX_STYLE,
-    WM_ACTIVATE, WM_DESTROY, WM_DROPFILES, WM_ENDSESSION, WM_ERASEBKGND, WM_GETMINMAXINFO,
-    WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_MOVE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_QUERYENDSESSION, WM_SIZE, WM_SYSKEYDOWN,
-    WM_TIMER, WNDCLASSEXW, WS_CAPTION, WS_EX_ACCEPTFILES, WS_OVERLAPPEDWINDOW, WS_POPUP,
-    WS_THICKFRAME, WS_VISIBLE, WindowFromPoint,
+    WM_ACTIVATE, WM_COPYDATA, WM_DESTROY, WM_DROPFILES, WM_ENDSESSION, WM_ERASEBKGND,
+    WM_GETMINMAXINFO, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+    WM_MOUSEWHEEL, WM_MOVE, WM_NCCREATE, WM_NCDESTROY, WM_PAINT, WM_QUERYENDSESSION, WM_SIZE,
+    WM_SYSKEYDOWN, WM_TIMER, WNDCLASSEXW, WS_CAPTION, WS_EX_ACCEPTFILES, WS_OVERLAPPEDWINDOW,
+    WS_POPUP, WS_THICKFRAME, WS_VISIBLE, WindowFromPoint,
 };
-use windows::core::{HSTRING, PCWSTR, w};
+use windows::core::{HSTRING, PCSTR, PCWSTR, w};
 
 use crate::anim::ANIMATION_TIMER_ID;
 use crate::config::Config;
+use crate::copydata;
 use crate::cursor::{self, CursorVisibility};
 use crate::loader::{LoadedImage, UiAction, apply_reply, map_reply_frame};
 use crate::loadthread::{LoadSession, LoadThread, REPLY_KICK_MESSAGE};
@@ -179,6 +191,14 @@ pub(crate) struct WindowState {
     /// viv.c:784/6712/6780): the momentary deactivate must not force-show
     /// a cursor the cycle had hidden.
     pub(crate) prevent_deactivate_show: bool,
+    /// When the previous command line was processed (upstream
+    /// `last_process_command_line_tick` + `got_last_process_command_line_tick`,
+    /// viv.c:792-793): a handoff arriving within
+    /// `config.add_command_line_timeout` of this stamp appends to the
+    /// playlist instead of replacing it (Explorer's multi-select launches
+    /// forward their command lines in a burst, viv.c:4778-4793). `None` =
+    /// no command line processed yet.
+    pub(crate) last_cl_tick: Option<u32>,
 }
 
 /// Window state pointer stored in GWLP_USERDATA between WM_NCCREATE and
@@ -1252,6 +1272,189 @@ fn mark_startup_not_found(hwnd: HWND) {
     refresh_status(hwnd);
 }
 
+/// Run one command line's FILE arguments through the open path (upstream
+/// `_viv_process_command_line`, viv.c:4744-5148, minus the switch commands
+/// riviv does not take — switches were dropped at parse, main.rs): ONE
+/// argument keeps single-file semantics (a folder recurses into a
+/// playlist, a wildcard expands, a file opens directly); a SECOND argument
+/// pulls the first into the playlist too — everything added in argument
+/// order — and the first-inserted entry is what opens. When nothing
+/// resolves, the "File not found." verdict shows over the kept display
+/// (upstream viv.c:5090-5098). Shared by the startup open (viv.c:5445) and
+/// the single-instance handoff receive (#21, viv.c:3715).
+///
+/// `is_add` is upstream's add-mode (viv.c:4778-4793): the file words are
+/// APPENDED to the playlist instead of replacing, and the display never
+/// changes — the receive-side rapid-handoff window, so a multi-select
+/// launch's burst of forwarded command lines builds one playlist instead
+/// of replacing each other.
+fn process_command_line(hwnd: HWND, args: &[OsString], is_add: bool) {
+    // The parse-time clear (viv.c:4998-5006): a REPLACING command line with
+    // at least one file word starts a fresh playlist; a switch-only line
+    // (empty `args` here, or in add-mode) never clears.
+    if !is_add && !args.is_empty() {
+        // SAFETY: the borrow spans only the clear.
+        if let Some(state) = unsafe { state_of(hwnd) } {
+            state.playlist.clear();
+        }
+    }
+    // Two-plus words add every word (upstream's loop adds the stashed
+    // `single` once it sees the second word, then each next — net: all of
+    // them, viv.c:5008-5023); a lone word is NOT added here — below it
+    // either opens directly (replace) or is appended (add).
+    if args.len() >= 2 {
+        // SAFETY: the borrow spans the adds' metadata reads (read_dir /
+        // FindFirstFile never pump messages).
+        if let Some(state) = unsafe { state_of(hwnd) } {
+            for arg in args {
+                playlist::add_filename(&mut state.playlist, Path::new(arg));
+            }
+        }
+    }
+    if is_add {
+        // SAFETY: the borrow spans the adds' metadata reads.
+        if let Some(state) = unsafe { state_of(hwnd) } {
+            // The bootstrap (viv.c:5028-5036): the current file seeds an
+            // EMPTY playlist before the argument lands — after the
+            // two-plus-word adds above, a non-empty list skips it, exactly
+            // upstream's order.
+            if state.playlist.is_empty()
+                && let Some(current) = state.nav_current.as_ref()
+            {
+                let current = current.clone();
+                state.playlist.add(current.path, current.modified);
+            }
+            // A lone word IS appended in add-mode (viv.c:5038-5041).
+            if args.len() == 1 {
+                playlist::add_filename(&mut state.playlist, Path::new(&args[0]));
+            }
+        }
+    }
+    // Show the first image — never in add-mode (viv.c:5046-5098).
+    if !is_add && !args.is_empty() {
+        let resolved = if args.len() == 1 {
+            open_from_filename(hwnd, &args[0])
+        } else {
+            // SAFETY: the borrow ends at the end of this statement (the
+            // entry is cloned out).
+            let first = (unsafe { state_of(hwnd) }).and_then(|s| s.playlist.first().cloned());
+            first.is_some_and(|entry| open_from_filename(hwnd, &entry.path))
+        };
+        if !resolved {
+            mark_startup_not_found(hwnd);
+        }
+    }
+    // Stamp the add-window anchor (viv.c:5146-5148): the END of every
+    // command-line processing, add-mode included — a handoff arriving
+    // within add_command_line_timeout of THIS one appends instead of
+    // replacing.
+    // SAFETY: the borrow spans only the tick store.
+    if let Some(state) = unsafe { state_of(hwnd) } {
+        // SAFETY: a cheap kernel tick query.
+        state.last_cl_tick = Some(unsafe { GetTickCount() });
+    }
+}
+
+/// WM_COPYDATA / `_VIV_COPYDATA_COMMAND_LINE` (upstream viv.c:3688-3719):
+/// the single-instance handoff receive. The second instance's command line
+/// is re-run in the first — adopt its working directory, walk its file
+/// arguments through the same open path the startup command line took,
+/// then show per the second launch's show state. Returns whether the
+/// message was ours; a payload under 4 bytes is handled-and-ignored
+/// (upstream's `e-p >= sizeof(DWORD)` gate, viv.c:3706).
+fn on_copydata(hwnd: HWND, cds: &COPYDATASTRUCT) -> bool {
+    if cds.dwData != copydata::COPYDATA_COMMAND_LINE {
+        return false;
+    }
+    // Foreground first (viv.c:3696): the sender also tried right before
+    // blocking in SendMessage (viv.c:5302); failing to steal foreground
+    // under lock is tolerated — the return is ignored exactly like
+    // upstream.
+    // SAFETY: hwnd is live and owned by this thread.
+    let _ = unsafe { SetForegroundWindow(hwnd) };
+    let bytes = if cds.cbData >= size_of::<u32>() as u32 && !cds.lpData.is_null() {
+        // SAFETY: the WM_COPYDATA contract guarantees lpData addresses
+        // cbData readable bytes for the duration of the message.
+        Some(unsafe { std::slice::from_raw_parts(cds.lpData.cast::<u8>(), cds.cbData as usize) })
+    } else {
+        None
+    };
+    let Some(handoff) = bytes.and_then(copydata::decode) else {
+        return true;
+    };
+    // Adopt the sender's cwd BEFORE parsing (viv.c:3711-3713): its relative
+    // file arguments must resolve against ITS working directory. Fail-soft —
+    // upstream ignores the return (a vanished directory keeps ours).
+    let mut cwd = handoff.cwd.clone();
+    cwd.push(0);
+    // SAFETY: cwd is NUL-terminated and outlives the call.
+    let _ = unsafe { SetCurrentDirectoryW(PCWSTR::from_raw(cwd.as_ptr())) };
+    // The same switch/file filter main.rs ran at startup, over the ORIGINAL
+    // command line: CommandLineToArgvW is the splitter std itself uses for
+    // `args_os`, and the exe word is skipped like upstream's first
+    // string_get_word (viv.c:4789-4790).
+    let args = handoff_file_args(&handoff.command_line);
+    // The add-vs-replace decision (upstream viv.c:4778-4793): a command
+    // line arriving within add_command_line_timeout of the previous one,
+    // with something loaded, APPENDS. The tick difference wraps like C's
+    // DWORD arithmetic (GetTickCount wraps at 2^32 ms).
+    // SAFETY: the read-only borrow ends inside is_some_and.
+    let is_add = (unsafe { state_of(hwnd) }).is_some_and(|state| {
+        state.config.add_command_line_timeout != 0
+            && state.last_cl_tick.is_some_and(|tick| {
+                // SAFETY: a cheap kernel tick query.
+                (unsafe { GetTickCount() }).wrapping_sub(tick)
+                    < state.config.add_command_line_timeout as u32
+            })
+            // `*_viv_current_fd->cFileName` non-empty — never append onto a
+            // blank viewer, the handoff must open something.
+            && state.nav_current.is_some()
+    });
+    process_command_line(hwnd, &args, is_add);
+    // Show per the second launch's requested state (viv.c:3717): a "run
+    // maximized" shortcut forwards SW_MAXIMIZE; a plain launch's
+    // SW_SHOWNORMAL restores a minimized window and brings it forward.
+    // SAFETY: hwnd is live.
+    let _ = unsafe { ShowWindow(hwnd, SHOW_WINDOW_CMD(handoff.show_cmd as i32)) };
+    true
+}
+
+/// Split a forwarded command line into main.rs's file arguments: drop the
+/// exe word, then run the shared switch/file/absolutize filter. An
+/// unparseable line yields nothing — the handoff degenerates to a pure
+/// bring-to-front, matching upstream's nothing-found word loop.
+fn handoff_file_args(cl: &[u16]) -> Vec<OsString> {
+    let mut cmd = cl.to_vec();
+    cmd.push(0);
+    let mut argc = 0i32;
+    // SAFETY: cmd is NUL-terminated and outlives the call; on failure the
+    // return is null and nothing was allocated. On success argv points at
+    // an argc-sized array of NUL-terminated strings in LocalFree-owned
+    // memory, read out below and freed exactly once on every path.
+    let argv = unsafe { CommandLineToArgvW(PCWSTR::from_raw(cmd.as_ptr()), &mut argc) };
+    if argv.is_null() {
+        return Vec::new();
+    }
+    let mut words = Vec::new();
+    for i in 0..argc.max(0) as usize {
+        // SAFETY: argv[0..argc) are readable NUL-terminated strings per the
+        // CommandLineToArgvW contract; the walk reads up to each NUL.
+        let word = unsafe {
+            let arg = *argv.add(i);
+            let mut n = 0usize;
+            while *arg.0.add(n) != 0 {
+                n += 1;
+            }
+            OsString::from_wide(std::slice::from_raw_parts(arg.0, n))
+        };
+        words.push(word);
+    }
+    // SAFETY: argv came from CommandLineToArgvW and nothing retains it —
+    // the strings were all copied out above.
+    let _ = unsafe { LocalFree(Some(HLOCAL(argv.cast()))) };
+    crate::file_args(words.into_iter().skip(1))
+}
+
 /// The reply-kick handler: drain the current load session's queue and apply
 /// each reply to the display (upstream `_VIV_WM_REPLY`, viv.c:2762-3060).
 /// Protocol decisions live in the pure `loader::apply_reply`; this shell
@@ -1919,6 +2122,20 @@ unsafe extern "system" fn wnd_proc(
             on_drop_files(hwnd, HDROP(wparam.0 as *mut c_void));
             LRESULT(0)
         }
+        // The single-instance handoff receive (#21; upstream viv.c:3688-3719):
+        // only the command-line id is ours — anything else (upstream also
+        // multiplexes its Everything-search IPC here) goes to the default.
+        WM_COPYDATA => {
+            // SAFETY: lparam points at the sender-owned COPYDATASTRUCT for
+            // the duration of the message (the WM_COPYDATA contract).
+            if on_copydata(hwnd, unsafe { &*(lparam.0 as *const COPYDATASTRUCT) }) {
+                LRESULT(1)
+            } else {
+                // SAFETY: hwnd/msg are exactly what this callback received;
+                // the default procedure handles everything we do not.
+                unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+            }
+        }
         WM_TIMER => {
             if wparam.0 == ANIMATION_TIMER_ID {
                 on_animation_timer(hwnd);
@@ -2235,6 +2452,110 @@ pub(crate) fn run(args: Vec<OsString>) -> Result<(), String> {
     // the very first show (upstream saves it off before any window
     // exists for exactly this reason, viv.c:5264-5266).
     let config = Config::load();
+    // The single-instance gate (#21; upstream viv.c:5278-5341 — config
+    // first, viv.c:5261 → 5278, class registration after): with
+    // multiple_instances off (the default), a second process hands its
+    // command line to the window that owns the RIVIV mutex and exits
+    // without ever creating a window. The mutex name and find-class are
+    // deliberately not upstream's VOIDIMAGEVIEWER so both viewers run side
+    // by side (README Differences).
+    let single_instance_mutex = if config.multiple_instances == 0 {
+        // SAFETY: clears the thread's last error so ERROR_ALREADY_EXISTS
+        // can only mean this CreateMutexA (upstream SetLastError(0),
+        // viv.c:5281).
+        unsafe { SetLastError(WIN32_ERROR(0)) };
+        // SAFETY: a named-mutex create over a static NUL-terminated name;
+        // the returned handle is valid even when the mutex already exists.
+        let mutex = unsafe { CreateMutexA(None, false, copydata::MUTEX_NAME) }
+            .map_err(|e| format!("CreateMutexA failed: {e}"))?;
+        // SAFETY: reading the thread's last error immediately after the call.
+        if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+            // Find the owner's window and hand off (viv.c:5286-5334). No
+            // window (the owner is mid-startup, before its class exists) is
+            // upstream's accepted race: the handoff is lost and this
+            // process still exits (viv.c:5336-5340) rather than show a
+            // second window.
+            // SAFETY: a pure top-level window search by static class name.
+            let other = unsafe { FindWindowA(copydata::FIND_CLASS, PCSTR::null()) }
+                .ok()
+                .filter(|h| !h.is_invalid());
+            if let Some(hwnd) = other {
+                // Let this process hand over the foreground (viv.c:5302) —
+                // the receiver foregrounds itself too; a lock denial is
+                // ignored like upstream.
+                // SAFETY: the found window is not ours but is live.
+                let _ = unsafe { SetForegroundWindow(hwnd) };
+                // The payload: this launch's ORIGINAL command line verbatim,
+                // its cwd, and its effective show command (the launcher's
+                // wShowWindow when STARTF_USESHOWWINDOW is set, else nCmdShow
+                // — SW_SHOWNORMAL for a plain launch — viv.c:5303-5310).
+                // SAFETY: GetCommandLineW returns this process's
+                // NUL-terminated command line, valid for the process
+                // lifetime; the walk reads up to that NUL.
+                let cl = unsafe {
+                    let cl = GetCommandLineW();
+                    let mut n = 0usize;
+                    while *cl.0.add(n) != 0 {
+                        n += 1;
+                    }
+                    std::slice::from_raw_parts(cl.0, n)
+                };
+                let mut cwd_buf = [0u16; copydata::STRING_SIZE];
+                // SAFETY: cwd_buf outlives the call; returns the length in
+                // u16 units WITHOUT the NUL on success, or the REQUIRED size
+                // WITH it when the buffer is too small. Upstream's
+                // GetCurrentDirectory(STRING_SIZE, …) truncates identically;
+                // a cwd longer than STRING_SIZE-1 is sent empty rather than
+                // upstream's uninitialized stack (the receiver's
+                // SetCurrentDirectory just fails either way).
+                let cwd_len = unsafe { GetCurrentDirectoryW(Some(&mut cwd_buf)) } as usize;
+                let cwd: &[u16] = if cwd_len < copydata::STRING_SIZE {
+                    &cwd_buf[..cwd_len]
+                } else {
+                    &[]
+                };
+                let mut si = STARTUPINFOW {
+                    cb: size_of::<STARTUPINFOW>() as u32,
+                    ..Default::default()
+                };
+                // SAFETY: fills this process's STARTUPINFOW; a read-only query.
+                unsafe { GetStartupInfoW(&mut si) };
+                let show_cmd = if (si.dwFlags & STARTF_USESHOWWINDOW).0 != 0 {
+                    u32::from(si.wShowWindow)
+                } else {
+                    SW_SHOWNORMAL.0 as u32
+                };
+                let payload = copydata::encode(show_cmd, cl, cwd);
+                let cds = COPYDATASTRUCT {
+                    dwData: copydata::COPYDATA_COMMAND_LINE,
+                    cbData: payload.len() as u32,
+                    // The receiver reads its copy during the synchronous
+                    // send — the const is a lie the API demands (lpData is
+                    // *mut), nothing writes through it.
+                    lpData: payload.as_ptr() as *mut c_void,
+                };
+                // SAFETY: cds outlives the synchronous send; WM_COPYDATA
+                // copies the payload into the receiver — the pointer is not
+                // retained past the call (and must not be: SendMessage
+                // blocks until the receiver returns, viv.c:5332).
+                let _ = unsafe {
+                    SendMessageW(
+                        hwnd,
+                        WM_COPYDATA,
+                        None,
+                        Some(LPARAM(&cds as *const COPYDATASTRUCT as isize)),
+                    )
+                };
+            }
+            // SAFETY: the handle CreateMutexA returned to this process
+            // (upstream closes it in _viv_kill, viv.c:5528).
+            let _ = unsafe { CloseHandle(mutex) };
+            return Ok(());
+        }
+        Some(mutex)
+    } else {
+        None // multiple_instances=1: no mutex is created at all (viv.c:5278)
+    };
     let show_maximized = config.maximized != 0;
     let mut rect = initial_window_rect(&config)?;
     let state = WindowState {
@@ -2266,6 +2587,7 @@ pub(crate) fn run(args: Vec<OsString>) -> Result<(), String> {
         is_mouseover: false,
         last_cursor_pt: POINT { x: -1, y: -1 },
         prevent_deactivate_show: false,
+        last_cl_tick: None,
     };
 
     // SAFETY: returns the module handle of this exe; no side effects.
@@ -2398,35 +2720,11 @@ pub(crate) fn run(args: Vec<OsString>) -> Result<(), String> {
         let _ = unsafe { ShowWindow(hwnd, SW_MAXIMIZE) };
     }
 
-    // The command line's file arguments (upstream viv.c:4990-5100; main.rs
-    // has already skipped switch-shaped words and absolutized the rest):
-    // ONE argument keeps single-file semantics (a folder recurses into a
-    // playlist, a wildcard expands, a file opens directly); a SECOND
-    // argument pulls the first into the playlist too — everything added in
-    // argument order — and the first-inserted entry is what opens. When
-    // nothing resolves, the startup "File not found." verdict shows over
-    // the blank window (upstream viv.c:5090-5098).
-    if !args.is_empty() {
-        if args.len() == 1 {
-            if !open_from_filename(hwnd, &args[0]) {
-                mark_startup_not_found(hwnd);
-            }
-        } else {
-            for arg in &args {
-                // SAFETY: the borrow spans the add's metadata reads.
-                if let Some(state) = unsafe { state_of(hwnd) } {
-                    playlist::add_filename(&mut state.playlist, Path::new(arg));
-                }
-            }
-            // SAFETY: the borrow ends at the end of this statement (the
-            // entry is cloned out).
-            let first = (unsafe { state_of(hwnd) }).and_then(|s| s.playlist.first().cloned());
-            let resolved = first.is_some_and(|entry| open_from_filename(hwnd, &entry.path));
-            if !resolved {
-                mark_startup_not_found(hwnd);
-            }
-        }
-    }
+    // The startup command line (upstream viv.c:5445 — the very same
+    // _viv_process_command_line the handoff receive re-runs, #21): the
+    // first run through never takes add-mode (the tick starts unset), so
+    // this is a plain replace/open.
+    process_command_line(hwnd, &args, false);
 
     // If we did not show the window above, make sure it is shown now
     // (upstream viv.c:5444-5451).
@@ -2465,6 +2763,12 @@ pub(crate) fn run(args: Vec<OsString>) -> Result<(), String> {
                 }
             }
         }
+    }
+    if let Some(mutex) = single_instance_mutex {
+        // SAFETY: the handle this process created (upstream's _viv_kill
+        // closes it, viv.c:5528) — process exit would reclaim it anyway;
+        // this is the explicit mirror.
+        let _ = unsafe { CloseHandle(mutex) };
     }
     Ok(())
 }
