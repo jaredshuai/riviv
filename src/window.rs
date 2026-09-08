@@ -32,8 +32,8 @@ use std::os::windows::ffi::OsStringExt;
 use std::path::Path;
 
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, GetLastError, HLOCAL, HWND, LPARAM,
-    LRESULT, LocalFree, POINT, RECT, SetLastError, WIN32_ERROR, WPARAM,
+    ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, GetLastError, HLOCAL, HWND, LPARAM, LRESULT,
+    LocalFree, POINT, RECT, SetLastError, WIN32_ERROR, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
     COLOR_BTNFACE, GetMonitorInfoW, HBRUSH, InvalidateRect, MONITOR_DEFAULTTOPRIMARY, MONITORINFO,
@@ -1394,21 +1394,17 @@ fn on_copydata(hwnd: HWND, cds: &COPYDATASTRUCT) -> bool {
     // `args_os`, and the exe word is skipped like upstream's first
     // string_get_word (viv.c:4789-4790).
     let args = handoff_file_args(&handoff.command_line);
-    // The add-vs-replace decision (upstream viv.c:4778-4793): a command
-    // line arriving within add_command_line_timeout of the previous one,
-    // with something loaded, APPENDS. The tick difference wraps like C's
-    // DWORD arithmetic (GetTickCount wraps at 2^32 ms).
+    // The add-vs-replace decision (upstream viv.c:4778-4793) — the pure
+    // `handoff_add_mode` below, fed the receiver's facts.
     // SAFETY: the read-only borrow ends inside is_some_and.
     let is_add = (unsafe { state_of(hwnd) }).is_some_and(|state| {
-        state.config.add_command_line_timeout != 0
-            && state.last_cl_tick.is_some_and(|tick| {
-                // SAFETY: a cheap kernel tick query.
-                (unsafe { GetTickCount() }).wrapping_sub(tick)
-                    < state.config.add_command_line_timeout as u32
-            })
-            // `*_viv_current_fd->cFileName` non-empty — never append onto a
-            // blank viewer, the handoff must open something.
-            && state.nav_current.is_some()
+        // SAFETY: a cheap kernel tick query.
+        handoff_add_mode(
+            unsafe { GetTickCount() },
+            state.last_cl_tick,
+            state.config.add_command_line_timeout,
+            state.nav_current.is_some(),
+        )
     });
     process_command_line(hwnd, &args, is_add);
     // Show per the second launch's requested state (viv.c:3717): a "run
@@ -1453,6 +1449,24 @@ fn handoff_file_args(cl: &[u16]) -> Vec<OsString> {
     // the strings were all copied out above.
     let _ = unsafe { LocalFree(Some(HLOCAL(argv.cast()))) };
     crate::file_args(words.into_iter().skip(1))
+}
+
+/// Whether a forwarded command line APPENDS to the playlist instead of
+/// replacing (upstream viv.c:4778-4793): the previous command line ran
+/// within `add_command_line_timeout` ticks AND something is loaded. The
+/// tick difference wraps exactly like C's DWORD subtraction (GetTickCount
+/// wraps at 2^32 ms), and a negative timeout casts to a huge DWORD the
+/// same way C's `(DWORD)config_add_command_line_timeout` does. `timeout`
+/// 0 disables the window entirely (the first condition upstream reads).
+fn handoff_add_mode(
+    now: u32,
+    last_cl_tick: Option<u32>,
+    timeout: i32,
+    current_loaded: bool,
+) -> bool {
+    timeout != 0
+        && last_cl_tick.is_some_and(|tick| now.wrapping_sub(tick) < timeout as u32)
+        && current_loaded
 }
 
 /// The reply-kick handler: drain the current load session's queue and apply
@@ -2439,10 +2453,6 @@ pub(crate) fn run(args: Vec<OsString>) -> Result<(), String> {
     };
     // SAFETY: `icex` outlives the call; a pure registration query.
     let _ = unsafe { InitCommonControlsEx(&icex) };
-    // The decode worker, started once per process before any load is
-    // requested (at most one decode is ever active — see `loadthread.rs`).
-    // A spawn failure is system-level: fail loud (ADR 0001) via run's Err.
-    let load_thread = LoadThread::start()?;
     // The settings, loaded before the window exists so the remembered
     // rect drives creation (upstream config_load_settings before
     // RegisterClassEx, viv.c:5261-5262 → 5354), the startup rect
@@ -2458,16 +2468,25 @@ pub(crate) fn run(args: Vec<OsString>) -> Result<(), String> {
     // command line to the window that owns the RIVIV mutex and exits
     // without ever creating a window. The mutex name and find-class are
     // deliberately not upstream's VOIDIMAGEVIEWER so both viewers run side
-    // by side (README Differences).
-    let single_instance_mutex = if config.multiple_instances == 0 {
+    // by side (README Differences). It runs BEFORE the decode worker
+    // below: a forwarding launch must not die at a worker-spawn failure
+    // before it could hand off (Codex PR #30 P2). The binding is
+    // underscore-prefixed on purpose: its Drop at run's scope end is the
+    // release.
+    let _single_instance_mutex = if config.multiple_instances == 0 {
         // SAFETY: clears the thread's last error so ERROR_ALREADY_EXISTS
         // can only mean this CreateMutexA (upstream SetLastError(0),
         // viv.c:5281).
         unsafe { SetLastError(WIN32_ERROR(0)) };
         // SAFETY: a named-mutex create over a static NUL-terminated name;
         // the returned handle is valid even when the mutex already exists.
-        let mutex = unsafe { CreateMutexA(None, false, copydata::MUTEX_NAME) }
-            .map_err(|e| format!("CreateMutexA failed: {e}"))?;
+        // RAII (see `OwnedMutex`): every exit path — the handoff return,
+        // the fail-loud `?`s below, or the pump's end — releases the mutex
+        // exactly once.
+        let mutex = copydata::OwnedMutex::new(
+            unsafe { CreateMutexA(None, false, copydata::MUTEX_NAME) }
+                .map_err(|e| format!("CreateMutexA failed: {e}"))?,
+        );
         // SAFETY: reading the thread's last error immediately after the call.
         if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
             // Find the owner's window and hand off (viv.c:5286-5334). No
@@ -2547,15 +2566,20 @@ pub(crate) fn run(args: Vec<OsString>) -> Result<(), String> {
                     )
                 };
             }
-            // SAFETY: the handle CreateMutexA returned to this process
-            // (upstream closes it in _viv_kill, viv.c:5528).
-            let _ = unsafe { CloseHandle(mutex) };
+            // Exit without a window (viv.c:5336-5340); the OwnedMutex Drop
+            // closes the handle on the way out (upstream _viv_kill,
+            // viv.c:5528).
             return Ok(());
         }
         Some(mutex)
     } else {
         None // multiple_instances=1: no mutex is created at all (viv.c:5278)
     };
+    // The decode worker, started once per process before any load is
+    // requested (at most one decode is ever active — see `loadthread.rs`).
+    // A spawn failure is system-level: fail loud (ADR 0001) via run's Err —
+    // reached only by the instance that keeps the window.
+    let load_thread = LoadThread::start()?;
     let show_maximized = config.maximized != 0;
     let mut rect = initial_window_rect(&config)?;
     let state = WindowState {
@@ -2764,18 +2788,73 @@ pub(crate) fn run(args: Vec<OsString>) -> Result<(), String> {
             }
         }
     }
-    if let Some(mutex) = single_instance_mutex {
-        // SAFETY: the handle this process created (upstream's _viv_kill
-        // closes it, viv.c:5528) — process exit would reclaim it anyway;
-        // this is the explicit mirror.
-        let _ = unsafe { CloseHandle(mutex) };
-    }
+    // The OwnedMutex drops here with run's scope — the explicit mirror of
+    // upstream's CloseHandle in _viv_kill (viv.c:5528), covering every
+    // return path (the fail-loud `?`s above included, Codex PR #30 P1).
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rapid_handoff_appends_when_something_is_loaded() {
+        // The Explorer multi-select burst: the 2nd..Nth command lines
+        // arrive within the timeout of the previous one and append
+        // (viv.c:4782-4792's three nested gates, all true).
+        assert!(handoff_add_mode(1_500, Some(1_100), 500, true)); // 400 < 500
+    }
+
+    #[test]
+    fn expired_handoff_replaces() {
+        // A deliberate later launch replaces the display/playlist.
+        assert!(!handoff_add_mode(1_601, Some(1_100), 500, true)); // 501 >= 500
+    }
+
+    #[test]
+    fn handoff_at_the_exact_timeout_replaces() {
+        // The comparison is strict `<` (viv.c:4784) — delta == timeout is
+        // already a replace.
+        assert!(!handoff_add_mode(1_600, Some(1_100), 500, true));
+    }
+
+    #[test]
+    fn wrapped_tick_delta_still_measures_rapid() {
+        // GetTickCount wraps at 2^32: the C subtraction is DWORD
+        // arithmetic, so a delta across the wrap counts normally.
+        let last = u32::MAX - 100; // 499 ms before the wrap point
+        assert!(handoff_add_mode(300, Some(last), 500, true)); // 401 ms
+        assert!(!handoff_add_mode(700, Some(last), 500, true)); // 801 ms
+    }
+
+    #[test]
+    fn disabled_timeout_never_appends() {
+        // add_command_line_timeout = 0 disables the whole gate (the first
+        // condition upstream reads, viv.c:4781).
+        assert!(!handoff_add_mode(1_100, Some(1_099), 0, true));
+    }
+
+    #[test]
+    fn first_command_line_never_appends() {
+        // No previous stamp (upstream's got_last_process_command_line_tick
+        // gate, viv.c:4782) — the startup open is always a replace.
+        assert!(!handoff_add_mode(1_000, None, 500, true));
+    }
+
+    #[test]
+    fn blank_viewer_replaces_even_when_rapid() {
+        // `*_viv_current_fd->cFileName` empty — never append onto a blank
+        // viewer; the handoff must open something (viv.c:4785-4791).
+        assert!(!handoff_add_mode(1_500, Some(1_100), 500, false));
+    }
+
+    #[test]
+    fn negative_timeout_behaves_like_the_c_dword_cast() {
+        // A hand-edited negative ini value reaches C as a huge DWORD —
+        // effectively "always rapid"; riviv's `as u32` mirrors the cast.
+        assert!(handoff_add_mode(1_000, Some(999), -1, true));
+    }
 
     #[test]
     fn first_run_is_three_fifths_of_the_monitor_centered_in_its_frame() {
