@@ -237,7 +237,14 @@ impl Config {
                 let _ = std::fs::create_dir_all(&dir);
                 save_by_location(dir.join(FILE_NAME), self.to_pairs(false));
             }
-            if let Some(dir) = exe_dir() {
+            if let Some(dir) = exe_dir()
+                // An exe living INSIDE the appdata dir would have the
+                // marker write clobber the full table just saved to the
+                // same path (upstream cannot hit this: its appdata path is
+                // fixed to %APPDATA%voidimageviewer while the exe-dir
+                // save always goes to the install dir).
+                && appdata_dir().is_none_or(|ad| ad != dir)
+            {
                 save_by_location(dir.join(FILE_NAME), self.to_pairs(true));
             }
         } else if let Some(dir) = exe_dir() {

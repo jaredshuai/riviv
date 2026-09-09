@@ -42,8 +42,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     RegisterClassExW, SW_HIDE, SW_SHOW, SendMessageW, SetWindowLongPtrW, ShowWindow,
     TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CTLCOLORBTN,
     WM_CTLCOLORSTATIC, WM_DESTROY, WM_DRAWITEM, WM_NOTIFY, WM_SETFONT, WNDCLASSEXW, WNDPROC,
-    WS_BORDER, WS_CHILD, WS_CLIPSIBLINGS, WS_EX_CONTROLPARENT, WS_EX_DLGMODALFRAME, WS_GROUP,
-    WS_POPUP, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+    WS_BORDER, WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_CONTROLPARENT,
+    WS_EX_DLGMODALFRAME, WS_GROUP, WS_POPUP, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
 use windows::core::{HSTRING, PCWSTR, PWSTR, w};
 
@@ -81,7 +81,7 @@ const PAGE_CLASS: PCWSTR = w!("riviv_options_page");
 const DLG_WIDE: i32 = 310;
 const DLG_HIGH: i32 = 271;
 const TREE: (i32, i32, i32, i32) = (6, 6, 84, 240);
-const PAGE: (i32, i32, i32, i32) = (106, 26, 186, 214);
+const PAGE: (i32, i32, i32, i32) = (106, 26, 194, 216);
 const BTN_W: i32 = 50;
 const BTN_H: i32 = 14;
 
@@ -159,7 +159,16 @@ pub(crate) fn open(owner: HWND) {
         right: dlu(DLG_WIDE, 0).0,
         bottom: dlu(0, DLG_HIGH).1,
     };
-    let style = WINDOW_STYLE(WS_POPUP.0 | WS_VISIBLE.0 | WS_CLIPSIBLINGS.0);
+    // rc STYLE: WS_POPUP|WS_VISIBLE|WS_CLIPSIBLINGS|WS_CLIPCHILDREN|
+    // WS_CAPTION|WS_SYSMENU — the caption carries the title and the X.
+    let style = WINDOW_STYLE(
+        WS_POPUP.0
+            | WS_VISIBLE.0
+            | WS_CLIPSIBLINGS.0
+            | WS_CLIPCHILDREN.0
+            | WS_CAPTION.0
+            | WS_SYSMENU.0,
+    );
     let ex = WINDOW_EX_STYLE(WS_EX_DLGMODALFRAME.0 | WS_EX_CONTROLPARENT.0);
     // SAFETY: in/out rect valid for the call; a failure leaves the raw
     // client size and the caption draws tight — cosmetic only.
@@ -307,7 +316,7 @@ fn build_dialog(dlg: HWND, font: HGDIOBJ, dlu: impl Fn(i32, i32) -> (i32, i32), 
     // strings that outlive the calls; the tree/page handles are stored
     // before any message can use them.
     unsafe {
-        let (px, psize) = (dlu(PAGE.0, PAGE.1), dlu(PAGE.2 - PAGE.0, PAGE.3 - PAGE.1));
+        let (px, psize) = (dlu(PAGE.0, PAGE.1), dlu(PAGE.2, PAGE.3));
         // The page containers first (the tree sits beside them).
         if let Some(state) = dlg_state_of(dlg) {
             for (i, _page) in PAGES.iter().enumerate() {
@@ -570,7 +579,8 @@ fn build_dialog(dlg: HWND, font: HGDIOBJ, dlu: impl Fn(i32, i32) -> (i32, i32), 
         let ok_text = HSTRING::from(loc::get(loc::Id::OptionsOk));
         let cancel_text = HSTRING::from(loc::get(loc::Id::OptionsCancel));
         let by1 = dlu(0, DLG_HIGH - 19).1;
-        let (bx1, bx2) = dlu(DLG_WIDE - 112, DLG_WIDE - 58);
+        let bx1 = dlu(DLG_WIDE - 112, 0).0;
+        let bx2 = dlu(DLG_WIDE - 58, 0).0;
         let bw = dlu(BTN_W, 0).0;
         for (id, label, def) in [
             (IDOK_BTN, ok_text, true),

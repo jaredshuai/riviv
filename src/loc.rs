@@ -227,28 +227,28 @@ const EN_US: [&str; Id::COUNT] = [
     "Nearest",                             // OptionsBlitNearest
     "Linear",                              // OptionsBlitLinear
     "&Keep Aspect Ratio",                  // OptionsKeepAspectRatio
-    "&Fill Window",                        // OptionsFillWindow
-    "Fill Window (Fullscreen)",            // OptionsFullscreenFill (riviv)
-    "Auto si&ze window:",                  // OptionsAutoZoom
-    "50%",                                 // OptionsAutoZoom50
-    "100%",                                // OptionsAutoZoom100
-    "200%",                                // OptionsAutoZoom200
-    "Auto Fit",                            // OptionsAutoZoomAutoFit
-    "&Windowed background color:",         // OptionsWindowedBg
-    "&Fullscreen background color:",       // OptionsFullscreenBg
-    "Show &remaining frames",              // OptionsFrameMinus (riviv)
-    "&Left click action:",                 // OptionsLeftClickAction
-    "&Right click action:",                // OptionsRightClickAction
-    "&Mouse wheel action:",                // OptionsMouseWheelAction
-    "Scroll",                              // ActionScroll
-    "Zoom In",                             // ActionZoomIn
-    "Next Image",                          // ActionNextImage
-    "Context Menu",                        // ActionContextMenu
-    "Zoom Out",                            // ActionZoomOut
-    "Previous Image",                      // ActionPreviousImage
-    "Zoom",                                // ActionZoom
-    "Next/Previous",                       // ActionNextPrev
-    "Previous/Next",                       // ActionPrevNext
+    "Fill Window", // OptionsFillWindow — upstream menu string minus its &F: the upstream OPTIONS page has no fill checkbox, and riviv's View page already carries "&Fullscreen background color:" — two &F on one dialog collide
+    "Fill Window (Fullscreen)", // OptionsFullscreenFill (riviv)
+    "Auto si&ze window:", // OptionsAutoZoom
+    "50%",         // OptionsAutoZoom50
+    "100%",        // OptionsAutoZoom100
+    "200%",        // OptionsAutoZoom200
+    "Auto Fit",    // OptionsAutoZoomAutoFit
+    "&Windowed background color:", // OptionsWindowedBg
+    "&Fullscreen background color:", // OptionsFullscreenBg
+    "Show &remaining frames", // OptionsFrameMinus (riviv)
+    "&Left click action:", // OptionsLeftClickAction
+    "&Right click action:", // OptionsRightClickAction
+    "&Mouse wheel action:", // OptionsMouseWheelAction
+    "Scroll",      // ActionScroll
+    "Zoom In",     // ActionZoomIn
+    "Next Image",  // ActionNextImage
+    "Context Menu", // ActionContextMenu
+    "Zoom Out",    // ActionZoomOut
+    "Previous Image", // ActionPreviousImage
+    "Zoom",        // ActionZoom
+    "Next/Previous", // ActionNextPrev
+    "Previous/Next", // ActionPrevNext
 ];
 
 /// zh-CN table — upstream localization_zh_cn.h:31/197-199/261-263.
@@ -297,7 +297,7 @@ const ZH_CN: [&str; Id::COUNT] = [
     "最近邻",                             // OptionsBlitNearest
     "线性",                               // OptionsBlitLinear
     "保持纵横比(&K)",                     // OptionsKeepAspectRatio
-    "填充窗口(&F)",                       // OptionsFillWindow
+    "填充窗口",                           // OptionsFillWindow — 同上去助记符
     "全屏时填充窗口",                     // OptionsFullscreenFill (riviv)
     "自动调窗(&Z):",                      // OptionsAutoZoom
     "50%",                                // OptionsAutoZoom50
@@ -534,7 +534,7 @@ mod tests {
             get_for(en, Id::OptionsKeepAspectRatio),
             "&Keep Aspect Ratio"
         );
-        assert_eq!(get_for(en, Id::OptionsFillWindow), "&Fill Window");
+        assert_eq!(get_for(en, Id::OptionsFillWindow), "Fill Window");
         assert_eq!(get_for(en, Id::OptionsAutoZoom), "Auto si&ze window:");
         assert_eq!(get_for(en, Id::OptionsAutoZoom50), "50%");
         assert_eq!(get_for(en, Id::OptionsAutoZoom100), "100%");
@@ -590,7 +590,7 @@ mod tests {
         assert_eq!(get_for(zh, Id::OptionsBlitNearest), "最近邻");
         assert_eq!(get_for(zh, Id::OptionsBlitLinear), "线性");
         assert_eq!(get_for(zh, Id::OptionsKeepAspectRatio), "保持纵横比(&K)");
-        assert_eq!(get_for(zh, Id::OptionsFillWindow), "填充窗口(&F)");
+        assert_eq!(get_for(zh, Id::OptionsFillWindow), "填充窗口");
         assert_eq!(get_for(zh, Id::OptionsAutoZoom), "自动调窗(&Z):");
         assert_eq!(get_for(zh, Id::OptionsAutoZoomAutoFit), "自动适应");
         assert_eq!(get_for(zh, Id::OptionsWindowedBg), "窗口背景颜色(&W):");

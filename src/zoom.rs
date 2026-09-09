@@ -291,6 +291,7 @@ impl View {
         let old_px = cx - rx;
         let old_py = cy - ry;
         let old_pos = self.pos;
+        let was_one_to_one = self.one_to_one;
         if self.one_to_one {
             // Leaving 1:1 by wheel: jump to the first level past the 1:1
             // size (viv.c:14014-14043). The loop's exit value (16 / -1)
@@ -319,8 +320,11 @@ impl View {
             self.pos += if out { -1 } else { 1 };
         }
         self.pos = self.pos.clamp(0, ZOOM_LIMIT - 1);
-        if self.pos == old_pos {
+        if self.pos == old_pos && !was_one_to_one {
             // Upstream only re-anchors when the level moved (viv.c:14052).
+            // Leaving 1:1 counts as a move even at the same level: the
+            // render size changes (the 1:1 arm rendered the source
+            // verbatim), so a repaint is still owed.
             return false;
         }
         let (rw, rh) = self.render_size(src_w, src_h, vp, fit);
@@ -431,7 +435,6 @@ fn render_size_at(
 /// exceed 100% of the source — upstream `fill_window`, viv.c:6922-6928);
 /// the anamorphic arm stretches to the viewport with a PER-AXIS clamp
 /// instead (viv.c:6930-6941).
-/// of the source (upstream `fill_window`, viv.c:6922-6928/6934-6941).
 fn fit_size(src_w: i32, src_h: i32, vp: Viewport, fit: FitPolicy) -> (i32, i32) {
     if !fit.keep_aspect {
         let (mut rw, mut rh) = (vp.wide, vp.high);

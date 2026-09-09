@@ -491,7 +491,10 @@ impl OptionsModel {
     /// `None` combo fields leave their key alone (an ini value outside the
     /// implemented set — the blank combo must not coerce it to 0).
     pub(crate) fn commit(&self, config: &mut Config) -> Effects {
+        // Both verdicts compare against the config as it stands NOW —
+        // before this method writes anything.
         let repaint = repaint_filters_colors(config, self);
+        let refit = fit_inputs_changed(config, self);
         if let Some(v) = self.shrink_blit_mode {
             config.shrink_blit_mode = v;
         }
@@ -523,23 +526,26 @@ impl OptionsModel {
         config.fullscreen_background_color_r = i32::from(self.fullscreen_bg[0]);
         config.fullscreen_background_color_g = i32::from(self.fullscreen_bg[1]);
         config.fullscreen_background_color_b = i32::from(self.fullscreen_bg[2]);
-        Effects { repaint }
+        Effects { repaint, refit }
     }
 }
 
 /// The filter/color/fit repaint decision against the config as it stands
 /// when commit starts (call before writing those fields).
+fn fit_inputs_changed(config: &Config, model: &OptionsModel) -> bool {
+    model.keep_aspect_ratio != (config.keep_aspect_ratio != 0)
+        || model.fill_window != (config.fill_window != 0)
+        || model.fullscreen_fill_window != (config.fullscreen_fill_window != 0)
+}
+
 fn repaint_filters_colors(config: &Config, model: &OptionsModel) -> bool {
     let filters = model
         .shrink_blit_mode
         .is_some_and(|v| v != config.shrink_blit_mode)
         || model.mag_filter.is_some_and(|v| v != config.mag_filter);
-    let fit = model.keep_aspect_ratio != (config.keep_aspect_ratio != 0)
-        || model.fill_window != (config.fill_window != 0)
-        || model.fullscreen_fill_window != (config.fullscreen_fill_window != 0);
     let colors =
         model.windowed_bg != config.windowed_bg() || model.fullscreen_bg != config.fullscreen_bg();
-    filters || fit || colors
+    filters || fit_inputs_changed(config, model) || colors
 }
 
 /// What the shell owes after an OK commit (upstream viv.c:8721-8767: a
@@ -548,6 +554,12 @@ fn repaint_filters_colors(config: &Config, model: &OptionsModel) -> bool {
 pub(crate) struct Effects {
     /// A whole-client repaint is owed (filter/fit/color change).
     pub(crate) repaint: bool,
+    /// The fit inputs changed (keep-aspect/fill): the pan offset must be
+    /// re-anchored against the new render size before that repaint —
+    /// upstream's FILL WINDOW menu command pairs its flip with
+    /// `_viv_on_size()` for exactly this (viv.c:2032-2051); riviv exposes
+    /// the toggle through Options, so OK performs the pairing.
+    pub(crate) refit: bool,
 }
 
 #[cfg(test)]
