@@ -23,7 +23,7 @@ use image::metadata::Orientation;
 use image::{AnimationDecoder, Frames, GenericImageView, ImageDecoder, ImageFormat, ImageReader};
 
 use crate::anim::{FrameScheduler, gif_delay_ms};
-use crate::pixels::{WINDOWED_BACKGROUND_RGB, composite_over_background_in_place};
+use crate::pixels::composite_over_background_in_place;
 use crate::surface::{DibFrame, Surface};
 
 /// Cumulative decoded-frame budget. Without a total cap a hostile file
@@ -115,13 +115,22 @@ enum Stop {
 /// status bar, upstream `_viv_load_render_wide/high`, viv.c:1557-1558) —
 /// the worker pre-generates each frame's first mips against its HALF
 /// (upstream passes `/2` into `_viv_get_mipmap`, viv.c:10302 et al.).
+/// Request-time decode inputs threaded to the sinks: the mip
+/// pre-generation viewport and the compositing background (upstream
+/// stashes both at request time, viv.c:1557-1558 + the decode-time
+/// composite).
+pub(crate) struct DecodeEnv {
+    pub(crate) render_viewport: (i32, i32),
+    pub(crate) background: [u8; 3],
+}
+
 pub(crate) fn decode_to_sink(
     path: &OsStr,
-    render_viewport: (i32, i32),
+    env: DecodeEnv,
     terminate: &AtomicBool,
     sink: &mut dyn FnMut(LoadReply),
 ) {
-    match produce(path, render_viewport, terminate, sink) {
+    match produce(path, env, terminate, sink) {
         Ok(()) => sink(LoadReply::Complete),
         Err(Stop::User(msg)) => sink(LoadReply::FailedUser(msg)),
         Err(Stop::Fatal(msg)) => sink(LoadReply::FatalSystem(msg)),
@@ -131,7 +140,7 @@ pub(crate) fn decode_to_sink(
 
 fn produce(
     path: &OsStr,
-    render_viewport: (i32, i32),
+    env: DecodeEnv,
     terminate: &AtomicBool,
     sink: &mut dyn FnMut(LoadReply),
 ) -> Result<(), Stop> {
@@ -169,7 +178,7 @@ fn produce(
                 gif_delay_ms,
                 orientation,
                 per_frame_bytes,
-                render_viewport,
+                env,
                 terminate,
                 sink,
             )
@@ -184,7 +193,7 @@ fn produce(
             // bitstreams, so still WebP files must take the static decoder or they
             // surface as "no frames decoded" load failures.
             if !decoder.has_animation() {
-                return sink_static(decoder, render_viewport, sink);
+                return sink_static(decoder, env, sink);
             }
             let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
             // WebP delays are the decoder's millisecond values, used as-is like
@@ -197,14 +206,14 @@ fn produce(
                 |ms| ms,
                 orientation,
                 per_frame_bytes,
-                render_viewport,
+                env,
                 terminate,
                 sink,
             )
         }
         _ => sink_static(
             reader.into_decoder().map_err(|e| user(e.to_string()))?,
-            render_viewport,
+            env,
             sink,
         ),
     }
@@ -226,7 +235,7 @@ fn stream_animation(
     normalize_delay: fn(u32) -> u32,
     orientation: Orientation,
     per_frame_bytes: usize,
-    render_viewport: (i32, i32),
+    env: DecodeEnv,
     terminate: &AtomicBool,
     sink: &mut dyn FnMut(LoadReply),
 ) -> Result<(), Stop> {
@@ -281,7 +290,7 @@ fn stream_animation(
         total_frame_bytes += buffer.len();
         // Resolve transparency against the windowed background before the
         // DIB copy — the render path has no alpha channel of its own.
-        composite_over_background_in_place(&mut buffer, WINDOWED_BACKGROUND_RGB);
+        composite_over_background_in_place(&mut buffer, env.background);
         // DIB failures are purely system-level (GDI allocation); fail
         // loud (ADR 0001) through the FatalSystem reply.
         let mut frame = DibFrame::from_rgba(w, h, &mut buffer.into_raw()).map_err(Stop::Fatal)?;
@@ -291,8 +300,8 @@ fn stream_animation(
         let target = crate::mip::select_mip_level(
             w as i32,
             h as i32,
-            render_viewport.0 / 2,
-            render_viewport.1 / 2,
+            env.render_viewport.0 / 2,
+            env.render_viewport.1 / 2,
         );
         if mip_pregen_allows(mip_objects_used, target) {
             frame.pregenerate_mips(target);
@@ -313,7 +322,7 @@ fn stream_animation(
 
 fn sink_static<D: ImageDecoder>(
     mut decoder: D,
-    render_viewport: (i32, i32),
+    env: DecodeEnv,
     sink: &mut dyn FnMut(LoadReply),
 ) -> Result<(), Stop> {
     let user = |msg: String| Stop::User(msg);
@@ -338,7 +347,7 @@ fn sink_static<D: ImageDecoder>(
     // Transparent regions show the windowed background instead of the raw
     // RGB under the alpha channel (upstream composites over
     // config_windowed_background_color; identity for opaque images).
-    composite_over_background_in_place(&mut rgba, WINDOWED_BACKGROUND_RGB);
+    composite_over_background_in_place(&mut rgba, env.background);
     let mut frame = DibFrame::from_rgba(w, h, &mut rgba).map_err(Stop::Fatal)?;
     // A static frame pre-generates un-gated: one frame's chain is at most
     // ~log2(128M px) ≈ 27 levels + the scratch DC, nowhere near the
@@ -348,8 +357,8 @@ fn sink_static<D: ImageDecoder>(
     frame.pregenerate_mips(crate::mip::select_mip_level(
         w as i32,
         h as i32,
-        render_viewport.0 / 2,
-        render_viewport.1 / 2,
+        env.render_viewport.0 / 2,
+        env.render_viewport.1 / 2,
     ));
     // A static image is a one-frame stream: first frame, then Complete from
     // decode_to_sink. delay_ms is unused (no second frame ever follows).

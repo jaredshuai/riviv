@@ -456,10 +456,9 @@ pub(crate) fn checked(cmd: Cmd, state: &MenuState) -> bool {
 /// Whether `cmd`'s menu item is selectable. Everything riviv registers is
 /// always available (upstream never gates zoom/navigation on image state
 /// either — its EnableMenuItem list, viv.c:7103-7121, covers clipboard/
-/// delete/print commands riviv does not register); the sole exception is
-/// the Options placeholder, greyed until the Options issue wires it.
-pub(crate) fn enabled(cmd: Cmd) -> bool {
-    cmd != Cmd::ViewOptions
+/// delete/print commands riviv does not register).
+pub(crate) fn enabled(_cmd: Cmd) -> bool {
+    true
 }
 
 #[cfg(test)]
@@ -626,12 +625,12 @@ mod tests {
     }
 
     #[test]
-    fn options_is_the_only_disabled_item() {
-        // The Options placeholder stays greyed until its issue wires the
-        // dialog; everything else is always selectable (upstream gates
-        // only clipboard/delete/print-style commands, none registered).
+    fn every_registered_item_is_selectable() {
+        // #24 wired the Options dialog: nothing riviv registers is ever
+        // greyed (upstream gates only clipboard/delete/print-style
+        // commands, none registered).
         for cmd in Cmd::ALL {
-            assert_eq!(enabled(cmd), cmd != Cmd::ViewOptions, "{cmd:?}");
+            assert!(enabled(cmd), "{cmd:?}");
         }
     }
 

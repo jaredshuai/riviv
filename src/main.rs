@@ -83,6 +83,8 @@ mod loadthread;
 mod loc;
 mod menu;
 mod mip;
+mod options;
+mod options_dlg;
 mod paint;
 mod pixels;
 mod playlist;

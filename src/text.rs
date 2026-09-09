@@ -75,9 +75,17 @@ pub(crate) fn status_main_text(loading: bool, not_found: bool, failed: bool) -> 
 /// shows `position + 1`; we take the 1-based position directly). Empty for
 /// static images; without a pre-known total the streaming decode counts
 /// against the loaded prefix (see `loader.rs`).
-pub(crate) fn status_frame_text(position_1based: usize, total: usize) -> String {
+/// The frame-counter part (upstream viv.c:11176-11208): `pos / total`, or
+/// with `remaining` on `- (total - pos) / total` — the frames-left form
+/// (`config_frame_minus`, toggled by a status-bar click upstream; riviv
+/// exposes it as an Options checkbox, #24). `total` is riviv's loaded
+/// prefix (the `m` in the README deviation note), so "remaining" counts
+/// down within what has streamed in so far.
+pub(crate) fn status_frame_text(position_1based: usize, total: usize, remaining: bool) -> String {
     if total <= 1 {
         String::new()
+    } else if remaining {
+        format!("- {} / {}", total - position_1based + 1, total)
     } else {
         format!("{position_1based} / {total}")
     }
@@ -239,10 +247,19 @@ mod tests {
 
     #[test]
     fn frame_counter_is_one_based_and_empty_for_static_images() {
-        assert_eq!(status_frame_text(1, 12), "1 / 12");
-        assert_eq!(status_frame_text(12, 12), "12 / 12");
-        assert_eq!(status_frame_text(1, 1), "", "static image — no counter");
-        assert_eq!(status_frame_text(0, 0), "", "no image at all");
+        assert_eq!(status_frame_text(1, 12, false), "1 / 12");
+        assert_eq!(status_frame_text(12, 12, false), "12 / 12");
+        assert_eq!(
+            status_frame_text(1, 1, false),
+            "",
+            "static image — no counter"
+        );
+        assert_eq!(status_frame_text(0, 0, false), "", "no image at all");
+        // frame_minus (viv.c:11187-11203): "- remaining / total", where the
+        // first frame still counts the whole total as remaining.
+        assert_eq!(status_frame_text(1, 12, true), "- 12 / 12");
+        assert_eq!(status_frame_text(5, 12, true), "- 8 / 12");
+        assert_eq!(status_frame_text(12, 12, true), "- 1 / 12");
     }
 
     #[test]
