@@ -49,10 +49,21 @@ pub(crate) fn window_size_client(
         1 => image,
         2 => (image.0.saturating_mul(2), image.1.saturating_mul(2)),
         // A zero divisor makes upstream skip that axis (rect stays 0);
-        // the clamp then keeps whatever the other axis produced.
+        // the clamp then keeps whatever the other axis produced. The
+        // multiply runs in i64 — a hand-edited huge `auto_fit_*_mul`
+        // overflows i32 before the division (upstream wraps as C;
+        // riviv keeps the widened value honest instead).
         _ => (
-            if wd != 0 { full_monitor.0 * wm / wd } else { 0 },
-            if hd != 0 { full_monitor.1 * hm / hd } else { 0 },
+            if wd != 0 {
+                (i64::from(full_monitor.0) * i64::from(wm) / i64::from(wd)) as i32
+            } else {
+                0
+            },
+            if hd != 0 {
+                (i64::from(full_monitor.1) * i64::from(hm) / i64::from(hd)) as i32
+            } else {
+                0
+            },
         ),
     };
     (w.clamp(0, work.0), h.clamp(0, work.1))

@@ -496,8 +496,10 @@ fn on_double_click(hwnd: HWND, lparam: LPARAM) {
         // 4 = next image: the second click advances again.
         4 => nav_next(hwnd, false),
         // 0/1/2/5/6 (scroll, slideshow, animation, 1:1 scroll, move
-        // window): the double-click toggles fullscreen.
-        _ => toggle_fullscreen(hwnd),
+        // window): the double-click toggles fullscreen; unknown values
+        // re-run the action, which does nothing (upstream viv.c:3313-3326).
+        0 | 1 | 2 | 5 | 6 => toggle_fullscreen(hwnd),
+        _ => {}
     }
 }
 
@@ -1167,7 +1169,12 @@ fn on_left_button_down(hwnd: HWND, lparam: LPARAM) {
             nav_next(hwnd, false);
             return;
         }
-        _ => {}
+        // 0 falls through to the drag below; values riviv has no
+        // handler for (1 slideshow, 2 animation pause, 5 1:1 scroll,
+        // 6 move-window, hand-edited unknowns) do NOTHING, like
+        // upstream's per-value switch (viv.c:6360-6415).
+        0 => {}
+        _ => return,
     }
     // SAFETY: the borrow spans only the drag-point store.
     if let Some(state) = unsafe { state_of(hwnd) } {

@@ -44,8 +44,8 @@ pub(crate) enum Cmd {
     ViewZoomOut,
     /// Zoom → Reset (`VIV_ID_VIEW_ZOOM_RESET`).
     ViewZoomReset,
-    /// View → Options... (`VIV_ID_VIEW_OPTIONS`) — placeholder until the
-    /// Options dialog issue wires it (greyed in the meantime).
+    /// View → Options... (`VIV_ID_VIEW_OPTIONS`) — opens the modal Options
+    /// dialog (#24; upstream viv.c:2332).
     ViewOptions,
     /// Navigate → Next (`VIV_ID_NAV_NEXT`).
     NavNext,
