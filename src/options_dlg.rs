@@ -306,8 +306,14 @@ fn register_classes() {
         if atom == 0 {
             // SAFETY: pure thread-error-slot read immediately after the call.
             let gle = unsafe { GetLastError() }.0;
-            eprintln!("riviv: RegisterClassExW({class:?}) failed (GLE={gle})");
-            ok = false;
+            // An already-registered class (from an earlier open, or a
+            // partial earlier pass) is NOT a failure — counting it would
+            // make every later open re-register and log forever (cubic
+            // round 3).
+            if gle != windows::Win32::Foundation::ERROR_CLASS_ALREADY_EXISTS.0 {
+                eprintln!("riviv: RegisterClassExW({class:?}) failed (GLE={gle})");
+                ok = false;
+            }
         }
     }
     DONE.store(ok, Ordering::Relaxed);
@@ -714,8 +720,14 @@ fn on_ok(dlg: HWND) {
     // SAFETY: the dialog-state borrow ends above (model is owned); the
     // owner borrow spans only the commit/re-anchor/invalidate/save —
     // none pump.
-    unsafe {
-        if let Some(owner_state) = state_of(owner) {
+    // SAFETY: the dialog-state borrow ends above (model is owned). The
+    // owner borrow spans only the commit/re-anchor/invalidate—save —
+    // `refresh_status` re-enters `state_of` (its SendMessageW calls run
+    // synchronously inside), so it MUST run after that borrow drops:
+    // overlapping `&mut WindowState` is UB (state_of's contract), caught
+    // in post-merge review (Codex/cubic round 3).
+    let effects = unsafe {
+        state_of(owner).map(|owner_state| {
             let effects = model.commit(&mut owner_state.config);
             if effects.refit {
                 // Re-anchor the pan offset against the new render size
@@ -730,10 +742,16 @@ fn on_ok(dlg: HWND) {
             if effects.repaint || effects.refit {
                 let _ = InvalidateRect(Some(owner), None, false);
             }
-            // The frame counter follows a frame_minus flip immediately
-            // (the next animation tick would refresh it anyway; OK makes
-            // it instant). SB_SETTEXT dedupes through the text cache.
-            crate::window::refresh_status(owner);
+            effects
+        })
+    };
+    if effects.is_some() {
+        // SAFETY: no state borrow is live (the map above ended).
+        crate::window::refresh_status(owner);
+    }
+    // SAFETY: a fresh short borrow for the save; nothing pumps.
+    unsafe {
+        if let Some(owner_state) = state_of(owner) {
             // Upstream saves unconditionally at OK (viv.c:8805).
             owner_state.config.save();
         }
