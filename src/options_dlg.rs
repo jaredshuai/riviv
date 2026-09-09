@@ -76,8 +76,9 @@ const PAGE_CLASS: PCWSTR = w!("riviv_options_page");
 
 /// The rc geometry (voidImageViewer.rc IDD_OPTIONS:53-66), in dialog
 /// units: client 310x271, tree (6,6) 84x240, page host at (106,26)
-/// 186x214 (the placeholder's rect — where upstream parks the page
-/// dialogs), buttons bottom-right.
+/// 194x216 (the largest page template — the rc's 186x214 placeholder is
+/// where upstream parks its page dialogs; riviv sizes the host to the
+/// page so nothing clips), buttons bottom-right.
 const DLG_WIDE: i32 = 310;
 const DLG_HIGH: i32 = 271;
 const TREE: (i32, i32, i32, i32) = (6, 6, 84, 240);
@@ -274,13 +275,14 @@ pub(crate) fn open(owner: HWND) {
 /// benignly — the error is ignored like every other registration here).
 /// Register the dialog/page classes once per process (upstream
 /// registers at init, before any dialog, viv.c:5340+). A failure is
-/// system-level: fail LOUD with the error code (ADR 0001) — but the
-/// classes genuinely exist after the first dialog, so a second pass is
-/// skipped entirely and ERROR_CLASS_ALREADY_EXISTS never surfaces.
+/// system-level: fail LOUD with the error code (ADR 0001) and SKIP the
+/// flag so the next open retries — a transient or partial failure must
+/// not leave the dialog unavailable for the rest of the process
+/// (cubic round 2).
 fn register_classes() {
     use std::sync::atomic::{AtomicBool, Ordering};
     static DONE: AtomicBool = AtomicBool::new(false);
-    if DONE.swap(true, Ordering::Relaxed) {
+    if DONE.load(Ordering::Relaxed) {
         return;
     }
     // WNDPROC is an Option over the fn type both procs already have.
@@ -288,6 +290,7 @@ fn register_classes() {
         (DIALOG_CLASS, Some(dialog_proc)),
         (PAGE_CLASS, Some(page_proc)),
     ];
+    let mut ok = true;
     for (class, proc) in classes {
         // SAFETY: the struct outlives the call; the brush is a shared
         // system brush (never deleted).
@@ -304,8 +307,10 @@ fn register_classes() {
             // SAFETY: pure thread-error-slot read immediately after the call.
             let gle = unsafe { GetLastError() }.0;
             eprintln!("riviv: RegisterClassExW({class:?}) failed (GLE={gle})");
+            ok = false;
         }
     }
+    DONE.store(ok, Ordering::Relaxed);
 }
 
 /// Build tree + pages + buttons into the fresh frame and show the
@@ -703,14 +708,32 @@ fn on_ok(dlg: HWND) {
         let _ = unsafe { DestroyWindow(dlg) };
         return;
     };
+    // SAFETY: the state is live — no WM_DESTROY can run while this handler
+    // owns the dialog.
+    let owner = unsafe { owner_of(dlg) };
     // SAFETY: the dialog-state borrow ends above (model is owned); the
-    // owner borrow spans only the commit/invalidate/save — none pump.
+    // owner borrow spans only the commit/re-anchor/invalidate/save —
+    // none pump.
     unsafe {
-        if let Some(owner_state) = state_of(owner_of(dlg)) {
+        if let Some(owner_state) = state_of(owner) {
             let effects = model.commit(&mut owner_state.config);
-            if effects.repaint {
-                let _ = InvalidateRect(Some(owner_of(dlg)), None, false);
+            if effects.refit {
+                // Re-anchor the pan offset against the new render size
+                // before repainting — upstream's FILL WINDOW menu command
+                // pairs its flip with `_viv_on_size()` (viv.c:2032-2051);
+                // the Options OK performs the same pairing.
+                let (vp, src) = crate::window::viewport_and_src(owner, owner_state);
+                let fit = crate::window::fit_policy(owner_state);
+                let (vx, vy) = (owner_state.view.view_x, owner_state.view.view_y);
+                owner_state.view.set_view(vx, vy, src.0, src.1, vp, fit);
             }
+            if effects.repaint || effects.refit {
+                let _ = InvalidateRect(Some(owner), None, false);
+            }
+            // The frame counter follows a frame_minus flip immediately
+            // (the next animation tick would refresh it anyway; OK makes
+            // it instant). SB_SETTEXT dedupes through the text cache.
+            crate::window::refresh_status(owner);
             // Upstream saves unconditionally at OK (viv.c:8805).
             owner_state.config.save();
         }
