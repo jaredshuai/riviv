@@ -290,7 +290,7 @@ fn status_snapshot(state: &WindowState, hwnd: HWND) -> status::StatusSnapshot {
 
 /// Refresh the status bar from current state, running the Win32 calls
 /// outside any state borrow (SB_SETTEXT redraws synchronously).
-fn refresh_status(hwnd: HWND) {
+pub(crate) fn refresh_status(hwnd: HWND) {
     // SAFETY: the borrow spans only reads into the snapshot struct; the
     // SendMessageW calls in status::update run after it drops. Two
     // sequential borrows, never nested.
@@ -310,7 +310,7 @@ fn snapshot_status_bar(hwnd: HWND) -> HWND {
 /// viv.c:13954-13957) and the displayed image's source size. A blank
 /// display yields (0, 0), against which the zoom model is inert like
 /// upstream's `_viv_get_render_size` no-image early-out (viv.c:6867).
-fn viewport_and_src(hwnd: HWND, state: &WindowState) -> (Viewport, (i32, i32)) {
+pub(crate) fn viewport_and_src(hwnd: HWND, state: &WindowState) -> (Viewport, (i32, i32)) {
     let mut client = RECT::default();
     // SAFETY: read-only query on the live window; a failed read leaves the
     // zeroed rect and collapses the viewport (the zoom math no-ops).
@@ -512,16 +512,21 @@ fn on_right_button(hwnd: HWND, msg: u32, lparam: LPARAM) -> bool {
     let action = (unsafe { state_of(hwnd) })
         .map(|s| s.config.right_click_action)
         .unwrap_or(0);
+    // Actions fire on press; under CS_DBLCLKS the second press of a rapid
+    // pair arrives as WM_RBUTTONDBLCLK — upstream runs the same arm on
+    // both (viv.c:3349-3367), so a fast right double-click performs the
+    // configured action TWICE, exactly like upstream.
+    let press = msg == WM_RBUTTONDOWN || msg == WM_RBUTTONDBLCLK;
     match action {
         1 => {
-            if msg == WM_RBUTTONDOWN {
+            if press {
                 let pt = lparam_point(lparam);
                 zoom_at(hwnd, true, (pt.x, pt.y));
             }
             true
         }
         2 => {
-            if msg == WM_RBUTTONDOWN {
+            if press {
                 nav_next(hwnd, true);
             }
             true
@@ -1154,8 +1159,8 @@ fn on_left_button_down(hwnd: HWND, lparam: LPARAM) {
     let pt = lparam_point(lparam);
     // The action dispatch (upstream `_viv_do_left_click_action`,
     // viv.c:3319-3325 + 6360-6415): 0 scroll starts the drag; 3 zooms in
-    // at the click; 4 advances. Unimplemented values fall to the drag like
-    // upstream's switch default (viv.c:6411-6414).
+    // at the click; 4 advances. Unimplemented values (1/2/5/6) do nothing
+    // — upstream's per-value switch has no default-to-scroll arm.
     // SAFETY: the borrow spans only the config read.
     let action = (unsafe { state_of(hwnd) })
         .map(|s| s.config.left_click_action)

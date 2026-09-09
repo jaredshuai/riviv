@@ -53,14 +53,20 @@ pub(crate) fn window_size_client(
         // multiply runs in i64 — a hand-edited huge `auto_fit_*_mul`
         // overflows i32 before the division (upstream wraps as C;
         // riviv keeps the widened value honest instead).
+        // A hand-edited huge `auto_fit_*_mul` overflows i32 before the
+        // division; the i64 math stays honest, then clamps into the i32
+        // axis bound before the outer work-area clamp (cubic round 2: an
+        // `as i32` wrap could NEGATE the target and collapse the axis).
         _ => (
             if wd != 0 {
-                (i64::from(full_monitor.0) * i64::from(wm) / i64::from(wd)) as i32
+                (i64::from(full_monitor.0) * i64::from(wm) / i64::from(wd))
+                    .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
             } else {
                 0
             },
             if hd != 0 {
-                (i64::from(full_monitor.1) * i64::from(hm) / i64::from(hd)) as i32
+                (i64::from(full_monitor.1) * i64::from(hm) / i64::from(hd))
+                    .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
             } else {
                 0
             },
