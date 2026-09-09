@@ -28,10 +28,10 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 
 use crate::mip;
-use crate::pixels::WINDOWED_BACKGROUND_RGB;
+
 use crate::stitch::STRETCH_EXTENT_LIMIT;
 use crate::window::{fatal, state_of};
-use crate::zoom::Viewport;
+use crate::zoom::{FitPolicy, Viewport};
 
 pub(crate) fn paint(hwnd: HWND) {
     // SAFETY: all GDI calls are bracketed by BeginPaint/EndPaint on the WM_PAINT
@@ -75,17 +75,44 @@ pub(crate) fn paint(hwnd: HWND) {
         // degrade-not-fatal by design for the same reason: the fatal modal
         // pumps messages and would alias this borrow (PR #10 P1).
         let mut img = (0, 0, 0, 0); // degenerate: the strips cover everything
+        // The mode-resolved background (upstream viv.c:4396 picks by
+        // `_viv_is_fullscreen`): the letterbox strips repaint live with the
+        // config color. Transparent-pixel compositing is NOT re-run on a
+        // color change (it flattens at decode against the windowed color,
+        // #3) — the same stale composite upstream shows after an Options
+        // color change (its own TODO list, viv.c:224).
+        let mut bg = [255u8, 255, 255];
+        // Gather the fit inputs and the background under one immutable
+        // borrow FIRST — the image borrow below is mutable.
+        // SAFETY: the borrow spans only the two Copy reads.
+        let fit = state_of(hwnd)
+            .map(|state| crate::window::fit_policy(state))
+            .unwrap_or(FitPolicy::WITHOUT_FILL);
+        if let Some(state) = state_of(hwnd) {
+            bg = if state.fullscreen {
+                state.config.fullscreen_bg()
+            } else {
+                state.config.windowed_bg()
+            };
+        }
         if let Some(state) = state_of(hwnd)
             && let Some(image) = state.image.as_mut()
         {
             let surface = image.surface_mut();
             let (sw, sh) = (surface.width(), surface.height());
+            // The two blit filters (config.c:41-42; 0 = COLORONCOLOR
+            // "Nearest", 1 = HALFTONE "Linear"): the shrink arm keys on
+            // `shrink_blit_mode`, the magnify arm on `mag_filter`
+            // (upstream viv.c:4205-4237 — brush-org realignment rides the
+            // HALFTONE SHRINK only).
+            let halftone_shrink = state.config.shrink_blit_mode == 1;
+            let halftone_mag = state.config.mag_filter == 1;
             // The zoom/pan view decides the destination rect (upstream
             // `_viv_get_render_size` + `rx = wide/2 - rw/2 - _viv_view_x`,
             // viv.c:4136-4149); GDI clips whatever pans off-window.
             let (rw, rh) = state
                 .view
-                .render_size(sw, sh, Viewport { wide: cw, high: ch });
+                .render_size(sw, sh, Viewport { wide: cw, high: ch }, fit);
             let dx = client.left + cw / 2 - rw / 2 - state.view.view_x;
             let dy = client.top + ch / 2 - rh / 2 - state.view.view_y;
             img = (dx, dy, rw, rh);
@@ -103,12 +130,18 @@ pub(crate) fn paint(hwnd: HWND) {
                         // for huge extents, GDI clips).
                         let _ = BitBlt(hdc, dx, dy, rw, rh, Some(src_dc), 0, 0, SRCCOPY);
                     } else if rw < mw || rh < mh {
-                        // Upstream shrink path: HALFTONE + brush-org
-                        // realignment anchored to the destination image
-                        // (viv.c:4205-4209 uses -rx,-ry) so the dither
-                        // pattern does not drift as the image moves.
-                        let _ = SetStretchBltMode(hdc, HALFTONE);
-                        let _ = SetBrushOrgEx(hdc, -dx, -dy, None);
+                        // Upstream shrink path (viv.c:4205-4214): HALFTONE +
+                        // brush-org realignment anchored to the destination
+                        // image (viv.c:4205-4209 uses -rx,-ry, so the dither
+                        // pattern does not drift as the image moves) when
+                        // `shrink_blit_mode` is Linear; Nearest is plain
+                        // COLORONCOLOR with no brush org.
+                        if halftone_shrink {
+                            let _ = SetStretchBltMode(hdc, HALFTONE);
+                            let _ = SetBrushOrgEx(hdc, -dx, -dy, None);
+                        } else {
+                            let _ = SetStretchBltMode(hdc, COLORONCOLOR);
+                        }
                         if mw >= STRETCH_EXTENT_LIMIT
                             || mh >= STRETCH_EXTENT_LIMIT
                             || rw >= STRETCH_EXTENT_LIMIT
@@ -177,59 +210,79 @@ pub(crate) fn paint(hwnd: HWND) {
                             );
                         }
                     } else {
-                        // Upstream magnify default: COLORONCOLOR
-                        // (`config_mag_filter`, config.c:42), clipped to the
-                        // viewport with the cut mapped back to source coords —
-                        // GDI walks the whole dest extent of a StretchBlt no
-                        // matter the clip region (viv.c:4056-4062), so an
-                        // unclipped 16x blit stretches a rect tens of
-                        // thousands of pixels wide on every paint (upstream's
-                        // tiled stretch exists for exactly this,
-                        // viv.c:14929-14936). After the cut both extents stay
-                        // viewport-bounded, so no stitching here.
-                        let _ = SetStretchBltMode(hdc, COLORONCOLOR);
-                        let whole = crate::zoom::BlitRect {
-                            dx,
-                            dy,
-                            dw: rw,
-                            dh: rh,
-                            sx: 0,
-                            sy: 0,
-                            sw: mw,
-                            sh: mh,
-                        };
-                        if let Some(b) = crate::zoom::clip_blit(
-                            whole,
-                            client.left,
-                            client.top,
-                            Viewport { wide: cw, high: ch },
-                        ) {
+                        // Magnify path (viv.c:4215-4227): COLORONCOLOR by
+                        // default (`config_mag_filter`, config.c:42), clipped
+                        // to the viewport with the cut mapped back to source
+                        // coords — GDI walks the whole dest extent of a
+                        // StretchBlt no matter the clip region
+                        // (viv.c:4056-4062), so an unclipped 16x blit
+                        // stretches a rect tens of thousands of pixels wide
+                        // on every paint (upstream's tiled stretch exists for
+                        // exactly this, viv.c:14929-14936). After the cut both
+                        // extents stay viewport-bounded, so no stitching here.
+                        // `mag_filter` Linear = HALFTONE magnified WITHOUT the
+                        // clip cut: cutting realigns the filter taps, so the
+                        // full rect stretches behind GDI's own clipping
+                        // (upstream's is_halftone keeps simple full rects for
+                        // the same reason, viv.c:4240-4250).
+                        if halftone_mag {
+                            let _ = SetStretchBltMode(hdc, HALFTONE);
                             // Fail-soft like the shrink path (viv.c:4278).
                             let _ = StretchBlt(
                                 hdc,
-                                b.dx,
-                                b.dy,
-                                b.dw,
-                                b.dh,
+                                dx,
+                                dy,
+                                rw,
+                                rh,
                                 Some(src_dc),
-                                b.sx,
-                                b.sy,
-                                b.sw,
-                                b.sh,
+                                0,
+                                0,
+                                mw,
+                                mh,
                                 SRCCOPY,
                             );
+                        } else {
+                            let _ = SetStretchBltMode(hdc, COLORONCOLOR);
+                            let whole = crate::zoom::BlitRect {
+                                dx,
+                                dy,
+                                dw: rw,
+                                dh: rh,
+                                sx: 0,
+                                sy: 0,
+                                sw: mw,
+                                sh: mh,
+                            };
+                            if let Some(b) = crate::zoom::clip_blit(
+                                whole,
+                                client.left,
+                                client.top,
+                                Viewport { wide: cw, high: ch },
+                            ) {
+                                // Fail-soft like the shrink path (viv.c:4278).
+                                let _ = StretchBlt(
+                                    hdc,
+                                    b.dx,
+                                    b.dy,
+                                    b.dw,
+                                    b.dh,
+                                    Some(src_dc),
+                                    b.sx,
+                                    b.sy,
+                                    b.sw,
+                                    b.sh,
+                                    SRCCOPY,
+                                );
+                            }
                         }
                     }
                 });
             }
         }
         // The letterbox fill, AFTER the blit and excluding its rect —
-        // upstream viv.c:4396-4407 + os_fill_clipped_rect (os.c:1502-1522).
-        // Background color: the same constant the decode path composites
-        // transparent pixels against — the two must never diverge or
-        // composited images show a fringe (riviv keeps the windowed color
-        // in fullscreen too; README deviation).
-        let [bg_r, bg_g, bg_b] = WINDOWED_BACKGROUND_RGB;
+        // upstream viv.c:4396-4407 + os_fill_clipped_rect (os.c:1502-1522),
+        // in the mode-resolved config color gathered above.
+        let [bg_r, bg_g, bg_b] = bg;
         // Already inside this function's outer unsafe block.
         let brush = CreateSolidBrush(COLORREF(
             (u32::from(bg_b) << 16) | (u32::from(bg_g) << 8) | u32::from(bg_r),

@@ -1,13 +1,9 @@
 //! Pixel-buffer math (pure logic, unit-tested).
 //!
 //! M2 seam: mipmap generation math (#9) lands here beside the BGRA
-//! conversion and the alpha compositing (#3, landed).
-
-/// Windowed background color, RGB. Upstream default is white (config.c:65-67)
-/// and paint fills the client with the same value; a mismatch between the two
-/// would show as a fringe around composited images. Configurable upstream,
-/// hardcoded until the M3 settings work.
-pub(crate) const WINDOWED_BACKGROUND_RGB: [u8; 3] = [255, 255, 255];
+//! conversion and the alpha compositing (#3, landed — the composite
+//! background itself is a runtime parameter since #24, snapshot from
+//! the config at request time).
 
 /// image crate yields RGBA rows (top-down); GDI 32bpp DIBs want BGRA.
 pub(crate) fn rgba8_to_bgra_in_place(buf: &mut [u8]) {
@@ -98,12 +94,5 @@ mod tests {
         let mut px = vec![10, 20, 30, 99];
         composite_over_background_in_place(&mut px, [255, 255, 255]);
         assert_eq!(px[3], 255);
-    }
-
-    #[test]
-    fn windowed_background_default_is_white_like_upstream() {
-        // config.c:65-67; also matches the paint fill, which must never
-        // diverge from the compositing background.
-        assert_eq!(WINDOWED_BACKGROUND_RGB, [255, 255, 255]);
     }
 }

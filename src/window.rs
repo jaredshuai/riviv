@@ -85,16 +85,17 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowRect, HMENU, HWND_TOP, IDC_ARROW, IsIconic, IsZoomed, KillTimer, LoadCursorW,
     MB_ICONERROR, MB_OK, MENU_ITEM_FLAGS, MF_BYCOMMAND, MF_CHECKED, MF_ENABLED, MF_GRAYED,
     MF_POPUP, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MINMAXINFO, MSG, MessageBoxW, PostMessageW,
-    PostQuitMessage, RegisterClassExW, SHOW_WINDOW_CMD, SW_MAXIMIZE, SW_SHOW, SW_SHOWNORMAL,
-    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOZORDER, SendMessageW,
+    PostQuitMessage, RegisterClassExW, SHOW_WINDOW_CMD, SW_MAXIMIZE, SW_RESTORE, SW_SHOW,
+    SW_SHOWNORMAL, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOZORDER, SendMessageW,
     SetForegroundWindow, SetMenu, SetProcessDPIAware, SetTimer, SetWindowLongPtrW, SetWindowPos,
     SetWindowTextW, ShowCursor, ShowWindow, TPM_CENTERALIGN, TPM_LEFTBUTTON, TPM_VCENTERALIGN,
-    TrackPopupMenu, TranslateMessage, USER_TIMER_MINIMUM, WINDOW_EX_STYLE, WM_ACTIVATE, WM_COMMAND,
-    WM_CONTEXTMENU, WM_COPYDATA, WM_DESTROY, WM_DROPFILES, WM_ENDSESSION, WM_ERASEBKGND,
-    WM_GETMINMAXINFO, WM_INITMENU, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_MOVE, WM_NCCREATE, WM_NCDESTROY, WM_NULL, WM_PAINT,
-    WM_QUERYENDSESSION, WM_SIZE, WM_SYSKEYDOWN, WM_TIMER, WNDCLASSEXW, WS_CAPTION,
-    WS_EX_ACCEPTFILES, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_THICKFRAME, WS_VISIBLE, WindowFromPoint,
+    TrackPopupMenu, TranslateMessage, USER_TIMER_MINIMUM, WINDOW_EX_STYLE, WINDOW_STYLE,
+    WM_ACTIVATE, WM_COMMAND, WM_CONTEXTMENU, WM_COPYDATA, WM_DESTROY, WM_DROPFILES, WM_ENDSESSION,
+    WM_ERASEBKGND, WM_GETMINMAXINFO, WM_INITMENU, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_MOVE, WM_NCCREATE, WM_NCDESTROY, WM_NULL,
+    WM_PAINT, WM_QUERYENDSESSION, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SIZE,
+    WM_SYSKEYDOWN, WM_TIMER, WNDCLASSEXW, WS_CAPTION, WS_EX_ACCEPTFILES, WS_OVERLAPPEDWINDOW,
+    WS_POPUP, WS_THICKFRAME, WS_VISIBLE, WindowFromPoint,
 };
 use windows::core::{HSTRING, PCSTR, PCWSTR, w};
 
@@ -111,7 +112,7 @@ use crate::playlist::{self, Playlist, PlaylistEntry};
 use crate::status;
 use crate::surface::Surface;
 use crate::text::{dialog_filter, title_wide, to_wide};
-use crate::zoom::{View, Viewport};
+use crate::zoom::{FitPolicy, View, Viewport};
 
 /// Window class name. Deliberately different from upstream's `VOIDIMAGEVIEWER`
 /// (class + mutex) so both viewers can coexist on one machine.
@@ -280,6 +281,7 @@ fn status_snapshot(state: &WindowState, hwnd: HWND) -> status::StatusSnapshot {
             .image
             .as_ref()
             .map(|i| (i.frame_position_1based(), i.frame_count())),
+        frame_remaining: state.config.frame_minus != 0,
         dimensions: state.image.as_ref().map(|i| (i.width(), i.height())),
         file_bytes: state.displayed_file_bytes,
         client_wide: client.right - client.left,
@@ -326,11 +328,26 @@ fn viewport_and_src(hwnd: HWND, state: &WindowState) -> (Viewport, (i32, i32)) {
     (vp, src)
 }
 
+/// The fit inputs of `_viv_get_render_size` resolved for the CURRENT mode
+/// (viv.c:6885-6891): the fill half switches with fullscreen —
+/// `fullscreen_fill_window` while fullscreen, `fill_window` while windowed
+/// — while keep-aspect is mode-independent. Read live at every size
+/// consumer, like upstream's globals.
+pub(crate) fn fit_policy(state: &WindowState) -> FitPolicy {
+    FitPolicy {
+        keep_aspect: state.config.keep_aspect_ratio != 0,
+        fill: if state.fullscreen {
+            state.config.fullscreen_fill_window != 0
+        } else {
+            state.config.fill_window != 0
+        },
+    }
+}
+
 /// Gather `_viv_should_show_cursor`'s live inputs (viv.c:14593-14619): a
 /// viewable image is up, we are foreground, the mouse is over us, nothing
 /// holds the capture, and (fullscreen OR the `windowed_hide_cursor`
-/// config). riviv wires that config input to `false` — the cursor only
-/// hides in fullscreen (README deviation; the upstream default is 1).
+/// config, default 1 — #24 wired it to the ini).
 fn cursor_conditions(hwnd: HWND, state: &WindowState) -> cursor::CursorConditions {
     cursor::CursorConditions {
         has_viewable_image: state.nav_current.is_some()
@@ -342,7 +359,7 @@ fn cursor_conditions(hwnd: HWND, state: &WindowState) -> cursor::CursorCondition
         // SAFETY: read-only query of this thread's capture window.
         captured: !unsafe { GetCapture() }.is_invalid(),
         fullscreen: state.fullscreen,
-        hide_when_windowed: false,
+        hide_when_windowed: state.config.windowed_hide_cursor != 0,
     }
 }
 
@@ -459,15 +476,56 @@ unsafe extern "system" fn fullscreen_dummy_proc(
     }
 }
 
-/// WM_LBUTTONDBLCLK (upstream viv.c:3298-3318): the default left-click
-/// action's double-click arm is the fullscreen toggle (action 0 is one of
-/// the toggling actions; 3/4 would run the click action instead). The
-/// first click of the pair started a drag, but the intervening
-/// WM_LBUTTONUP already ended it — the drag is over by the time the DBLCLK
-/// arrives. The cursor reappears first, like on every button message.
-fn on_double_click(hwnd: HWND) {
+/// WM_LBUTTONDBLCLK (upstream viv.c:3298-3327): the scroll-family actions
+/// double-click into the fullscreen toggle; the one-shot actions (zoom in,
+/// next) repeat themselves instead. The first click of the pair started a
+/// drag, but the intervening WM_LBUTTONUP already ended it — the drag is
+/// over by the time the DBLCLK arrives. The cursor reappears first, like
+/// on every button message.
+fn on_double_click(hwnd: HWND, lparam: LPARAM) {
     show_and_update_cursor(hwnd);
-    toggle_fullscreen(hwnd);
+    let pt = lparam_point(lparam);
+    // SAFETY: the borrow spans only the config read.
+    let action = (unsafe { state_of(hwnd) })
+        .map(|s| s.config.left_click_action)
+        .unwrap_or(0);
+    match action {
+        // 3 = zoom in: repeat at the click point (upstream's default arm
+        // re-runs `_viv_do_left_click_action`).
+        3 => zoom_at(hwnd, false, (pt.x, pt.y)),
+        // 4 = next image: the second click advances again.
+        4 => nav_next(hwnd, false),
+        // 0/1/2/5/6 (scroll, slideshow, animation, 1:1 scroll, move
+        // window): the double-click toggles fullscreen.
+        _ => toggle_fullscreen(hwnd),
+    }
+}
+
+/// WM_RBUTTONDOWN / WM_RBUTTONUP (upstream viv.c:3349-3367): actions 1
+/// (zoom out at the click) and 2 (previous image) fire on button-DOWN and
+/// swallow both messages so no context menu follows; anything else falls
+/// to DefWindowProc (whose RBUTTONUP handling produces WM_CONTEXTMENU).
+fn on_right_button(hwnd: HWND, msg: u32, lparam: LPARAM) -> bool {
+    // SAFETY: the borrow spans only the config read.
+    let action = (unsafe { state_of(hwnd) })
+        .map(|s| s.config.right_click_action)
+        .unwrap_or(0);
+    match action {
+        1 => {
+            if msg == WM_RBUTTONDOWN {
+                let pt = lparam_point(lparam);
+                zoom_at(hwnd, true, (pt.x, pt.y));
+            }
+            true
+        }
+        2 => {
+            if msg == WM_RBUTTONDOWN {
+                nav_next(hwnd, true);
+            }
+            true
+        }
+        _ => false,
+    }
 }
 
 /// `_viv_toggle_fullscreen` (viv.c:6574-6821). Enter: strip caption +
@@ -488,8 +546,9 @@ fn toggle_fullscreen(hwnd: HWND) {
     // SAFETY: the borrow spans the pure geometry gather.
     let gathered = (unsafe { state_of(hwnd) }).map(|state| {
         let (vp, src) = viewport_and_src(hwnd, state);
-        let old_render = state.view.render_size(src.0, src.1, vp);
-        let sizes = state.view.sizes_all_levels(src.0, src.1, vp);
+        let fit = fit_policy(state);
+        let old_render = state.view.render_size(src.0, src.1, vp, fit);
+        let sizes = state.view.sizes_all_levels(src.0, src.1, vp, fit);
         (state.fullscreen, state.view.level(), old_render, sizes, src)
     });
     let Some((was_fullscreen, level, old_render, sizes, src)) = gathered else {
@@ -745,20 +804,23 @@ fn toggle_fullscreen(hwnd: HWND) {
         }
         // The zoom offset (viv.c:6718-6778), computed AFTER the cover like
         // upstream: the fill_window branch reads sizes LIVE at the
-        // fullscreen viewport with 1:1 already cleared — a fresh sweep now,
-        // while the fullscreen_fill branch keeps the pre-toggle sweep from
-        // the gather above. Both fill modes are off in riviv, so the offset
-        // is always 0 and the level survives — kept wired and pure for the
-        // M3 config hookup.
+        // fullscreen viewport with 1:1 already cleared — a fresh sweep now
+        // (its fit resolves in the POST-toggle mode, exactly upstream's
+        // live `_viv_get_render_size` read), while the fullscreen_fill
+        // branch keeps the pre-toggle sweep from the gather above. Both
+        // flags flow in from the config (#24): the upstream default
+        // `fullscreen_fill_window=1` drops to the largest level that still
+        // covers the monitor on entry, exit adds it back.
         // SAFETY: the borrow spans the fullscreen-viewport sweep and the
         // pure offset math; nothing here pumps messages.
         let offset = (unsafe { state_of(hwnd) })
             .map(|state| {
                 let (fs_vp, _) = viewport_and_src(hwnd, state);
-                let sizes_fs = state.view.sizes_all_levels(src.0, src.1, fs_vp);
+                let fit_fs = fit_policy(state);
+                let sizes_fs = state.view.sizes_all_levels(src.0, src.1, fs_vp, fit_fs);
                 crate::zoom::fullscreen_zoom_offset(
-                    false,
-                    false,
+                    state.config.fullscreen_fill_window != 0,
+                    state.config.fill_window != 0,
                     &sizes,
                     &sizes_fs,
                     Viewport {
@@ -836,12 +898,68 @@ fn on_mousewheel(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
     // SAFETY: in-place conversion on the live window; a failure leaves the
     // screen point, which merely anchors elsewhere.
     let _ = unsafe { ScreenToClient(hwnd, &mut pt) };
-    // SAFETY: the borrow spans only the pure zoom math — nothing pumps.
+    // The action pick (upstream viv.c:3673-3677): Ctrl held selects
+    // `ctrl_mouse_wheel_action`, else `mouse_wheel_action`.
+    // SAFETY: GetKeyState reads this thread's key state.
+    let ctrl = (unsafe { GetKeyState(VK_CONTROL.0 as i32) } as u16) & 0x8000 != 0;
+    // SAFETY: the borrow spans only the action read.
+    let action = (unsafe { state_of(hwnd) })
+        .map(|s| {
+            if ctrl {
+                s.config.ctrl_mouse_wheel_action
+            } else {
+                s.config.mouse_wheel_action
+            }
+        })
+        .unwrap_or(0);
+    match action {
+        // Action 1: wheel up = previous, down = next (viv.c:14063-14074).
+        1 => {
+            if delta > 0 {
+                nav_next(hwnd, true);
+            } else if delta < 0 {
+                nav_next(hwnd, false);
+            }
+        }
+        // Action 2: wheel up = next, down = previous (viv.c:14075-14086).
+        2 => {
+            if delta > 0 {
+                nav_next(hwnd, false);
+            } else if delta < 0 {
+                nav_next(hwnd, true);
+            }
+        }
+        // Action 0 (and any hand-edited unknown value, which upstream's
+        // fall-through also zooms): one zoom level per notch, anchored at
+        // the cursor — upstream keys off the delta's sign only, so a zero
+        // delta counts as zoom-out.
+        _ => {
+            // SAFETY: the borrow spans only the pure zoom math — nothing
+            // pumps.
+            let changed = (unsafe { state_of(hwnd) }).is_some_and(|state| {
+                let (vp, src) = viewport_and_src(hwnd, state);
+                let fit = fit_policy(state);
+                state
+                    .view
+                    .zoom_step(delta <= 0, (pt.x, pt.y), src.0, src.1, vp, fit)
+            });
+            if changed {
+                repaint(hwnd);
+            }
+        }
+    }
+}
+
+/// One zoom step anchored at an explicit client point — the shared body of
+/// the wheel, the +/- keys (via the viewport center) and the click-action
+/// zooms (upstream `_viv_do_mousewheel_action` action 0 /
+/// `_viv_zoom_in(0,1,x,y)`, viv.c:13932+ / 6383-6390).
+fn zoom_at(hwnd: HWND, out: bool, cursor: (i32, i32)) {
+    // SAFETY: the borrow spans only the pure zoom math.
     let changed = (unsafe { state_of(hwnd) }).is_some_and(|state| {
         let (vp, src) = viewport_and_src(hwnd, state);
-        state
-            .view
-            .zoom_step(delta <= 0, (pt.x, pt.y), src.0, src.1, vp)
+        let fit = fit_policy(state);
+        state.view.zoom_step(out, cursor, src.0, src.1, vp, fit)
     });
     if changed {
         repaint(hwnd);
@@ -852,15 +970,150 @@ fn on_mousewheel(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
 /// `_viv_zoom_in` with have_xy=0 feeds the client-area center through the
 /// same wheel action, viv.c:11803-11821).
 fn zoom_step_centered(hwnd: HWND, out: bool) {
-    // SAFETY: the borrow spans only the pure zoom math.
-    let changed = (unsafe { state_of(hwnd) }).is_some_and(|state| {
-        let (vp, src) = viewport_and_src(hwnd, state);
-        state
-            .view
-            .zoom_step(out, (vp.wide / 2, vp.high / 2), src.0, src.1, vp)
+    // SAFETY: the borrow spans only the center read.
+    let center = (unsafe { state_of(hwnd) })
+        .map(|state| {
+            let (vp, _) = viewport_and_src(hwnd, state);
+            (vp.wide / 2, vp.high / 2)
+        })
+        .unwrap_or((0, 0));
+    zoom_at(hwnd, out, center);
+}
+
+/// The window-size-to-image command (upstream `VIV_ID_VIEW_WINDOW_SIZE_*`,
+/// viv.c:2076-2160) — auto_zoom's payload (viv.c:14363-14383): leave
+/// fullscreen and the maximized state, size the window around the
+/// displayed image (`fit::window_size_client` holds the target math),
+/// centered on the window's current center and nudged fully into the
+/// monitor's work area. A second pass recenters if the window manager
+/// clamped the requested size (upstream viv.c:2140-2160).
+fn window_size_to_image(hwnd: HWND, kind: i32) {
+    // SAFETY: the borrow spans only the config/image reads — nothing pumps.
+    let gathered = (unsafe { state_of(hwnd) }).map(|state| {
+        (
+            state.fullscreen,
+            state
+                .image
+                .as_ref()
+                .map(|img| (img.width(), img.height()))
+                .unwrap_or((0, 0)),
+            (
+                state.config.auto_fit_wide_mul,
+                state.config.auto_fit_wide_div,
+                state.config.auto_fit_high_mul,
+                state.config.auto_fit_high_div,
+            ),
+            state.config.show_menu != 0 && !state.menu.is_invalid(),
+            crate::status::height(state.status),
+        )
     });
-    if changed {
-        repaint(hwnd);
+    let Some((fullscreen, image, auto_fit, has_menu, status_h)) = gathered else {
+        return;
+    };
+    // Get out of fullscreen first (upstream viv.c:2081-2085).
+    if fullscreen {
+        toggle_fullscreen(hwnd);
+    }
+    // ...and out of the maximized state (viv.c:2086-2089) — a SetWindowPos
+    // with an explicit size already breaks it, but the restore keeps the
+    // remembered placement bookkeeping clean.
+    // SAFETY: live query on the owning thread.
+    if unsafe { IsZoomed(hwnd) }.as_bool() {
+        // SAFETY: as above.
+        let _ = unsafe { ShowWindow(hwnd, SW_RESTORE) };
+    }
+    // The percentage kinds need a live image (upstream viv.c:2091).
+    if image == (0, 0) && kind != 3 {
+        return;
+    }
+    // The monitors (upstream reads BOTH: the FULL rect for the auto-fit
+    // fraction, the WORK rect for the clamp, viv.c:2126/2142).
+    // SAFETY: read-only monitor queries on the live window.
+    let (work, full) = unsafe {
+        let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY);
+        let mut mi = MONITORINFO {
+            cbSize: size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        let _ = GetMonitorInfoW(monitor, &mut mi);
+        (mi.rcWork, mi.rcMonitor)
+    };
+    let client = crate::fit::window_size_client(
+        image,
+        kind,
+        (full.right - full.left, full.bottom - full.top),
+        (work.right - work.left, work.bottom - work.top),
+        auto_fit,
+    );
+    // The current center (upstream midx/midy, viv.c:2119-2121).
+    let mut rect = RECT::default();
+    // SAFETY: read-only rect query.
+    let _ = unsafe { GetWindowRect(hwnd, &mut rect) };
+    let (midx, midy) = ((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2);
+    // The outer rect for client + status bar (upstream viv.c:2139-2143:
+    // AdjustWindowRect over the client target, then + status height).
+    let mut outer = RECT {
+        left: 0,
+        top: 0,
+        right: client.0,
+        bottom: client.1 + status_h,
+    };
+    // SAFETY: live style read; the rect is a valid in/out.
+    let style = WINDOW_STYLE(unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) } as u32);
+    // SAFETY: in/out rect valid; a failure leaves the raw client size and
+    // the frame draws tight (upstream never checks either).
+    let _ = unsafe { AdjustWindowRect(&mut outer, style, has_menu) };
+    let wide = outer.right - outer.left;
+    let high = outer.bottom - outer.top;
+    // Center + nudge fully visible (upstream viv.c:2145-2153 +
+    // os_make_rect_completely_visible; the rect is already in the window's
+    // monitor frame, so the re-anchor pass is the identity).
+    let place = |wide: i32, high: i32| {
+        make_rect_completely_visible_core(
+            RECT {
+                left: midx - wide / 2,
+                top: midy - high / 2,
+                right: midx - wide / 2 + wide,
+                bottom: midy - high / 2 + high,
+            },
+            work,
+            work,
+        )
+    };
+    let target = place(wide, high);
+    // SAFETY: hwnd live and owned here; SWP_NOCOPYBITS like upstream
+    // (viv.c:2163) so the old pixels never show through the resize.
+    let _ = unsafe {
+        SetWindowPos(
+            hwnd,
+            None,
+            target.left,
+            target.top,
+            target.right - target.left,
+            target.bottom - target.top,
+            SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS,
+        )
+    };
+    // The track-limit second pass (upstream viv.c:2140-2160): if the
+    // window came out LARGER than requested, recenter the actual size.
+    let mut actual = RECT::default();
+    // SAFETY: read-only rect query.
+    let _ = unsafe { GetWindowRect(hwnd, &mut actual) };
+    let (aw, ah) = (actual.right - actual.left, actual.bottom - actual.top);
+    if aw > wide || ah > high {
+        let target = place(aw, ah);
+        // SAFETY: as the first SetWindowPos.
+        let _ = unsafe {
+            SetWindowPos(
+                hwnd,
+                None,
+                target.left,
+                target.top,
+                target.right - target.left,
+                target.bottom - target.top,
+                SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS,
+            )
+        };
     }
 }
 
@@ -870,7 +1123,8 @@ fn zoom_reset(hwnd: HWND) {
     // SAFETY: the borrow spans the pure reset math.
     if let Some(state) = unsafe { state_of(hwnd) } {
         let (vp, src) = viewport_and_src(hwnd, state);
-        state.view.reset_zoom(src.0, src.1, vp);
+        let fit = fit_policy(state);
+        state.view.reset_zoom(src.0, src.1, vp, fit);
     }
     repaint(hwnd);
 }
@@ -881,7 +1135,8 @@ fn toggle_one_to_one(hwnd: HWND) {
     // SAFETY: the borrow spans the pure toggle math.
     if let Some(state) = unsafe { state_of(hwnd) } {
         let (vp, src) = viewport_and_src(hwnd, state);
-        state.view.toggle_one_to_one(src.0, src.1, vp);
+        let fit = fit_policy(state);
+        state.view.toggle_one_to_one(src.0, src.1, vp, fit);
     }
     repaint(hwnd);
 }
@@ -895,6 +1150,25 @@ fn toggle_one_to_one(hwnd: HWND) {
 fn on_left_button_down(hwnd: HWND, lparam: LPARAM) {
     show_and_update_cursor(hwnd);
     let pt = lparam_point(lparam);
+    // The action dispatch (upstream `_viv_do_left_click_action`,
+    // viv.c:3319-3325 + 6360-6415): 0 scroll starts the drag; 3 zooms in
+    // at the click; 4 advances. Unimplemented values fall to the drag like
+    // upstream's switch default (viv.c:6411-6414).
+    // SAFETY: the borrow spans only the config read.
+    let action = (unsafe { state_of(hwnd) })
+        .map(|s| s.config.left_click_action)
+        .unwrap_or(0);
+    match action {
+        3 => {
+            zoom_at(hwnd, false, (pt.x, pt.y));
+            return;
+        }
+        4 => {
+            nav_next(hwnd, false);
+            return;
+        }
+        _ => {}
+    }
     // SAFETY: the borrow spans only the drag-point store.
     if let Some(state) = unsafe { state_of(hwnd) } {
         state.drag = Some((pt.x, pt.y));
@@ -959,7 +1233,10 @@ fn on_mouse_move(hwnd: HWND, lparam: LPARAM) {
                 false
             } else {
                 let (vp, src) = viewport_and_src(hwnd, state);
-                state.view.scroll_by(pt.x - lx, pt.y - ly, src.0, src.1, vp);
+                let fit = fit_policy(state);
+                state
+                    .view
+                    .scroll_by(pt.x - lx, pt.y - ly, src.0, src.1, vp, fit);
                 true
             }
         }
@@ -1086,9 +1363,13 @@ fn request_open(hwnd: HWND, path: &OsStr, origin: OpenOrigin<'_>) {
             client.right - client.left,
             (client.bottom - client.top - bar_h).max(0),
         );
-        let session = state
-            .load_thread
-            .request(hwnd, path.to_os_string(), render_viewport);
+        // The composite background snapshots at request time — a color
+        // change mid-load must not flip frames already in flight.
+        let background = state.config.windowed_bg();
+        let session =
+            state
+                .load_thread
+                .request(hwnd, path.to_os_string(), render_viewport, background);
         state.session = Some(session);
     }
     refresh_status(hwnd);
@@ -1543,6 +1824,9 @@ fn on_load_replies(hwnd: HWND) {
     let stop_timer;
     let mut invalidate = false;
     let mut title: Option<HSTRING> = None;
+    // A NEW image adopted the display this drain — the auto-size hook's
+    // trigger (upstream `_viv_start_first_frame`'s tail, viv.c:14363-14383).
+    let mut adopted_new_image = false;
     {
         // Copy the session facts out first so the immutable borrow ends
         // before the reply loop mutates the display state.
@@ -1564,6 +1848,12 @@ fn on_load_replies(hwnd: HWND) {
             // (memory DCs belong to their creating thread). A wrap failure
             // is GDI exhaustion — system-level, fail loud (ADR 0001).
             let reply = map_reply_frame(reply, Surface::from_frame);
+            // Whether THIS session already owned the display before the
+            // reply — the auto-size hook must fire on the adoption EDGE
+            // only (upstream's `_viv_start_first_frame` runs at the first
+            // frame; the completing reply's title refresh must not size
+            // the window again).
+            let displayed_before_reply = state.displayed_from == Some(session_id);
             let outcome = apply_reply(
                 &mut state.image,
                 &mut state.displayed_from,
@@ -1596,7 +1886,8 @@ fn on_load_replies(hwnd: HWND) {
                         // points, viv.c:2804/2835/7910) and the status
                         // bar's "(N KB)" follows the same commit/clear.
                         state.view.reset();
-                        if state.displayed_from == Some(session_id) {
+                        if state.displayed_from == Some(session_id) && !displayed_before_reply {
+                            adopted_new_image = true;
                             state.path = Some(session_path.clone());
                             title = Some(HSTRING::from_wide(&title_wide(state.path.as_deref())));
                             // Commit the staged size now that THIS session's
@@ -1628,6 +1919,18 @@ fn on_load_replies(hwnd: HWND) {
     }
     // Borrow dropped — the modal path below is safe.
     refresh_status(hwnd);
+    // Auto-size the window to the fresh image (upstream viv.c:14363-14383):
+    // windowed only, and only the four known types (a hand-edited type
+    // outside 0..=3 makes upstream's switch a no-op too).
+    if adopted_new_image {
+        // SAFETY: a fresh short borrow for the config/mode read.
+        let auto = (unsafe { state_of(hwnd) }).and_then(|s| {
+            (!s.fullscreen && s.config.auto_zoom != 0).then_some(s.config.auto_zoom_type)
+        });
+        if let Some(kind) = auto.filter(|k| (0..=3).contains(k)) {
+            window_size_to_image(hwnd, kind);
+        }
+    }
     // The display may have adopted an image (the hide-cursor conditions
     // just became satisfiable) — reconcile (upstream
     // `_viv_start_first_frame` → `_viv_update_show_cursor`, viv.c:14338).
@@ -2050,7 +2353,8 @@ fn on_initmenu(hwnd: HWND) {
     let snapshot = (unsafe { state_of(hwnd) }).map(|state| {
         let one_to_one = state.image.as_ref().is_some_and(|image| {
             let (vp, src) = viewport_and_src(hwnd, state);
-            let (rw, rh) = state.view.render_size(src.0, src.1, vp);
+            let fit = fit_policy(state);
+            let (rw, rh) = state.view.render_size(src.0, src.1, vp, fit);
             (rw, rh) == (image.width(), image.height())
         });
         menu::MenuState {
@@ -2200,9 +2504,9 @@ fn on_command(hwnd: HWND, cmd: menu::Cmd) {
         menu::Cmd::ViewBestFit | menu::Cmd::ViewZoomReset => zoom_reset(hwnd),
         menu::Cmd::ViewZoomIn => zoom_step_centered(hwnd, false),
         menu::Cmd::ViewZoomOut => zoom_step_centered(hwnd, true),
-        // The Options placeholder — greyed at WM_INITMENU, wired by the
-        // Options dialog issue (#24).
-        menu::Cmd::ViewOptions => {}
+        // The Options dialog (#24) — modal over the viewer; commits into
+        // the live config on OK (instant effect + save).
+        menu::Cmd::ViewOptions => crate::options_dlg::open(hwnd),
         menu::Cmd::NavNext => nav_next(hwnd, false),
         menu::Cmd::NavPrev => nav_next(hwnd, true),
         menu::Cmd::NavHome => home_open(hwnd, false),
@@ -2561,7 +2865,8 @@ fn on_size(hwnd: HWND) {
     // SAFETY: the borrow spans the pure re-anchor math.
     let reclamped = (unsafe { state_of(hwnd) }).is_some_and(|state| {
         let (vp, src) = viewport_and_src(hwnd, state);
-        state.view.on_resize(src.0, src.1, vp)
+        let fit = fit_policy(state);
+        state.view.on_resize(src.0, src.1, vp, fit)
     });
     if reclamped {
         repaint(hwnd);
@@ -2731,8 +3036,25 @@ unsafe extern "system" fn wnd_proc(
         // CS_DBLCLKS folds the second press of a double click into this
         // message (after DOWN/UP have already run — see on_double_click).
         WM_LBUTTONDBLCLK => {
-            on_double_click(hwnd);
+            on_double_click(hwnd, lparam);
             LRESULT(0)
+        }
+        WM_RBUTTONDOWN | WM_RBUTTONDBLCLK | WM_RBUTTONUP => {
+            // DBLCLK rides CS_DBLCLKS in place of the second DOWN — upstream
+            // handles it in the same arm (viv.c:3349-3355).
+            // Right-click actions 1/2 (zoom out / previous) swallow BOTH
+            // messages — upstream returns 0 on down and up (viv.c:3349-3367)
+            // so DefWindowProc never turns the click into WM_CONTEXTMENU.
+            // Action 0 falls through: the click becomes the context menu
+            // (riviv's bar-recovery slice).
+            if on_right_button(hwnd, msg, lparam) {
+                LRESULT(0)
+            } else {
+                // SAFETY: the parameters are exactly this callback's own;
+                // the default procedure owns everything unmatched (the
+                // context-menu production for the right click among them).
+                unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+            }
         }
         WM_MOUSEMOVE => {
             on_mouse_move(hwnd, lparam);

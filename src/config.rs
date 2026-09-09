@@ -169,6 +169,27 @@ impl Default for Config {
 }
 
 impl Config {
+    /// The windowed compositing/letterbox background as one triple
+    /// (upstream reads the three `config_windowed_background_color_*`
+    /// globals wherever it builds an RGB, e.g. viv.c:4396).
+    pub(crate) fn windowed_bg(&self) -> [u8; 3] {
+        [
+            self.windowed_background_color_r as u8,
+            self.windowed_background_color_g as u8,
+            self.windowed_background_color_b as u8,
+        ]
+    }
+
+    /// The fullscreen background as one triple (`config_fullscreen_
+    /// background_color_*`, viv.c:4396).
+    pub(crate) fn fullscreen_bg(&self) -> [u8; 3] {
+        [
+            self.fullscreen_background_color_r as u8,
+            self.fullscreen_background_color_g as u8,
+            self.fullscreen_background_color_b as u8,
+        ]
+    }
+
     /// Read the settings (config.c:268-293): the exe-dir file first; if IT
     /// switched `appdata` on, the appdata file's keys overlay (its missing
     /// keys keep the exe-dir values — upstream `ini_get_int(ini, key,
@@ -197,19 +218,27 @@ impl Config {
 
     /// Write the settings to the active location (config.c:404-429): the
     /// appdata dir (created if missing) when switched on, else the exe
-    /// dir — whose file degenerates to the `appdata` marker only while
-    /// the switch is ON (the real table then lives in appdata). With the
-    /// switch on but the appdata path unresolvable, upstream has NO
-    /// fallback branch — the save is silently skipped, never redirected
-    /// into the exe dir (which would clobber the root file). Failures are
-    /// logged, not fatal: upstream never checks its writes either, and a
-    /// read-only install must still run.
+    /// dir. With the switch on, the exe-dir file degenerates to the
+    /// `appdata` marker (the real table then lives in appdata) — upstream
+    /// writes BOTH files in two saves (the elevated `/appdata` helper's
+    /// `config_save_settings(config_appdata)` then
+    /// `config_save_settings(0)`, viv.c:4652-4662); riviv's direct
+    /// switch (#24, no CLI switches yet) performs the same pair in one
+    /// save. With the switch on but the appdata path unresolvable,
+    /// upstream has NO fallback branch — the save is silently skipped,
+    /// never redirected into the exe dir (which would clobber the root
+    /// file); the marker is still written so a later launch can find the
+    /// (failed) switch. Failures are logged, not fatal: upstream never
+    /// checks its writes either, and a read-only install must still run.
     pub(crate) fn save(&self) {
         if self.appdata != 0 {
             if let Some(dir) = appdata_dir() {
                 // Upstream CreateDirectory before saving (config.c:416).
                 let _ = std::fs::create_dir_all(&dir);
                 save_by_location(dir.join(FILE_NAME), self.to_pairs(false));
+            }
+            if let Some(dir) = exe_dir() {
+                save_by_location(dir.join(FILE_NAME), self.to_pairs(true));
             }
         } else if let Some(dir) = exe_dir() {
             save_by_location(dir.join(FILE_NAME), self.to_pairs(true));

@@ -17,13 +17,19 @@
 //! - a wheel notch / zoom key steps one level and re-anchors so the
 //!   source pixel under the cursor stays under the cursor
 //!   (`_viv_do_mousewheel_action` action 0, viv.c:13932-14097);
+//! - the fit inputs `config_keep_aspect_ratio` / `fill_window` /
+//!   `fullscreen_fill_window` ride a [`FitPolicy`] argument through every
+//!   size computation (upstream reads the globals live inside
+//!   `_viv_get_render_size`, viv.c:6886-7017; the fill half the policy
+//!   carries is already mode-resolved by the caller — windowed fill while
+//!   windowed, fullscreen fill while fullscreen, viv.c:6885-6891);
 //! - the fullscreen toggle's zoom offset (which level to show on the
 //!   monitor, `_viv_fullscreen_zoom_offset`, viv.c:6719-6778) is a pure
-//!   function over a size sweep — #8; riviv wires both fill modes off, so
-//!   the level is preserved across the toggle.
+//!   function over a size sweep — #8; both fill flags now flow in from
+//!   the config (#24), so upstream's default (`fullscreen_fill_window=1`)
+//!   drops to the largest level that still covers the monitor on entry.
 
 use crate::fit::fit_shrink;
-
 /// The 16-step zoom curve (viv.c:685). Index 0 is fit; the value lerps the
 /// render size from the fit size toward the 16x maximum per axis.
 pub(crate) const ZOOM_PRESETS: [f32; 16] = [
@@ -43,6 +49,31 @@ const ZOOM_LIMIT: i32 = 16;
 pub(crate) struct Viewport {
     pub(crate) wide: i32,
     pub(crate) high: i32,
+}
+
+/// The fit-time config inputs of `_viv_get_render_size` (viv.c:6886-7017):
+/// `keep_aspect` fits with the source aspect ratio (else the image
+/// anamorphically stretches to the viewport), `fill` lets the fit exceed
+/// 100% of the source (else the fit never upscales — the joint clamp for
+/// keep-aspect, per-axis otherwise). `allow_shrinking` (upstream default
+/// 1, viv.c:40; riviv has no toggle — its block, viv.c:6974-7001, never
+/// runs) is omitted. The `fill` half must already be mode-resolved by the
+/// caller (`_viv_is_fullscreen ? fullscreen_fill_window : fill_window`,
+/// viv.c:6885-6891).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FitPolicy {
+    pub(crate) keep_aspect: bool,
+    pub(crate) fill: bool,
+}
+
+impl FitPolicy {
+    /// The upstream defaults with both fill modes off (config.c:46-47) —
+    // keep aspect, never upscale. The tests pin it; paint uses it when no
+    // window state exists (a degenerate frame).
+    pub(crate) const WITHOUT_FILL: FitPolicy = FitPolicy {
+        keep_aspect: true,
+        fill: false,
+    };
 }
 
 /// Zoom + pan state for the displayed image. The image's top-left renders at
@@ -97,11 +128,17 @@ impl View {
     }
 
     /// The rendered size at the current level, in viewport pixels (upstream
-    /// `_viv_get_render_size` under the default config: keep-aspect,
-    /// allow-shrinking, no fill). A degenerate viewport or source yields
+    /// `_viv_get_render_size` under the default allow-shrinking: keep-aspect
+    /// mode by `fit`). A degenerate viewport or source yields
     /// (0, 0) like upstream's `!(wide && high)` early-out (viv.c:6871).
-    pub(crate) fn render_size(&self, src_w: i32, src_h: i32, vp: Viewport) -> (i32, i32) {
-        self.size_at(self.pos, self.one_to_one, src_w, src_h, vp)
+    pub(crate) fn render_size(
+        &self,
+        src_w: i32,
+        src_h: i32,
+        vp: Viewport,
+        fit: FitPolicy,
+    ) -> (i32, i32) {
+        self.size_at(self.pos, self.one_to_one, src_w, src_h, vp, fit)
     }
 
     /// The preset-curve size at `pos` (shared by the wheel handler's 1:1-exit
@@ -113,8 +150,9 @@ impl View {
         src_w: i32,
         src_h: i32,
         vp: Viewport,
+        fit: FitPolicy,
     ) -> (i32, i32) {
-        render_size_at(pos, one_to_one, src_w, src_h, vp)
+        render_size_at(pos, one_to_one, src_w, src_h, vp, fit)
     }
 
     /// Current zoom level 0..=15 (upstream reads `_viv_zoom_pos` directly;
@@ -150,10 +188,11 @@ impl View {
         src_w: i32,
         src_h: i32,
         vp: Viewport,
+        fit: FitPolicy,
     ) -> [(i32, i32); ZOOM_LEVEL_COUNT] {
         let mut sizes = [(0, 0); ZOOM_LEVEL_COUNT];
         for (pos, slot) in sizes.iter_mut().enumerate() {
-            *slot = self.size_at(pos as i32, self.one_to_one, src_w, src_h, vp);
+            *slot = self.size_at(pos as i32, self.one_to_one, src_w, src_h, vp, fit);
         }
         sizes
     }
@@ -161,8 +200,16 @@ impl View {
     /// Commit a candidate pan offset, clamped, and refresh the center anchor
     /// (upstream `_viv_view_set`, viv.c:6434-6560 — `config_keep_centered=1`
     /// arm). An image that fits the viewport is re-pinned to the center.
-    pub(crate) fn set_view(&mut self, vx: i32, vy: i32, src_w: i32, src_h: i32, vp: Viewport) {
-        let (rw, rh) = self.render_size(src_w, src_h, vp);
+    pub(crate) fn set_view(
+        &mut self,
+        vx: i32,
+        vy: i32,
+        src_w: i32,
+        src_h: i32,
+        vp: Viewport,
+        fit: FitPolicy,
+    ) {
+        let (rw, rh) = self.render_size(src_w, src_h, vp, fit);
         let rx = vp.wide / 2 - rw / 2 - vx;
         let ry = vp.high / 2 - rh / 2 - vy;
         self.view_x = clamp_axis(rx, rw, vp.wide, vx);
@@ -185,23 +232,37 @@ impl View {
     /// Drag-pan by `(mx, my)` cursor-delta pixels — the image follows the
     /// mouse (upstream `_viv_view_scroll`, viv.c:11931-11947: view decreases
     /// by the delta, then clamps).
-    pub(crate) fn scroll_by(&mut self, mx: i32, my: i32, src_w: i32, src_h: i32, vp: Viewport) {
-        self.set_view(self.view_x - mx, self.view_y - my, src_w, src_h, vp);
+    pub(crate) fn scroll_by(
+        &mut self,
+        mx: i32,
+        my: i32,
+        src_w: i32,
+        src_h: i32,
+        vp: Viewport,
+        fit: FitPolicy,
+    ) {
+        self.set_view(self.view_x - mx, self.view_y - my, src_w, src_h, vp, fit);
     }
 
     /// Re-anchor after the viewport resized: put the source pixel that was
     /// at the center back at the center, then re-clamp (upstream WM_SIZE,
     /// viv.c:1643-1651). Returns whether the pan offset moved (a repaint is
     /// owed — upstream `view_set(invalidate = 1)`).
-    pub(crate) fn on_resize(&mut self, src_w: i32, src_h: i32, vp: Viewport) -> bool {
-        let (rw, rh) = self.render_size(src_w, src_h, vp);
+    pub(crate) fn on_resize(
+        &mut self,
+        src_w: i32,
+        src_h: i32,
+        vp: Viewport,
+        fit: FitPolicy,
+    ) -> bool {
+        let (rw, rh) = self.render_size(src_w, src_h, vp, fit);
         // Upstream: (int)((ix * rw) / src + 0.5) + dst_pos-term - wide/2 - rw/2
         // — with dst_pos 500 the middle terms cancel to plain -rw/2, and the
         // truncation lands BEFORE the subtraction (viv.c:1648-1649).
         let vx = ((self.center_src_x * f64::from(rw) / f64::from(src_w)) + 0.5) as i32 - rw / 2;
         let vy = ((self.center_src_y * f64::from(rh) / f64::from(src_h)) + 0.5) as i32 - rh / 2;
         let before = (self.view_x, self.view_y);
-        self.set_view(vx, vy, src_w, src_h, vp);
+        self.set_view(vx, vy, src_w, src_h, vp, fit);
         (self.view_x, self.view_y) != before
     }
 
@@ -218,8 +279,9 @@ impl View {
         src_w: i32,
         src_h: i32,
         vp: Viewport,
+        fit: FitPolicy,
     ) -> bool {
-        let (old_rw, old_rh) = self.render_size(src_w, src_h, vp);
+        let (old_rw, old_rh) = self.render_size(src_w, src_h, vp, fit);
         let (cx, cy) = cursor;
         // The cursor's pixel offset inside the current (scaled) image —
         // unclamped on purpose: upstream's clamping here is commented out
@@ -237,7 +299,7 @@ impl View {
             self.pos = if out {
                 let mut found = -1;
                 for pos in (0..ZOOM_LIMIT).rev() {
-                    if self.size_at(pos, false, src_w, src_h, vp).0 < old_rw {
+                    if self.size_at(pos, false, src_w, src_h, vp, fit).0 < old_rw {
                         found = pos;
                         break;
                     }
@@ -246,7 +308,7 @@ impl View {
             } else {
                 let mut found = ZOOM_LIMIT;
                 for pos in 0..ZOOM_LIMIT {
-                    if self.size_at(pos, false, src_w, src_h, vp).0 > old_rw {
+                    if self.size_at(pos, false, src_w, src_h, vp, fit).0 > old_rw {
                         found = pos;
                         break;
                     }
@@ -261,7 +323,7 @@ impl View {
             // Upstream only re-anchors when the level moved (viv.c:14052).
             return false;
         }
-        let (rw, rh) = self.render_size(src_w, src_h, vp);
+        let (rw, rh) = self.render_size(src_w, src_h, vp, fit);
         let new_px = if old_rw != 0 {
             i64::from(old_px) * i64::from(rw) / i64::from(old_rw)
         } else {
@@ -279,6 +341,7 @@ impl View {
             src_w,
             src_h,
             vp,
+            fit,
         );
         true
     }
@@ -287,7 +350,13 @@ impl View {
     /// viv.c:9318-9339): entering saves the current level and forces 0;
     /// leaving restores it. The view re-clamps for the new size (upstream
     /// re-runs view_set with the current offset and invalidates).
-    pub(crate) fn toggle_one_to_one(&mut self, src_w: i32, src_h: i32, vp: Viewport) {
+    pub(crate) fn toggle_one_to_one(
+        &mut self,
+        src_w: i32,
+        src_h: i32,
+        vp: Viewport,
+        fit: FitPolicy,
+    ) {
         if self.one_to_one {
             self.one_to_one = false;
             self.pos = self.saved_pos;
@@ -296,35 +365,42 @@ impl View {
             self.one_to_one = true;
             self.pos = 0;
         }
-        self.set_view(self.view_x, self.view_y, src_w, src_h, vp);
+        self.set_view(self.view_x, self.view_y, src_w, src_h, vp, fit);
     }
 
     /// Ctrl+0 — back to fit (upstream `VIV_ID_VIEW_ZOOM_RESET`,
     /// viv.c:1676-1681): leave 1:1, level 0, re-clamp the current offset
     /// (which recenters an image that now fits again).
-    pub(crate) fn reset_zoom(&mut self, src_w: i32, src_h: i32, vp: Viewport) {
+    pub(crate) fn reset_zoom(&mut self, src_w: i32, src_h: i32, vp: Viewport, fit: FitPolicy) {
         self.one_to_one = false;
         self.pos = 0;
-        self.set_view(self.view_x, self.view_y, src_w, src_h, vp);
+        self.set_view(self.view_x, self.view_y, src_w, src_h, vp, fit);
     }
 }
 
 /// The number of zoom levels (upstream `_VIV_ZOOM_MAX`, viv.c:684).
 pub(crate) const ZOOM_LEVEL_COUNT: usize = 16;
 
-/// The preset-curve render size at `pos` under the default config
-/// (keep-aspect, allow-shrinking, no fill) — the body of upstream
-/// `_viv_get_render_size` (viv.c:6853-7017): 1:1 is the source size
-/// verbatim, level 0 is fit-shrink, and higher levels lerp toward the 16x
-/// per-axis maximum with float math truncated per axis.
-fn render_size_at(pos: i32, one_to_one: bool, src_w: i32, src_h: i32, vp: Viewport) -> (i32, i32) {
+/// The preset-curve render size at `pos` — the body of upstream
+/// `_viv_get_render_size` (viv.c:6853-7017) under the always-on
+/// allow-shrinking: 1:1 is the source size verbatim, level 0 is the fit
+/// ([`fit_size`]), and higher levels lerp toward the 16x per-axis maximum
+/// with float math truncated per axis.
+fn render_size_at(
+    pos: i32,
+    one_to_one: bool,
+    src_w: i32,
+    src_h: i32,
+    vp: Viewport,
+    fit: FitPolicy,
+) -> (i32, i32) {
     if src_w <= 0 || src_h <= 0 || vp.wide <= 0 || vp.high <= 0 {
         return (0, 0);
     }
     if one_to_one {
         return (src_w, src_h);
     }
-    let (fw, fh) = fit_shrink(src_w, src_h, vp.wide, vp.high);
+    let (fw, fh) = fit_size(src_w, src_h, vp, fit);
     if pos <= 0 {
         return (fw, fh);
     }
@@ -332,27 +408,70 @@ fn render_size_at(pos: i32, one_to_one: bool, src_w: i32, src_h: i32, vp: Viewpo
     // Upstream: rw = rw + (int)((max_zoom_wide - rw) * preset) — float
     // multiply, int truncation, per axis independently (aspect drifts a
     // little between levels; that is the upstream curve, viv.c:7012-7016).
-    // The max term stays in i64: 16 * src overflows i32 for pathological
-    // aspect ratios (a 2^31/16-wide strip) that still fit the decode
-    // budget.
-    let rw = fw
-        + ((i64::from(ZOOM_LIMIT) * i64::from(src_w) - i64::from(fw)) as f32 * ZOOM_PRESETS[idx])
-            as i32;
-    let rh = fh
-        + ((i64::from(ZOOM_LIMIT) * i64::from(src_h) - i64::from(fh)) as f32 * ZOOM_PRESETS[idx])
-            as i32;
+    // The ladder maximum: keep-aspect takes 16x the LARGER of fit/source
+    // per axis (viv.c:6986-7003); the anamorphic arm always takes 16x the
+    // (already axis-clamped) stretch (viv.c:7005-7008). The max stays in
+    // i64: 16 * src overflows i32 for pathological aspect ratios (a
+    // 2^31/16-wide strip) that still fit the decode budget.
+    let max_of = |fit_len: i32, src_len: i32| {
+        i64::from(if fit.keep_aspect && fit_len <= src_len {
+            src_len
+        } else {
+            fit_len
+        }) * i64::from(ZOOM_LIMIT)
+    };
+    let rw = fw + ((max_of(fw, src_w) - i64::from(fw)) as f32 * ZOOM_PRESETS[idx]) as i32;
+    let rh = fh + ((max_of(fh, src_h) - i64::from(fh)) as f32 * ZOOM_PRESETS[idx]) as i32;
     (rw, rh)
 }
 
-/// The fullscreen zoom offset (upstream `_viv_toggle_fullscreen`'s offset
-/// block, viv.c:6718-6778). The two branches read DIFFERENT size sweeps —
-/// both audited against upstream (cubic/PR16 + dual-agent review):
-/// - `fullscreen_fill_window` (upstream default 1): scans `sizes_windowed`
-///   — the sweep from BEFORE the toggle (viv.c:6584-6601, inheriting the
-///   1:1 flag) — against the fullscreen monitor size; the largest level
-///   that still fits, capped at the current level. Entering SUBTRACTS it
-///   (drop to the biggest filling view), exit adds it back.
-/// - else `fill_window` (windowed fill, default 0): a NEGATIVE offset.
+/// The level-0 fit (upstream viv.c:6892-6941): keep-aspect without fill IS
+/// the M1 [`crate::fit::fit_shrink`] (contain-fit with the JOINT
+/// never-upscale clamp); keep-aspect with fill drops that clamp (the fit may
+/// exceed 100% of the source — upstream `fill_window`, viv.c:6922-6928);
+/// the anamorphic arm stretches to the viewport with a PER-AXIS clamp
+/// instead (viv.c:6930-6941).
+/// of the source (upstream `fill_window`, viv.c:6922-6928/6934-6941).
+fn fit_size(src_w: i32, src_h: i32, vp: Viewport, fit: FitPolicy) -> (i32, i32) {
+    if !fit.keep_aspect {
+        let (mut rw, mut rh) = (vp.wide, vp.high);
+        if !fit.fill {
+            if rw > src_w {
+                rw = src_w;
+            }
+            if rh > src_h {
+                rh = src_h;
+            }
+        }
+        return (rw, rh);
+    }
+    if !fit.fill {
+        return fit_shrink(src_w, src_h, vp.wide, vp.high);
+    }
+    let (mut rw, mut rh) =
+        if i64::from(vp.high) * i64::from(src_w) < i64::from(vp.wide) * i64::from(src_h) {
+            // tall: height binds, width derives (ceil, like upstream's
+            // `+ _viv_image_high - 1`, viv.c:6901-6906)
+            (
+                ((i64::from(vp.high) * i64::from(src_w) + i64::from(src_h) - 1) / i64::from(src_h))
+                    as i32,
+                vp.high,
+            )
+        } else {
+            (
+                vp.wide,
+                ((i64::from(vp.wide) * i64::from(src_h) + i64::from(src_w) - 1) / i64::from(src_w))
+                    as i32,
+            )
+        };
+    if rw <= 0 {
+        rw = 1;
+    }
+    if rh <= 0 {
+        rh = 1;
+    }
+    (rw, rh)
+}
 ///   Upstream's loop calls `_viv_get_render_size` LIVE (viv.c:6749-6754) —
 ///   by then the window is already the fullscreen cover, the bar is gone
 ///   and `_viv_1to1` was cleared (6610), so this branch scans
@@ -491,13 +610,16 @@ mod tests {
         wide: 400,
         high: 300,
     };
+    /// The default policy everywhere the tests do not say otherwise — the
+    /// pre-#24 behavior (both fill modes off, keep aspect).
+    const FIT: FitPolicy = FitPolicy::WITHOUT_FILL;
 
     #[test]
     fn level_zero_is_fit_and_never_upscales() {
         let v = View::new();
         // 2000x1500 into 400x300 -> 400x300; 100x50 stays 100x50.
-        assert_eq!(v.render_size(2000, 1500, VP), (400, 300));
-        assert_eq!(v.render_size(100, 50, VP), (100, 50));
+        assert_eq!(v.render_size(2000, 1500, VP, FIT), (400, 300));
+        assert_eq!(v.render_size(100, 50, VP, FIT), (100, 50));
     }
 
     #[test]
@@ -506,10 +628,10 @@ mod tests {
         // viv.c:7004) — 1600%, not 1:1.
         let mut v = View::new();
         for _ in 0..20 {
-            v.zoom_step(false, (200, 150), 100, 60, VP);
+            v.zoom_step(false, (200, 150), 100, 60, VP, FIT);
         }
         assert_eq!(v.pos, 15);
-        assert_eq!(v.render_size(100, 60, VP), (1600, 960));
+        assert_eq!(v.render_size(100, 60, VP, FIT), (1600, 960));
     }
 
     #[test]
@@ -520,13 +642,13 @@ mod tests {
             pos: 3,
             ..View::new()
         };
-        assert_eq!(v.render_size(100, 60, VP), (156, 94));
+        assert_eq!(v.render_size(100, 60, VP, FIT), (156, 94));
         // level 14: 100 + 1500*0.7993 -> 1298; 60 + 900*0.7993 -> 779
         let v = View {
             pos: 14,
             ..View::new()
         };
-        assert_eq!(v.render_size(100, 60, VP), (1298, 779));
+        assert_eq!(v.render_size(100, 60, VP, FIT), (1298, 779));
     }
 
     #[test]
@@ -536,7 +658,7 @@ mod tests {
             pos: 15,
             ..View::new()
         };
-        assert_eq!(v.render_size(800, 600, VP), (12800, 9600));
+        assert_eq!(v.render_size(800, 600, VP, FIT), (12800, 9600));
     }
 
     #[test]
@@ -546,9 +668,9 @@ mod tests {
             ..View::new()
         };
         // larger than the viewport (fit would shrink it)...
-        assert_eq!(v.render_size(800, 600, VP), (800, 600));
+        assert_eq!(v.render_size(800, 600, VP, FIT), (800, 600));
         // ...and smaller (fit would keep it — 1:1 must not "fit-clamp").
-        assert_eq!(v.render_size(100, 50, VP), (100, 50));
+        assert_eq!(v.render_size(100, 50, VP, FIT), (100, 50));
     }
 
     #[test]
@@ -561,8 +683,8 @@ mod tests {
         let mut v = View::new();
         let cursor = (100, 100);
         let src_px: (i64, i64) = (200, 200);
-        assert!(v.zoom_step(false, cursor, 800, 600, VP));
-        let (rw, rh) = v.render_size(800, 600, VP);
+        assert!(v.zoom_step(false, cursor, 800, 600, VP, FIT));
+        let (rw, rh) = v.render_size(800, 600, VP, FIT);
         assert_eq!((rw, rh), (524, 393));
         let rx = 400 / 2 - rw / 2 - v.view_x;
         let ry = 300 / 2 - rh / 2 - v.view_y;
@@ -572,8 +694,8 @@ mod tests {
         // zooming, the acceptance criterion). The projection truncates to
         // whole pixels, so "still under the cursor" is exact when the
         // division lands evenly and within 1 px otherwise.
-        assert!(v.zoom_step(false, cursor, 800, 600, VP));
-        let (rw, rh) = v.render_size(800, 600, VP);
+        assert!(v.zoom_step(false, cursor, 800, 600, VP, FIT));
+        let (rw, rh) = v.render_size(800, 600, VP, FIT);
         let rx = 400 / 2 - rw / 2 - v.view_x;
         let ry = 300 / 2 - rh / 2 - v.view_y;
         let bx = (cursor.0 - rx) as i64 * 800 / i64::from(rw);
@@ -585,7 +707,7 @@ mod tests {
     #[test]
     fn wheel_out_below_fit_stays_put() {
         let mut v = View::new();
-        assert!(!v.zoom_step(true, (200, 150), 800, 600, VP));
+        assert!(!v.zoom_step(true, (200, 150), 800, 600, VP, FIT));
         assert_eq!(v.pos, 0);
     }
 
@@ -595,7 +717,7 @@ mod tests {
             pos: 15,
             ..View::new()
         };
-        assert!(!v.zoom_step(false, (200, 150), 100, 60, VP));
+        assert!(!v.zoom_step(false, (200, 150), 100, 60, VP, FIT));
         assert_eq!(v.pos, 15);
     }
 
@@ -608,16 +730,16 @@ mod tests {
             one_to_one: true,
             ..View::new()
         };
-        assert!(v.zoom_step(false, (200, 150), 800, 600, VP));
+        assert!(v.zoom_step(false, (200, 150), 800, 600, VP, FIT));
         assert!(!v.one_to_one);
-        assert!(v.render_size(800, 600, VP).0 > 800);
+        assert!(v.render_size(800, 600, VP, FIT).0 > 800);
 
         let mut v = View {
             one_to_one: true,
             ..View::new()
         };
-        assert!(v.zoom_step(true, (200, 150), 800, 600, VP));
-        assert!(v.render_size(800, 600, VP).0 < 800);
+        assert!(v.zoom_step(true, (200, 150), 800, 600, VP, FIT));
+        assert!(v.render_size(800, 600, VP, FIT).0 < 800);
     }
 
     #[test]
@@ -626,21 +748,21 @@ mod tests {
             pos: 5,
             ..View::new()
         };
-        v.toggle_one_to_one(800, 600, VP);
-        assert_eq!(v.render_size(800, 600, VP), (800, 600));
-        v.toggle_one_to_one(800, 600, VP);
+        v.toggle_one_to_one(800, 600, VP, FIT);
+        assert_eq!(v.render_size(800, 600, VP, FIT), (800, 600));
+        v.toggle_one_to_one(800, 600, VP, FIT);
         assert_eq!(v.pos, 5);
     }
 
     #[test]
     fn zoom_reset_recenters_to_fit() {
         let mut v = View::new();
-        v.zoom_step(false, (200, 150), 800, 600, VP);
-        v.scroll_by(500, 500, 800, 600, VP); // pan hard against the clamp
-        v.reset_zoom(800, 600, VP);
+        v.zoom_step(false, (200, 150), 800, 600, VP, FIT);
+        v.scroll_by(500, 500, 800, 600, VP, FIT); // pan hard against the clamp
+        v.reset_zoom(800, 600, VP, FIT);
         assert_eq!(v.pos, 0);
         assert_eq!((v.view_x, v.view_y), (0, 0));
-        assert_eq!(v.render_size(800, 600, VP), (400, 300));
+        assert_eq!(v.render_size(800, 600, VP, FIT), (400, 300));
     }
 
     #[test]
@@ -652,19 +774,19 @@ mod tests {
             pos: 15,
             ..View::new()
         };
-        let (rw, _) = v.render_size(1280, 960, VP);
+        let (rw, _) = v.render_size(1280, 960, VP, FIT);
         assert!(rw > VP.wide);
-        v.scroll_by(10, 0, 1280, 960, VP);
+        v.scroll_by(10, 0, 1280, 960, VP, FIT);
         let rx_before = VP.wide / 2 - rw / 2 - v.view_x;
-        v.scroll_by(10, 0, 1280, 960, VP);
+        v.scroll_by(10, 0, 1280, 960, VP, FIT);
         let rx_after = VP.wide / 2 - rw / 2 - v.view_x;
         assert_eq!(rx_after - rx_before, 10); // image followed the cursor
         // Dragging left "forever" walks toward the image's right end: the
         // image's right edge must never leave the viewport's right edge.
-        v.scroll_by(-1_000_000, 0, 1280, 960, VP);
+        v.scroll_by(-1_000_000, 0, 1280, 960, VP, FIT);
         assert_eq!(VP.wide / 2 - rw / 2 - v.view_x, VP.wide - rw);
         // ...and dragging back the other way pins at the left edge instead.
-        v.scroll_by(2_000_000, 0, 1280, 960, VP);
+        v.scroll_by(2_000_000, 0, 1280, 960, VP, FIT);
         assert_eq!(VP.wide / 2 - rw / 2 - v.view_x, 0);
     }
 
@@ -673,7 +795,7 @@ mod tests {
         // An image that fits stays centered no matter how hard it is
         // dragged (keep_centered, viv.c:6465-6496).
         let mut v = View::new();
-        v.scroll_by(100, 100, 100, 60, VP);
+        v.scroll_by(100, 100, 100, 60, VP, FIT);
         assert_eq!((v.view_x, v.view_y), (0, 0));
     }
 
@@ -686,9 +808,9 @@ mod tests {
             pos: 15,
             ..View::new()
         };
-        let (rw, rh) = v.render_size(100, 60, VP);
+        let (rw, rh) = v.render_size(100, 60, VP, FIT);
         assert_eq!((rw, rh), (1600, 960));
-        v.scroll_by(-10, -5, 100, 60, VP); // the image follows the cursor
+        v.scroll_by(-10, -5, 100, 60, VP, FIT); // the image follows the cursor
         let rx0 = VP.wide / 2 - rw / 2 - v.view_x;
         let ry0 = VP.high / 2 - rh / 2 - v.view_y;
         let cx0 = (i64::from(VP.wide / 2 - rx0) * 100 / i64::from(rw)) as i32;
@@ -699,7 +821,7 @@ mod tests {
             wide: 200,
             high: 100,
         };
-        v.on_resize(100, 60, smaller);
+        v.on_resize(100, 60, smaller, FIT);
         let rx = smaller.wide / 2 - rw / 2 - v.view_x;
         let ry = smaller.high / 2 - rh / 2 - v.view_y;
         assert_eq!(
@@ -723,7 +845,8 @@ mod tests {
             Viewport {
                 wide: 900,
                 high: 700
-            }
+            },
+            FIT
         ));
         assert_eq!((v.view_x, v.view_y), (0, 0));
     }
@@ -734,8 +857,8 @@ mod tests {
             pos: 15,
             ..View::new()
         };
-        let (rw, _) = v.render_size(1280, 960, VP);
-        v.scroll_by(2_000_000, 0, 1280, 960, VP); // pinned at the left edge
+        let (rw, _) = v.render_size(1280, 960, VP, FIT);
+        v.scroll_by(2_000_000, 0, 1280, 960, VP, FIT); // pinned at the left edge
         assert_eq!(VP.wide / 2 - rw / 2 - v.view_x, 0);
         v.on_resize(
             1280,
@@ -744,6 +867,7 @@ mod tests {
                 wide: 380,
                 high: 290,
             },
+            FIT,
         );
         let (rw, _) = v.render_size(
             1280,
@@ -752,6 +876,7 @@ mod tests {
                 wide: 380,
                 high: 290,
             },
+            FIT,
         );
         let rx = 380 / 2 - rw / 2 - v.view_x;
         assert!(rx <= 380 && rx + rw >= 380, "gap after resize: rx={rx}");
@@ -776,19 +901,19 @@ mod tests {
     fn degenerate_geometry_renders_nothing() {
         let v = View::new();
         assert_eq!(
-            v.render_size(100, 60, Viewport { wide: 0, high: 0 }),
+            v.render_size(100, 60, Viewport { wide: 0, high: 0 }, FIT),
             (0, 0)
         );
-        assert_eq!(v.render_size(0, 60, VP), (0, 0));
+        assert_eq!(v.render_size(0, 60, VP, FIT), (0, 0));
         // ...and state changes stay inert rather than panicking. The level
         // itself still steps (upstream has no image guard here either,
         // viv.c:14041-14050) but nothing renders or moves.
         let mut v = View::new();
-        assert!(v.zoom_step(false, (0, 0), 0, 0, VP));
-        v.scroll_by(100, 100, 0, 0, VP);
-        v.on_resize(0, 0, VP);
-        v.toggle_one_to_one(0, 0, VP);
-        v.reset_zoom(0, 0, VP);
+        assert!(v.zoom_step(false, (0, 0), 0, 0, VP, FIT));
+        v.scroll_by(100, 100, 0, 0, VP, FIT);
+        v.on_resize(0, 0, VP, FIT);
+        v.toggle_one_to_one(0, 0, VP, FIT);
+        v.reset_zoom(0, 0, VP, FIT);
         assert_eq!(v.view_x, 0);
         assert_eq!(v.view_y, 0);
     }
@@ -904,8 +1029,63 @@ mod tests {
     }
 
     #[test]
+    fn fill_upscales_the_fit_and_ladders_from_the_filled_size() {
+        // keep_aspect + fill (upstream viv.c:6893-6928): a 100x60 image in
+        // 400x300 fits to 400x240 (contain, NO never-upscale clamp), and the
+        // ladder maximum becomes 16x the FILLED fit (viv.c:6986-6991) —
+        // level 15 = 6400x3840, not 16x the source.
+        let v = View::new();
+        let fill = FitPolicy {
+            keep_aspect: true,
+            fill: true,
+        };
+        assert_eq!(v.render_size(100, 60, VP, fill), (400, 240));
+        let v = View {
+            pos: 15,
+            ..View::new()
+        };
+        assert_eq!(v.render_size(100, 60, VP, fill), (6400, 3840));
+    }
+
+    #[test]
+    fn anamorphic_stretch_fits_the_viewport_axes_independently() {
+        // !keep_aspect (viv.c:6930-6941): the fit stretches to the viewport
+        // (aspect be damned); without fill each axis clamps to the source on
+        // its own (100x60 in 400x300 -> 100x60; a 300x200 image -> 300x200,
+        // width clamped from 400 while height clamps from 300).
+        let stretch = FitPolicy {
+            keep_aspect: false,
+            fill: false,
+        };
+        let v = View::new();
+        assert_eq!(v.render_size(100, 60, VP, stretch), (100, 60));
+        assert_eq!(v.render_size(300, 200, VP, stretch), (300, 200));
+        // ...and the ladder maxes at 16x the (per-axis clamped) stretch,
+        // NOT 16x the source (viv.c:7005-7008): 100x60 at level 15 =
+        // 1600x960 — same as keep-aspect here, but via the other arm.
+        let v = View {
+            pos: 15,
+            ..View::new()
+        };
+        assert_eq!(v.render_size(100, 60, VP, stretch), (1600, 960));
+        // fill: the uncamped viewport stretch 400x300 -> level 0 IS the
+        // viewport, level 15 = 6400x4800.
+        let stretch_fill = FitPolicy {
+            keep_aspect: false,
+            fill: true,
+        };
+        let v = View::new();
+        assert_eq!(v.render_size(100, 60, VP, stretch_fill), (400, 300));
+        let v = View {
+            pos: 15,
+            ..View::new()
+        };
+        assert_eq!(v.render_size(100, 60, VP, stretch_fill), (6400, 4800));
+    }
+
+    #[test]
     fn fullscreen_offset_is_zero_with_both_fill_modes_off() {
-        // riviv's wiring (no config yet): the level survives the toggle.
+        // Both fill modes off: the offset is 0 and the level survives.
         let sizes = [(1920, 1080); ZOOM_LEVEL_COUNT];
         assert_eq!(
             fullscreen_zoom_offset(
@@ -1135,9 +1315,9 @@ mod tests {
     #[test]
     fn sizes_all_levels_sweeps_the_preset_curve() {
         let v = View::new();
-        let sizes = v.sizes_all_levels(100, 60, VP);
+        let sizes = v.sizes_all_levels(100, 60, VP, FIT);
         for pos in 0..ZOOM_LEVEL_COUNT as i32 {
-            assert_eq!(sizes[pos as usize], v.size_at(pos, false, 100, 60, VP));
+            assert_eq!(sizes[pos as usize], v.size_at(pos, false, 100, 60, VP, FIT));
         }
         assert_eq!(sizes[0], (100, 60)); // fit keeps the small image
         assert_eq!(sizes[15], (1600, 960)); // top = 16x
@@ -1152,7 +1332,7 @@ mod tests {
             ..View::new()
         };
         assert_eq!(
-            v.sizes_all_levels(800, 600, VP),
+            v.sizes_all_levels(800, 600, VP, FIT),
             [(800, 600); ZOOM_LEVEL_COUNT]
         );
     }
@@ -1172,7 +1352,7 @@ mod tests {
         assert!(!v.one_to_one);
         assert_eq!(v.pos, 0);
         assert_eq!(v.saved_pos, 7); // stale on purpose, like upstream
-        v.toggle_one_to_one(100, 60, VP); // re-entry saves the CURRENT level
+        v.toggle_one_to_one(100, 60, VP, FIT); // re-entry saves the CURRENT level
         assert_eq!(v.saved_pos, 0);
     }
 }

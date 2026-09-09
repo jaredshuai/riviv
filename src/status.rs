@@ -40,6 +40,8 @@ pub(crate) struct StatusSnapshot {
     pub(crate) load_failed: bool,
     /// 1-based frame position / loaded frame count; `None` when blank.
     pub(crate) frame: Option<(usize, usize)>,
+    /// The frames-remaining form (`config_frame_minus`, viv.c:11187-11203).
+    pub(crate) frame_remaining: bool,
     /// Canvas size; `None` when blank.
     pub(crate) dimensions: Option<(i32, i32)>,
     /// Byte size of the displayed file, if known (skipped when 0/unknown,
@@ -110,7 +112,7 @@ pub(crate) fn update(hwnd: HWND, snapshot: &StatusSnapshot) {
         snapshot.load_failed,
     );
     let frame_text = match snapshot.frame {
-        Some((position, total)) => status_frame_text(position, total),
+        Some((position, total)) => status_frame_text(position, total, snapshot.frame_remaining),
         None => String::new(),
     };
     let dimension_text = match snapshot.dimensions {

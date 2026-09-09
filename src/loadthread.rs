@@ -32,7 +32,7 @@ use std::thread::JoinHandle;
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
 
-use crate::loader::{LoadReply, decode_to_sink};
+use crate::loader::{DecodeEnv, LoadReply, decode_to_sink};
 use crate::surface::DibFrame;
 
 /// Kick message, posted whenever the worker queues a reply (upstream
@@ -68,6 +68,10 @@ unsafe impl Send for SendHwnd {}
 struct Job {
     path: OsString,
     render_viewport: (i32, i32),
+    /// The request-time windowed background the decode composites
+    /// transparent pixels against (upstream flattens at decode against
+    /// `config_windowed_background_color_*`, viv.c:1076+).
+    background: [u8; 3],
     hwnd: SendHwnd,
     terminate: Arc<AtomicBool>,
     queue: Arc<Mutex<VecDeque<LoadReply<DibFrame>>>>,
@@ -106,6 +110,7 @@ impl LoadThread {
         hwnd: HWND,
         path: OsString,
         render_viewport: (i32, i32),
+        background: [u8; 3],
     ) -> LoadSession {
         let id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
         let terminate = Arc::new(AtomicBool::new(false));
@@ -116,6 +121,7 @@ impl LoadThread {
         let job = Job {
             path: worker_path,
             render_viewport,
+            background,
             hwnd: SendHwnd(hwnd),
             terminate: Arc::clone(&terminate),
             queue: Arc::clone(&queue),
@@ -154,6 +160,7 @@ fn worker(receiver: Receiver<Job>) {
         let Job {
             path,
             render_viewport,
+            background,
             hwnd: SendHwnd(hwnd),
             terminate,
             queue,
@@ -195,7 +202,15 @@ fn worker(receiver: Receiver<Job>) {
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
         };
-        decode_to_sink(&path, render_viewport, &terminate, &mut sink);
+        decode_to_sink(
+            &path,
+            DecodeEnv {
+                render_viewport,
+                background,
+            },
+            &terminate,
+            &mut sink,
+        );
     }
 }
 

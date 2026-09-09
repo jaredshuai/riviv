@@ -88,12 +88,89 @@ pub(crate) enum Id {
     MenuHelp,
     /// Help → "About" (viv.c:965).
     MenuAbout,
+    /// Options dialog caption (#24; upstream LOCALIZATION_ID_OPTIONS_CAPTION,
+    /// en_us.h:209 — the app-name half carries the riviv brand like AppName).
+    OptionsCaption,
+    /// Options page name: General (en_us.h:210).
+    OptionsGeneral,
+    /// Options page name: View (en_us.h:211).
+    OptionsView,
+    /// Options page name: Controls (en_us.h:212).
+    OptionsControls,
+    /// OK button (en_us.h:213).
+    OptionsOk,
+    /// Cancel button (en_us.h:214).
+    OptionsCancel,
+    /// General page: store-settings-in-appdata checkbox (en_us.h:215 — the
+    /// %APPDATA% subpath is the riviv brand, like AppName).
+    OptionsAppdata,
+    /// General page: multiple instances checkbox (en_us.h:216).
+    OptionsMultipleInstances,
+    /// View page: shrink blit mode label (en_us.h:221).
+    OptionsShrinkBlitMode,
+    /// View page: magnify blit mode label (en_us.h:222).
+    OptionsMagnifyBlitMode,
+    /// Blit mode combo item: Nearest = COLORONCOLOR (en_us.h:223).
+    OptionsBlitNearest,
+    /// Blit mode combo item: Linear = HALFTONE (en_us.h:224).
+    OptionsBlitLinear,
+    /// View page: keep aspect ratio checkbox (en_us.h:86 — upstream ships
+    /// this as a MENU string; riviv's options page reuses it).
+    OptionsKeepAspectRatio,
+    /// View page: fill window checkbox (en_us.h:87, menu string reused).
+    OptionsFillWindow,
+    /// View page: fullscreen fill checkbox — riviv-authored (upstream has
+    /// no separate string: its single "Fill Window" command toggles the
+    /// fullscreen half while fullscreen, viv.c:2038-2047).
+    OptionsFullscreenFill,
+    /// View page: auto-size window label (en_us.h:225).
+    OptionsAutoZoom,
+    /// Auto-size combo item: 50% (en_us.h:226).
+    OptionsAutoZoom50,
+    /// Auto-size combo item: 100% (en_us.h:227).
+    OptionsAutoZoom100,
+    /// Auto-size combo item: 200% (en_us.h:228).
+    OptionsAutoZoom200,
+    /// Auto-size combo item: Auto Fit (en_us.h:229).
+    OptionsAutoZoomAutoFit,
+    /// View page: windowed background color label (en_us.h:233).
+    OptionsWindowedBg,
+    /// View page: fullscreen background color label (en_us.h:234).
+    OptionsFullscreenBg,
+    /// View page: remaining-frames checkbox — riviv-authored (upstream has
+    /// no string: the toggle is a click on the status-bar frame counter,
+    /// viv.c:3994-3999).
+    OptionsFrameMinus,
+    /// Controls page: left click action label (en_us.h:235).
+    OptionsLeftClickAction,
+    /// Controls page: right click action label (en_us.h:236).
+    OptionsRightClickAction,
+    /// Controls page: mouse wheel action label (en_us.h:237).
+    OptionsMouseWheelAction,
+    /// Left-click combo item: Scroll (en_us.h:263).
+    ActionScroll,
+    /// Left-click combo item: Zoom In (en_us.h:266).
+    ActionZoomIn,
+    /// Left-click combo item: Next Image (en_us.h:267).
+    ActionNextImage,
+    /// Right-click combo item: Context Menu (en_us.h:270).
+    ActionContextMenu,
+    /// Right-click combo item: Zoom Out (en_us.h:271).
+    ActionZoomOut,
+    /// Right-click combo item: Previous Image (en_us.h:272).
+    ActionPreviousImage,
+    /// Wheel combo item: Zoom (en_us.h:273).
+    ActionZoom,
+    /// Wheel combo item: Next/Previous (en_us.h:274).
+    ActionNextPrev,
+    /// Wheel combo item: Previous/Next (en_us.h:275).
+    ActionPrevNext,
 }
 
 impl Id {
     /// Variant count; array-typing both tables against this keeps them
     /// length-locked to the enum by construction.
-    pub(crate) const COUNT: usize = Self::MenuAbout as usize + 1;
+    pub(crate) const COUNT: usize = Self::ActionPrevNext as usize + 1;
 }
 
 /// Table choice (upstream `LOCALIZATION_LANGUAGE_*`, localization.h:30-32).
@@ -135,6 +212,43 @@ const EN_US: [&str; Id::COUNT] = [
     "&End",            // MenuEnd
     "&Help",           // MenuHelp
     "&About",          // MenuAbout
+    // Options block (#24; en_us.h:209-237/263-275 + the two menu strings
+    // 86-87 + two riviv-authored labels).
+    "Options - riviv",                     // OptionsCaption (brand swap)
+    "General",                             // OptionsGeneral
+    "View",                                // OptionsView
+    "Controls",                            // OptionsControls
+    "OK",                                  // OptionsOk
+    "Cancel",                              // OptionsCancel
+    "&Store settings in %APPDATA%\\riviv", // OptionsAppdata (path swap)
+    "Allow multiple &instances",           // OptionsMultipleInstances
+    "&Shrink blit mode:",                  // OptionsShrinkBlitMode
+    "&Magnify blit mode:",                 // OptionsMagnifyBlitMode
+    "Nearest",                             // OptionsBlitNearest
+    "Linear",                              // OptionsBlitLinear
+    "&Keep Aspect Ratio",                  // OptionsKeepAspectRatio
+    "&Fill Window",                        // OptionsFillWindow
+    "Fill Window (Fullscreen)",            // OptionsFullscreenFill (riviv)
+    "Auto si&ze window:",                  // OptionsAutoZoom
+    "50%",                                 // OptionsAutoZoom50
+    "100%",                                // OptionsAutoZoom100
+    "200%",                                // OptionsAutoZoom200
+    "Auto Fit",                            // OptionsAutoZoomAutoFit
+    "&Windowed background color:",         // OptionsWindowedBg
+    "&Fullscreen background color:",       // OptionsFullscreenBg
+    "Show &remaining frames",              // OptionsFrameMinus (riviv)
+    "&Left click action:",                 // OptionsLeftClickAction
+    "&Right click action:",                // OptionsRightClickAction
+    "&Mouse wheel action:",                // OptionsMouseWheelAction
+    "Scroll",                              // ActionScroll
+    "Zoom In",                             // ActionZoomIn
+    "Next Image",                          // ActionNextImage
+    "Context Menu",                        // ActionContextMenu
+    "Zoom Out",                            // ActionZoomOut
+    "Previous Image",                      // ActionPreviousImage
+    "Zoom",                                // ActionZoom
+    "Next/Previous",                       // ActionNextPrev
+    "Previous/Next",                       // ActionPrevNext
 ];
 
 /// zh-CN table — upstream localization_zh_cn.h:31/197-199/261-263.
@@ -169,6 +283,42 @@ const ZH_CN: [&str; Id::COUNT] = [
     "末页(&E)",          // MenuEnd
     "帮助(&H)",          // MenuHelp
     "关于(&A)",          // MenuAbout
+    // Options block (#24; zh_cn.h:209-238/264-276 + 86-87 + two riviv labels).
+    "选项 - riviv",                       // OptionsCaption (brand swap)
+    "常规",                               // OptionsGeneral
+    "视图",                               // OptionsView
+    "控件",                               // OptionsControls
+    "确定",                               // OptionsOk
+    "取消",                               // OptionsCancel
+    "在 %APPDATA%\\riviv 中存储设置(&S)", // OptionsAppdata (path swap)
+    "允许多个实例(&I)",                   // OptionsMultipleInstances
+    "缩小位图模式(&S):",                  // OptionsShrinkBlitMode
+    "放大位图模式(&M):",                  // OptionsMagnifyBlitMode
+    "最近邻",                             // OptionsBlitNearest
+    "线性",                               // OptionsBlitLinear
+    "保持纵横比(&K)",                     // OptionsKeepAspectRatio
+    "填充窗口(&F)",                       // OptionsFillWindow
+    "全屏时填充窗口",                     // OptionsFullscreenFill (riviv)
+    "自动调窗(&Z):",                      // OptionsAutoZoom
+    "50%",                                // OptionsAutoZoom50
+    "100%",                               // OptionsAutoZoom100
+    "200%",                               // OptionsAutoZoom200
+    "自动适应",                           // OptionsAutoZoomAutoFit
+    "窗口背景颜色(&W):",                  // OptionsWindowedBg
+    "全屏背景颜色(&F):",                  // OptionsFullscreenBg
+    "显示剩余帧(&R)",                     // OptionsFrameMinus (riviv)
+    "左键操作(&L):",                      // OptionsLeftClickAction
+    "右键操作(&R):",                      // OptionsRightClickAction
+    "鼠标滚轮操作(&M):",                  // OptionsMouseWheelAction
+    "滚动",                               // ActionScroll
+    "放大",                               // ActionZoomIn
+    "下一张图像",                         // ActionNextImage
+    "上下文菜单",                         // ActionContextMenu
+    "缩小",                               // ActionZoomOut
+    "上一张图像",                         // ActionPreviousImage
+    "缩放",                               // ActionZoom
+    "下一张/上一张",                      // ActionNextPrev
+    "上一张/下一张",                      // ActionPrevNext
 ];
 
 /// Map a `GetUserDefaultUILanguage` LANGID onto the table choice
@@ -350,6 +500,116 @@ mod tests {
         // into both entries — the title never changes with the language.
         assert_eq!(get_for(Language::English, Id::AppName), "riviv");
         assert_eq!(get_for(Language::ChineseSimplified, Id::AppName), "riviv");
+    }
+
+    #[test]
+    fn options_strings_carry_the_upstream_texts_in_both_languages() {
+        // The #24 options block — localization_en_us.h:209-237/263-275 +
+        // the two reused menu strings (86-87); the caption/appdata path
+        // carry the riviv brand, and OptionsFullscreenFill /
+        // OptionsFrameMinus are riviv-authored (no upstream string).
+        let en = Language::English;
+        assert_eq!(get_for(en, Id::OptionsCaption), "Options - riviv");
+        assert_eq!(get_for(en, Id::OptionsGeneral), "General");
+        assert_eq!(get_for(en, Id::OptionsView), "View");
+        assert_eq!(get_for(en, Id::OptionsControls), "Controls");
+        assert_eq!(get_for(en, Id::OptionsOk), "OK");
+        assert_eq!(get_for(en, Id::OptionsCancel), "Cancel");
+        assert_eq!(
+            get_for(en, Id::OptionsAppdata),
+            "&Store settings in %APPDATA%\\riviv"
+        );
+        assert_eq!(
+            get_for(en, Id::OptionsMultipleInstances),
+            "Allow multiple &instances"
+        );
+        assert_eq!(get_for(en, Id::OptionsShrinkBlitMode), "&Shrink blit mode:");
+        assert_eq!(
+            get_for(en, Id::OptionsMagnifyBlitMode),
+            "&Magnify blit mode:"
+        );
+        assert_eq!(get_for(en, Id::OptionsBlitNearest), "Nearest");
+        assert_eq!(get_for(en, Id::OptionsBlitLinear), "Linear");
+        assert_eq!(
+            get_for(en, Id::OptionsKeepAspectRatio),
+            "&Keep Aspect Ratio"
+        );
+        assert_eq!(get_for(en, Id::OptionsFillWindow), "&Fill Window");
+        assert_eq!(get_for(en, Id::OptionsAutoZoom), "Auto si&ze window:");
+        assert_eq!(get_for(en, Id::OptionsAutoZoom50), "50%");
+        assert_eq!(get_for(en, Id::OptionsAutoZoom100), "100%");
+        assert_eq!(get_for(en, Id::OptionsAutoZoom200), "200%");
+        assert_eq!(get_for(en, Id::OptionsAutoZoomAutoFit), "Auto Fit");
+        assert_eq!(
+            get_for(en, Id::OptionsWindowedBg),
+            "&Windowed background color:"
+        );
+        assert_eq!(
+            get_for(en, Id::OptionsFullscreenBg),
+            "&Fullscreen background color:"
+        );
+        assert_eq!(
+            get_for(en, Id::OptionsLeftClickAction),
+            "&Left click action:"
+        );
+        assert_eq!(
+            get_for(en, Id::OptionsRightClickAction),
+            "&Right click action:"
+        );
+        assert_eq!(
+            get_for(en, Id::OptionsMouseWheelAction),
+            "&Mouse wheel action:"
+        );
+        assert_eq!(get_for(en, Id::ActionScroll), "Scroll");
+        assert_eq!(get_for(en, Id::ActionZoomIn), "Zoom In");
+        assert_eq!(get_for(en, Id::ActionNextImage), "Next Image");
+        assert_eq!(get_for(en, Id::ActionContextMenu), "Context Menu");
+        assert_eq!(get_for(en, Id::ActionZoomOut), "Zoom Out");
+        assert_eq!(get_for(en, Id::ActionPreviousImage), "Previous Image");
+        assert_eq!(get_for(en, Id::ActionZoom), "Zoom");
+        assert_eq!(get_for(en, Id::ActionNextPrev), "Next/Previous");
+        assert_eq!(get_for(en, Id::ActionPrevNext), "Previous/Next");
+
+        let zh = Language::ChineseSimplified;
+        assert_eq!(get_for(zh, Id::OptionsCaption), "选项 - riviv");
+        assert_eq!(get_for(zh, Id::OptionsGeneral), "常规");
+        assert_eq!(get_for(zh, Id::OptionsView), "视图");
+        assert_eq!(get_for(zh, Id::OptionsControls), "控件");
+        assert_eq!(get_for(zh, Id::OptionsOk), "确定");
+        assert_eq!(get_for(zh, Id::OptionsCancel), "取消");
+        assert_eq!(
+            get_for(zh, Id::OptionsAppdata),
+            "在 %APPDATA%\\riviv 中存储设置(&S)"
+        );
+        assert_eq!(
+            get_for(zh, Id::OptionsMultipleInstances),
+            "允许多个实例(&I)"
+        );
+        assert_eq!(get_for(zh, Id::OptionsShrinkBlitMode), "缩小位图模式(&S):");
+        assert_eq!(get_for(zh, Id::OptionsMagnifyBlitMode), "放大位图模式(&M):");
+        assert_eq!(get_for(zh, Id::OptionsBlitNearest), "最近邻");
+        assert_eq!(get_for(zh, Id::OptionsBlitLinear), "线性");
+        assert_eq!(get_for(zh, Id::OptionsKeepAspectRatio), "保持纵横比(&K)");
+        assert_eq!(get_for(zh, Id::OptionsFillWindow), "填充窗口(&F)");
+        assert_eq!(get_for(zh, Id::OptionsAutoZoom), "自动调窗(&Z):");
+        assert_eq!(get_for(zh, Id::OptionsAutoZoomAutoFit), "自动适应");
+        assert_eq!(get_for(zh, Id::OptionsWindowedBg), "窗口背景颜色(&W):");
+        assert_eq!(get_for(zh, Id::OptionsFullscreenBg), "全屏背景颜色(&F):");
+        assert_eq!(get_for(zh, Id::OptionsLeftClickAction), "左键操作(&L):");
+        assert_eq!(get_for(zh, Id::OptionsRightClickAction), "右键操作(&R):");
+        assert_eq!(
+            get_for(zh, Id::OptionsMouseWheelAction),
+            "鼠标滚轮操作(&M):"
+        );
+        assert_eq!(get_for(zh, Id::ActionScroll), "滚动");
+        assert_eq!(get_for(zh, Id::ActionZoomIn), "放大");
+        assert_eq!(get_for(zh, Id::ActionNextImage), "下一张图像");
+        assert_eq!(get_for(zh, Id::ActionContextMenu), "上下文菜单");
+        assert_eq!(get_for(zh, Id::ActionZoomOut), "缩小");
+        assert_eq!(get_for(zh, Id::ActionPreviousImage), "上一张图像");
+        assert_eq!(get_for(zh, Id::ActionZoom), "缩放");
+        assert_eq!(get_for(zh, Id::ActionNextPrev), "下一张/上一张");
+        assert_eq!(get_for(zh, Id::ActionPrevNext), "上一张/下一张");
     }
 
     #[test]
