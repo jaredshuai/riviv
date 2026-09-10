@@ -57,6 +57,9 @@
 //! - `loc` — bilingual string tables + one-shot system-language detection
 //!   (#20, landed)
 //! - `copydata` — the single-instance handoff payload codec (#21, landed)
+//! - `assoc` — file associations, the start-menu shortcuts and the
+//!   install-family command line (`/install`-family switches, run before
+//!   the window exists; #26)
 //! - `keys` — per-command keyboard bindings: the default table, the ini
 //!   `*_keys` codec, the lookup router and the Controls-page name model
 //!   (#25)
@@ -76,6 +79,7 @@
 #![windows_subsystem = "windows"]
 
 mod anim;
+mod assoc;
 mod config;
 mod copydata;
 mod cursor;

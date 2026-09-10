@@ -3,3 +3,4 @@
 # 可重建的本地索引 / 工具私有目录
 .codegraph/
 .codebase-memory/
+installer/nsis/*Setup*.exe

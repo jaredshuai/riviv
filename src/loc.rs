@@ -106,6 +106,14 @@ pub(crate) enum Id {
     OptionsAppdata,
     /// General page: multiple instances checkbox (en_us.h:216).
     OptionsMultipleInstances,
+    /// General page: start-menu shortcuts checkbox (en_us.h:217).
+    OptionsStartMenu,
+    /// General page: associations group box caption (en_us.h:218).
+    OptionsAssociations,
+    /// General page: Check All button (en_us.h:219).
+    OptionsCheckAll,
+    /// General page: Check None button (en_us.h:220).
+    OptionsCheckNone,
     /// View page: shrink blit mode label (en_us.h:221).
     OptionsShrinkBlitMode,
     /// View page: magnify blit mode label (en_us.h:222).
@@ -240,6 +248,10 @@ const EN_US: [&str; Id::COUNT] = [
     "Cancel",                              // OptionsCancel
     "&Store settings in %APPDATA%\\riviv", // OptionsAppdata (path swap)
     "Allow multiple &instances",           // OptionsMultipleInstances
+    "Start &menu shortcuts",               // OptionsStartMenu
+    "Associations",                        // OptionsAssociations
+    "Check &All",                          // OptionsCheckAll
+    "Check &None",                         // OptionsCheckNone
     "&Shrink blit mode:",                  // OptionsShrinkBlitMode
     "&Magnify blit mode:",                 // OptionsMagnifyBlitMode
     "Nearest",                             // OptionsBlitNearest
@@ -319,6 +331,10 @@ const ZH_CN: [&str; Id::COUNT] = [
     "取消",                               // OptionsCancel
     "在 %APPDATA%\\riviv 中存储设置(&S)", // OptionsAppdata (path swap)
     "允许多个实例(&I)",                   // OptionsMultipleInstances
+    "开始菜单快捷方式(&M)",               // OptionsStartMenu
+    "文件关联",                           // OptionsAssociations
+    "全选(&A)",                           // OptionsCheckAll
+    "全不选(&N)",                         // OptionsCheckNone
     "缩小位图模式(&S):",                  // OptionsShrinkBlitMode
     "放大位图模式(&M):",                  // OptionsMagnifyBlitMode
     "最近邻",                             // OptionsBlitNearest
@@ -559,6 +575,10 @@ mod tests {
             get_for(en, Id::OptionsMultipleInstances),
             "Allow multiple &instances"
         );
+        assert_eq!(get_for(en, Id::OptionsStartMenu), "Start &menu shortcuts");
+        assert_eq!(get_for(en, Id::OptionsAssociations), "Associations");
+        assert_eq!(get_for(en, Id::OptionsCheckAll), "Check &All");
+        assert_eq!(get_for(en, Id::OptionsCheckNone), "Check &None");
         assert_eq!(get_for(en, Id::OptionsShrinkBlitMode), "&Shrink blit mode:");
         assert_eq!(
             get_for(en, Id::OptionsMagnifyBlitMode),
@@ -621,6 +641,10 @@ mod tests {
             get_for(zh, Id::OptionsMultipleInstances),
             "允许多个实例(&I)"
         );
+        assert_eq!(get_for(zh, Id::OptionsStartMenu), "开始菜单快捷方式(&M)");
+        assert_eq!(get_for(zh, Id::OptionsAssociations), "文件关联");
+        assert_eq!(get_for(zh, Id::OptionsCheckAll), "全选(&A)");
+        assert_eq!(get_for(zh, Id::OptionsCheckNone), "全不选(&N)");
         assert_eq!(get_for(zh, Id::OptionsShrinkBlitMode), "缩小位图模式(&S):");
         assert_eq!(get_for(zh, Id::OptionsMagnifyBlitMode), "放大位图模式(&M):");
         assert_eq!(get_for(zh, Id::OptionsBlitNearest), "最近邻");

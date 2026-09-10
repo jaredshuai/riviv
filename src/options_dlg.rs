@@ -28,8 +28,8 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::UI::Controls::Dialogs::{CC_FULLOPEN, CC_RGBINIT, CHOOSECOLORW, ChooseColorW};
 use windows::Win32::UI::Controls::{
-    BST_CHECKED, DRAWITEMSTRUCT, EM_SETSEL, NMTREEVIEWW, TVGN_CARET, TVI_LAST, TVI_ROOT,
-    TVIF_PARAM, TVIF_TEXT, TVINSERTSTRUCTW, TVITEMW, TVM_INSERTITEM, TVM_SELECTITEM,
+    BST_CHECKED, BST_UNCHECKED, DRAWITEMSTRUCT, EM_SETSEL, NMTREEVIEWW, TVGN_CARET, TVI_LAST,
+    TVI_ROOT, TVIF_PARAM, TVIF_TEXT, TVINSERTSTRUCTW, TVITEMW, TVM_INSERTITEM, TVM_SELECTITEM,
     TVN_SELCHANGEDW, TVS_HASBUTTONS, TVS_HASLINES, TVS_LINESATROOT, TVS_SHOWSELALWAYS,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -77,6 +77,21 @@ const REMOVE_KEY_BTN: i32 = 254;
 /// IDC_EDIT_KEY_CURRENTLY_USED_BY_LIST, resource.h:77).
 const EDIT_KEY_EDIT_ID: i32 = 260;
 const EDIT_USED_BY_ID: i32 = 261;
+/// The General page's association area (#26; upstream IDC_STARTMENU /
+/// IDC_BMP..IDC_WEBP / IDC_CHECKALL / IDC_CHECKNONE — riviv's own numbering
+/// beside the declarative table, the key-editor precedent: registry state,
+/// not OptionsModel state). The 9 checkboxes run ASSOC_CHK_ID..+8 in
+/// `assoc::EXTENSIONS` order.
+const STARTMENU_CHK_ID: i32 = 270;
+const ASSOC_CHK_ID: i32 = 271;
+const CHECK_ALL_BTN: i32 = 280;
+const CHECK_NONE_BTN: i32 = 281;
+
+/// The per-extension checkbox labels (rc:36-44 — upstream hardcodes them
+/// English with mnemonics; not in the localization tables).
+const ASSOC_CHK_LABELS: [&str; 9] = [
+    "&BMP", "&GIF", "IC&O", "JP&EG", "&JPG", "&PNG", "&TIF", "TIF&F", "&WEBP",
+];
 
 /// Page p's control i (and the page containers themselves at 100*p+5).
 /// Deterministic so the WM_COMMAND dispatch and the smoke script share it.
@@ -130,6 +145,11 @@ struct DlgState {
     add_key_btn: HWND,
     edit_key_btn: HWND,
     remove_key_btn: HWND,
+    /// The General page's association area (#26): the start-menu checkbox
+    /// and the 9 per-extension checkboxes (registry-backed — their state
+    /// never enters OptionsModel).
+    startmenu_chk: HWND,
+    assoc_chks: [HWND; 9],
     /// ChooseColor's 16 custom-color slots (the API needs a stable
     /// address for the dialog's lifetime).
     cust_colors: [COLORREF; 16],
@@ -262,6 +282,8 @@ pub(crate) fn open(owner: HWND) {
                 add_key_btn: HWND::default(),
                 edit_key_btn: HWND::default(),
                 remove_key_btn: HWND::default(),
+                startmenu_chk: HWND::default(),
+                assoc_chks: [HWND::default(); 9],
                 cust_colors: [COLORREF(0); 16],
             })) as *mut c_void as _,
         )
@@ -634,6 +656,9 @@ fn build_dialog(dlg: HWND, font: HGDIOBJ, dlu: impl Fn(i32, i32) -> (i32, i32), 
             // beside the declarative table (a multi-control composite, not
             // one Field).
             build_key_editor(dlg, state, font, &dlu);
+            // The General page's association area (#26) — the same
+            // beside-the-table discipline (registry-backed checkboxes).
+            build_general_assoc(state, font, &dlu);
         }
 
         // OK / Cancel (rc:198/252,252).
@@ -709,6 +734,134 @@ fn auto_zoom_pair(state: &DlgState) -> Option<(HWND, HWND)> {
         }
     }
     Some((combo?, check?))
+}
+
+/// Build the General page's association area (#26; upstream INITDIALOG
+/// viv.c:7947-7968, geometry from IDD_GENERAL rc:34-52): the start-menu
+/// checkbox, the Associations group with the 9 per-extension checkboxes
+/// (initial state read from the registry), and Check All / Check None.
+/// Hand-built beside the declarative table — the checkboxes carry
+/// REGISTRY state (upstream reads them back at OK the same way), not
+/// OptionsModel state.
+fn build_general_assoc(state: &mut DlgState, font: HGDIOBJ, dlu: &impl Fn(i32, i32) -> (i32, i32)) {
+    let page = state.pages[0];
+    // SAFETY: every creation below uses the live page parent; the state
+    // reads/writes run before the dialog is interactive (still inside
+    // build_dialog) so no handler can interleave.
+    unsafe {
+        let set_font = |hwnd: HWND| {
+            let _ = SendMessageW(
+                hwnd,
+                WM_SETFONT,
+                Some(WPARAM(font.0 as usize)),
+                Some(LPARAM(1)),
+            );
+        };
+        // Start menu shortcuts checkbox (rc:34: (0,36) 186x10).
+        let (x, y) = dlu(0, 36);
+        let (w, h) = dlu(186, 10);
+        let label = HSTRING::from(loc::get(loc::Id::OptionsStartMenu));
+        let startmenu = CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            w!("BUTTON"),
+            &label,
+            WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_AUTOCHECKBOX as u32),
+            x,
+            y,
+            w,
+            h,
+            Some(page),
+            Some(HMENU(STARTMENU_CHK_ID as *mut c_void)),
+            None,
+            None,
+        )
+        .unwrap_or_default();
+        set_font(startmenu);
+        let _ = SendMessageW(
+            startmenu,
+            BM_SETCHECK,
+            Some(WPARAM(crate::assoc::is_start_menu_shortcuts() as usize)),
+            Some(LPARAM(0)),
+        );
+        state.startmenu_chk = startmenu;
+
+        // The Associations group box (rc:35: (0,54) 54x124).
+        let (x, y) = dlu(0, 54);
+        let (w, h) = dlu(54, 124);
+        let label = HSTRING::from(loc::get(loc::Id::OptionsAssociations));
+        let _ = CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            w!("BUTTON"),
+            &label,
+            WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | BS_GROUPBOX as u32),
+            x,
+            y,
+            w,
+            h,
+            Some(page),
+            None,
+            None,
+            None,
+        );
+
+        // The 9 extension checkboxes (rc:36-44: x=6, y=66+12*i, 42x10) —
+        // ids in EXTENSIONS order so OK's index arithmetic is the table
+        // order (upstream's `_viv_association_dlg_item_id`).
+        for (i, label_text) in ASSOC_CHK_LABELS.iter().enumerate() {
+            let (x, y) = dlu(6, 66 + 12 * i as i32);
+            let (w, h) = dlu(42, 10);
+            let label = HSTRING::from(*label_text);
+            let chk = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("BUTTON"),
+                &label,
+                WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_AUTOCHECKBOX as u32),
+                x,
+                y,
+                w,
+                h,
+                Some(page),
+                Some(HMENU((ASSOC_CHK_ID + i as i32) as *mut c_void)),
+                None,
+                None,
+            )
+            .unwrap_or_default();
+            set_font(chk);
+            let _ = SendMessageW(
+                chk,
+                BM_SETCHECK,
+                Some(WPARAM(crate::assoc::is_association(i) as usize)),
+                Some(LPARAM(0)),
+            );
+            state.assoc_chks[i] = chk;
+        }
+
+        // Check All / Check None (rc:50-51: (60,60)/(60,78) 54x14).
+        for (id, label_id) in [
+            (CHECK_ALL_BTN, loc::Id::OptionsCheckAll),
+            (CHECK_NONE_BTN, loc::Id::OptionsCheckNone),
+        ] {
+            let (x, y) = dlu(60, if id == CHECK_ALL_BTN { 60 } else { 78 });
+            let (w, h) = dlu(54, 14);
+            let label = HSTRING::from(loc::get(label_id));
+            let btn = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("BUTTON"),
+                &label,
+                WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | BS_PUSHBUTTON as u32),
+                x,
+                y,
+                w,
+                h,
+                Some(page),
+                Some(HMENU(id as *mut c_void)),
+                None,
+                None,
+            )
+            .unwrap_or_default();
+            set_font(btn);
+        }
+    }
 }
 
 /// Build the Controls page's key-editor area (upstream INITDIALOG,
@@ -1136,6 +1289,58 @@ fn on_ok(dlg: HWND) {
     // SAFETY: the state is live — no WM_DESTROY can run while this handler
     // owns the dialog.
     let owner = unsafe { owner_of(dlg) };
+    // The association area FIRST (upstream's IDOK order: associations at
+    // viv.c:8693-8709, before the View/Controls reads): checked-vs-registry
+    // diffs apply directly at standard-user level — HKCU never needs
+    // elevation, and upstream counts these changes OUT of the shield
+    // (the need_admin loop is commented out, viv.c:8498-8516). The
+    // start-menu toggle instead collects a CLI switch for the re-executed
+    // self (viv.c:8677-8690 + 8801-8809): CSIDL_COMMON_PROGRAMS needs the
+    // admin pass, which the CHILD's install-CLI decides on.
+    let mut admin_params = String::new();
+    {
+        // SAFETY: the borrow spans the BM_GETCHECK queries and the registry
+        // writes — neither pumps (SendMessage to our own children is
+        // synchronous, the registry APIs are not message-based).
+        unsafe {
+            if let Some(state) = dlg_state_of(dlg) {
+                for (i, &chk) in state.assoc_chks.iter().enumerate() {
+                    // A checkbox that failed to create reads as UNCHECKED —
+                    // treating that as the user's choice could uninstall an
+                    // existing association, so an invalid handle abstains.
+                    if chk.is_invalid() {
+                        continue;
+                    }
+                    let checked = SendMessageW(chk, BM_GETCHECK, Some(WPARAM(0)), Some(LPARAM(0))).0
+                        as isize
+                        == BST_CHECKED.0 as isize;
+                    let installed = crate::assoc::is_association(i);
+                    if checked && !installed {
+                        crate::assoc::install_association_by_extension(i);
+                    } else if !checked && installed {
+                        crate::assoc::uninstall_association_by_extension(i);
+                    }
+                }
+                let want_menu = !state.startmenu_chk.is_invalid()
+                    && SendMessageW(
+                        state.startmenu_chk,
+                        BM_GETCHECK,
+                        Some(WPARAM(0)),
+                        Some(LPARAM(0)),
+                    )
+                    .0 as isize
+                        == BST_CHECKED.0 as isize;
+                if want_menu != crate::assoc::is_start_menu_shortcuts() {
+                    // `_viv_append_admin_param` (viv.c:12793-12797): " /<sw>".
+                    admin_params = if want_menu {
+                        " /startmenu".to_string()
+                    } else {
+                        " /nostartmenu".to_string()
+                    };
+                }
+            }
+        }
+    }
     // SAFETY: the dialog-state borrow ends above (model is owned); the
     // owner borrow spans only the commit/re-anchor/invalidate/save —
     // none pump.
@@ -1190,6 +1395,18 @@ fn on_ok(dlg: HWND) {
         // SAFETY: no borrow is live (both maps above ended); the rebuild
         // takes its own short borrows and pumps nothing.
         crate::window::rebuild_menu_bar(owner);
+    }
+    // The collected admin command runs BEFORE the save (upstream's order:
+    // os_shell_execute at viv.c:8808, config_save_settings at 8812) — no
+    // state borrow is live here, and the child exits before this process
+    // reaches DestroyWindow (the wait is upstream's `wait=1`).
+    if !admin_params.is_empty() {
+        let exe = std::env::current_exe()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if let Err(e) = crate::assoc::shell_execute(&exe, Some(&admin_params), None, true) {
+            eprintln!("riviv: {e}");
+        }
     }
     // SAFETY: a fresh short borrow for the save; nothing pumps.
     unsafe {
@@ -1318,6 +1535,29 @@ fn on_clicked(dlg: HWND, id: i32) {
         }
         REMOVE_KEY_BTN => {
             on_remove_key(dlg);
+            return;
+        }
+        CHECK_ALL_BTN | CHECK_NONE_BTN => {
+            // Upstream viv.c:7982-8000: set all nine extension checkboxes.
+            let check = if id == CHECK_ALL_BTN {
+                BST_CHECKED
+            } else {
+                BST_UNCHECKED
+            };
+            // SAFETY: the borrow spans only the BM_SETCHECK sends to our
+            // own children — nothing pumps.
+            unsafe {
+                if let Some(state) = dlg_state_of(dlg) {
+                    for &chk in &state.assoc_chks {
+                        let _ = SendMessageW(
+                            chk,
+                            BM_SETCHECK,
+                            Some(WPARAM(check.0 as usize)),
+                            Some(LPARAM(0)),
+                        );
+                    }
+                }
+            }
             return;
         }
         _ => {}
