@@ -33,7 +33,7 @@ use crate::menu::Cmd;
 /// The settings file's section name and basename (upstream uses
 /// "voidImageViewer" for both; riviv names its own).
 const SECTION: &str = "riviv";
-const FILE_NAME: &str = "riviv.ini";
+pub(crate) const FILE_NAME: &str = "riviv.ini";
 /// The `%APPDATA%` subdirectory (upstream: "voidimageviewer").
 const APPDATA_DIR: &str = "riviv";
 
@@ -469,8 +469,9 @@ impl Config {
     }
 }
 
-/// The exe's directory (upstream `string_get_exe_path`).
-fn exe_dir() -> Option<PathBuf> {
+/// The exe's directory (upstream `string_get_exe_path`). The install-family
+/// CLI reuses it as the copy source and the bare `-uninstall` default (#26).
+pub(crate) fn exe_dir() -> Option<PathBuf> {
     std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
@@ -483,8 +484,9 @@ fn exe_dir_ini() -> Option<PathBuf> {
 /// `%APPDATA%\riviv` — resolved through the roaming-AppData KNOWN FOLDER
 /// like upstream (`SHGetSpecialFolderLocation(CSIDL_APPDATA)`,
 /// string.c:637-655), not the `APPDATA` environment variable a launcher
-/// can strip or override while the known folder stays correct.
-fn appdata_dir() -> Option<PathBuf> {
+/// can strip or override while the known folder stays correct. The
+/// uninstall CLI cleans it out (#26, viv.c:4720-4726).
+pub(crate) fn appdata_dir() -> Option<PathBuf> {
     use std::os::windows::ffi::OsStringExt;
     let mut buf = [0u16; 260]; // MAX_PATH
     // SAFETY: `buf` is a valid MAX_PATH-sized out-buffer for the duration

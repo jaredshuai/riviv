@@ -28,6 +28,7 @@ windows = { version = "0.62", features = [
     "Win32_System_Environment",
     "Win32_System_LibraryLoader",
     "Win32_System_Performance",
+    "Win32_System_Registry",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
     "Win32_Security",
@@ -37,6 +38,10 @@ windows = { version = "0.62", features = [
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+[build-dependencies]
+# 嵌入 res/riviv.ico + 版本信息(#26);自带资源对象写出,无外部 rc.exe
+winresource = "0.1.31"
 
 [lints.clippy]
 # unsafe 密集 FFI:每个 unsafe 块必须带 SAFETY 注释(AGENTS.md 技术栈约定)

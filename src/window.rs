@@ -37,8 +37,8 @@ use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::Path;
 
 use windows::Win32::Foundation::{
-    ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, GetLastError, HLOCAL, HWND, LPARAM, LRESULT,
-    LocalFree, POINT, RECT, SetLastError, WIN32_ERROR, WPARAM,
+    ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, GetLastError, HLOCAL, HMODULE, HWND, LPARAM,
+    LRESULT, LocalFree, POINT, RECT, SetLastError, WIN32_ERROR, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
     COLOR_BTNFACE, GetMonitorInfoW, HBRUSH, InvalidateRect, MONITOR_DEFAULTTOPRIMARY, MONITORINFO,
@@ -80,21 +80,23 @@ use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRect, AppendMenuW, CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW,
     CheckMenuItem, CreateMenu, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
     DestroyWindow, DispatchMessageW, EnableMenuItem, FindWindowA, GWL_STYLE, GWLP_USERDATA,
-    GetClientRect, GetCursorPos, GetForegroundWindow, GetMenu, GetMessageW, GetWindowLongPtrW,
-    GetWindowRect, HMENU, HWND_TOP, IDC_ARROW, IsIconic, IsZoomed, KillTimer, LoadCursorW,
-    MB_ICONERROR, MB_OK, MENU_ITEM_FLAGS, MF_BYCOMMAND, MF_CHECKED, MF_ENABLED, MF_GRAYED,
-    MF_POPUP, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MINMAXINFO, MSG, MessageBoxW, PostMessageW,
-    PostQuitMessage, RegisterClassExW, SHOW_WINDOW_CMD, SW_MAXIMIZE, SW_RESTORE, SW_SHOW,
-    SW_SHOWNORMAL, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOZORDER, SendMessageW,
-    SetForegroundWindow, SetMenu, SetProcessDPIAware, SetTimer, SetWindowLongPtrW, SetWindowPos,
-    SetWindowTextW, ShowCursor, ShowWindow, TPM_CENTERALIGN, TPM_LEFTBUTTON, TPM_VCENTERALIGN,
-    TrackPopupMenu, TranslateMessage, USER_TIMER_MINIMUM, WINDOW_EX_STYLE, WINDOW_STYLE,
-    WM_ACTIVATE, WM_COMMAND, WM_CONTEXTMENU, WM_COPYDATA, WM_DESTROY, WM_DROPFILES, WM_ENDSESSION,
-    WM_ERASEBKGND, WM_GETMINMAXINFO, WM_INITMENU, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_MOVE, WM_NCCREATE, WM_NCDESTROY, WM_NULL,
-    WM_PAINT, WM_QUERYENDSESSION, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SIZE,
-    WM_SYSKEYDOWN, WM_TIMER, WNDCLASSEXW, WS_CAPTION, WS_EX_ACCEPTFILES, WS_OVERLAPPEDWINDOW,
-    WS_POPUP, WS_THICKFRAME, WS_VISIBLE, WindowFromPoint,
+    GetClientRect, GetCursorPos, GetForegroundWindow, GetMenu, GetMessageW, GetSystemMetrics,
+    GetWindowLongPtrW, GetWindowRect, HICON, HMENU, HWND_TOP, IDC_ARROW, IMAGE_ICON, IsIconic,
+    IsZoomed, KillTimer, LR_DEFAULTCOLOR, LoadCursorW, LoadImageW, MB_ICONERROR, MB_OK,
+    MENU_ITEM_FLAGS, MF_BYCOMMAND, MF_CHECKED, MF_ENABLED, MF_GRAYED, MF_POPUP, MF_SEPARATOR,
+    MF_STRING, MF_UNCHECKED, MINMAXINFO, MSG, MessageBoxW, PostMessageW, PostQuitMessage,
+    RegisterClassExW, SHOW_WINDOW_CMD, SM_CXICON, SM_CXSMICON, SM_CYICON, SM_CYSMICON, SW_MAXIMIZE,
+    SW_RESTORE, SW_SHOW, SW_SHOWNORMAL, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOCOPYBITS,
+    SWP_NOZORDER, SYSTEM_METRICS_INDEX, SendMessageW, SetForegroundWindow, SetMenu,
+    SetProcessDPIAware, SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowCursor,
+    ShowWindow, TPM_CENTERALIGN, TPM_LEFTBUTTON, TPM_VCENTERALIGN, TrackPopupMenu,
+    TranslateMessage, USER_TIMER_MINIMUM, WINDOW_EX_STYLE, WINDOW_STYLE, WM_ACTIVATE, WM_COMMAND,
+    WM_CONTEXTMENU, WM_COPYDATA, WM_DESTROY, WM_DROPFILES, WM_ENDSESSION, WM_ERASEBKGND,
+    WM_GETMINMAXINFO, WM_INITMENU, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_MOVE, WM_NCCREATE, WM_NCDESTROY, WM_NULL, WM_PAINT,
+    WM_QUERYENDSESSION, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SIZE, WM_SYSKEYDOWN,
+    WM_TIMER, WNDCLASSEXW, WS_CAPTION, WS_EX_ACCEPTFILES, WS_OVERLAPPEDWINDOW, WS_POPUP,
+    WS_THICKFRAME, WS_VISIBLE, WindowFromPoint,
 };
 use windows::core::{HSTRING, PCSTR, PCWSTR, w};
 
@@ -3375,6 +3377,40 @@ pub(crate) fn fatal(message: &str) -> ! {
     std::process::exit(1)
 }
 
+/// The embedded icon resource (id 1, build.rs) at one of the system's icon
+/// metrics — the window class's hIcon/hIconSm (#26; upstream loads its rc
+/// icon the same way, viv.c:5346-5350). A load failure degrades to a zero
+/// handle (the class default icon) rather than failing startup: the icon
+/// is cosmetic. The handle is owned by the module's resource section for
+/// the process lifetime (no DestroyIcon — class icons outlive every
+/// orderly teardown).
+// The resource-ordinal-to-pointer cast inside is the MAKEINTRESOURCEW FFI
+// idiom (the "pointer" IS the id) — not a dereference target.
+#[allow(clippy::manual_dangling_ptr)]
+fn load_icon_resource(
+    hinstance: HMODULE,
+    cx_metric: SYSTEM_METRICS_INDEX,
+    cy_metric: SYSTEM_METRICS_INDEX,
+) -> HICON {
+    // SAFETY: read-only system-metric queries.
+    let (cx, cy) = unsafe { (GetSystemMetrics(cx_metric), GetSystemMetrics(cy_metric)) };
+    // SAFETY: hinstance is this process's module handle (valid for the
+    // process lifetime); resource id 1 is the icon build.rs embeds; the
+    // returned shared handle is used only as the class icon.
+    unsafe {
+        LoadImageW(
+            Some(hinstance.into()),
+            PCWSTR(1usize as *const u16),
+            IMAGE_ICON,
+            cx,
+            cy,
+            LR_DEFAULTCOLOR,
+        )
+        .map(|h| HICON(h.0))
+        .unwrap_or_default()
+    }
+}
+
 pub(crate) fn run(args: Vec<OsString>) -> Result<(), String> {
     // SAFETY: process-wide and must run before ANY DPI-sensitive query —
     // a GetMonitorInfo/GetCursorPos-scale call while still unaware LOCKS
@@ -3427,7 +3463,18 @@ pub(crate) fn run(args: Vec<OsString>) -> Result<(), String> {
     // below overwrites config.maximized with the live zoomed state from
     // the very first show (upstream saves it off before any window
     // exists for exactly this reason, viv.c:5264-5266).
-    let config = Config::load();
+    let mut config = Config::load();
+    // The install-family command line (upstream viv.c:5268-5276, between
+    // config load and the mutex): `-install`-style switches perform their
+    // work — associations as this user, everything else through the
+    // elevated re-execution — and the process exits instead of ever
+    // creating a window. The raw GetCommandLineW is read INSIDE (the
+    // quoting semantics and the `/isrunas <rest>` re-execution need it;
+    // `file_args` cannot see either). At this point nothing else exists to
+    // tear down: no worker thread, no mutex, and COM needs no shutdown.
+    if crate::assoc::process_install_command_line(&mut config) {
+        return Ok(());
+    }
     // The single-instance gate (#21; upstream viv.c:5278-5341 — config
     // first, viv.c:5261 → 5278, class registration after): with
     // multiple_instances off (the default), a second process hands its
@@ -3595,6 +3642,13 @@ pub(crate) fn run(args: Vec<OsString>) -> Result<(), String> {
         style: CS_DBLCLKS | CS_VREDRAW | CS_HREDRAW, // CS_DBLCLKS now, double-click = M2
         lpfnWndProc: Some(wnd_proc),
         hInstance: hinstance.into(),
+        // The embedded icon resource (#26; build.rs pins it as the FIRST
+        // icon = id 1): LoadImageW at the system's large/small metric so
+        // the shell resolves both sizes (upstream loads its rc icon the
+        // same way, viv.c:5346-5350). A load failure degrades to the
+        // class-default icon — cosmetic, not fatal.
+        hIcon: load_icon_resource(hinstance, SM_CXICON, SM_CYICON),
+        hIconSm: load_icon_resource(hinstance, SM_CXSMICON, SM_CYSMICON),
         // SAFETY: IDC_ARROW is a predefined system resource; failing here would
         // register a cursorless class (no pointer over the client), so
         // propagate instead (ADR 0001).
