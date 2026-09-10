@@ -68,9 +68,8 @@ use windows::Win32::UI::Controls::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetCapture, GetKeyNameTextW, GetKeyState, GetKeyboardLayout, MAPVK_VK_TO_VSC, MapVirtualKeyExW,
-    ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_ADD, VK_CONTROL,
-    VK_END, VK_ESCAPE, VK_F1, VK_HOME, VK_LEFT, VK_MENU, VK_NEXT, VK_OEM_MINUS, VK_OEM_PLUS,
-    VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SUBTRACT,
+    ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_CONTROL, VK_ESCAPE,
+    VK_MENU, VK_SHIFT,
 };
 use windows::Win32::UI::Shell::{
     CommandLineToArgvW, DragFinish, DragQueryFileW, FILEOPENDIALOGOPTIONS, FOS_NOCHANGEDIR,
@@ -2261,7 +2260,12 @@ fn show_about(hwnd: HWND) {
 /// keyed by its slot, append separators/items with their accelerator
 /// labels. Returns an invalid HMENU on failure (callers degrade to a
 /// menu-less window, like a failed status bar).
-fn create_menu_bar() -> HMENU {
+/// The menu bar from the command table (upstream `_viv_create_menu`,
+/// viv.c:12314-12399). The accelerator label on each item is the
+/// command's FIRST registered binding from `keys` (upstream
+/// `_viv_key_list->start[...]`, viv.c:12365-12367 — the live map, so
+/// custom bindings relabel the menu after an Options OK rebuilds it).
+fn create_menu_bar(keys: &crate::keys::KeyMap) -> HMENU {
     // SAFETY: pure menu-object construction; no window involvement. A
     // failure (NULL handle) degrades to a menu-less window.
     let Ok(bar) = (unsafe { CreateMenu() }) else {
@@ -2295,17 +2299,14 @@ fn create_menu_bar() -> HMENU {
                     )
                 };
             }
-            menu::Entry::Item {
-                loc,
-                parent,
-                cmd,
-                key,
-            } => {
-                // The accelerator label: the default key's display name
+            menu::Entry::Item { loc, parent, cmd } => {
+                // The accelerator label: the first binding's display name
                 // via GetKeyNameTextW (layout-localized like upstream,
                 // `_viv_vk_to_text` viv.c:12221-12261), composed by the
                 // pure `menu::key_label`.
-                let label = key.and_then(|k| vk_text(k.vk).map(|t| menu::key_label(k, &t)));
+                let label = keys
+                    .first(cmd)
+                    .and_then(|k| vk_text(k.vk).map(|t| menu::key_label(k, &t)));
                 let text = to_wide(&menu::item_text(loc::get(loc), label.as_deref()));
                 // SAFETY: text outlives the append.
                 let _ = unsafe {
@@ -2322,13 +2323,45 @@ fn create_menu_bar() -> HMENU {
     bar
 }
 
+/// Rebuild the menu bar after the bindings changed (upstream's Options OK:
+/// `_viv_key_list_copy` then `_viv_create_menu` + reattach + destroy-old,
+/// viv.c:8779-8800). A new bar is built from the live key map so custom
+/// bindings relabel their items; the swap attaches only when a bar is
+/// currently attached (upstream's GetMenu guard — fullscreen detaches it,
+/// so the rebuilt bar waits in the state for the reattach).
+pub(crate) fn rebuild_menu_bar(hwnd: HWND) {
+    // SAFETY: the borrow spans only the KeyMap clone.
+    let keys = (unsafe { state_of(hwnd) }).map(|s| s.config.keys.clone());
+    let Some(keys) = keys else { return };
+    let bar = create_menu_bar(&keys);
+    // SAFETY: fresh borrow for the swap; nothing below pumps.
+    unsafe {
+        if let Some(state) = state_of(hwnd) {
+            // SAFETY: read-only menu query on the live window.
+            let attached = GetMenu(hwnd);
+            if !attached.is_invalid() && !bar.is_invalid() {
+                // SAFETY: the new bar is freshly built; the window takes
+                // ownership here (the old one is destroyed after).
+                let _ = SetMenu(hwnd, Some(bar));
+            }
+            if !state.menu.is_invalid() {
+                // SAFETY: the state owns the old bar and nothing else
+                // references it — SetMenu above already replaced it when
+                // it was attached, and a detached bar has no window user.
+                let _ = DestroyMenu(state.menu);
+            }
+            state.menu = bar;
+        }
+    }
+}
+
 /// The key-name half of an accelerator label (upstream `_viv_vk_to_text`,
 /// viv.c:12221-12261): scan code from the thread's keyboard layout, then
 /// `GetKeyNameTextW` with the extended-key bit for the navigation keys
 /// riviv registers (upstream's full extended list covers keys riviv has
 /// no default binding for). None = no name (the item then shows no
 /// accelerator).
-fn vk_text(vk: u16) -> Option<String> {
+pub(crate) fn vk_text(vk: u16) -> Option<String> {
     // SAFETY: read-only layout query for this thread.
     let hkl = unsafe { GetKeyboardLayout(GetCurrentThreadId()) };
     // SAFETY: pure VK→scan-code mapping.
@@ -2338,10 +2371,34 @@ fn vk_text(vk: u16) -> Option<String> {
     }
     let mut lparam = (scan as i32) << 16;
     // The extended bit (1 << 24) for keys that live only on the extended
-    // cluster (arrows/Home/End) — without it GetKeyNameTextW names the
-    // wrong key or fails (viv.c:12243-12254).
-    if matches!(vk, v if v == VK_HOME.0 || v == VK_END.0 || v == VK_LEFT.0 || v == VK_RIGHT.0) {
+    // cluster, and the "don't care" bit (1 << 25) for the modifiers —
+    // upstream's full lists (viv.c:12243-12254). Custom bindings (#25)
+    // can name any VK, so the whole table ships.
+    const EXTENDED: &[u16] = &[
+        0x21, // VK_PRIOR
+        0x22, // VK_NEXT
+        0x23, // VK_END
+        0x24, // VK_HOME
+        0x25, // VK_LEFT
+        0x26, // VK_UP
+        0x27, // VK_RIGHT
+        0x28, // VK_DOWN
+        0x2d, // VK_INSERT
+        0x2e, // VK_DELETE
+        0x90, // VK_NUMLOCK
+        0x6f, // VK_DIVIDE
+    ];
+    const DONT_CARE: &[u16] = &[
+        0x11, // VK_CONTROL
+        0x10, // VK_SHIFT
+        0x12, // VK_MENU
+        0x5b, // VK_LWIN
+        0x5c, // VK_RWIN
+    ];
+    if EXTENDED.contains(&vk) {
         lparam |= 1 << 24;
+    } else if DONT_CARE.contains(&vk) {
+        lparam |= 1 << 25;
     }
     let mut buf = [0u16; 64];
     // SAFETY: buf outlives the call; a zero return means "no name".
@@ -2634,31 +2691,13 @@ fn update_menu_frame(hwnd: HWND, show: bool, menu: HMENU) {
     }
 }
 
+/// WM_KEYDOWN / WM_SYSKEYDOWN (upstream viv.c:6346-6406): the ESC arm
+/// first (cancel drag / leave fullscreen), then the binding-table route —
+/// exact modifier+VK match, first command in table order wins — into the
+/// same `on_command` dispatch the menu uses. The bindings live in the
+/// config's [`crate::keys::KeyMap`] (ini `*_keys` overlays applied at
+/// load; upstream walks `_viv_key_list`, viv.c:6390-6405).
 fn on_keydown(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
-    // Upstream default keymap (viv.c:970-1049): Ctrl+O = open file and
-    // Ctrl+Shift+O = add file (viv.c:975); the navigation keys are
-    // UNMODIFIED Right/PgDn (next), Left/PgUp (prev), Home/End
-    // (viv.c:1040-1045). Up/Down are slideshow rate, not navigation — they
-    // stay unwired until the slideshow work.
-    if wparam.0 == usize::from(b'O') {
-        // SAFETY: GetKeyState reads thread-local async key state; the VKs are valid.
-        let ctrl = unsafe { GetKeyState(i32::from(VK_CONTROL.0)) } < 0;
-        // Upstream matches the full modifier mask (viv.c:6396-6402) —
-        // Ctrl+Alt+O is NOT Open File.
-        // SAFETY: GetKeyState reads thread-local async key state; VK_MENU is valid.
-        let alt = unsafe { GetKeyState(i32::from(VK_MENU.0)) } < 0;
-        if ctrl && !alt {
-            // SAFETY: GetKeyState reads thread-local async key state; VK_SHIFT is valid.
-            let shift = unsafe { GetKeyState(i32::from(VK_SHIFT.0)) } < 0;
-            open_image_via_dialog(hwnd, shift);
-        }
-        return;
-    }
-    // The zoom keys bind with upstream's exact modifier masks (viv.c:1017-
-    // 1024): '+'/'=' and numpad '+' zoom in, '-'/numpad '-' out — Ctrl
-    // accelerates ONLY the numpad variants; Ctrl+'0' resets to fit;
-    // Ctrl+Alt+'0' toggles temporary 1:1. Key repeat intentionally steps
-    // repeatedly (upstream has no repeat gating on zoom commands).
     // SAFETY: GetKeyState reads thread-local async key state; the VKs are valid.
     let (ctrl, shift, alt) = unsafe {
         (
@@ -2672,7 +2711,8 @@ fn on_keydown(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
     // viv.c:6367-6382: an unmodified ESC with a mouse action active
     // releases the capture FIRST; only otherwise does it exit fullscreen —
     // the slideshow pause arm of that block lands with the slideshow
-    // work).
+    // work). This arm is NOT a binding: it stands even when the ini
+    // binds ESC somewhere.
     if vk == VK_ESCAPE.0 && !ctrl && !shift && !alt {
         // SAFETY: the borrow spans only the Option take.
         let was_dragging =
@@ -2690,75 +2730,22 @@ fn on_keydown(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
         }
         return;
     }
-    // Alt+Return toggles fullscreen (upstream default keymap, viv.c:995 —
-    // an Alt-modified key, so it arrives as WM_SYSKEYDOWN; the exact-mask
-    // rule means Ctrl+Alt+Return is NOT the toggle).
-    if vk == VK_RETURN.0 && alt && !ctrl && !shift {
-        toggle_fullscreen(hwnd);
-        return;
-    }
-    // The menu-registered command keys the keyboard path also answers
-    // (upstream default keymap, exact masks): Ctrl+B open folder
-    // (viv.c:972), Ctrl+Q exit (viv.c:986), Ctrl+F1 about (viv.c:1074).
-    if vk == u16::from(b'B') && ctrl && !alt && !shift {
-        open_folder_via_dialog(hwnd);
-        return;
-    }
-    if vk == u16::from(b'Q') && ctrl && !alt && !shift {
-        // SAFETY: legal on the owning thread; WM_DESTROY saves the config
-        // and posts the quit (upstream _viv_exit, viv.c:1883-1888).
-        let _ = unsafe { DestroyWindow(hwnd) };
-        return;
-    }
-    if vk == VK_F1.0 && ctrl && !alt && !shift {
-        show_about(hwnd);
-        return;
-    }
-    if (vk == VK_OEM_PLUS.0 && !ctrl && !shift && !alt) || (vk == VK_ADD.0 && !shift && !alt) {
-        zoom_step_centered(hwnd, false);
-        return;
-    }
-    if (vk == VK_OEM_MINUS.0 && !ctrl && !shift && !alt) || (vk == VK_SUBTRACT.0 && !shift && !alt)
-    {
-        zoom_step_centered(hwnd, true);
-        return;
-    }
-    if vk == u16::from(b'0') && ctrl && !shift {
-        if alt {
-            toggle_one_to_one(hwnd);
-        } else {
-            zoom_reset(hwnd);
-        }
-        return;
-    }
-    // The navigation keys bind with no modifiers at all — Ctrl+Left etc.
-    // are the animation frame-step commands (M2 later), so any held
-    // ctrl/shift/alt disqualifies the key.
-    if ctrl || shift || alt {
-        return;
-    }
-    // Auto-repeat (lParam bit 30, upstream viv.c:6403): a repeated
-    // next/prev waits for the in-flight load instead of stacking opens.
-    let is_repeat = (lparam.0 & 0x4000_0000) != 0;
-    let repeat_waits = || {
+    // The binding route (upstream hands the repeat bit to
+    // `_viv_command_with_is_key_repeat`, whose only consumers are the
+    // navigation commands, viv.c:1707-1715 — riviv applies the same gate
+    // at the route: an auto-repeated next/prev waits for the in-flight
+    // load instead of stacking opens).
+    // SAFETY: the read-only borrow ends inside and_then.
+    let cmd = (unsafe { state_of(hwnd) }).and_then(|s| s.config.keys.lookup(ctrl, alt, shift, vk));
+    let Some(cmd) = cmd else { return };
+    if matches!(cmd, menu::Cmd::NavNext | menu::Cmd::NavPrev) && (lparam.0 & 0x4000_0000) != 0 {
         // SAFETY: the read-only borrow ends inside is_some_and.
-        (unsafe { state_of(hwnd) }).is_some_and(|s| nav_repeat_waits_for_load(s))
-    };
-    if vk == VK_RIGHT.0 || vk == VK_NEXT.0 {
-        if is_repeat && repeat_waits() {
+        let waits = (unsafe { state_of(hwnd) }).is_some_and(|s| nav_repeat_waits_for_load(s));
+        if waits {
             return;
         }
-        nav_next(hwnd, false);
-    } else if vk == VK_LEFT.0 || vk == VK_PRIOR.0 {
-        if is_repeat && repeat_waits() {
-            return;
-        }
-        nav_next(hwnd, true);
-    } else if vk == VK_HOME.0 {
-        home_open(hwnd, false);
-    } else if vk == VK_END.0 {
-        home_open(hwnd, true);
     }
+    on_command(hwnd, cmd);
 }
 
 /// WM_DROPFILES (upstream viv.c:3076-3128).
@@ -3627,13 +3614,18 @@ pub(crate) fn run(args: Vec<OsString>) -> Result<(), String> {
 
     // The startup window rect (kept from the load above — viv.c:5354-5387).
     let title = HSTRING::from_wide(&title_wide(None));
+    // The loaded bindings (still borrowed from the state box; the menu bar
+    // below needs them after the box moves into the window).
+    let keys = state.config.keys.clone();
     let state_ptr = Box::into_raw(Box::new(state));
 
     // The menu bar (upstream `_viv_create_menu` before CreateWindowExW,
-    // viv.c:5352): built once from the command table. A creation failure
-    // degrades to a menu-less window — every menu call guards on the
-    // invalid handle (the status-bar posture).
-    let menu_bar = create_menu_bar();
+    // viv.c:5352): built once from the command table over the LOADED key
+    // bindings (the ini's `*_keys` overlays are already in the config;
+    // upstream reads `_viv_key_list`, likewise seeded before this point).
+    // A creation failure degrades to a menu-less window — every menu call
+    // guards on the invalid handle (the status-bar posture).
+    let menu_bar = create_menu_bar(&keys);
     if menu_bar.is_invalid() {
         eprintln!("menu bar unavailable: CreateMenu failed");
     }

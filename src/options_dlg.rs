@@ -28,34 +28,55 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::UI::Controls::Dialogs::{CC_FULLOPEN, CC_RGBINIT, CHOOSECOLORW, ChooseColorW};
 use windows::Win32::UI::Controls::{
-    BST_CHECKED, DRAWITEMSTRUCT, NMTREEVIEWW, TVGN_CARET, TVI_LAST, TVI_ROOT, TVIF_PARAM,
-    TVIF_TEXT, TVINSERTSTRUCTW, TVITEMW, TVM_INSERTITEM, TVM_SELECTITEM, TVN_SELCHANGEDW,
-    TVS_HASBUTTONS, TVS_HASLINES, TVS_LINESATROOT, TVS_SHOWSELALWAYS,
+    BST_CHECKED, DRAWITEMSTRUCT, EM_SETSEL, NMTREEVIEWW, TVGN_CARET, TVI_LAST, TVI_ROOT,
+    TVIF_PARAM, TVIF_TEXT, TVINSERTSTRUCTW, TVITEMW, TVM_INSERTITEM, TVM_SELECTITEM,
+    TVN_SELCHANGEDW, TVS_HASBUTTONS, TVS_HASLINES, TVS_LINESATROOT, TVS_SHOWSELALWAYS,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    EnableWindow, GetKeyState, SetFocus, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, BM_GETCHECK, BM_SETCHECK, BN_CLICKED, BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON,
-    BS_OWNERDRAW, BS_PUSHBUTTON, CB_ADDSTRING, CB_ERR, CB_GETCURSEL, CB_SETCURSEL,
-    CBS_DROPDOWNLIST, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-    GWLP_USERDATA, GetDialogBaseUnits, GetMessageW, GetParent, GetWindowLongPtrW, GetWindowRect,
-    HMENU, IsChild, IsDialogMessageW, IsWindow, IsWindowVisible, MSG, PostQuitMessage,
-    RegisterClassExW, SW_HIDE, SW_SHOW, SendMessageW, SetWindowLongPtrW, ShowWindow,
-    TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CTLCOLORBTN,
-    WM_CTLCOLORSTATIC, WM_DESTROY, WM_DRAWITEM, WM_NOTIFY, WM_SETFONT, WNDCLASSEXW, WNDPROC,
-    WS_BORDER, WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_CONTROLPARENT,
-    WS_EX_DLGMODALFRAME, WS_GROUP, WS_POPUP, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+    BS_GROUPBOX, BS_OWNERDRAW, BS_PUSHBUTTON, CB_ADDSTRING, CB_ERR, CB_GETCURSEL, CB_SETCURSEL,
+    CBS_DROPDOWNLIST, CallWindowProcW, CreateWindowExW, DLGC_WANTALLKEYS, DefWindowProcW,
+    DestroyWindow, DispatchMessageW, ES_AUTOHSCROLL, ES_WANTRETURN, GWLP_USERDATA, GWLP_WNDPROC,
+    GetDialogBaseUnits, GetMessageW, GetParent, GetWindowLongPtrW, GetWindowRect, HMENU, IsChild,
+    IsDialogMessageW, IsWindow, IsWindowVisible, LB_ADDSTRING, LB_ERR, LB_GETCURSEL,
+    LB_GETITEMDATA, LB_RESETCONTENT, LB_SETCURSEL, LB_SETITEMDATA, LBN_SELCHANGE,
+    LBS_NOINTEGRALHEIGHT, LBS_NOTIFY, MSG, PostQuitMessage, RegisterClassExW, SW_HIDE, SW_SHOW,
+    SendMessageW, SetWindowLongPtrW, SetWindowTextW, ShowWindow, TranslateMessage, WINDOW_EX_STYLE,
+    WINDOW_STYLE, WM_CLOSE, WM_COMMAND, WM_CTLCOLORBTN, WM_CTLCOLORSTATIC, WM_DESTROY, WM_DRAWITEM,
+    WM_GETDLGCODE, WM_KEYDOWN, WM_LBUTTONDOWN, WM_NOTIFY, WM_RBUTTONDOWN, WM_SETFONT,
+    WM_SYSKEYDOWN, WNDCLASSEXW, WNDPROC, WS_BORDER, WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN,
+    WS_CLIPSIBLINGS, WS_EX_CLIENTEDGE, WS_EX_CONTROLPARENT, WS_EX_DLGMODALFRAME, WS_GROUP,
+    WS_POPUP, WS_SYSMENU, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
 use windows::core::{HSTRING, PCWSTR, PWSTR, w};
 
+use crate::keys::{self, KeyMap};
 use crate::options::{self, Field, Kind, OptionsModel, PAGES};
-use crate::window::state_of;
-use crate::{loc, text};
+use crate::window::{state_of, vk_text};
+use crate::{loc, menu, text};
 
 /// Dialog control ids (each child's `hMenu` integer). IDOK/IDCANCEL are the
 /// Win32 standards IsDialogMessage routes Enter/Esc through.
 const IDOK_BTN: i32 = 1;
 const IDCANCEL_BTN: i32 = 2;
 const TREE_ID: i32 = 101;
+/// The Controls page's key-editor area (upstream IDC_COMMANDS_LIST /
+/// IDC_KEYS_LIST / IDC_ADD_KEY / IDC_EDIT_KEY / IDC_REMOVE_KEY, resource.h:
+/// 60-64 — riviv's own numbering; the area is hand-built beside the
+/// declarative control table, not part of it). The 250+ block stays clear
+/// of the `ctrl_id` grid (whose page-2 slots run 210-212).
+const CMD_LIST_ID: i32 = 250;
+const KEYS_LIST_ID: i32 = 251;
+const ADD_KEY_BTN: i32 = 252;
+const EDIT_KEY_BTN: i32 = 253;
+const REMOVE_KEY_BTN: i32 = 254;
+/// The EditKey capture dialog's controls (upstream IDC_EDIT_KEY_EDIT /
+/// IDC_EDIT_KEY_CURRENTLY_USED_BY_LIST, resource.h:77).
+const EDIT_KEY_EDIT_ID: i32 = 260;
+const EDIT_USED_BY_ID: i32 = 261;
 
 /// Page p's control i (and the page containers themselves at 100*p+5).
 /// Deterministic so the WM_COMMAND dispatch and the smoke script share it.
@@ -73,6 +94,8 @@ fn index_of_ctrl(id: i32) -> usize {
 
 const DIALOG_CLASS: PCWSTR = w!("riviv_options");
 const PAGE_CLASS: PCWSTR = w!("riviv_options_page");
+/// The EditKey capture dialog's frame class (#25).
+const EDIT_KEY_CLASS: PCWSTR = w!("riviv_edit_key");
 
 /// The rc geometry (voidImageViewer.rc IDD_OPTIONS:53-66), in dialog
 /// units: client 310x271, tree (6,6) 84x240, page host at (106,26)
@@ -96,6 +119,17 @@ struct DlgState {
     /// The working model: checkbox/combo reads at OK overwrite the plain
     /// fields; the two colors are edited in place by the pickers.
     model: OptionsModel,
+    /// The Controls page's working key map (upstream deep-copies the
+    /// global list into the page at INITDIALOG, viv.c:8259-8265, and
+    /// commits it back at OK, viv.c:8779).
+    keys: KeyMap,
+    /// The key-editor area's controls (the Controls page's dedicated
+    /// block, `HWND::default()` while unbuilt).
+    cmd_list: HWND,
+    key_list: HWND,
+    add_key_btn: HWND,
+    edit_key_btn: HWND,
+    remove_key_btn: HWND,
     /// ChooseColor's 16 custom-color slots (the API needs a stable
     /// address for the dialog's lifetime).
     cust_colors: [COLORREF; 16],
@@ -130,12 +164,16 @@ unsafe fn dlg_state_of(hwnd: HWND) -> Option<&'static mut DlgState> {
 pub(crate) fn open(owner: HWND) {
     // SAFETY: a short read of the owner state before any dialog exists;
     // nothing pumps between the borrow and its end.
-    let model = unsafe { state_of(owner) }.map(|s| OptionsModel::from_config(&s.config));
-    let Some(model) = model else { return };
-    // SAFETY: a second short read of the owner state, same contract.
-    let last_page = unsafe { state_of(owner) }
-        .map(|s| s.config.options_last_page.clamp(0, PAGES.len() as i32 - 1) as usize)
-        .unwrap_or(0);
+    let init = unsafe { state_of(owner) }.map(|s| {
+        (
+            OptionsModel::from_config(&s.config),
+            s.config.keys.clone(),
+            s.config.options_last_page.clamp(0, PAGES.len() as i32 - 1) as usize,
+        )
+    });
+    let Some((model, keys, last_page)) = init else {
+        return;
+    };
 
     // SAFETY: pure stock-object query; the handle lives for the process.
     let font = unsafe { GetStockObject(DEFAULT_GUI_FONT) };
@@ -218,6 +256,12 @@ pub(crate) fn open(owner: HWND) {
                 pages: [HWND::default(); 3],
                 ctrls: [Vec::new(), Vec::new(), Vec::new()],
                 model,
+                keys,
+                cmd_list: HWND::default(),
+                key_list: HWND::default(),
+                add_key_btn: HWND::default(),
+                edit_key_btn: HWND::default(),
+                remove_key_btn: HWND::default(),
                 cust_colors: [COLORREF(0); 16],
             })) as *mut c_void as _,
         )
@@ -286,9 +330,10 @@ fn register_classes() {
         return;
     }
     // WNDPROC is an Option over the fn type both procs already have.
-    let classes: [(PCWSTR, WNDPROC); 2] = [
+    let classes: [(PCWSTR, WNDPROC); 3] = [
         (DIALOG_CLASS, Some(dialog_proc)),
         (PAGE_CLASS, Some(page_proc)),
+        (EDIT_KEY_CLASS, Some(edit_key_proc)),
     ];
     let mut ok = true;
     for (class, proc) in classes {
@@ -584,6 +629,11 @@ fn build_dialog(dlg: HWND, font: HGDIOBJ, dlu: impl Fn(i32, i32) -> (i32, i32), 
                     == BST_CHECKED.0 as isize;
                 let _ = EnableWindow(combo, on);
             }
+
+            // The Controls page's key-editor area (#25) — hand-built
+            // beside the declarative table (a multi-control composite, not
+            // one Field).
+            build_key_editor(dlg, state, font, &dlu);
         }
 
         // OK / Cancel (rc:198/252,252).
@@ -659,6 +709,375 @@ fn auto_zoom_pair(state: &DlgState) -> Option<(HWND, HWND)> {
         }
     }
     Some((combo?, check?))
+}
+
+/// Build the Controls page's key-editor area (upstream INITDIALOG,
+/// viv.c:8225-8308: the commands listbox over every non-popup command,
+/// then the first selection's key list + button states). Geometry from
+/// IDD_CONTROLS (rc:103-114): the label at y=53, the commands list at
+/// 64..142, the group at 148..215, the keys list and three buttons
+/// inside it.
+fn build_key_editor(
+    dlg: HWND,
+    state: &mut DlgState,
+    font: HGDIOBJ,
+    dlu: &impl Fn(i32, i32) -> (i32, i32),
+) {
+    let page = state.pages[2];
+    // SAFETY: every creation below uses the live page parent; handles are
+    // stored into the dialog state before any message can use them.
+    unsafe {
+        let set_font = |hwnd: HWND| {
+            let _ = SendMessageW(
+                hwnd,
+                WM_SETFONT,
+                Some(WPARAM(font.0 as usize)),
+                Some(LPARAM(1)),
+            );
+        };
+        // "&Commands:" static.
+        let (x, y) = dlu(0, 53);
+        let (w, h) = dlu(57, 8);
+        let label = HSTRING::from(loc::get(loc::Id::OptionsCommands));
+        let _ = CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            w!("STATIC"),
+            &label,
+            WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0),
+            x,
+            y,
+            w,
+            h,
+            Some(page),
+            None,
+            None,
+            None,
+        );
+        // The commands list (rc:104): every registered command in table
+        // order, display-named, the Cmd index riding as item data
+        // (upstream stores command_index, viv.c:8292-8301).
+        let (x, y) = dlu(0, 64);
+        let (w, h) = dlu(193, 78);
+        let cmd_list = CreateWindowExW(
+            WINDOW_EX_STYLE(WS_EX_CLIENTEDGE.0),
+            w!("LISTBOX"),
+            None,
+            WINDOW_STYLE(
+                WS_CHILD.0
+                    | WS_VISIBLE.0
+                    | WS_TABSTOP.0
+                    | WS_VSCROLL.0
+                    | (LBS_NOTIFY | LBS_NOINTEGRALHEIGHT) as u32,
+            ),
+            x,
+            y,
+            w,
+            h,
+            Some(page),
+            Some(HMENU(CMD_LIST_ID as *mut c_void)),
+            None,
+            None,
+        )
+        .unwrap_or_default();
+        set_font(cmd_list);
+        for cmd in menu::Cmd::ALL {
+            let text = HSTRING::from(keys::command_display_name(cmd));
+            let index = SendMessageW(
+                cmd_list,
+                LB_ADDSTRING,
+                Some(WPARAM(0)),
+                Some(LPARAM(text.as_ptr() as isize)),
+            );
+            if index.0 as i32 != LB_ERR {
+                let _ = SendMessageW(
+                    cmd_list,
+                    LB_SETITEMDATA,
+                    Some(WPARAM(index.0 as usize)),
+                    Some(LPARAM(cmd.id() as isize)),
+                );
+            }
+        }
+        // The group + keys list + buttons (rc:105-114).
+        let (x, y) = dlu(0, 148);
+        let (w, h) = dlu(193, 67);
+        let group = HSTRING::from(loc::get(loc::Id::OptionsSettingsForSelected));
+        let _ = CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            w!("BUTTON"),
+            &group,
+            WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | BS_GROUPBOX as u32),
+            x,
+            y,
+            w,
+            h,
+            Some(page),
+            None,
+            None,
+            None,
+        );
+        let (x, y) = dlu(7, 158);
+        let (w, h) = dlu(125, 50);
+        let key_list = CreateWindowExW(
+            WINDOW_EX_STYLE(WS_EX_CLIENTEDGE.0),
+            w!("LISTBOX"),
+            None,
+            WINDOW_STYLE(
+                WS_CHILD.0
+                    | WS_VISIBLE.0
+                    | WS_TABSTOP.0
+                    | WS_VSCROLL.0
+                    | (LBS_NOTIFY | LBS_NOINTEGRALHEIGHT) as u32,
+            ),
+            x,
+            y,
+            w,
+            h,
+            Some(page),
+            Some(HMENU(KEYS_LIST_ID as *mut c_void)),
+            None,
+            None,
+        )
+        .unwrap_or_default();
+        set_font(key_list);
+        let buttons = [
+            (
+                ADD_KEY_BTN,
+                loc::Id::OptionsAddKey,
+                (138, 158),
+                BS_PUSHBUTTON as u32,
+            ),
+            (
+                EDIT_KEY_BTN,
+                loc::Id::OptionsEditKey,
+                (137, 177),
+                BS_PUSHBUTTON as u32,
+            ),
+            (
+                REMOVE_KEY_BTN,
+                loc::Id::OptionsRemoveKey,
+                (137, 195),
+                BS_PUSHBUTTON as u32,
+            ),
+        ];
+        let mut handles = [HWND::default(); 3];
+        for (i, (id, label_id, (bx, by), style_extra)) in buttons.iter().enumerate() {
+            let (x, y) = dlu(*bx, *by);
+            let (w, h) = dlu(50, 14);
+            let label = HSTRING::from(loc::get(*label_id));
+            let hwnd = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("BUTTON"),
+                &label,
+                WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | *style_extra),
+                x,
+                y,
+                w,
+                h,
+                Some(page),
+                Some(HMENU(*id as *mut c_void)),
+                None,
+                None,
+            )
+            .unwrap_or_default();
+            set_font(hwnd);
+            handles[i] = hwnd;
+        }
+        state.cmd_list = cmd_list;
+        state.key_list = key_list;
+        state.add_key_btn = handles[0];
+        state.edit_key_btn = handles[1];
+        state.remove_key_btn = handles[2];
+        // First selection + refresh (upstream viv.c:8303-8304).
+        let _ = SendMessageW(cmd_list, LB_SETCURSEL, Some(WPARAM(0)), Some(LPARAM(0)));
+    }
+    refresh_key_list(dlg, 0);
+}
+
+/// Refresh the keys list to the selected command (upstream
+/// `_viv_options_key_list_sel_change`, viv.c:8012-8064): refill with the
+/// working map's bindings (label text + flags as item data), enable
+/// Add with a selection / Edit+Remove with keys, and restore the given
+/// selection index clamped to the list end.
+fn refresh_key_list(dlg: HWND, prev_key_index: i32) {
+    // SAFETY: the borrow spans only message sends to our own controls;
+    // nothing pumps.
+    unsafe {
+        let Some(state) = dlg_state_of(dlg) else {
+            return;
+        };
+        let sel = SendMessageW(
+            state.cmd_list,
+            LB_GETCURSEL,
+            Some(WPARAM(0)),
+            Some(LPARAM(0)),
+        );
+        let _ = SendMessageW(
+            state.key_list,
+            LB_RESETCONTENT,
+            Some(WPARAM(0)),
+            Some(LPARAM(0)),
+        );
+        let mut key_count: i32 = 0;
+        let mut cmd = None;
+        if sel.0 as i32 != LB_ERR {
+            let data = SendMessageW(
+                state.cmd_list,
+                LB_GETITEMDATA,
+                Some(WPARAM(sel.0 as usize)),
+                Some(LPARAM(0)),
+            );
+            cmd = menu::Cmd::from_id(data.0 as u16);
+        }
+        if let Some(cmd) = cmd {
+            for k in state.keys.keys(cmd).to_vec() {
+                let label = vk_text(k.vk)
+                    .map(|t| menu::key_label(k, &t))
+                    .unwrap_or_default();
+                let text = HSTRING::from(label);
+                let index = SendMessageW(
+                    state.key_list,
+                    LB_ADDSTRING,
+                    Some(WPARAM(0)),
+                    Some(LPARAM(text.as_ptr() as isize)),
+                );
+                if index.0 as i32 != LB_ERR {
+                    let _ = SendMessageW(
+                        state.key_list,
+                        LB_SETITEMDATA,
+                        Some(WPARAM(index.0 as usize)),
+                        Some(LPARAM(i32::from(keys::to_flags(k)) as isize)),
+                    );
+                }
+                key_count += 1;
+            }
+            let _ = EnableWindow(state.add_key_btn, true);
+            let _ = EnableWindow(state.edit_key_btn, key_count != 0);
+            let _ = EnableWindow(state.remove_key_btn, key_count != 0);
+            let sel = if prev_key_index == LB_ERR || prev_key_index > key_count - 1 {
+                key_count - 1
+            } else {
+                prev_key_index
+            };
+            if key_count != 0 {
+                let _ = SendMessageW(
+                    state.key_list,
+                    LB_SETCURSEL,
+                    Some(WPARAM(sel as usize)),
+                    Some(LPARAM(0)),
+                );
+            }
+        } else {
+            let _ = EnableWindow(state.add_key_btn, false);
+            let _ = EnableWindow(state.edit_key_btn, false);
+            let _ = EnableWindow(state.remove_key_btn, false);
+        }
+    }
+}
+
+/// The command selected in the commands list, if any.
+fn selected_cmd(dlg: HWND) -> Option<menu::Cmd> {
+    // SAFETY: the borrow spans only two message sends; nothing pumps.
+    unsafe {
+        let state = dlg_state_of(dlg)?;
+        let sel = SendMessageW(
+            state.cmd_list,
+            LB_GETCURSEL,
+            Some(WPARAM(0)),
+            Some(LPARAM(0)),
+        )
+        .0 as i32;
+        if sel == LB_ERR {
+            return None;
+        }
+        let data = SendMessageW(
+            state.cmd_list,
+            LB_GETITEMDATA,
+            Some(WPARAM(sel as usize)),
+            Some(LPARAM(0)),
+        );
+        menu::Cmd::from_id(data.0 as u16)
+    }
+}
+
+/// The Edit/Add button (upstream `_viv_options_edit_key`, viv.c:8160-8224):
+/// open the capture dialog on the selected key (or empty for Add); on a
+/// captured chord, strip it from every command first (ownership), then
+/// append (Add) or replace in place (Edit). A canceled dialog still runs
+/// the strip for the 0 chord — a harmless no-op unless the ini planted a
+/// 0 binding, exactly like upstream's unconditional call (viv.c:8196).
+fn on_edit_key(dlg: HWND, key_index: Option<usize>) {
+    let Some(cmd) = selected_cmd(dlg) else { return };
+    let initial: u16 = match key_index {
+        None => 0,
+        Some(i) => {
+            // SAFETY: read-only item-data query on our own list.
+            unsafe {
+                dlg_state_of(dlg)
+                    .map(|state| {
+                        SendMessageW(
+                            state.key_list,
+                            LB_GETITEMDATA,
+                            Some(WPARAM(i)),
+                            Some(LPARAM(0)),
+                        )
+                        .0 as u16
+                    })
+                    .unwrap_or(0)
+            }
+        }
+    };
+    let captured = edit_key_modal(dlg, initial);
+    // SAFETY: the borrow spans only the working-map edit; the modal has
+    // returned (no pump).
+    unsafe {
+        if let Some(state) = dlg_state_of(dlg) {
+            state.keys.remove_all(keys::from_flags(captured));
+        }
+    }
+    if captured == 0 {
+        return; // canceled (upstream refreshes only on a capture)
+    }
+    // SAFETY: as above.
+    unsafe {
+        if let Some(state) = dlg_state_of(dlg) {
+            match key_index {
+                None => state.keys.add(cmd, keys::from_flags(captured)),
+                Some(i) => state.keys.replace(cmd, i, keys::from_flags(captured)),
+            }
+        }
+    }
+    refresh_key_list(dlg, key_index.map(|i| i as i32).unwrap_or(LB_ERR));
+}
+
+/// The Remove button (upstream `_viv_options_remove_key`, viv.c:8066-8094):
+/// drop the selected binding (by value) and refresh holding the index.
+fn on_remove_key(dlg: HWND) {
+    let Some(cmd) = selected_cmd(dlg) else { return };
+    // SAFETY: the borrow spans the item-data read + the removal; nothing
+    // pumps.
+    unsafe {
+        let Some(state) = dlg_state_of(dlg) else {
+            return;
+        };
+        let sel = SendMessageW(
+            state.key_list,
+            LB_GETCURSEL,
+            Some(WPARAM(0)),
+            Some(LPARAM(0)),
+        )
+        .0 as i32;
+        if sel == LB_ERR {
+            return;
+        }
+        let data = SendMessageW(
+            state.key_list,
+            LB_GETITEMDATA,
+            Some(WPARAM(sel as usize)),
+            Some(LPARAM(0)),
+        );
+        state.keys.remove(cmd, keys::from_flags(data.0 as u16));
+        refresh_key_list(dlg, sel);
+    }
 }
 
 /// The combo init pass: the selection index for a value the table
@@ -745,9 +1164,32 @@ fn on_ok(dlg: HWND) {
             effects
         })
     };
+    // The working key map commits alongside (upstream
+    // `_viv_key_list_copy` at OK, viv.c:8779) — a changed map rebuilds
+    // the menu bar so the accelerator labels follow the bindings
+    // (upstream `_viv_create_menu` right after the copy, viv.c:8784-8800).
+    // SAFETY: the dialog-state borrow ends at the clone; the owner borrow
+    // spans only the compare/assign — nothing pumps.
+    let keys_changed = unsafe {
+        let work = dlg_state_of(dlg).map(|state| state.keys.clone());
+        work.is_some_and(|work| {
+            state_of(owner).is_some_and(|owner_state| {
+                let changed = work != owner_state.config.keys;
+                if changed {
+                    owner_state.config.keys = work;
+                }
+                changed
+            })
+        })
+    };
     if effects.is_some() {
         // SAFETY: no state borrow is live (the map above ended).
         crate::window::refresh_status(owner);
+    }
+    if keys_changed {
+        // SAFETY: no borrow is live (both maps above ended); the rebuild
+        // takes its own short borrows and pumps nothing.
+        crate::window::rebuild_menu_bar(owner);
     }
     // SAFETY: a fresh short borrow for the save; nothing pumps.
     unsafe {
@@ -788,6 +1230,16 @@ unsafe extern "system" fn dialog_proc(
         match msg {
             WM_COMMAND if (wparam.0 >> 16) & 0xffff == BN_CLICKED as usize => {
                 on_clicked(hwnd, (wparam.0 & 0xffff) as i32);
+                LRESULT(0)
+            }
+            // The commands list's selection change refills the keys list
+            // (upstream LBN_SELCHANGE → `_viv_options_key_list_sel_change`,
+            // viv.c:8322-8326; the page forwards WM_COMMAND to the frame).
+            WM_COMMAND
+                if (wparam.0 >> 16) & 0xffff == LBN_SELCHANGE as usize
+                    && (wparam.0 & 0xffff) as i32 == CMD_LIST_ID =>
+            {
+                refresh_key_list(hwnd, 0);
                 LRESULT(0)
             }
             WM_NOTIFY => {
@@ -838,6 +1290,38 @@ fn on_clicked(dlg: HWND, id: i32) {
     }
     let page = page_of_ctrl(id);
     let index = index_of_ctrl(id);
+    // The key-editor area's buttons first (their ids sit outside the
+    // ctrl_id grid).
+    match id {
+        ADD_KEY_BTN => {
+            on_edit_key(dlg, None);
+            return;
+        }
+        EDIT_KEY_BTN => {
+            let sel: Option<usize> = {
+                // SAFETY: read-only selection query on our own list.
+                unsafe {
+                    dlg_state_of(dlg).and_then(|state| {
+                        let sel = SendMessageW(
+                            state.key_list,
+                            LB_GETCURSEL,
+                            Some(WPARAM(0)),
+                            Some(LPARAM(0)),
+                        )
+                        .0 as i32;
+                        (sel != LB_ERR).then_some(sel as usize)
+                    })
+                }
+            };
+            on_edit_key(dlg, sel);
+            return;
+        }
+        REMOVE_KEY_BTN => {
+            on_remove_key(dlg);
+            return;
+        }
+        _ => {}
+    }
     let Some(ctrl) = PAGES.get(page).and_then(|p| p.controls.get(index)) else {
         return;
     };
@@ -1062,6 +1546,448 @@ unsafe extern "system" fn page_proc(
                 LRESULT(GetSysColorBrush(COLOR_BTNFACE).0 as isize)
             }
             _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The EditKey capture dialog (#25; upstream IDD_EDIT_KEY +
+// `_viv_edit_key_proc`, viv.c:8125-8158 + the subclassed edit
+// `_viv_edit_key_edit_proc`, viv.c:12470-12513).
+// ---------------------------------------------------------------------------
+
+/// Per-dialog heap state. Unlike the Options frame's box, this one is
+/// freed by the modal function AFTER the pump (the captured value is read
+/// out of it once the window is gone) — the dialog proc never frees it.
+struct EditKeyState {
+    /// The captured chord (flags form); 0 = nothing captured yet.
+    value: u16,
+    edit: HWND,
+    used_by: HWND,
+    /// The Options dialog (the used-by list walks up to the viewer
+    /// through it).
+    options: HWND,
+}
+
+/// The EditKey window's dlu geometry (rc IDD_EDIT_KEY:139-151).
+const EK_WIDE: i32 = 186;
+const EK_HIGH: i32 = 119;
+
+/// Open the capture dialog over `options`; returns the captured chord
+/// (flags), 0 on cancel (upstream `DialogBoxParam` returning the userdata
+/// — where a canceled dialog ends with 0, viv.c:8139/8144).
+fn edit_key_modal(options: HWND, initial: u16) -> u16 {
+    // SAFETY: pure stock/base queries mirroring `open`.
+    unsafe {
+        let font = GetStockObject(DEFAULT_GUI_FONT);
+        let base = GetDialogBaseUnits();
+        let dlu = |x: i32, y: i32| -> (i32, i32) {
+            (
+                x * (base as u16 as i32) / 4,
+                y * ((base >> 16) as u16 as i32) / 8,
+            )
+        };
+        register_classes();
+
+        let mut parent_rect = RECT::default();
+        let _ = GetWindowRect(options, &mut parent_rect);
+        let mut outer = RECT {
+            left: 0,
+            top: 0,
+            right: dlu(EK_WIDE, 0).0,
+            bottom: dlu(0, EK_HIGH).1,
+        };
+        let style = WINDOW_STYLE(
+            WS_POPUP.0 | WS_VISIBLE.0 | WS_CLIPSIBLINGS.0 | WS_CAPTION.0 | WS_SYSMENU.0,
+        );
+        let ex = WINDOW_EX_STYLE(WS_EX_DLGMODALFRAME.0 | WS_EX_CONTROLPARENT.0);
+        let _ = AdjustWindowRectEx(&mut outer, style, false, ex);
+        let wide = outer.right - outer.left;
+        let high = outer.bottom - outer.top;
+        let ox = parent_rect.left + (parent_rect.right - parent_rect.left - wide).max(0) / 2;
+        let oy = parent_rect.top + (parent_rect.bottom - parent_rect.top - high).max(0) / 2;
+
+        // Caption by mode (upstream LPARAM: 0 = Add, else Edit, viv.c:8128).
+        let caption_id = if initial != 0 {
+            loc::Id::EditKeyCaption
+        } else {
+            loc::Id::AddKeyCaption
+        };
+        let caption = HSTRING::from(loc::get(caption_id));
+        let dlg = CreateWindowExW(
+            ex,
+            EDIT_KEY_CLASS,
+            &caption,
+            style,
+            ox,
+            oy,
+            wide,
+            high,
+            Some(options),
+            None,
+            None,
+            None,
+        );
+        let Ok(dlg) = dlg else {
+            // System-level failure (ADR 0001): fail loud; the edit is
+            // simply canceled (0), the Options dialog keeps running.
+            let gle = GetLastError().0;
+            eprintln!("riviv: edit-key dialog CreateWindowExW failed (GLE={gle})");
+            return 0;
+        };
+        let state_ptr = Box::into_raw(Box::new(EditKeyState {
+            value: initial,
+            edit: HWND::default(),
+            used_by: HWND::default(),
+            options,
+        }));
+        SetWindowLongPtrW(dlg, GWLP_USERDATA, state_ptr as *mut c_void as _);
+
+        // "Shortcut &key:" + the capture edit (rc:143-144).
+        let (x, y) = dlu(7, 7);
+        let (w, h) = dlu(44, 8);
+        let l1 = HSTRING::from(loc::get(loc::Id::OptionsShortcutKey));
+        let _ = CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            w!("STATIC"),
+            &l1,
+            WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0),
+            x,
+            y,
+            w,
+            h,
+            Some(dlg),
+            None,
+            None,
+            None,
+        );
+        let (x, y) = dlu(7, 17);
+        let (w, h) = dlu(172, 14);
+        let edit = CreateWindowExW(
+            WINDOW_EX_STYLE(WS_EX_CLIENTEDGE.0),
+            w!("EDIT"),
+            None,
+            WINDOW_STYLE(
+                WS_CHILD.0 | WS_VISIBLE.0 | WS_TABSTOP.0 | (ES_AUTOHSCROLL | ES_WANTRETURN) as u32,
+            ),
+            x,
+            y,
+            w,
+            h,
+            Some(dlg),
+            Some(HMENU(EDIT_KEY_EDIT_ID as *mut c_void)),
+            None,
+            None,
+        )
+        .unwrap_or_default();
+        let _ = SendMessageW(
+            edit,
+            WM_SETFONT,
+            Some(WPARAM(font.0 as usize)),
+            Some(LPARAM(1)),
+        );
+        // The subclass that captures keys (upstream GWLP_WNDPROC swap with
+        // the old proc parked in GWLP_USERDATA, viv.c:8147-8148).
+        let old_proc =
+            SetWindowLongPtrW(edit, GWLP_WNDPROC, edit_key_edit_proc as *const () as isize);
+        SetWindowLongPtrW(edit, GWLP_USERDATA, old_proc);
+
+        // "Shortcut key currently used by:" + the list (rc:145-146).
+        let (x, y) = dlu(7, 36);
+        let (w, h) = dlu(102, 8);
+        let l2 = HSTRING::from(loc::get(loc::Id::OptionsShortcutKeyUsedBy));
+        let _ = CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            w!("STATIC"),
+            &l2,
+            WINDOW_STYLE(WS_CHILD.0 | WS_VISIBLE.0),
+            x,
+            y,
+            w,
+            h,
+            Some(dlg),
+            None,
+            None,
+            None,
+        );
+        let (x, y) = dlu(7, 47);
+        let (w, h) = dlu(172, 43);
+        let used_by = CreateWindowExW(
+            WINDOW_EX_STYLE(WS_EX_CLIENTEDGE.0),
+            w!("LISTBOX"),
+            None,
+            WINDOW_STYLE(
+                WS_CHILD.0
+                    | WS_VISIBLE.0
+                    | WS_VSCROLL.0
+                    | (LBS_NOTIFY | LBS_NOINTEGRALHEIGHT) as u32,
+            ),
+            x,
+            y,
+            w,
+            h,
+            Some(dlg),
+            Some(HMENU(EDIT_USED_BY_ID as *mut c_void)),
+            None,
+            None,
+        )
+        .unwrap_or_default();
+        let _ = SendMessageW(
+            used_by,
+            WM_SETFONT,
+            Some(WPARAM(font.0 as usize)),
+            Some(LPARAM(1)),
+        );
+        // OK / Cancel (rc:147-148).
+        let by1 = dlu(0, 98).1;
+        let bw = dlu(50, 0).0;
+        let bh = dlu(0, 14).1;
+        for (id, label_id, bx, def) in [
+            (IDOK_BTN, loc::Id::OptionsOk, 70, true),
+            (IDCANCEL_BTN, loc::Id::OptionsCancel, 129, false),
+        ] {
+            let label = HSTRING::from(loc::get(label_id));
+            let handle = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("BUTTON"),
+                &label,
+                WINDOW_STYLE(
+                    WS_CHILD.0
+                        | WS_VISIBLE.0
+                        | WS_TABSTOP.0
+                        | if def { BS_DEFPUSHBUTTON } else { BS_PUSHBUTTON } as u32,
+                ),
+                dlu(bx, 0).0,
+                by1,
+                bw,
+                bh,
+                Some(dlg),
+                Some(HMENU(id as *mut c_void)),
+                None,
+                None,
+            )
+            .unwrap_or_default();
+            let _ = SendMessageW(
+                handle,
+                WM_SETFONT,
+                Some(WPARAM(font.0 as usize)),
+                Some(LPARAM(1)),
+            );
+        }
+
+        (*state_ptr).edit = edit;
+        (*state_ptr).used_by = used_by;
+        set_captured_key(dlg, initial);
+        let _ = SetFocus(Some(edit));
+
+        // The modal loop: disable the Options frame (the dialog-manager
+        // owner disable), pump through IsDialogMessageW. Messages for the
+        // disabled Options family still dispatch through their own procs
+        // (WM_TIMER repaints etc.), like the outer modal loop.
+        let _ = EnableWindow(options, false);
+        let _ = ShowWindow(dlg, SW_SHOW);
+        let mut msg = MSG::default();
+        loop {
+            let r = GetMessageW(&mut msg, None, 0, 0).0;
+            if r == 0 {
+                PostQuitMessage(msg.wParam.0 as i32);
+                break;
+            }
+            if r == -1 {
+                break;
+            }
+            let for_dialog = msg.hwnd == dlg || IsChild(dlg, msg.hwnd).as_bool();
+            if !(for_dialog && IsDialogMessageW(dlg, &raw const msg).as_bool()) {
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+            if !IsWindow(Some(dlg)).as_bool() {
+                break;
+            }
+        }
+        let _ = EnableWindow(options, true);
+        if IsWindow(Some(dlg)).as_bool() {
+            let _ = DestroyWindow(dlg);
+        }
+        // The result outlives the window (the box is ours to free here —
+        // the dialog proc never drops it).
+        let value = (*state_ptr).value;
+        drop(Box::from_raw(state_ptr));
+        value
+    }
+}
+
+/// The EditKey frame proc (upstream `_viv_edit_key_proc`, viv.c:8125-8158):
+/// OK ends with the captured value, Cancel/close with 0.
+unsafe extern "system" fn edit_key_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    // SAFETY: the userdata box is live from creation until the modal
+    // function frees it — after every message this window can receive.
+    unsafe {
+        let state_ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut EditKeyState;
+        match msg {
+            WM_COMMAND if (wparam.0 >> 16) & 0xffff == BN_CLICKED as usize => {
+                match (wparam.0 & 0xffff) as i32 {
+                    IDOK_BTN => {
+                        let _ = DestroyWindow(hwnd);
+                    }
+                    IDCANCEL_BTN => {
+                        if !state_ptr.is_null() {
+                            (*state_ptr).value = 0;
+                        }
+                        let _ = DestroyWindow(hwnd);
+                    }
+                    _ => {}
+                }
+                LRESULT(0)
+            }
+            WM_CLOSE => {
+                // X / Alt+F4 = cancel (the dialog convention).
+                if !state_ptr.is_null() {
+                    (*state_ptr).value = 0;
+                }
+                let _ = DestroyWindow(hwnd);
+                LRESULT(0)
+            }
+            WM_CTLCOLORBTN | WM_CTLCOLORSTATIC => {
+                LRESULT(GetSysColorBrush(COLOR_BTNFACE).0 as isize)
+            }
+            _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+        }
+    }
+}
+
+/// The capture edit's subclass (upstream `_viv_edit_key_edit_proc`,
+/// viv.c:12470-12513): swallow every key, ignore bare modifiers, capture
+/// anything else as the chord; WANTALLKEYS keeps the IsDialogMessage
+/// pump from eating keys first (Enter/Esc capture like upstream's).
+unsafe extern "system" fn edit_key_edit_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    // SAFETY: GWLP_USERDATA holds the original EDIT proc from the swap in
+    // edit_key_modal for the control's lifetime.
+    unsafe {
+        let last_proc = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+        match msg {
+            WM_GETDLGCODE => LRESULT(DLGC_WANTALLKEYS as isize),
+            WM_KEYDOWN | WM_SYSKEYDOWN => {
+                let vk = wparam.0 as u16;
+                if matches!(
+                    vk,
+                    v if v == VK_CONTROL.0
+                        || v == VK_SHIFT.0
+                        || v == VK_MENU.0
+                        || v == VK_LWIN.0
+                        || v == VK_RWIN.0
+                ) {
+                    return LRESULT(0);
+                }
+                let (ctrl, shift, alt) = (
+                    GetKeyState(i32::from(VK_CONTROL.0)) < 0,
+                    GetKeyState(i32::from(VK_SHIFT.0)) < 0,
+                    GetKeyState(i32::from(VK_MENU.0)) < 0,
+                );
+                let flags = keys::to_flags(crate::menu::KeyDef {
+                    ctrl,
+                    alt,
+                    shift,
+                    vk,
+                });
+                // The parent owns the value + the used-by list.
+                let parent = GetParent(hwnd).unwrap_or_default();
+                set_captured_key(parent, flags);
+                LRESULT(0)
+            }
+            WM_LBUTTONDOWN | WM_RBUTTONDOWN => {
+                // Focus follows a click on the read-only capture field.
+                let _ = SetFocus(Some(hwnd));
+                LRESULT(0)
+            }
+            _ => CallWindowProcW(
+                Some(std::mem::transmute::<
+                    isize,
+                    unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT,
+                >(last_proc)),
+                hwnd,
+                msg,
+                wparam,
+                lparam,
+            ),
+        }
+    }
+}
+
+/// Record the captured chord: store it, show its label (upstream
+/// `_viv_edit_key_set_key`, viv.c:12586-12604 — the caret moves to the
+/// end), and refresh the "currently used by" list (upstream
+/// `_viv_options_edit_key_changed`, viv.c:12555-12584 — which scans the
+/// VIEWER's live map, not the Options working copy).
+///
+/// # Safety
+///
+/// `dlg` must be the live EditKey frame created by `edit_key_modal`.
+unsafe fn set_captured_key(dlg: HWND, flags: u16) {
+    // SAFETY: the state box is live for the dialog's lifetime (freed by
+    // the modal function after the pump).
+    unsafe {
+        let ptr = GetWindowLongPtrW(dlg, GWLP_USERDATA) as *mut EditKeyState;
+        if ptr.is_null() {
+            return;
+        }
+        (*ptr).value = flags;
+        let k = keys::from_flags(flags);
+        let label = if flags != 0 {
+            vk_text(k.vk)
+                .map(|t| menu::key_label(k, &t))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        let text = HSTRING::from(label);
+        let _ = SetWindowTextW((*ptr).edit, &text);
+        // Caret to the end (upstream os_edit_move_caret_to_end).
+        let _ = SendMessageW(
+            (*ptr).edit,
+            EM_SETSEL,
+            Some(WPARAM(0x7fffffff)),
+            Some(LPARAM(0x7fffffff)),
+        );
+        // The used-by list: the viewer's LIVE bindings (upstream reads
+        // the global `_viv_key_list`; the working copy differs until OK).
+        let _ = SendMessageW(
+            (*ptr).used_by,
+            LB_RESETCONTENT,
+            Some(WPARAM(0)),
+            Some(LPARAM(0)),
+        );
+        if flags != 0 {
+            let owners = state_of(owner_of((*ptr).options))
+                .map(|s| s.config.keys.owners(k))
+                .unwrap_or_default();
+            for cmd in owners {
+                let name = HSTRING::from(keys::command_display_name(cmd));
+                let index = SendMessageW(
+                    (*ptr).used_by,
+                    LB_ADDSTRING,
+                    Some(WPARAM(0)),
+                    Some(LPARAM(name.as_ptr() as isize)),
+                );
+                if index.0 as i32 != LB_ERR {
+                    let _ = SendMessageW(
+                        (*ptr).used_by,
+                        LB_SETCURSEL,
+                        Some(WPARAM(0)),
+                        Some(LPARAM(0)),
+                    );
+                }
+            }
         }
     }
 }

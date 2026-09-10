@@ -147,6 +147,24 @@ pub(crate) enum Id {
     OptionsRightClickAction,
     /// Controls page: mouse wheel action label (en_us.h:237).
     OptionsMouseWheelAction,
+    /// Controls page: the commands list caption (en_us.h:238).
+    OptionsCommands,
+    /// Controls page: the key-list group caption (en_us.h:239).
+    OptionsSettingsForSelected,
+    /// Controls page: the Add-key button (en_us.h:240).
+    OptionsAddKey,
+    /// Controls page: the Edit-key button (en_us.h:241).
+    OptionsEditKey,
+    /// Controls page: the Remove-key button (en_us.h:242).
+    OptionsRemoveKey,
+    /// Edit-key dialog caption, Add flavor (en_us.h:243).
+    AddKeyCaption,
+    /// Edit-key dialog caption, Edit flavor (en_us.h:244).
+    EditKeyCaption,
+    /// Edit-key dialog: the shortcut label (en_us.h:245).
+    OptionsShortcutKey,
+    /// Edit-key dialog: the currently-used-by label (en_us.h:246).
+    OptionsShortcutKeyUsedBy,
     /// Left-click combo item: Scroll (en_us.h:263).
     ActionScroll,
     /// Left-click combo item: Zoom In (en_us.h:266).
@@ -240,6 +258,15 @@ const EN_US: [&str; Id::COUNT] = [
     "&Left click action:", // OptionsLeftClickAction
     "&Right click action:", // OptionsRightClickAction
     "&Mouse wheel action:", // OptionsMouseWheelAction
+    "&Commands:",  // OptionsCommands
+    "Settings for selected command", // OptionsSettingsForSelected
+    "&Add...",     // OptionsAddKey
+    "&Edit...",    // OptionsEditKey
+    "Remo&ve",     // OptionsRemoveKey
+    "Add Keyboard Shortcut", // AddKeyCaption
+    "Edit Keyboard Shortcut", // EditKeyCaption
+    "Shortcut &key:", // OptionsShortcutKey
+    "Shortcut key currently used by:", // OptionsShortcutKeyUsedBy
     "Scroll",      // ActionScroll
     "Zoom In",     // ActionZoomIn
     "Next Image",  // ActionNextImage
@@ -310,6 +337,15 @@ const ZH_CN: [&str; Id::COUNT] = [
     "左键操作(&L):",                      // OptionsLeftClickAction
     "右键操作(&R):",                      // OptionsRightClickAction
     "鼠标滚轮操作(&M):",                  // OptionsMouseWheelAction
+    "命令(&C):",                          // OptionsCommands
+    "所选命令的设置",                     // OptionsSettingsForSelected
+    "添加(&A)...",                        // OptionsAddKey
+    "编辑(&E)...",                        // OptionsEditKey
+    "删除(&V)",                           // OptionsRemoveKey
+    "添加键盘快捷键",                     // AddKeyCaption
+    "编辑键盘快捷键",                     // EditKeyCaption
+    "快捷键(&K):",                        // OptionsShortcutKey
+    "当前使用此快捷键的命令:",            // OptionsShortcutKeyUsedBy
     "滚动",                               // ActionScroll
     "放大",                               // ActionZoomIn
     "下一张图像",                         // ActionNextImage
