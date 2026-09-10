@@ -26,6 +26,9 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 
 use crate::ini;
+use crate::keys;
+use crate::keys::KeyMap;
+use crate::menu::Cmd;
 
 /// The settings file's section name and basename (upstream uses
 /// "voidImageViewer" for both; riviv names its own).
@@ -98,6 +101,11 @@ pub(crate) struct Config {
     pub(crate) orientation: i32,
     pub(crate) title_bar_format: i32,
     pub(crate) add_command_line_timeout: i32,
+    /// The per-command keyboard bindings (#25; upstream keeps these OUTSIDE
+    /// the `config_*` int globals in `_viv_key_list`, but loads/saves them
+    /// through the same ini pass — riding inside `Config` gives them the
+    /// same two-location overlay and `.tmp` save discipline for free).
+    pub(crate) keys: KeyMap,
 }
 
 impl Default for Config {
@@ -164,6 +172,7 @@ impl Default for Config {
             orientation: 1,
             title_bar_format: 1,
             add_command_line_timeout: 500,
+            keys: KeyMap::default(),
         }
     }
 }
@@ -341,18 +350,30 @@ impl Config {
         if root {
             apply_byte!(appdata = "appdata");
         }
+        // The `*_keys` overlays (config.c:180-222): a PRESENT line replaces
+        // the command's bindings wholesale (empty = none); a missing line
+        // keeps whatever stands — the defaults, or an earlier file's value
+        // in the appdata-overlay pass.
+        for cmd in Cmd::ALL {
+            let name = keys::ini_name(cmd);
+            if let Some(value) = pairs.get(&name) {
+                self.keys.apply_ini(cmd, value);
+            }
+        }
     }
 
-    /// The key=value table in upstream save order (config.c:293-347).
-    /// The exe-dir (`root`) form degenerates to the `appdata` marker only
-    /// when the switch is ON — that is where the real table then lives
-    /// (config.c:298-300: `is_root && config_appdata`).
-    fn to_pairs(&self, root: bool) -> Vec<(&'static str, String)> {
+    /// The key=value table in upstream save order (config.c:293-383): the
+    /// int keys, then one `*_keys` line per command in command order
+    /// (present-but-empty clears — upstream writes the line even for an
+    /// empty list). The exe-dir (`root`) form degenerates to the
+    /// `appdata` marker only when the switch is ON — that is where the
+    /// real table then lives (config.c:298-300: `is_root && config_appdata`).
+    fn to_pairs(&self, root: bool) -> Vec<(String, String)> {
         let i = |v: i32| v.to_string();
         if root && self.appdata != 0 {
-            return vec![("appdata", i(self.appdata))];
+            return vec![("appdata".to_string(), i(self.appdata))];
         }
-        vec![
+        let int_pairs: [(&str, String); 60] = [
             ("x", i(self.x)),
             ("y", i(self.y)),
             ("wide", i(self.wide)),
@@ -434,7 +455,17 @@ impl Config {
             ("toolbar_move_window", i(self.toolbar_move_window)),
             ("title_bar_format", i(self.title_bar_format)),
             ("add_command_line_timeout", i(self.add_command_line_timeout)),
-        ]
+        ];
+        let mut pairs: Vec<(String, String)> = int_pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), v.clone()))
+            .collect();
+        // The per-command key lists (upstream appends them after the int
+        // table, one line per command, config.c:350-383).
+        for cmd in Cmd::ALL {
+            pairs.push((keys::ini_name(cmd), self.keys.to_ini(cmd)));
+        }
+        pairs
     }
 }
 
@@ -484,7 +515,7 @@ fn appdata_ini() -> Option<PathBuf> {
 /// MoveFileExW(REPLACE_EXISTING) with the CopyFile+DeleteFile fallback
 /// (config.c:394-400; `std::fs::rename` IS MoveFileExW with the replace
 /// flag on Windows).
-fn save_by_location(path: PathBuf, pairs: Vec<(&str, String)>) {
+fn save_by_location(path: PathBuf, pairs: Vec<(String, String)>) {
     let text = ini::serialize(SECTION, &pairs);
     let tmp = path.with_extension("ini.tmp");
     if let Err(e) = std::fs::write(&tmp, text) {
@@ -551,7 +582,8 @@ mod tests {
         let text = ini::serialize(SECTION, &c.to_pairs(false));
         let back = parse_apply(&text, true);
         assert_eq!(back, c, "every save key must be a load key");
-        assert_eq!(c.to_pairs(false).len(), 60, "the upstream int-key table");
+        // 60 int keys + one *_keys line per command (17).
+        assert_eq!(c.to_pairs(false).len(), 77, "the upstream save table");
     }
 
     #[test]
@@ -601,14 +633,45 @@ mod tests {
         let c = Config::default();
         assert_eq!(
             c.to_pairs(true).len(),
-            60,
+            77,
             "active store writes the full table"
         );
         let c = Config {
             appdata: 1,
             ..Config::default()
         };
-        assert_eq!(c.to_pairs(true), vec![("appdata", "1".to_string())]);
+        assert_eq!(
+            c.to_pairs(true),
+            vec![("appdata".to_string(), "1".to_string())]
+        );
+    }
+
+    #[test]
+    fn keys_lines_replace_and_missing_lines_keep_defaults() {
+        // config.c:180-222: a present `*_keys` line rebuilds that
+        // command's list (empty = no bindings); a missing line leaves the
+        // default table standing.
+        let c = parse_apply("[riviv]\nnavigate_next_keys=78\nfile_exit_keys=\n", true);
+        assert_eq!(c.keys.keys(Cmd::NavNext).len(), 1);
+        assert_eq!(c.keys.keys(Cmd::NavNext)[0].vk, 78);
+        assert!(c.keys.keys(Cmd::FileExit).is_empty());
+        // Untouched commands keep their defaults (and the ini overlay of a
+        // second location only replaces lines IT carries).
+        assert_eq!(c.keys.keys(Cmd::FileOpenFile).len(), 1);
+        let c = parse_apply("[riviv]\n[riviv]\n", true);
+        assert_eq!(c.keys, KeyMap::default());
+    }
+
+    #[test]
+    fn keys_lines_round_trip_through_save() {
+        // A customized map saves to decimal flags and reads back identically
+        // ('N'=0x4E=78 bare, Ctrl+F2=0x1F1=497).
+        let mut c = Config::default();
+        c.keys.set(Cmd::NavNext, vec![crate::keys::from_flags(78)]);
+        c.keys.add(Cmd::HelpAbout, crate::keys::from_flags(497));
+        let text = ini::serialize(SECTION, &c.to_pairs(false));
+        let back = parse_apply(&text, true);
+        assert_eq!(back.keys, c.keys);
     }
 
     #[test]

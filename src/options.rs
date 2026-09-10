@@ -15,8 +15,9 @@
 //! page drops title-bar-format / loop-once / preload / cache (features not
 //! implemented), and keeps-aspect / fill / fullscreen-fill / frame-minus
 //! move here from upstream's MENU surface (viv.c:2032-2060 / 3994-3999),
-//! which riviv's menu does not register. The Controls page drops the
-//! key-binding editor (#25).
+//! which riviv's menu does not register. The Controls page's key-binding
+//! editor lives in `keys.rs` + the hand-built area of `options_dlg.rs`
+//! (#25) — a multi-control composite, not one declarative Field.
 
 use crate::config::Config;
 use crate::loc;
@@ -313,7 +314,9 @@ pub(crate) const VIEW: &[Ctrl] = &[
     },
 ];
 
-/// Controls (rc IDD_CONTROLS:91-115; the key-binding editor is #25).
+/// Controls (rc IDD_CONTROLS:91-115; the three action combos — the
+/// key-binding editor area is hand-built in `options_dlg.rs` beside this
+/// table, #25).
 pub(crate) const CONTROLS: &[Ctrl] = &[
     Ctrl {
         kind: Kind::Combo(LEFT_CLICK_ACTIONS),

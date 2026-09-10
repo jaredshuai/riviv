@@ -12,8 +12,9 @@
 //! on demand in exactly this order).
 //!
 //! The Win32 half lives in `window.rs`: it walks [`ENTRIES`] into real
-//! HMENU objects, appends the accelerator labels, and dispatches
-//! WM_COMMAND through [`Cmd::from_id`].
+//! HMENU objects, appends the accelerator labels (from the live
+//! [`crate::keys::KeyMap`]'s first binding per command — #25), and
+//! dispatches WM_COMMAND through [`Cmd::from_id`].
 
 use crate::loc;
 
@@ -123,12 +124,9 @@ impl Slot {
     pub(crate) const COUNT: usize = Self::Help as usize + 1;
 }
 
-/// A default key binding (upstream `_viv_default_keys[]`, viv.c:969-1129 —
-/// flags are `CONFIG_KEYFLAG_CTRL/ALT/SHIFT << 8 | VK`; riviv keeps the
-/// parts split). One entry per command — the FIRST key upstream registers,
-/// which is the one the menu label displays (viv.c:12354-12366); the
-/// keyboard path keeps answering the alternates (numpad +/-, PgUp/PgDn)
-/// that upstream also registers.
+/// One keyboard binding (upstream `config_key_t`'s `WORD key` with the
+/// parts split; the wire/in form lives in [`crate::keys`]). The menu
+/// label shows the command's FIRST registered binding (viv.c:12354-12366).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct KeyDef {
     pub(crate) ctrl: bool,
@@ -138,21 +136,12 @@ pub(crate) struct KeyDef {
     pub(crate) vk: u16,
 }
 
-// Win32 virtual-key codes used by the default keys (WinUser.h; kept as raw
-// values so this module stays pure-logic with no windows crate dependency).
-const VK_RETURN: u16 = 0x0d;
-const VK_END: u16 = 0x23;
-const VK_HOME: u16 = 0x24;
-const VK_LEFT: u16 = 0x25;
-const VK_RIGHT: u16 = 0x27;
-const VK_F1: u16 = 0x70;
-const VK_OEM_PLUS: u16 = 0xbb;
-const VK_OEM_MINUS: u16 = 0xbd;
-
 /// One row of the menu table (upstream `_viv_command_t`, viv.c:408-413):
-/// what to append, into which parent slot, and the default key whose label
-/// rides along on items. The enum shape makes the invalid upstream combos
-/// (a key on a separator, a localization id on a separator) unrepresentable.
+/// what to append and into which parent slot. The enum shape makes the
+/// invalid upstream combos (a localization id on a separator) unrepresentable.
+/// Accelerator labels are NOT part of the row — they come from the live
+/// [`crate::keys::KeyMap`] at build time (#25; upstream
+/// `_viv_key_list->start[...]`, viv.c:12365-12367).
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Entry {
     Separator {
@@ -168,7 +157,6 @@ pub(crate) enum Entry {
         loc: loc::Id,
         parent: Slot,
         cmd: Cmd,
-        key: Option<KeyDef>,
     },
 }
 
@@ -187,23 +175,11 @@ pub(crate) const ENTRIES: &[Entry] = &[
         loc: loc::Id::MenuOpenFile,
         parent: Slot::File,
         cmd: Cmd::FileOpenFile,
-        key: Some(KeyDef {
-            ctrl: true,
-            alt: false,
-            shift: false,
-            vk: b'O' as u16,
-        }),
     },
     Entry::Item {
         loc: loc::Id::MenuOpenFolder,
         parent: Slot::File,
         cmd: Cmd::FileOpenFolder,
-        key: Some(KeyDef {
-            ctrl: true,
-            alt: false,
-            shift: false,
-            vk: b'B' as u16,
-        }),
     },
     // Upstream slots Add File after the open rows (viv.c:805, after the
     // Everything row riviv does not ship).
@@ -211,24 +187,12 @@ pub(crate) const ENTRIES: &[Entry] = &[
         loc: loc::Id::MenuAddFile,
         parent: Slot::File,
         cmd: Cmd::FileAddFile,
-        key: Some(KeyDef {
-            ctrl: true,
-            alt: false,
-            shift: true,
-            vk: b'O' as u16,
-        }),
     },
     Entry::Separator { parent: Slot::File },
     Entry::Item {
         loc: loc::Id::MenuExit,
         parent: Slot::File,
         cmd: Cmd::FileExit,
-        key: Some(KeyDef {
-            ctrl: true,
-            alt: false,
-            shift: false,
-            vk: b'Q' as u16,
-        }),
     },
     // View (viv.c:839-935): Menu toggle, fullscreen, 1:1 / Best Fit, the
     // Zoom submenu, Options last — upstream's relative order, gaps dropped.
@@ -241,38 +205,22 @@ pub(crate) const ENTRIES: &[Entry] = &[
         loc: loc::Id::MenuMenu,
         parent: Slot::View,
         cmd: Cmd::ViewMenu,
-        // Upstream registers no default key for VIV_ID_VIEW_MENU
-        // (absent from _viv_default_keys).
-        key: None,
     },
     Entry::Separator { parent: Slot::View },
     Entry::Item {
         loc: loc::Id::MenuFullscreen,
         parent: Slot::View,
         cmd: Cmd::ViewFullscreen,
-        key: Some(KeyDef {
-            ctrl: false,
-            alt: true,
-            shift: false,
-            vk: VK_RETURN,
-        }),
     },
     Entry::Item {
         loc: loc::Id::MenuOneToOne,
         parent: Slot::View,
         cmd: Cmd::ViewOneToOne,
-        key: Some(KeyDef {
-            ctrl: true,
-            alt: true,
-            shift: false,
-            vk: b'0' as u16,
-        }),
     },
     Entry::Item {
         loc: loc::Id::MenuBestFit,
         parent: Slot::View,
         cmd: Cmd::ViewBestFit,
-        key: None,
     },
     Entry::Popup {
         loc: loc::Id::MenuZoom,
@@ -283,46 +231,22 @@ pub(crate) const ENTRIES: &[Entry] = &[
         loc: loc::Id::MenuZoomIn,
         parent: Slot::ViewZoom,
         cmd: Cmd::ViewZoomIn,
-        key: Some(KeyDef {
-            ctrl: false,
-            alt: false,
-            shift: false,
-            vk: VK_OEM_PLUS,
-        }),
     },
     Entry::Item {
         loc: loc::Id::MenuZoomOut,
         parent: Slot::ViewZoom,
         cmd: Cmd::ViewZoomOut,
-        key: Some(KeyDef {
-            ctrl: false,
-            alt: false,
-            shift: false,
-            vk: VK_OEM_MINUS,
-        }),
     },
     Entry::Item {
         loc: loc::Id::MenuZoomReset,
         parent: Slot::ViewZoom,
         cmd: Cmd::ViewZoomReset,
-        key: Some(KeyDef {
-            ctrl: true,
-            alt: false,
-            shift: false,
-            vk: b'0' as u16,
-        }),
     },
     Entry::Separator { parent: Slot::View },
     Entry::Item {
         loc: loc::Id::MenuOptions,
         parent: Slot::View,
         cmd: Cmd::ViewOptions,
-        key: Some(KeyDef {
-            ctrl: false,
-            alt: false,
-            shift: false,
-            vk: b'O' as u16,
-        }),
     },
     // Navigate (viv.c:952-959).
     Entry::Popup {
@@ -334,45 +258,21 @@ pub(crate) const ENTRIES: &[Entry] = &[
         loc: loc::Id::MenuNext,
         parent: Slot::Navigate,
         cmd: Cmd::NavNext,
-        key: Some(KeyDef {
-            ctrl: false,
-            alt: false,
-            shift: false,
-            vk: VK_RIGHT,
-        }),
     },
     Entry::Item {
         loc: loc::Id::MenuPrevious,
         parent: Slot::Navigate,
         cmd: Cmd::NavPrev,
-        key: Some(KeyDef {
-            ctrl: false,
-            alt: false,
-            shift: false,
-            vk: VK_LEFT,
-        }),
     },
     Entry::Item {
         loc: loc::Id::MenuHome,
         parent: Slot::Navigate,
         cmd: Cmd::NavHome,
-        key: Some(KeyDef {
-            ctrl: false,
-            alt: false,
-            shift: false,
-            vk: VK_HOME,
-        }),
     },
     Entry::Item {
         loc: loc::Id::MenuEnd,
         parent: Slot::Navigate,
         cmd: Cmd::NavEnd,
-        key: Some(KeyDef {
-            ctrl: false,
-            alt: false,
-            shift: false,
-            vk: VK_END,
-        }),
     },
     // Help (viv.c:962-965): upstream precedes About with Help /
     // command-line options / website / donate rows riviv does not ship.
@@ -385,12 +285,6 @@ pub(crate) const ENTRIES: &[Entry] = &[
         loc: loc::Id::MenuAbout,
         parent: Slot::Help,
         cmd: Cmd::HelpAbout,
-        key: Some(KeyDef {
-            ctrl: true,
-            alt: false,
-            shift: false,
-            vk: VK_F1,
-        }),
     },
 ];
 
@@ -523,32 +417,15 @@ mod tests {
     }
 
     #[test]
-    fn default_keys_are_globally_unique() {
-        // One physical chord must not trigger two commands — upstream's
-        // key list would deliver the key to whichever command matched
-        // first (config.c's key ownership), so the table must never
-        // register a duplicate.
-        let mut seen: Vec<KeyDef> = Vec::new();
-        for entry in ENTRIES {
-            if let Entry::Item { key: Some(key), .. } = entry {
-                assert!(
-                    !seen.contains(key),
-                    "key {key:?} bound to more than one command"
-                );
-                seen.push(*key);
-            }
-        }
-    }
-
-    #[test]
     fn key_labels_use_upstreams_modifier_order() {
         // _viv_get_key_text appends Ctrl, then Alt, then Shift (viv.c:
-        // 12287-12301) before the key name.
+        // 12287-12301) before the key name. VKs: F1=0x70, Return=0x0D,
+        // Right=0x27 (WinUser.h).
         let chord = KeyDef {
             ctrl: true,
             alt: true,
             shift: true,
-            vk: VK_F1,
+            vk: 0x70,
         };
         assert_eq!(key_label(chord, "F1"), "Ctrl+Alt+Shift+F1");
         assert_eq!(
@@ -557,7 +434,7 @@ mod tests {
                     ctrl: false,
                     alt: true,
                     shift: false,
-                    vk: VK_RETURN
+                    vk: 0x0d
                 },
                 "Enter"
             ),
@@ -582,7 +459,7 @@ mod tests {
                     ctrl: false,
                     alt: false,
                     shift: false,
-                    vk: VK_RIGHT
+                    vk: 0x27
                 },
                 "Right"
             ),

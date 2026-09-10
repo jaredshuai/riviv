@@ -57,7 +57,10 @@
 //! - `loc` — bilingual string tables + one-shot system-language detection
 //!   (#20, landed)
 //! - `copydata` — the single-instance handoff payload codec (#21, landed)
-//! - `menu` — the menu command table: WM_COMMAND ids, default keys,
+//! - `keys` — per-command keyboard bindings: the default table, the ini
+//!   `*_keys` codec, the lookup router and the Controls-page name model
+//!   (#25)
+//! - `menu` — the menu command table: WM_COMMAND ids,
 //!   accelerator labels and the WM_INITMENU check/enable model (#23)
 //! - `paint` — WM_PAINT render; M2: stitch/mip (#9); zoom/pan offsets,
 //!   the BitBlt 1:1 path and the COLORONCOLOR magnify filter landed (#7)
@@ -78,6 +81,7 @@ mod copydata;
 mod cursor;
 mod fit;
 mod ini;
+mod keys;
 mod loader;
 mod loadthread;
 mod loc;
