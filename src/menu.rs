@@ -26,9 +26,15 @@ pub(crate) enum Cmd {
     FileOpenFile,
     /// File → Open Folder... (`VIV_ID_FILE_OPEN_FOLDER`).
     FileOpenFolder,
+    /// File → Open Everything Search... (`VIV_ID_FILE_OPEN_EVERYTHING_
+    /// SEARCH`, viv.c:804) — the #22 search dialog's Open flavor.
+    FileOpenEverythingSearch,
     /// File → Add File... (`VIV_ID_FILE_ADD_FILE`) — the Ctrl+Shift+O
     /// append path.
     FileAddFile,
+    /// File → Add Everything Search... (`VIV_ID_FILE_ADD_EVERYTHING_
+    /// SEARCH`, viv.c:807) — the #22 search dialog's Add flavor.
+    FileAddEverythingSearch,
     /// File → Exit (`VIV_ID_FILE_EXIT`).
     FileExit,
     /// View → Menu toggle (`VIV_ID_VIEW_MENU`).
@@ -89,7 +95,9 @@ impl Cmd {
     pub(crate) const ALL: [Cmd; Cmd::COUNT] = [
         Self::FileOpenFile,
         Self::FileOpenFolder,
+        Self::FileOpenEverythingSearch,
         Self::FileAddFile,
+        Self::FileAddEverythingSearch,
         Self::FileExit,
         Self::ViewMenu,
         Self::ViewFullscreen,
@@ -181,12 +189,26 @@ pub(crate) const ENTRIES: &[Entry] = &[
         parent: Slot::File,
         cmd: Cmd::FileOpenFolder,
     },
+    // Upstream's Everything rows (viv.c:804/807, after Open Folder and Add
+    // File, skipping the unimplemented Add Folder between them) — #22.
+    // Upstream MF_OWNERDRAW-hides both from the menu (viv.c:12328 skips
+    // them); riviv shows implemented commands (the Add File precedent).
+    Entry::Item {
+        loc: loc::Id::MenuOpenEverythingSearch,
+        parent: Slot::File,
+        cmd: Cmd::FileOpenEverythingSearch,
+    },
     // Upstream slots Add File after the open rows (viv.c:805, after the
-    // Everything row riviv does not ship).
+    // Everything row).
     Entry::Item {
         loc: loc::Id::MenuAddFile,
         parent: Slot::File,
         cmd: Cmd::FileAddFile,
+    },
+    Entry::Item {
+        loc: loc::Id::MenuAddEverythingSearch,
+        parent: Slot::File,
+        cmd: Cmd::FileAddEverythingSearch,
     },
     Entry::Separator { parent: Slot::File },
     Entry::Item {

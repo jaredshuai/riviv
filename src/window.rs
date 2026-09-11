@@ -104,6 +104,7 @@ use crate::anim::ANIMATION_TIMER_ID;
 use crate::config::Config;
 use crate::copydata;
 use crate::cursor::{self, CursorVisibility};
+use crate::everything;
 use crate::loader::{LoadedImage, UiAction, apply_reply, map_reply_frame};
 use crate::loadthread::{LoadSession, LoadThread, REPLY_KICK_MESSAGE};
 use crate::loc;
@@ -233,6 +234,17 @@ pub(crate) struct WindowState {
     /// subfolder of a recursive scan). `None` = never picked; the dialog
     /// then falls back to the current image's parent like riviv's Ctrl+O.
     pub(crate) last_open_folder: Option<OsString>,
+    /// Everything-search random mode (#22; upstream `_viv_random` +
+    /// `_viv_random_tot_results` + CRT rand, viv.c:749-751): the armed
+    /// search term, the result total (0xFFFFFFFF until a reply narrows
+    /// it), the stored QUERY2 request flags the reply parse walks
+    /// (upstream `_viv_everything_request_flags`, viv.c:751 — stored at
+    /// send, never read from the reply echo), and the MSVC-LCG state the
+    /// random offsets draw from.
+    pub(crate) random_search: Option<Vec<u16>>,
+    pub(crate) random_tot_results: u32,
+    pub(crate) everything_request_flags: u32,
+    pub(crate) random_rand_state: u32,
 }
 
 /// Window state pointer stored in GWLP_USERDATA between WM_NCCREATE and
@@ -1486,7 +1498,15 @@ fn scan_dir(hwnd: HWND) -> std::path::PathBuf {
 /// playlist, the folder scan of `scan_dir` — and a scan that finds
 /// NOTHING blanks the display (`_viv_blank`, viv.c:6245-6253; unreachable
 /// while the playlist is non-empty, its first node always qualifies).
-fn home_open(hwnd: HWND, end: bool) {
+/// In random mode (checked first, `end` ignored like upstream) the call
+/// just draws one more random image (viv.c:6122-6125).
+pub(crate) fn home_open(hwnd: HWND, end: bool) {
+    // Random mode first (viv.c:6122): borrow only long enough to decide.
+    // SAFETY: the read-only borrow ends inside is_some_and.
+    if (unsafe { state_of(hwnd) }).is_some_and(|s| s.random_search.is_some()) {
+        everything::send_random(hwnd);
+        return;
+    }
     // SAFETY: the borrow ends at the end of this statement (the entry is
     // cloned out); nothing below pumps.
     let playlist_target = (unsafe { state_of(hwnd) }).and_then(|s| {
@@ -1512,8 +1532,12 @@ fn home_open(hwnd: HWND, end: bool) {
 /// by id), folder-scan arm over the current file's parent otherwise, and
 /// no current at all becomes home(0) — for prev too (viv.c:6101-6104).
 /// next/prev NEVER blanks: no candidate is a no-op (viv.c:6093-6099).
+/// In random mode every direction draws one more random image (upstream
+/// checks `_viv_random` after its load-wait gate, viv.c:5855-5858; riviv's
+/// gate lives in the keydown route, so the check sits at the top here).
 fn nav_next(hwnd: HWND, prev: bool) {
     enum Mode {
+        Random,
         Home,
         Playlist,
         Scan,
@@ -1521,6 +1545,7 @@ fn nav_next(hwnd: HWND, prev: bool) {
     // SAFETY: the borrow ends at the end of this statement (only the mode
     // is taken out); nothing below pumps.
     let mode = match unsafe { state_of(hwnd) } {
+        Some(state) if state.random_search.is_some() => Mode::Random,
         Some(state) => match state.nav_current.as_ref() {
             None => Mode::Home,
             Some(_) if state.playlist.is_empty() => Mode::Scan,
@@ -1529,6 +1554,7 @@ fn nav_next(hwnd: HWND, prev: bool) {
         None => return,
     };
     match mode {
+        Mode::Random => everything::send_random(hwnd),
         Mode::Home => home_open(hwnd, false),
         Mode::Playlist => {
             // SAFETY: the borrow ends at the end of this statement (the
@@ -1554,11 +1580,14 @@ fn nav_next(hwnd: HWND, prev: bool) {
 
 /// Upstream `_viv_blank` (viv.c:7908-7930): clear the display, the
 /// navigation reference AND the playlist; the title falls back to the app
-/// name. Any in-flight load is superseded (upstream `_viv_clear` stops the
-/// load thread). The failure flags are NOT reset — upstream's
-/// `_viv_clear`/`_viv_blank` leave `_viv_file_not_found`/`_viv_load_failed`
-/// alone (viv.c:1268-1293), so a stale verdict survives the blank until the
-/// next open resets it (viv.c:1447-1458).
+/// name. Random mode EXITS here too (viv.c:7912-7917 — upstream frees
+/// `_viv_random` right after `_viv_clear`; the result total stays stale,
+/// harmlessly, the next randomize resets it). Any in-flight load is
+/// superseded (upstream `_viv_clear` stops the load thread). The failure
+/// flags are NOT reset — upstream's `_viv_clear`/`_viv_blank` leave
+/// `_viv_file_not_found`/`_viv_load_failed` alone (viv.c:1268-1293), so a
+/// stale verdict survives the blank until the next open resets it
+/// (viv.c:1447-1458).
 fn blank_display(hwnd: HWND) {
     let stop_timer;
     {
@@ -1571,6 +1600,7 @@ fn blank_display(hwnd: HWND) {
         state.path = None;
         state.playlist.clear();
         state.nav_current = None;
+        state.random_search = None;
         state.displayed_file_bytes = None;
         state.pending_file_bytes = None;
         state.session = None;
@@ -1625,6 +1655,21 @@ fn mark_startup_not_found(hwnd: HWND) {
     refresh_status(hwnd);
 }
 
+/// Seed an EMPTY playlist with the current image (upstream
+/// `add_current_if_empty`, viv.c:9341-9351): the current file becomes the
+/// first entry with a FRESH id — the navigation reference is NOT remapped
+/// (only `_viv_add_current_path_to_playlist`, viv.c:13511-13517, does
+/// that). Shared by the add-mode command line, shift-drops and the
+/// Everything ADD reply.
+fn playlist_add_current_if_empty(state: &mut WindowState) {
+    if state.playlist.is_empty()
+        && let Some(current) = state.nav_current.as_ref()
+    {
+        let current = current.clone();
+        state.playlist.add(current.path, current.modified);
+    }
+}
+
 /// Run one command line's FILE arguments through the open path (upstream
 /// `_viv_process_command_line`, viv.c:4744-5148, minus the switch commands
 /// riviv does not take — switches were dropped at parse, main.rs): ONE
@@ -1644,11 +1689,16 @@ fn mark_startup_not_found(hwnd: HWND) {
 fn process_command_line(hwnd: HWND, args: &[OsString], is_add: bool) {
     // The parse-time clear (viv.c:4998-5006): a REPLACING command line with
     // at least one file word starts a fresh playlist; a switch-only line
-    // (empty `args` here, or in add-mode) never clears.
-    if !is_add && !args.is_empty() {
-        // SAFETY: the borrow spans only the clear.
+    // (empty `args` here, or in add-mode) never clears. Random mode exits
+    // on the first file word of ANY command line — add-mode included, the
+    // clear sits OUTSIDE upstream's `!is_add` gate (viv.c:4998-5003).
+    if !args.is_empty() {
+        // SAFETY: the borrow spans the clear and one field store.
         if let Some(state) = unsafe { state_of(hwnd) } {
-            state.playlist.clear();
+            if !is_add {
+                state.playlist.clear();
+            }
+            state.random_search = None;
         }
     }
     // Two-plus words add every word (upstream's loop adds the stashed
@@ -1671,12 +1721,7 @@ fn process_command_line(hwnd: HWND, args: &[OsString], is_add: bool) {
             // EMPTY playlist before the argument lands — after the
             // two-plus-word adds above, a non-empty list skips it, exactly
             // upstream's order.
-            if state.playlist.is_empty()
-                && let Some(current) = state.nav_current.as_ref()
-            {
-                let current = current.clone();
-                state.playlist.add(current.path, current.modified);
-            }
+            playlist_add_current_if_empty(state);
             // A lone word IS appended in add-mode (viv.c:5038-5041).
             if args.len() == 1 {
                 playlist::add_filename(&mut state.playlist, Path::new(&args[0]));
@@ -1766,6 +1811,99 @@ fn on_copydata(hwnd: HWND, cds: &COPYDATASTRUCT) -> bool {
     // SAFETY: hwnd is live.
     let _ = unsafe { ShowWindow(hwnd, SHOW_WINDOW_CMD(handoff.show_cmd as i32)) };
     true
+}
+
+/// An Everything OPEN/ADD reply (upstream viv.c:3808-3904): exit random
+/// mode, OPEN clears the playlist and ADD seeds an empty one with the
+/// current image (`add_current_if_empty`), then every parseable item
+/// appends — and OPEN homes onto the sort extreme (which is the MTIME
+/// NEWEST result under the default sort, not the first result; the list
+/// itself keeps Everything's result order). The parse walks the flags
+/// stored at SEND time, never the reply's echo.
+fn on_everything_reply(hwnd: HWND, cds: &COPYDATASTRUCT, add: bool) {
+    // SAFETY: the WM_COPYDATA contract guarantees lpData addresses cbData
+    // readable bytes for the duration of the message (the null/size gate
+    // ran in the message arm before this).
+    let bytes = unsafe { std::slice::from_raw_parts(cds.lpData.cast::<u8>(), cds.cbData as usize) };
+    // SAFETY: the borrow spans the random exit, the playlist ops and the
+    // flags read — the metadata-free adds never pump.
+    let parsed = (unsafe { state_of(hwnd) }).map(|state| {
+        state.random_search = None;
+        if add {
+            playlist_add_current_if_empty(state);
+        } else {
+            state.playlist.clear();
+        }
+        let flags = state.everything_request_flags;
+        let reply = everything::parse_list2(bytes, flags);
+        for item in &reply.items {
+            let path = OsString::from_wide(&item.path);
+            state.playlist.add(path, item.modified_ticks.unwrap_or(0));
+        }
+        reply
+    });
+    if !add && parsed.is_some() {
+        home_open(hwnd, false);
+    }
+}
+
+/// An Everything RANDOM reply (upstream viv.c:3724-3804) — the exact
+/// three-way split: no items with a positive total stores the total and
+/// retries (the random index was past the end); otherwise the FIRST item
+/// opens directly when it survives the filters (folder/length/extension —
+/// all inside `parse_list2`); anything else is upstream's silent hard stop,
+/// no retry.
+fn on_random_reply(hwnd: HWND, cds: &COPYDATASTRUCT) {
+    enum Decision {
+        Open(everything::List2Item),
+        Retry,
+        Stop,
+    }
+    // SAFETY: same WM_COPYDATA contract as on_everything_reply.
+    let bytes = unsafe { std::slice::from_raw_parts(cds.lpData.cast::<u8>(), cds.cbData as usize) };
+    // SAFETY: the borrow spans the flags read and the total store — nothing
+    // pumps.
+    let decision = (unsafe { state_of(hwnd) }).map(|state| {
+        let reply = everything::parse_list2(bytes, state.everything_request_flags);
+        if reply.numitems == 0 {
+            if reply.totitems > 0 {
+                state.random_tot_results = reply.totitems;
+                Decision::Retry
+            } else {
+                Decision::Stop
+            }
+        } else {
+            reply
+                .items
+                .first()
+                .cloned()
+                .map_or(Decision::Stop, Decision::Open)
+        }
+    });
+    match decision {
+        Some(Decision::Open(item)) => {
+            let path = OsString::from_wide(&item.path);
+            // The direct open (upstream `_viv_open(fd,0)` with zeroed
+            // reserved fields, viv.c:3790 — a fresh id-0 navigation
+            // reference).
+            request_open(hwnd, &path, OpenOrigin::Direct);
+        }
+        // numitems == 0 && totitems > 0: re-query with the narrowed total
+        // (viv.c:3799-3802 posts the retry; send_random re-checks
+        // random-search arming itself).
+        Some(Decision::Retry) => {
+            // SAFETY: queues a message; never pumps.
+            let _ = unsafe {
+                PostMessageW(
+                    Some(hwnd),
+                    everything::RETRY_RANDOM_MESSAGE,
+                    WPARAM(0),
+                    LPARAM(0),
+                )
+            };
+        }
+        _ => {}
+    }
 }
 
 /// Split a forwarded command line into main.rs's file arguments: drop the
@@ -2090,20 +2228,19 @@ fn open_image_via_dialog(hwnd: HWND, add: bool) {
     let Some(path) = open_file_dialog(hwnd, initial_dir.as_deref()) else {
         return; // user cancelled
     };
-    // SAFETY: the borrow spans only the playlist mutation —
+    // SAFETY: the borrow spans the playlist mutation and one field store —
     // nothing pumps.
     if let Some(state) = unsafe { state_of(hwnd) } {
+        // Any picked file exits random mode (viv.c:2383-2388 — upstream
+        // clears right after GetOpenFileName succeeds, before the
+        // open/add branch).
+        state.random_search = None;
         if add {
             // Add File appends (viv.c:2396-2402): the current
             // file becomes the first entry when the list is
             // empty, then the pick — no clear, no home, the
             // display stays.
-            if state.playlist.is_empty()
-                && let Some(current) = state.nav_current.as_ref()
-            {
-                let current = current.clone();
-                state.playlist.add(current.path, current.modified);
-            }
+            playlist_add_current_if_empty(state);
             playlist::add_filename(&mut state.playlist, Path::new(&path));
         } else {
             // Open File clears the playlist before opening
@@ -2137,9 +2274,11 @@ fn open_folder_via_dialog(hwnd: HWND) {
     let Some(folder) = pick_folder(hwnd, initial_dir.as_deref()) else {
         return; // cancelled / unavailable
     };
-    // SAFETY: the borrow spans the playlist clear and the memory store —
-    // nothing pumps.
+    // SAFETY: the borrow spans the playlist clear, the memory store and
+    // the random exit — nothing pumps.
     if let Some(state) = unsafe { state_of(hwnd) } {
+        // A picked folder exits random mode (viv.c:2424-2429).
+        state.random_search = None;
         state.playlist.clear();
         state.last_open_folder = Some(folder.clone());
     }
@@ -2556,6 +2695,11 @@ fn on_command(hwnd: HWND, cmd: menu::Cmd) {
     match cmd {
         menu::Cmd::FileOpenFile => open_image_via_dialog(hwnd, false),
         menu::Cmd::FileOpenFolder => open_folder_via_dialog(hwnd),
+        // The Everything search dialog (#22; upstream viv.c:2510-2516):
+        // modal over the viewer; the Open flavor clears the playlist via
+        // the query reply, the Add flavor appends.
+        menu::Cmd::FileOpenEverythingSearch => everything::open_search_dialog(hwnd, false),
+        menu::Cmd::FileAddEverythingSearch => everything::open_search_dialog(hwnd, true),
         menu::Cmd::FileAddFile => open_image_via_dialog(hwnd, true),
         menu::Cmd::FileExit => {
             // Upstream `_viv_exit` (viv.c:1883-1888) saves the config and
@@ -2760,16 +2904,16 @@ fn on_drop_files(hwnd: HWND, hdrop: HDROP) {
         // append (`add_current_if_empty`, viv.c:3090-3094 — the current
         // file becomes the first playlist entry with a FRESH id when the
         // list is empty), no shift means replace (`clearall` runs even for
-        // a single dropped file, viv.c:3095-3098).
+        // a single dropped file, viv.c:3095-3098). ANY drop exits random
+        // mode first (viv.c:3082-3087).
         let is_shift = GetKeyState(i32::from(VK_SHIFT.0)) < 0;
-        // SAFETY: the borrow spans only the playlist mutation.
+        // SAFETY: the borrow spans the playlist mutation and one field
+        // store.
         if let Some(state) = state_of(hwnd) {
-            if is_shift && state.playlist.is_empty() {
-                if let Some(current) = state.nav_current.as_ref() {
-                    let current = current.clone();
-                    state.playlist.add(current.path, current.modified);
-                }
-            } else if !is_shift {
+            state.random_search = None;
+            if is_shift {
+                playlist_add_current_if_empty(state);
+            } else {
                 state.playlist.clear();
             }
         }
@@ -3090,21 +3234,42 @@ unsafe extern "system" fn wnd_proc(
             on_drop_files(hwnd, HDROP(wparam.0 as *mut c_void));
             LRESULT(0)
         }
-        // The single-instance handoff receive (#21; upstream viv.c:3688-3719):
-        // only the command-line id is ours — anything else (upstream also
-        // multiplexes its Everything-search IPC here) goes to the default.
+        // The single-instance handoff receive (#21; upstream viv.c:3688-3719)
+        // + the Everything-search replies (#22; upstream viv.c:3724-3904):
+        // only the command-line id claims the message (upstream `return 1`
+        // for it alone, viv.c:3720); the Everything ids are processed and
+        // then fall to the default — upstream's arms break to DefWindowProc
+        // (returning FALSE, which Everything does not check, viv.c:3904-3907).
         // A null lparam is a malformed foreign send no legitimate sender
         // makes — upstream null-derefs straight into an access violation
         // here; riviv routes it to the default instead (the PR #27 rule:
         // where C crashes on pathological input, Rust must degrade
         // gracefully, never UB).
         WM_COPYDATA => {
-            // SAFETY: lparam points at the sender-owned COPYDATASTRUCT for
-            // the duration of the message (the WM_COPYDATA contract), and
-            // the null guard keeps hostile sends out of the cast.
-            if lparam.0 != 0 && on_copydata(hwnd, unsafe { &*(lparam.0 as *const COPYDATASTRUCT) })
+            if lparam.0 != 0
+                // SAFETY: lparam points at the sender-owned COPYDATASTRUCT
+                // for the duration of the message (the WM_COPYDATA
+                // contract), and the null guard keeps hostile sends out of
+                // the cast.
+                && on_copydata(hwnd, unsafe { &*(lparam.0 as *const COPYDATASTRUCT) })
             {
                 LRESULT(1)
+            } else if lparam.0 != 0 {
+                // SAFETY: same contract + null guard as above.
+                let cds = unsafe { &*(lparam.0 as *const COPYDATASTRUCT) };
+                match cds.dwData {
+                    everything::COPYDATA_OPEN_EVERYTHING_SEARCH => {
+                        on_everything_reply(hwnd, cds, false)
+                    }
+                    everything::COPYDATA_ADD_EVERYTHING_SEARCH => {
+                        on_everything_reply(hwnd, cds, true)
+                    }
+                    everything::COPYDATA_RANDOM_EVERYTHING_SEARCH => on_random_reply(hwnd, cds),
+                    _ => {}
+                }
+                // SAFETY: hwnd/msg are exactly what this callback received;
+                // the default procedure handles everything we do not.
+                unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
             } else {
                 // SAFETY: hwnd/msg are exactly what this callback received;
                 // the default procedure handles everything we do not.
@@ -3128,6 +3293,15 @@ unsafe extern "system" fn wnd_proc(
         // just wakes the UI thread to drain them (upstream _VIV_WM_REPLY).
         REPLY_KICK_MESSAGE => {
             on_load_replies(hwnd);
+            LRESULT(0)
+        }
+        // The random-Everything retry (#22; upstream
+        // _VIV_WM_RETRY_RANDOM_EVERYTHING_SEARCH, viv.c:2754-2756): an
+        // out-of-range index learned the real total; redraw one. Upstream
+        // breaks to the default afterwards — equivalent to returning 0 for
+        // a WM_APP message nobody else consumes.
+        everything::RETRY_RANDOM_MESSAGE => {
+            everything::send_random(hwnd);
             LRESULT(0)
         }
         WM_DESTROY => {
@@ -3631,6 +3805,10 @@ pub(crate) fn run(args: Vec<OsString>) -> Result<(), String> {
         prevent_deactivate_show: false,
         last_cl_tick: None,
         last_open_folder: None,
+        random_search: None,
+        random_tot_results: 0,
+        everything_request_flags: 0,
+        random_rand_state: 0,
     };
 
     // SAFETY: returns the module handle of this exe; no side effects.

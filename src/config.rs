@@ -584,8 +584,9 @@ mod tests {
         let text = ini::serialize(SECTION, &c.to_pairs(false));
         let back = parse_apply(&text, true);
         assert_eq!(back, c, "every save key must be a load key");
-        // 60 int keys + one *_keys line per command (17).
-        assert_eq!(c.to_pairs(false).len(), 77, "the upstream save table");
+        // 60 int keys + one *_keys line per command (19, with #22's two
+        // Everything searches).
+        assert_eq!(c.to_pairs(false).len(), 79, "the upstream save table");
     }
 
     #[test]
@@ -635,7 +636,7 @@ mod tests {
         let c = Config::default();
         assert_eq!(
             c.to_pairs(true).len(),
-            77,
+            79,
             "active store writes the full table"
         );
         let c = Config {

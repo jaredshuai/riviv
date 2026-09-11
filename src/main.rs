@@ -83,6 +83,7 @@ mod assoc;
 mod config;
 mod copydata;
 mod cursor;
+mod everything;
 mod fit;
 mod ini;
 mod keys;
