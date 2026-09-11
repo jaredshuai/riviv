@@ -1360,6 +1360,14 @@ fn request_open(hwnd: HWND, path: &OsStr, origin: OpenOrigin<'_>) {
                 id: 0,
             },
         });
+        // The title follows the request too (upstream copies fd into
+        // _viv_current_fd and updates the title when the load is queued,
+        // viv.c:1574-1578): the name shows while Loading, and a failure
+        // never reverts it — the FAILED handler touches neither
+        // _viv_current_fd nor the title (viv.c:2832-2840); only blank
+        // clears both (viv.c:7919-7923). The actual SetWindowTextW runs
+        // after the borrow below.
+        state.path = Some(path.to_os_string());
         // The byte size is STAGED, not committed: a replacement load that
         // fails before its first frame keeps the old image on screen, and
         // the status bar must keep showing the OLD file's size with it
@@ -1396,6 +1404,17 @@ fn request_open(hwnd: HWND, path: &OsStr, origin: OpenOrigin<'_>) {
                 .load_thread
                 .request(hwnd, path.to_os_string(), render_viewport, background);
         state.session = Some(session);
+    }
+    // The request-time title update (upstream viv.c:1577-1578 — see the
+    // path store above). The borrow is dropped before the call like every
+    // SetWindowTextW here.
+    // SAFETY: the short borrow spans only the path read for the title.
+    if let Some(state) = unsafe { state_of(hwnd) } {
+        let title = HSTRING::from_wide(&title_wide(state.path.as_deref()));
+        // SAFETY: hwnd is live; the HSTRING outlives the call. Fail-soft
+        // like every other title update (upstream viv.c:1249 ignores the
+        // SetWindowTextW return too).
+        let _ = unsafe { SetWindowTextW(hwnd, &title) };
     }
     refresh_status(hwnd);
 }
@@ -2058,8 +2077,14 @@ fn on_load_replies(hwnd: HWND) {
                             // reaches here, so the old size survives).
                             state.displayed_file_bytes = state.pending_file_bytes.take();
                         } else {
-                            state.path = None;
-                            title = Some(HSTRING::from_wide(&title_wide(None)));
+                            // The mid-stream FAILED clear: the display goes
+                            // blank but the title KEEPS the failed file's
+                            // name — upstream's FAILED handler runs
+                            // _viv_clear on the frame data only, leaving
+                            // _viv_current_fd and the title untouched
+                            // (viv.c:2832-2840); only blank clears both
+                            // (viv.c:7919-7923). The status bar's "(N KB)"
+                            // still clears with the display.
                             state.displayed_file_bytes = None;
                         }
                     }
