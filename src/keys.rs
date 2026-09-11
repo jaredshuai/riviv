@@ -82,7 +82,15 @@ pub(crate) fn from_flags(flags: u16) -> KeyDef {
 const DEFAULT_KEYS: &[(Cmd, &[KeyDef])] = &[
     (Cmd::FileOpenFile, &[key(true, false, false, b'O' as u16)]),
     (Cmd::FileOpenFolder, &[key(true, false, false, b'B' as u16)]),
+    (
+        Cmd::FileOpenEverythingSearch,
+        &[key(true, false, false, b'E' as u16)],
+    ),
     (Cmd::FileAddFile, &[key(true, false, true, b'O' as u16)]),
+    (
+        Cmd::FileAddEverythingSearch,
+        &[key(true, false, true, b'E' as u16)],
+    ),
     (Cmd::FileExit, &[key(true, false, false, b'Q' as u16)]),
     (Cmd::ViewOneToOne, &[key(true, true, false, b'0' as u16)]),
     (Cmd::ViewFullscreen, &[key(false, true, false, VK_RETURN)]),
@@ -634,7 +642,15 @@ mod tests {
         let expect = [
             (Cmd::FileOpenFile, "file_open_file_keys"),
             (Cmd::FileOpenFolder, "file_open_folder_keys"),
+            (
+                Cmd::FileOpenEverythingSearch,
+                "file_open_everything_search_keys",
+            ),
             (Cmd::FileAddFile, "file_add_file_keys"),
+            (
+                Cmd::FileAddEverythingSearch,
+                "file_add_everything_search_keys",
+            ),
             (Cmd::FileExit, "file_exit_keys"),
             (Cmd::ViewMenu, "view_menu_keys"),
             (Cmd::ViewFullscreen, "view_fullscreen_keys"),

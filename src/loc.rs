@@ -191,12 +191,26 @@ pub(crate) enum Id {
     ActionNextPrev,
     /// Wheel combo item: Previous/Next (en_us.h:275).
     ActionPrevNext,
+    /// File → "Open Everything &Search..." (#22; viv.c:804, en_us.h:37 —
+    /// upstream MF_OWNERDRAW-hides the row; riviv shows it like Add File).
+    MenuOpenEverythingSearch,
+    /// File → "Add Everything Search..." (viv.c:807, en_us.h:40 — no
+    /// accelerator in either language).
+    MenuAddEverythingSearch,
+    /// Search dialog caption, Open flavor (#22; en_us.h:282).
+    EverythingLoadCaption,
+    /// Search dialog caption, Add flavor (#22; en_us.h:281).
+    EverythingAddCaption,
+    /// Search dialog's Randomize checkbox (#22; en_us.h:283).
+    EverythingRandomize,
+    /// "Everything not available" error box (#22; en_us.h:280).
+    EverythingNotAvailable,
 }
 
 impl Id {
     /// Variant count; array-typing both tables against this keeps them
     /// length-locked to the enum by construction.
-    pub(crate) const COUNT: usize = Self::ActionPrevNext as usize + 1;
+    pub(crate) const COUNT: usize = Self::EverythingNotAvailable as usize + 1;
 }
 
 /// Table choice (upstream `LOCALIZATION_LANGUAGE_*`, localization.h:30-32).
@@ -288,6 +302,13 @@ const EN_US: [&str; Id::COUNT] = [
     "Zoom",        // ActionZoom
     "Next/Previous", // ActionNextPrev
     "Previous/Next", // ActionPrevNext
+    // Everything block (#22; en_us.h:37/40/280-283).
+    "Open Everything &Search...", // MenuOpenEverythingSearch
+    "Add Everything Search...",   // MenuAddEverythingSearch
+    "Load Everything Search",     // EverythingLoadCaption
+    "Add Everything Search",      // EverythingAddCaption
+    "Randomize",                  // EverythingRandomize
+    "Everything not available",   // EverythingNotAvailable
 ];
 
 /// zh-CN table — upstream localization_zh_cn.h:31/197-199/261-263.
@@ -371,6 +392,13 @@ const ZH_CN: [&str; Id::COUNT] = [
     "缩放",                               // ActionZoom
     "下一张/上一张",                      // ActionNextPrev
     "上一张/下一张",                      // ActionPrevNext
+    // Everything block (#22; zh_cn.h:37/40/281-284).
+    "打开 Everything 搜索(&S)...", // MenuOpenEverythingSearch
+    "添加 Everything 搜索...",     // MenuAddEverythingSearch
+    "加载 Everything 搜索",        // EverythingLoadCaption
+    "添加 Everything 搜索",        // EverythingAddCaption
+    "随机化",                      // EverythingRandomize
+    "Everything 不可用",           // EverythingNotAvailable
 ];
 
 /// Map a `GetUserDefaultUILanguage` LANGID onto the table choice
