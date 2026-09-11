@@ -4,7 +4,7 @@ Unofficial Rust rewrite of [voidtools/voidImageViewer](https://github.com/voidto
 
 Based on voidImageViewer by David Carpenter / voidtools. See [LICENSE](LICENSE). The original C implementation is preserved under [`c-original/`](c-original/) as a read-only behavioral reference.
 
-> **Status: early development (M3 features complete).** Current scope: Win32 window + GDI rendering, animated GIF/WebP playback at author timing, alpha-composited transparency for every supported format (PNG, JPEG, BMP, ICO, TIFF, GIF and WebP), drag & drop, a keyboard-navigable playlist, zoom/pan over the upstream 16-level preset curve, the settings foundation (the window rect is remembered across runs in a `[riviv]` ini with upstream's 60% first-run auto-fit), en/zh-CN localization driven by the system UI language, single-instance command-line forwarding (a second launch hands its image to the running viewer and exits), a menu bar over a command table (File/View/Navigate/Help carrying the implemented commands, toggled by `show_menu`), the Options dialog (General/View/Controls pages over the same ini — filters, fit/fill, auto-size, background colors, frame-minus, mouse actions, multiple instances, appdata location, start-menu shortcuts and file associations; OK applies live and saves), custom keyboard shortcuts (per-command bindings over the same ini — upstream's `*_keys` lines — editable on the Controls page; the keyboard route and the menu accelerator labels follow the live table), and the install family (the `/install`-family CLI, an embedded app icon, and an NSIS installer), and the Everything IPC search (Ctrl+E / Ctrl+Shift+E open a hand-built Search Everything dialog; the query goes out as a QUERY2 WM_COPYDATA to a running Everything, the LIST2 results fill the playlist — Open replaces, Add appends — and the Randomize checkbox arms an endless one-image-at-a-time mode bound to next/prev/home). M3 is feature-complete; see [Roadmap](#roadmap).
+> **Status: early development (M4 planned).** Current scope: Win32 window + GDI rendering, animated GIF/WebP playback at author timing, alpha-composited transparency for every supported format (PNG, JPEG, BMP, ICO, TIFF, GIF and WebP), drag & drop, a keyboard-navigable playlist, zoom/pan over the upstream 16-level preset curve, the settings foundation (the window rect is remembered across runs in a `[riviv]` ini with upstream's 60% first-run auto-fit), en/zh-CN localization driven by the system UI language, single-instance command-line forwarding (a second launch hands its image to the running viewer and exits), a menu bar over a command table (File/View/Navigate/Help carrying the implemented commands, toggled by `show_menu`), the Options dialog (General/View/Controls pages over the same ini — filters, fit/fill, auto-size, background colors, frame-minus, mouse actions, multiple instances, appdata location, start-menu shortcuts and file associations; OK applies live and saves), custom keyboard shortcuts (per-command bindings over the same ini — upstream's `*_keys` lines — editable on the Controls page; the keyboard route and the menu accelerator labels follow the live table), and the install family (the `/install`-family CLI, an embedded app icon, and an NSIS installer), and the Everything IPC search (Ctrl+E / Ctrl+Shift+E open a hand-built Search Everything dialog; the query goes out as a QUERY2 WM_COPYDATA to a running Everything, the LIST2 results fill the playlist — Open replaces, Add appends — and the Randomize checkbox arms an endless one-image-at-a-time mode bound to next/prev/home). M3 is feature-complete; M4 (the remaining upstream features) is ticketed as #37–#50; see [Roadmap](#roadmap).
 
 ## Build
 
@@ -58,6 +58,21 @@ Giant images (upstream semantics): panoramas ≥ 32768 px render through 512-px 
   - [x] options dialog (General/View/Controls) (#24)
   - [x] custom shortcuts (#25)
   - [x] file associations + NSIS installer (#26: `/install`-family CLI, General-page association checkboxes, app icon, `installer/` NSIS port)
+- [ ] M4 — the remaining upstream features (interaction & shell completion)
+  - [ ] slideshow: View→Slideshow + Slideshow menu + rate presets (#37)
+  - [ ] animation controls: play/pause, jumps, frame step, rate, loop-once (#38)
+  - [ ] navigation sort / shuffle / jump-to (#39)
+  - [ ] preload next + last-image cache + PRELOAD status part (#40)
+  - [ ] clipboard: cut / copy / copy filename / copy image / paste (#41)
+  - [ ] shell verbs: print / edit / preview / location / properties / wallpaper / close (#42)
+  - [ ] file management: rename / delete ×3 / rotate / copy-to / move-to (#43)
+  - [ ] panscan + input completion: NUMPAD family, X buttons, middle-drag scroll (#44)
+  - [ ] toolbar (#45, blocked by #37)
+  - [ ] view presets + window size + always-on-top + view toggles (#46, blocked by #45)
+  - [ ] status-bar POS/RGB/temp-text + title-bar format (#47)
+  - [ ] config CLI second pass + usage dialog (#48, blocked by #37/#39)
+  - [ ] full context menu (#49, blocked by #37/#39/#41/#42/#43)
+  - [ ] ICM evaluation: embedded ICC profiles (#50)
 
 ## Differences from upstream (intentional)
 
