@@ -265,7 +265,10 @@ pub(crate) fn parse_list2(bytes: &[u8], stored_request_flags: u32) -> List2Reply
         }
         // The trailer walk consumes SIZE, DATE_CREATED, DATE_MODIFIED in
         // wire order (viv.c:3866-3890) — only MODIFIED is kept, the others
-        // are stepped over to reach it.
+        // are stepped over to reach it. A REQUESTED trailer cut short means
+        // the item's data is incomplete: the whole item drops (the same
+        // fail-soft skip as a malformed data area), never a half-parsed
+        // path with invented mtimes (cubic P2).
         let mut trailer = str_end;
         let mut read_trailer = || -> Option<u64> {
             let lo = u64::from(read_dword(trailer)?);
@@ -273,16 +276,20 @@ pub(crate) fn parse_list2(bytes: &[u8], stored_request_flags: u32) -> List2Reply
             trailer += 8;
             Some(lo | (hi << 32))
         };
-        if stored_request_flags & REQ_SIZE != 0 {
-            let _ = read_trailer();
+        if stored_request_flags & REQ_SIZE != 0 && read_trailer().is_none() {
+            continue;
         }
-        if stored_request_flags & REQ_DATE_CREATED != 0 {
-            let _ = read_trailer();
+        if stored_request_flags & REQ_DATE_CREATED != 0 && read_trailer().is_none() {
+            continue;
         }
-        let modified_ticks = (stored_request_flags & REQ_DATE_MODIFIED != 0)
-            .then(&mut read_trailer)
-            .flatten()
-            .map(filetime_to_unix_ticks);
+        let modified_ticks = if stored_request_flags & REQ_DATE_MODIFIED != 0 {
+            match read_trailer() {
+                Some(ft) => Some(filetime_to_unix_ticks(ft)),
+                None => continue,
+            }
+        } else {
+            None
+        };
         items.push(List2Item {
             path,
             modified_ticks,
@@ -1024,6 +1031,33 @@ mod tests {
         let bytes = list2(1, &[(0, r"C:\a.png", Some(9), None, None)], flags);
         let reply = parse_list2(&bytes, flags);
         assert_eq!(reply.items[0].modified_ticks, None);
+    }
+
+    #[test]
+    fn list2_truncated_requested_trailer_drops_the_whole_item() {
+        // cubic P2: a trailer the flags asked for but the buffer cut short
+        // makes the item's data incomplete — the item drops entirely, its
+        // neighbors parse on. (Half-parsing would invent mtime 0 for a
+        // reply that claimed to carry one.)
+        let flags = REQ_FULL_PATH_AND_NAME | REQ_SIZE | REQ_DATE_MODIFIED;
+        let mut bytes = list2(
+            2,
+            &[
+                (0, r"C:\a.png", Some(1), None, Some(2)),
+                (0, r"C:\b.png", Some(3), None, Some(4)),
+            ],
+            flags,
+        );
+        // Chop 4 bytes off the end: item 2's MODIFIED trailer loses its
+        // high dword (item 1 keeps everything — its block sits earlier).
+        bytes.truncate(bytes.len() - 4);
+        let reply = parse_list2(&bytes, flags);
+        assert_eq!(reply.items.len(), 1, "only the complete item survives");
+        assert_eq!(unwide(&reply.items[0].path), r"C:\a.png");
+        assert_eq!(
+            reply.items[0].modified_ticks,
+            Some(filetime_to_unix_ticks(2))
+        );
     }
 
     #[test]

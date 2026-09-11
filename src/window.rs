@@ -1821,9 +1821,17 @@ fn on_copydata(hwnd: HWND, cds: &COPYDATASTRUCT) -> bool {
 /// itself keeps Everything's result order). The parse walks the flags
 /// stored at SEND time, never the reply's echo.
 fn on_everything_reply(hwnd: HWND, cds: &COPYDATASTRUCT, add: bool) {
+    // The forged-reply gate (cubic P1): a null lpData or a payload too
+    // short for the LIST2 header is not ours to parse — `from_raw_parts`
+    // over a null/short pointer is UB even at length zero, and a foreign
+    // sender owes us nothing. Handled-and-ignored like the command-line
+    // arm's size gate.
+    if cds.lpData.is_null() || cds.cbData < 20 {
+        return;
+    }
     // SAFETY: the WM_COPYDATA contract guarantees lpData addresses cbData
-    // readable bytes for the duration of the message (the null/size gate
-    // ran in the message arm before this).
+    // readable bytes for the duration of the message; the gate above keeps
+    // null/short pointers out of the slice.
     let bytes = unsafe { std::slice::from_raw_parts(cds.lpData.cast::<u8>(), cds.cbData as usize) };
     // SAFETY: the borrow spans the random exit, the playlist ops and the
     // flags read — the metadata-free adds never pump.
@@ -1859,7 +1867,11 @@ fn on_random_reply(hwnd: HWND, cds: &COPYDATASTRUCT) {
         Retry,
         Stop,
     }
-    // SAFETY: same WM_COPYDATA contract as on_everything_reply.
+    // Same forged-reply gate as on_everything_reply (cubic P1).
+    if cds.lpData.is_null() || cds.cbData < 20 {
+        return;
+    }
+    // SAFETY: same WM_COPYDATA contract + gate as on_everything_reply.
     let bytes = unsafe { std::slice::from_raw_parts(cds.lpData.cast::<u8>(), cds.cbData as usize) };
     // SAFETY: the borrow spans the flags read and the total store — nothing
     // pumps.
