@@ -513,6 +513,14 @@ impl<F> LoadedImage<F> {
         self.frames.len() > 1
     }
 
+    /// Whether the decode stream has ended — the closest thing to
+    /// upstream's pre-known `_viv_frame_count`: until it flips, a
+    /// one-frame display might still be an animation's first frame, which
+    /// the slideshow gate must treat as "animation, hold" (cubic round 1).
+    pub(crate) fn decode_complete(&self) -> bool {
+        self.decode_complete
+    }
+
     /// The 1-based frame position for the status bar's `n / m` counter
     /// (#5; upstream shows `_viv_frame_position + 1`, viv.c:11204). `0`
     /// while nothing is displayed so the counter can hide on `total <= 1`.

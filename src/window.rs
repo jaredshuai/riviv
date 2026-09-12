@@ -525,19 +525,17 @@ fn on_double_click(hwnd: HWND, lparam: LPARAM) {
         .map(|s| s.config.left_click_action)
         .unwrap_or(0);
     match action {
-        // 3 = zoom in: repeat at the click point (upstream's default arm
-        // re-runs `_viv_do_left_click_action`).
+        // 3/4 = zoom in / next image: the default arm re-runs the click
+        // action (upstream viv.c:3313-3326).
         3 => zoom_at(hwnd, false, (pt.x, pt.y)),
-        // 4 = next image: the second click advances again.
         4 => nav_next(hwnd, false, true),
-        // 1 = play/pause slideshow: the double-click toggles the running
-        // state (upstream re-runs `_viv_do_left_click_action`, whose
-        // action-1 arm is `_viv_pause`, viv.c:3313-3326 + 6360-6415).
-        1 => slideshow_toggle(hwnd),
-        // 0/2/5/6 (scroll, animation, 1:1 scroll, move window): the
-        // double-click toggles fullscreen; unknown values re-run the
-        // action, which does nothing (upstream viv.c:3313-3326).
-        0 | 2 | 5 | 6 => toggle_fullscreen(hwnd),
+        // 0/1/2/5/6 (scroll, slideshow, animation, 1:1 scroll, move
+        // window): the double-click toggles FULLSCREEN — upstream's arm
+        // switches on exactly these values and never re-runs the action,
+        // so action 1's second click presents the run the first click
+        // toggled (cubic round 1); unknown values re-run the action,
+        // which does nothing.
+        0 | 1 | 2 | 5 | 6 => toggle_fullscreen(hwnd),
         _ => {}
     }
 }
@@ -1687,22 +1685,27 @@ fn reset_slideshow_timer(hwnd: HWND) {
 /// #45/#46 and plug into this point.)
 fn slideshow_start(hwnd: HWND) {
     // SAFETY: the borrow spans the two guards only.
-    let go = (unsafe { state_of(hwnd) })
-        .is_some_and(|state| !state.status_file_not_found && !state.slideshow);
-    if !go {
+    // Upstream order (viv.c:6821-6841): the File-not-found verdict is the
+    // only early return; the FULLSCREEN transition comes next — BEFORE the
+    // running check — so F11 over a running WINDOWED slideshow (started
+    // via Space/left-click) still presents; only then does an
+    // already-running slideshow no-op the start (cubic round 1).
+    // SAFETY: the borrow spans only the guard read.
+    if (unsafe { state_of(hwnd) }).is_some_and(|state| state.status_file_not_found) {
         return;
     }
-    // Enter fullscreen first (viv.c:6827-6830) — the toggle happens before
-    // the running check, so F11 over a running WINDOWED slideshow (started
-    // via Space) still presents, exactly like upstream.
     // SAFETY: the read-only borrow ends inside is_some_and.
     if !(unsafe { state_of(hwnd) }).is_some_and(|state| state.fullscreen) {
         toggle_fullscreen(hwnd);
     }
-    // SAFETY: the borrow spans the flag flip and the rate read.
-    let arm = (unsafe { state_of(hwnd) }).map(|state| {
+    // SAFETY: the borrow spans the running check, the flag flip and the
+    // rate read.
+    let arm = (unsafe { state_of(hwnd) }).and_then(|state| {
+        if state.slideshow {
+            return None; // already running: the start is a no-op (viv.c:6833)
+        }
         state.slideshow = true;
-        state.config.slideshow_rate as u32
+        Some(state.config.slideshow_rate as u32)
     });
     let Some(rate) = arm else {
         return;
@@ -1804,10 +1807,15 @@ fn on_slideshow_timer(hwnd: HWND) {
             // flag is the truth.
             return None;
         }
-        let is_animation = state
-            .image
-            .as_ref()
-            .is_some_and(|i| i.is_animated() && i.frame_count() >= 2);
+        let is_animation = state.image.as_ref().is_some_and(|i| {
+            // Upstream's `_viv_frame_count > 1` reads a PRE-KNOWN total;
+            // riviv's frame_count is the loaded prefix, so an animation's
+            // first frame still counts as "maybe an animation" until the
+            // stream completes — hold those too (cubic round 1). A
+            // genuinely static image flips to advance at its Complete, at
+            // worst delaying the step by the decode.
+            i.is_animated() || !i.decode_complete()
+        });
         match slideshow::timer_gate(
             state.config.loop_animations_once != 0,
             is_animation,
