@@ -33,10 +33,14 @@ pub(crate) const ANIMATION_TIMER_ID: usize = 1;
 
 /// Result of one timer event: the frame to display now and whether it
 /// changed (a repaint is only needed when at least one frame boundary was
-/// crossed — upstream's `invalidate` flag, viv.c:3279-3287).
+/// crossed — upstream's `invalidate` flag, viv.c:3279-3287). `looped` says
+/// the advance wrapped past the last frame — the moment upstream raises
+/// `_viv_frame_looped` (viv.c:3243), which the slideshow's timeup gate
+/// waits for (#37).
 pub(crate) struct FrameAdvance {
     pub(crate) position: usize,
     pub(crate) repaint: bool,
+    pub(crate) looped: bool,
 }
 
 /// Pure timing state for one animation: upstream's
@@ -108,6 +112,7 @@ impl FrameScheduler {
 
         let mut position = position;
         let mut repaint = false;
+        let mut looped = false;
         loop {
             // Upstream floors a zero delay to 1 ms so a zero-delay frame
             // still advances at a bounded rate (viv.c:3211-3214). GIF never
@@ -123,6 +128,7 @@ impl FrameScheduler {
                         // Loop the animation (viv.c:3243-3248; upstream has a
                         // play-once slideshow variant we don't build in #3).
                         position = 0;
+                        looped = true;
                     } else {
                         // The next frame is still decoding: ignore this tick,
                         // zero the accumulator, and wait at the prefix edge
@@ -140,7 +146,11 @@ impl FrameScheduler {
                 break;
             }
         }
-        FrameAdvance { position, repaint }
+        FrameAdvance {
+            position,
+            repaint,
+            looped,
+        }
     }
 }
 
@@ -209,6 +219,12 @@ mod tests {
         let adv = s.on_timer(100, FREQ, &delays, 1, true);
         assert_eq!(adv.position, 0);
         assert!(adv.repaint);
+        // The wrap is the loop-completion moment upstream marks
+        // `_viv_frame_looped` (viv.c:3243) — reported once per wrap, and
+        // only for completed animations (the streaming edge does not wrap).
+        assert!(adv.looped);
+        let adv = s.on_timer(250, FREQ, &delays, 0, false);
+        assert!(!adv.looped);
     }
 
     #[test]

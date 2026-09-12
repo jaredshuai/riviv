@@ -33,10 +33,15 @@ pub(crate) struct ComboEntry {
 /// 0 scroll, 1 slideshow, 2 animation pause, 3 zoom in, 4 next, 5 1:1
 /// scroll, 6 move-window). Unimplemented values stay valid INI values — they
 /// just have no combo row, so the combo shows blank and OK preserves them.
+/// Value 1 landed with #37.
 pub(crate) const LEFT_CLICK_ACTIONS: &[ComboEntry] = &[
     ComboEntry {
         label: loc::Id::ActionScroll,
         value: 0,
+    },
+    ComboEntry {
+        label: loc::Id::ActionPlayPauseSlideshow,
+        value: 1,
     },
     ComboEntry {
         label: loc::Id::ActionZoomIn,
@@ -608,9 +613,10 @@ mod tests {
     #[test]
     fn action_tables_carry_only_implemented_values_in_upstream_order() {
         // The values are upstream's action numbering; the ORDER is the
-        // combo order (upstream's AddString order, viv.c:8225-8252).
+        // combo order (upstream's AddString order, viv.c:8225-8252). The
+        // left-click slideshow row landed with #37.
         let values = |t: &[ComboEntry]| t.iter().map(|e| e.value).collect::<Vec<_>>();
-        assert_eq!(values(LEFT_CLICK_ACTIONS), vec![0, 3, 4]);
+        assert_eq!(values(LEFT_CLICK_ACTIONS), vec![0, 1, 3, 4]);
         assert_eq!(values(RIGHT_CLICK_ACTIONS), vec![0, 1, 2]);
         assert_eq!(values(WHEEL_ACTIONS), vec![0, 1, 2]);
         assert_eq!(values(AUTO_ZOOM_TYPES), vec![0, 1, 2, 3]);
@@ -620,10 +626,11 @@ mod tests {
     #[test]
     fn combo_index_maps_values_and_rejects_the_unimplemented() {
         assert_eq!(combo_index(LEFT_CLICK_ACTIONS, 0), Some(0));
-        assert_eq!(combo_index(LEFT_CLICK_ACTIONS, 4), Some(2));
-        // The slideshow/animation/1:1/move values have no row (not
-        // implemented): the combo shows blank and OK must preserve them.
-        assert_eq!(combo_index(LEFT_CLICK_ACTIONS, 1), None);
+        assert_eq!(combo_index(LEFT_CLICK_ACTIONS, 1), Some(1));
+        assert_eq!(combo_index(LEFT_CLICK_ACTIONS, 4), Some(3));
+        // The animation/1:1/move values have no row (not implemented):
+        // the combo shows blank and OK must preserve them.
+        assert_eq!(combo_index(LEFT_CLICK_ACTIONS, 2), None);
         assert_eq!(combo_index(LEFT_CLICK_ACTIONS, 5), None);
         assert_eq!(combo_index(AUTO_ZOOM_TYPES, 7), None);
         assert_eq!(combo_index(BLIT_MODES, 2), None);

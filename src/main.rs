@@ -65,6 +65,10 @@
 //!   (#25)
 //! - `menu` — the menu command table: WM_COMMAND ids,
 //!   accelerator labels and the WM_INITMENU check/enable model (#23)
+//! - `slideshow` — the slideshow rate model: presets, stepping, custom
+//!   compose, the WM_TIMER advance gate and the rate readout (#37)
+//! - `custom_rate_dlg` — the Set Custom Rate dialog over that model
+//!   (hand-built, the #22 dialog pattern) (#37)
 //! - `paint` — WM_PAINT render; M2: stitch/mip (#9); zoom/pan offsets,
 //!   the BitBlt 1:1 path and the COLORONCOLOR magnify filter landed (#7)
 //! - `playlist` — playlist model + navigation math + recursive folder/wildcard
@@ -83,6 +87,7 @@ mod assoc;
 mod config;
 mod copydata;
 mod cursor;
+mod custom_rate_dlg;
 mod everything;
 mod fit;
 mod ini;
@@ -97,6 +102,7 @@ mod options_dlg;
 mod paint;
 mod pixels;
 mod playlist;
+mod slideshow;
 mod status;
 mod stitch;
 mod surface;
