@@ -38,6 +38,9 @@ pub(crate) struct StatusSnapshot {
     /// The current display's load failed at user level — "Failed to load
     /// image.".
     pub(crate) load_failed: bool,
+    /// A slideshow is running — "Slideshow playing" below every verdict
+    /// (#37; upstream viv.c:11374-11377).
+    pub(crate) slideshow: bool,
     /// 1-based frame position / loaded frame count; `None` when blank.
     pub(crate) frame: Option<(usize, usize)>,
     /// The frames-remaining form (`config_frame_minus`, viv.c:11187-11203).
@@ -110,6 +113,7 @@ pub(crate) fn update(hwnd: HWND, snapshot: &StatusSnapshot) {
         snapshot.loading,
         snapshot.file_not_found,
         snapshot.load_failed,
+        snapshot.slideshow,
     );
     let frame_text = match snapshot.frame {
         Some((position, total)) => status_frame_text(position, total, snapshot.frame_remaining),

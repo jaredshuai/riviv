@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use image::metadata::Orientation;
 use image::{AnimationDecoder, Frames, GenericImageView, ImageDecoder, ImageFormat, ImageReader};
 
-use crate::anim::{FrameScheduler, gif_delay_ms};
+use crate::anim::{self, FrameScheduler, gif_delay_ms};
 use crate::pixels::composite_over_background_in_place;
 use crate::surface::{DibFrame, Surface};
 
@@ -513,6 +513,14 @@ impl<F> LoadedImage<F> {
         self.frames.len() > 1
     }
 
+    /// Whether the decode stream has ended — the closest thing to
+    /// upstream's pre-known `_viv_frame_count`: until it flips, a
+    /// one-frame display might still be an animation's first frame, which
+    /// the slideshow gate must treat as "animation, hold" (cubic round 1).
+    pub(crate) fn decode_complete(&self) -> bool {
+        self.decode_complete
+    }
+
     /// The 1-based frame position for the status bar's `n / m` counter
     /// (#5; upstream shows `_viv_frame_position + 1`, viv.c:11204). `0`
     /// while nothing is displayed so the counter can hide on `total <= 1`.
@@ -529,8 +537,16 @@ impl<F> LoadedImage<F> {
     }
 
     /// WM_TIMER body: advance by the time elapsed since the last event and
-    /// return whether the displayed frame changed (a repaint is due).
-    pub(crate) fn advance_on_timer(&mut self, now: u64, freq: u64) -> bool {
+    /// report the result (the repaint need and the wrap-past-the-last-frame
+    /// mark — #37's slideshow gate waits on that loop completion, upstream
+    /// `_viv_frame_looped`, viv.c:3243). `stop_at_loop` is that gate: break
+    /// the catch-up at the wrap (viv.c:3245-3250).
+    pub(crate) fn advance_on_timer(
+        &mut self,
+        now: u64,
+        freq: u64,
+        stop_at_loop: bool,
+    ) -> anim::FrameAdvance {
         debug_assert!(self.is_animated(), "static images are never on a timer");
         let advance = self.scheduler.on_timer(
             now,
@@ -538,9 +554,10 @@ impl<F> LoadedImage<F> {
             &self.delays_ms,
             self.position,
             self.decode_complete,
+            stop_at_loop,
         );
         self.position = advance.position;
-        advance.repaint
+        advance
     }
 }
 
@@ -733,9 +750,9 @@ mod tests {
         assert_eq!(out.actions, Vec::<UiAction>::new());
         let mut img = image.unwrap();
         assert!(img.is_animated());
-        assert!(!img.advance_on_timer(99, FREQ));
+        assert!(!img.advance_on_timer(99, FREQ, false).repaint);
         assert_eq!(*img.surface(), 1);
-        assert!(img.advance_on_timer(100, FREQ));
+        assert!(img.advance_on_timer(100, FREQ, false).repaint);
         assert_eq!(*img.surface(), 2);
     }
 
@@ -760,12 +777,15 @@ mod tests {
             additional(2),
         );
         let mut img = image.unwrap();
-        assert!(!img.advance_on_timer(5_099, FREQ), "99 ms since arrival");
+        assert!(
+            !img.advance_on_timer(5_099, FREQ, false).repaint,
+            "99 ms since arrival"
+        );
         assert_eq!(*img.surface(), 1);
-        assert!(img.advance_on_timer(5_100, FREQ));
+        assert!(img.advance_on_timer(5_100, FREQ, false).repaint);
         assert_eq!(*img.surface(), 2);
         // No frame 3: hold at the edge without accumulating.
-        assert!(!img.advance_on_timer(8_000, FREQ));
+        assert!(!img.advance_on_timer(8_000, FREQ, false).repaint);
         assert_eq!(*img.surface(), 2);
     }
 
@@ -793,9 +813,12 @@ mod tests {
         let mut img = image.unwrap();
         assert!(img.is_animated(), "old animation kept");
         // The kept prefix plays and wraps — not stalled at the edge.
-        assert!(img.advance_on_timer(200, FREQ));
+        assert!(img.advance_on_timer(200, FREQ, false).repaint);
         assert_eq!(*img.surface(), 2);
-        assert!(img.advance_on_timer(300, FREQ), "wraps at the edge");
+        assert!(
+            img.advance_on_timer(300, FREQ, false).repaint,
+            "wraps at the edge"
+        );
         assert_eq!(*img.surface(), 1);
     }
 
@@ -810,7 +833,7 @@ mod tests {
         // of frames 1 and 2 (100 + 100) and stops at frame 3's.
         apply_reply(&mut image, &mut displayed_from, 1, 200, FREQ, additional(3));
         let mut img = image.unwrap();
-        assert!(img.advance_on_timer(350, FREQ));
+        assert!(img.advance_on_timer(350, FREQ, false).repaint);
         assert_eq!(*img.surface(), 3);
     }
 
@@ -835,14 +858,14 @@ mod tests {
         apply_reply(&mut image, &mut displayed_from, 1, 0, FREQ, frame(1));
         apply_reply(&mut image, &mut displayed_from, 1, 0, FREQ, additional(2));
         let img = image.as_mut().unwrap();
-        assert!(img.advance_on_timer(100, FREQ));
+        assert!(img.advance_on_timer(100, FREQ, false).repaint);
         assert_eq!(*img.surface(), 2);
         // At the edge with the decode still in flight: hold frame 2.
-        assert!(!img.advance_on_timer(5_000, FREQ));
+        assert!(!img.advance_on_timer(5_000, FREQ, false).repaint);
         assert_eq!(*img.surface(), 2);
         img.mark_complete();
         // Same edge after completion: wrap to frame 0.
-        assert!(img.advance_on_timer(5_100, FREQ));
+        assert!(img.advance_on_timer(5_100, FREQ, false).repaint);
         assert_eq!(*img.surface(), 1);
     }
 
@@ -906,9 +929,9 @@ mod tests {
         img.push_frame(2, 100);
         img.push_frame(3, 100);
         assert_eq!(img.frame_count(), 3);
-        assert!(img.advance_on_timer(100, FREQ));
+        assert!(img.advance_on_timer(100, FREQ, false).repaint);
         assert_eq!(img.frame_position_1based(), 2);
-        assert!(img.advance_on_timer(200, FREQ));
+        assert!(img.advance_on_timer(200, FREQ, false).repaint);
         assert_eq!(img.frame_position_1based(), 3);
     }
 
@@ -1010,9 +1033,9 @@ mod tests {
         // Session 2's Complete must not freeze session 1's frame set.
         apply_reply(&mut image, &mut displayed_from, 2, 0, FREQ, Reply::Complete);
         let mut img = image.unwrap();
-        img.advance_on_timer(100, FREQ);
+        img.advance_on_timer(100, FREQ, false);
         // Still open at the edge: holds instead of wrapping.
-        assert!(!img.advance_on_timer(5_000, FREQ));
+        assert!(!img.advance_on_timer(5_000, FREQ, false).repaint);
         assert_eq!(*img.surface(), 2);
     }
 

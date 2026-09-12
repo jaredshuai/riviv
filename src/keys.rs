@@ -35,10 +35,14 @@ const VK_RETURN: u16 = 0x0d;
 const VK_END: u16 = 0x23;
 const VK_HOME: u16 = 0x24;
 const VK_LEFT: u16 = 0x25;
+const VK_UP: u16 = 0x26;
 const VK_RIGHT: u16 = 0x27;
+const VK_DOWN: u16 = 0x28;
 const VK_NEXT: u16 = 0x22;
 const VK_PRIOR: u16 = 0x21;
 const VK_F1: u16 = 0x70;
+const VK_F11: u16 = 0x7a;
+const VK_SPACE: u16 = 0x20;
 const VK_ADD: u16 = 0x6b;
 const VK_SUBTRACT: u16 = 0x6d;
 const VK_OEM_PLUS: u16 = 0xbb;
@@ -94,6 +98,9 @@ const DEFAULT_KEYS: &[(Cmd, &[KeyDef])] = &[
     (Cmd::FileExit, &[key(true, false, false, b'Q' as u16)]),
     (Cmd::ViewOneToOne, &[key(true, true, false, b'0' as u16)]),
     (Cmd::ViewFullscreen, &[key(false, true, false, VK_RETURN)]),
+    // View → Slideshow owns F11 (viv.c:996, upstream row order: after the
+    // fullscreen row) — #37.
+    (Cmd::ViewSlideshow, &[key(false, false, false, VK_F11)]),
     (
         Cmd::ViewZoomIn,
         &[
@@ -112,6 +119,17 @@ const DEFAULT_KEYS: &[(Cmd, &[KeyDef])] = &[
     ),
     (Cmd::ViewZoomReset, &[key(true, false, false, b'0' as u16)]),
     (Cmd::ViewOptions, &[key(false, false, false, b'O' as u16)]),
+    // The slideshow trio lands right after the Options row in upstream's
+    // table (viv.c:1035-1037, between Options and the navigation rows).
+    (Cmd::SlideshowPause, &[key(false, false, false, VK_SPACE)]),
+    (
+        Cmd::SlideshowRateDecrease,
+        &[key(false, false, false, VK_DOWN)],
+    ),
+    (
+        Cmd::SlideshowRateIncrease,
+        &[key(false, false, false, VK_UP)],
+    ),
     (
         Cmd::NavNext,
         &[
@@ -654,12 +672,49 @@ mod tests {
             (Cmd::FileExit, "file_exit_keys"),
             (Cmd::ViewMenu, "view_menu_keys"),
             (Cmd::ViewFullscreen, "view_fullscreen_keys"),
+            (Cmd::ViewSlideshow, "view_slideshow_keys"),
             (Cmd::ViewOneToOne, "view_11_keys"),
             (Cmd::ViewBestFit, "view_best_fit_keys"),
             (Cmd::ViewZoomIn, "view_zoom_zoom_in_keys"),
             (Cmd::ViewZoomOut, "view_zoom_zoom_out_keys"),
             (Cmd::ViewZoomReset, "view_zoom_reset_keys"),
             (Cmd::ViewOptions, "view_options_keys"),
+            // The slideshow block (#37): Play/Pause under the Slideshow
+            // menu ("&Play/Pause" filters to playpause), the rest under
+            // its Rate submenu (en_us.h:118-140).
+            (Cmd::SlideshowPause, "slideshow_playpause_keys"),
+            (
+                Cmd::SlideshowRateDecrease,
+                "slideshow_rate_decrease_rate_keys",
+            ),
+            (
+                Cmd::SlideshowRateIncrease,
+                "slideshow_rate_increase_rate_keys",
+            ),
+            (
+                Cmd::SlideshowRate250,
+                "slideshow_rate_250_milliseconds_keys",
+            ),
+            (
+                Cmd::SlideshowRate500,
+                "slideshow_rate_500_milliseconds_keys",
+            ),
+            (Cmd::SlideshowRate1000, "slideshow_rate_1_second_keys"),
+            (Cmd::SlideshowRate2000, "slideshow_rate_2_seconds_keys"),
+            (Cmd::SlideshowRate3000, "slideshow_rate_3_seconds_keys"),
+            (Cmd::SlideshowRate4000, "slideshow_rate_4_seconds_keys"),
+            (Cmd::SlideshowRate5000, "slideshow_rate_5_seconds_keys"),
+            (Cmd::SlideshowRate6000, "slideshow_rate_6_seconds_keys"),
+            (Cmd::SlideshowRate7000, "slideshow_rate_7_seconds_keys"),
+            (Cmd::SlideshowRate8000, "slideshow_rate_8_seconds_keys"),
+            (Cmd::SlideshowRate9000, "slideshow_rate_9_seconds_keys"),
+            (Cmd::SlideshowRate10000, "slideshow_rate_10_seconds_keys"),
+            (Cmd::SlideshowRate20000, "slideshow_rate_20_seconds_keys"),
+            (Cmd::SlideshowRate30000, "slideshow_rate_30_seconds_keys"),
+            (Cmd::SlideshowRate40000, "slideshow_rate_40_seconds_keys"),
+            (Cmd::SlideshowRate50000, "slideshow_rate_50_seconds_keys"),
+            (Cmd::SlideshowRate60000, "slideshow_rate_1_minute_keys"),
+            (Cmd::SlideshowRateCustom, "slideshow_rate_custom_keys"),
             (Cmd::NavNext, "navigate_next_keys"),
             (Cmd::NavPrev, "navigate_previous_keys"),
             (Cmd::NavHome, "navigate_home_keys"),

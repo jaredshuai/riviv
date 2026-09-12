@@ -41,6 +41,9 @@ pub(crate) enum Cmd {
     ViewMenu,
     /// View → Fullscreen (`VIV_ID_VIEW_FULLSCREEN`).
     ViewFullscreen,
+    /// View → Slideshow (`VIV_ID_VIEW_SLIDESHOW`, viv.c:854) — #37: the
+    /// start-only toggle (enters fullscreen first when windowed).
+    ViewSlideshow,
     /// View → 1:1 (`VIV_ID_VIEW_1TO1`).
     ViewOneToOne,
     /// View → Best Fit (`VIV_ID_VIEW_BESTFIT`).
@@ -54,6 +57,53 @@ pub(crate) enum Cmd {
     /// View → Options... (`VIV_ID_VIEW_OPTIONS`) — opens the modal Options
     /// dialog (#24; upstream viv.c:2332).
     ViewOptions,
+    /// Slideshow → Play/Pause (`VIV_ID_SLIDESHOW_PAUSE`, viv.c:894) — #37:
+    /// the running-state TOGGLE (no fullscreen entry, unlike F11).
+    SlideshowPause,
+    /// Slideshow → Rate → Decrease Rate (`VIV_ID_SLIDESHOW_RATE_DEC`,
+    /// viv.c:898).
+    SlideshowRateDecrease,
+    /// Slideshow → Rate → Increase Rate (`VIV_ID_SLIDESHOW_RATE_INC`,
+    /// viv.c:899).
+    SlideshowRateIncrease,
+    /// Slideshow → Rate → 250 ms (`VIV_ID_SLIDESHOW_RATE_250`, viv.c:902).
+    SlideshowRate250,
+    /// Slideshow → Rate → 500 ms (`VIV_ID_SLIDESHOW_RATE_500`, viv.c:903).
+    SlideshowRate500,
+    /// Slideshow → Rate → 1 s (`VIV_ID_SLIDESHOW_RATE_1000`, viv.c:904).
+    SlideshowRate1000,
+    /// Slideshow → Rate → 2 s (`VIV_ID_SLIDESHOW_RATE_2000`, viv.c:905).
+    SlideshowRate2000,
+    /// Slideshow → Rate → 3 s (`VIV_ID_SLIDESHOW_RATE_3000`, viv.c:906).
+    SlideshowRate3000,
+    /// Slideshow → Rate → 4 s (`VIV_ID_SLIDESHOW_RATE_4000`, viv.c:907).
+    SlideshowRate4000,
+    /// Slideshow → Rate → 5 s (`VIV_ID_SLIDESHOW_RATE_5000`, viv.c:908).
+    SlideshowRate5000,
+    /// Slideshow → Rate → 6 s (`VIV_ID_SLIDESHOW_RATE_6000`, viv.c:909).
+    SlideshowRate6000,
+    /// Slideshow → Rate → 7 s (`VIV_ID_SLIDESHOW_RATE_7000`, viv.c:910).
+    SlideshowRate7000,
+    /// Slideshow → Rate → 8 s (`VIV_ID_SLIDESHOW_RATE_8000`, viv.c:911).
+    SlideshowRate8000,
+    /// Slideshow → Rate → 9 s (`VIV_ID_SLIDESHOW_RATE_9000`, viv.c:912).
+    SlideshowRate9000,
+    /// Slideshow → Rate → 10 s (`VIV_ID_SLIDESHOW_RATE_10000`, viv.c:913).
+    SlideshowRate10000,
+    /// Slideshow → Rate → 20 s (`VIV_ID_SLIDESHOW_RATE_20000`, viv.c:914).
+    SlideshowRate20000,
+    /// Slideshow → Rate → 30 s (`VIV_ID_SLIDESHOW_RATE_30000`, viv.c:915).
+    SlideshowRate30000,
+    /// Slideshow → Rate → 40 s (`VIV_ID_SLIDESHOW_RATE_40000`, viv.c:916).
+    SlideshowRate40000,
+    /// Slideshow → Rate → 50 s (`VIV_ID_SLIDESHOW_RATE_50000`, viv.c:917).
+    SlideshowRate50000,
+    /// Slideshow → Rate → 1 min (`VIV_ID_SLIDESHOW_RATE_60000`,
+    /// viv.c:918).
+    SlideshowRate60000,
+    /// Slideshow → Rate → Custom... (`VIV_ID_SLIDESHOW_RATE_CUSTOM`,
+    /// viv.c:918 rate block tail) — the value dialog.
+    SlideshowRateCustom,
     /// Navigate → Next (`VIV_ID_NAV_NEXT`).
     NavNext,
     /// Navigate → Previous (`VIV_ID_NAV_PREV`).
@@ -76,6 +126,31 @@ impl Cmd {
     /// 1-based over the enum order).
     pub(crate) fn id(self) -> u16 {
         self as u16 + 1
+    }
+
+    /// The rate (in ms) a Rate-submenu row selects; `None` for Custom
+    /// (which opens the dialog) and every non-rate command (viv.c:902-918).
+    pub(crate) fn slideshow_rate_ms(self) -> Option<u32> {
+        match self {
+            Self::SlideshowRate250 => Some(250),
+            Self::SlideshowRate500 => Some(500),
+            Self::SlideshowRate1000 => Some(1_000),
+            Self::SlideshowRate2000 => Some(2_000),
+            Self::SlideshowRate3000 => Some(3_000),
+            Self::SlideshowRate4000 => Some(4_000),
+            Self::SlideshowRate5000 => Some(5_000),
+            Self::SlideshowRate6000 => Some(6_000),
+            Self::SlideshowRate7000 => Some(7_000),
+            Self::SlideshowRate8000 => Some(8_000),
+            Self::SlideshowRate9000 => Some(9_000),
+            Self::SlideshowRate10000 => Some(10_000),
+            Self::SlideshowRate20000 => Some(20_000),
+            Self::SlideshowRate30000 => Some(30_000),
+            Self::SlideshowRate40000 => Some(40_000),
+            Self::SlideshowRate50000 => Some(50_000),
+            Self::SlideshowRate60000 => Some(60_000),
+            _ => None,
+        }
     }
 
     /// Inverse of [`Cmd::id`] for the WM_COMMAND dispatch (upstream's
@@ -101,12 +176,34 @@ impl Cmd {
         Self::FileExit,
         Self::ViewMenu,
         Self::ViewFullscreen,
+        Self::ViewSlideshow,
         Self::ViewOneToOne,
         Self::ViewBestFit,
         Self::ViewZoomIn,
         Self::ViewZoomOut,
         Self::ViewZoomReset,
         Self::ViewOptions,
+        Self::SlideshowPause,
+        Self::SlideshowRateDecrease,
+        Self::SlideshowRateIncrease,
+        Self::SlideshowRate250,
+        Self::SlideshowRate500,
+        Self::SlideshowRate1000,
+        Self::SlideshowRate2000,
+        Self::SlideshowRate3000,
+        Self::SlideshowRate4000,
+        Self::SlideshowRate5000,
+        Self::SlideshowRate6000,
+        Self::SlideshowRate7000,
+        Self::SlideshowRate8000,
+        Self::SlideshowRate9000,
+        Self::SlideshowRate10000,
+        Self::SlideshowRate20000,
+        Self::SlideshowRate30000,
+        Self::SlideshowRate40000,
+        Self::SlideshowRate50000,
+        Self::SlideshowRate60000,
+        Self::SlideshowRateCustom,
         Self::NavNext,
         Self::NavPrev,
         Self::NavHome,
@@ -123,6 +220,12 @@ pub(crate) enum Slot {
     File,
     View,
     ViewZoom,
+    /// The Slideshow top-level menu (#37; upstream `_VIV_MENU_SLIDESHOW`,
+    /// viv.c:892 — between View and Animation in the root order).
+    Slideshow,
+    /// The Slideshow → Rate popup (#37; upstream `_VIV_MENU_SLIDESHOW_RATE`,
+    /// viv.c:897).
+    SlideshowRate,
     Navigate,
     Help,
 }
@@ -169,9 +272,9 @@ pub(crate) enum Entry {
 }
 
 /// The command table (upstream `_viv_commands[]`, viv.c:798-965, pruned to
-/// riviv's implemented commands; the unimplemented menus — Edit, Slideshow,
-/// Animation and the dead rows inside File/View/Navigate/Help — wait for
-/// their features). Order is upstream order.
+/// riviv's implemented commands; the unimplemented menus — Edit, Animation
+/// and the dead rows inside File/View/Navigate/Help — wait for their
+/// features). Order is upstream order.
 pub(crate) const ENTRIES: &[Entry] = &[
     // File (viv.c:800-821).
     Entry::Popup {
@@ -234,6 +337,12 @@ pub(crate) const ENTRIES: &[Entry] = &[
         parent: Slot::View,
         cmd: Cmd::ViewFullscreen,
     },
+    // View → Slideshow (viv.c:854, directly after Fullscreen) — #37.
+    Entry::Item {
+        loc: loc::Id::MenuSlideshow,
+        parent: Slot::View,
+        cmd: Cmd::ViewSlideshow,
+    },
     Entry::Item {
         loc: loc::Id::MenuOneToOne,
         parent: Slot::View,
@@ -269,6 +378,129 @@ pub(crate) const ENTRIES: &[Entry] = &[
         loc: loc::Id::MenuOptions,
         parent: Slot::View,
         cmd: Cmd::ViewOptions,
+    },
+    // Slideshow (#37; upstream viv.c:892-918 — a root menu between View
+    // and Navigate, its Rate submenu after Play/Pause and a separator).
+    Entry::Popup {
+        loc: loc::Id::MenuSlideshowMenu,
+        parent: Slot::Root,
+        slot: Slot::Slideshow,
+    },
+    Entry::Item {
+        loc: loc::Id::MenuSlideshowPlayPause,
+        parent: Slot::Slideshow,
+        cmd: Cmd::SlideshowPause,
+    },
+    Entry::Separator {
+        parent: Slot::Slideshow,
+    },
+    Entry::Popup {
+        loc: loc::Id::MenuSlideshowRate,
+        parent: Slot::Slideshow,
+        slot: Slot::SlideshowRate,
+    },
+    Entry::Item {
+        loc: loc::Id::MenuSlideshowRateDecrease,
+        parent: Slot::SlideshowRate,
+        cmd: Cmd::SlideshowRateDecrease,
+    },
+    Entry::Item {
+        loc: loc::Id::MenuSlideshowRateIncrease,
+        parent: Slot::SlideshowRate,
+        cmd: Cmd::SlideshowRateIncrease,
+    },
+    Entry::Separator {
+        parent: Slot::SlideshowRate,
+    },
+    Entry::Item {
+        loc: loc::Id::MenuRate250Milliseconds,
+        parent: Slot::SlideshowRate,
+        cmd: Cmd::SlideshowRate250,
+    },
+    Entry::Item {
+        loc: loc::Id::MenuRate500Milliseconds,
+        parent: Slot::SlideshowRate,
+        cmd: Cmd::SlideshowRate500,
+    },
+    Entry::Item {
+        loc: loc::Id::MenuRate1Second,
+        parent: Slot::SlideshowRate,
+        cmd: Cmd::SlideshowRate1000,
+    },
+    Entry::Item {
+        loc: loc::Id::MenuRate2Seconds,
+        parent: Slot::SlideshowRate,
+        cmd: Cmd::SlideshowRate2000,
+    },
+    Entry::Item {
+        loc: loc::Id::MenuRate3Seconds,
+        parent: Slot::SlideshowRate,
+        cmd: Cmd::SlideshowRate3000,
+    },
+    Entry::Item {
+        loc: loc::Id::MenuRate4Seconds,
+        parent: Slot::SlideshowRate,
+        cmd: Cmd::SlideshowRate4000,
+    },
+    Entry::Item {
+        loc: loc::Id::MenuRate5Seconds,
+        parent: Slot::SlideshowRate,
+        cmd: Cmd::SlideshowRate5000,
+    },
+    Entry::Item {
+        loc: loc::Id::MenuRate6Seconds,
+        parent: Slot::SlideshowRate,
+        cmd: Cmd::SlideshowRate6000,
+    },
+    Entry::Item {
+        loc: loc::Id::MenuRate7Seconds,
+        parent: Slot::SlideshowRate,
+        cmd: Cmd::SlideshowRate7000,
+    },
+    Entry::Item {
+        loc: loc::Id::MenuRate8Seconds,
+        parent: Slot::SlideshowRate,
+        cmd: Cmd::SlideshowRate8000,
+    },
+    Entry::Item {
+        loc: loc::Id::MenuRate9Seconds,
+        parent: Slot::SlideshowRate,
+        cmd: Cmd::SlideshowRate9000,
+    },
+    Entry::Item {
+        loc: loc::Id::MenuRate10Seconds,
+        parent: Slot::SlideshowRate,
+        cmd: Cmd::SlideshowRate10000,
+    },
+    Entry::Item {
+        loc: loc::Id::MenuRate20Seconds,
+        parent: Slot::SlideshowRate,
+        cmd: Cmd::SlideshowRate20000,
+    },
+    Entry::Item {
+        loc: loc::Id::MenuRate30Seconds,
+        parent: Slot::SlideshowRate,
+        cmd: Cmd::SlideshowRate30000,
+    },
+    Entry::Item {
+        loc: loc::Id::MenuRate40Seconds,
+        parent: Slot::SlideshowRate,
+        cmd: Cmd::SlideshowRate40000,
+    },
+    Entry::Item {
+        loc: loc::Id::MenuRate50Seconds,
+        parent: Slot::SlideshowRate,
+        cmd: Cmd::SlideshowRate50000,
+    },
+    Entry::Item {
+        loc: loc::Id::MenuRate1Minute,
+        parent: Slot::SlideshowRate,
+        cmd: Cmd::SlideshowRate60000,
+    },
+    Entry::Item {
+        loc: loc::Id::MenuRateCustom,
+        parent: Slot::SlideshowRate,
+        cmd: Cmd::SlideshowRateCustom,
     },
     // Navigate (viv.c:952-959).
     Entry::Popup {
@@ -356,6 +588,12 @@ pub(crate) struct MenuState {
     /// (upstream's raw size compare degenerates to 0 == 0 there; riviv
     /// guards it).
     pub(crate) one_to_one: bool,
+    /// The slideshow running flag (#37; upstream viv.c:7133/7138 — BOTH
+    /// View → Slideshow and Slideshow → Play/Pause carry the check).
+    pub(crate) slideshow: bool,
+    /// The current rate in ms (#37; the Rate submenu's radio — the preset
+    /// row whose value matches, or Custom when none does, viv.c:7140-7189).
+    pub(crate) slideshow_rate_ms: u32,
 }
 
 /// Whether `cmd`'s menu item carries a check in `state` (upstream
@@ -365,8 +603,20 @@ pub(crate) fn checked(cmd: Cmd, state: &MenuState) -> bool {
         Cmd::ViewMenu => state.show_menu,
         Cmd::ViewFullscreen => state.fullscreen,
         Cmd::ViewOneToOne => state.one_to_one,
-        _ => false,
+        Cmd::ViewSlideshow | Cmd::SlideshowPause => state.slideshow,
+        // The radio's checked row: the preset that equals the rate, or
+        // Custom when the rate is no preset (viv.c:7140-7189's switch
+        // default).
+        Cmd::SlideshowRateCustom => !crate::slideshow::is_preset(state.slideshow_rate_ms),
+        cmd => cmd.slideshow_rate_ms() == Some(state.slideshow_rate_ms),
     }
+}
+
+/// Whether `cmd`'s check renders as a radio dot (upstream passes
+/// `MFT_RADIOCHECK` in the CheckMenuItem flags for the whole Rate submenu
+/// family, viv.c:7165-7189 — a display trait, not a state).
+pub(crate) fn radio(cmd: Cmd) -> bool {
+    cmd.slideshow_rate_ms().is_some() || cmd == Cmd::SlideshowRateCustom
 }
 
 /// Whether `cmd`'s menu item is selectable. Everything riviv registers is
@@ -439,6 +689,20 @@ mod tests {
     }
 
     #[test]
+    fn slideshow_command_ids_are_pinned_for_the_wire() {
+        // smoke37 posts these as raw WM_COMMAND wparams; inserting a command
+        // ahead of the slideshow block would silently shift every wire id.
+        assert_eq!(Cmd::ViewSlideshow.id(), 9);
+        assert_eq!(Cmd::SlideshowPause.id(), 16);
+        assert_eq!(Cmd::SlideshowRateDecrease.id(), 17);
+        assert_eq!(Cmd::SlideshowRateIncrease.id(), 18);
+        assert_eq!(Cmd::SlideshowRate250.id(), 19);
+        assert_eq!(Cmd::SlideshowRate500.id(), 20);
+        assert_eq!(Cmd::SlideshowRateCustom.id(), 36);
+        assert_eq!(Cmd::NavNext.id(), 37);
+    }
+
+    #[test]
     fn key_labels_use_upstreams_modifier_order() {
         // _viv_get_key_text appends Ctrl, then Alt, then Shift (viv.c:
         // 12287-12301) before the key name. VKs: F1=0x70, Return=0x0D,
@@ -502,25 +766,100 @@ mod tests {
 
     #[test]
     fn check_marks_mirror_the_upstream_conditions() {
-        // viv.c:7125/7131/7132 — the Menu/Fullscreen/1:1 checks; every
-        // other item is unchecked regardless of state.
+        // viv.c:7125/7131/7132 — the Menu/Fullscreen/1:1 checks; viv.c:
+        // 7133/7138 — both slideshow rows check with the running flag.
+        // Every non-rate item is unchecked with the toggles off.
         let on = MenuState {
             show_menu: true,
             fullscreen: true,
             one_to_one: true,
+            slideshow: true,
+            slideshow_rate_ms: 5_000,
         };
         let off = MenuState {
             show_menu: false,
             fullscreen: false,
             one_to_one: false,
+            slideshow: false,
+            slideshow_rate_ms: 5_000,
         };
         for cmd in Cmd::ALL {
-            assert_eq!(
-                checked(cmd, &on),
-                matches!(cmd, Cmd::ViewMenu | Cmd::ViewFullscreen | Cmd::ViewOneToOne)
+            let expected_on = matches!(
+                cmd,
+                Cmd::ViewMenu
+                    | Cmd::ViewFullscreen
+                    | Cmd::ViewOneToOne
+                    | Cmd::ViewSlideshow
+                    | Cmd::SlideshowPause
+                    | Cmd::SlideshowRate5000
             );
-            assert!(!checked(cmd, &off));
+            assert_eq!(checked(cmd, &on), expected_on, "{cmd:?} with everything on");
+            assert_eq!(
+                checked(cmd, &off),
+                cmd.slideshow_rate_ms() == Some(5_000),
+                "{cmd:?} with toggles off keeps only the rate radio"
+            );
         }
+    }
+
+    #[test]
+    fn the_rate_radio_checks_the_matching_preset_or_custom() {
+        // viv.c:7140-7189: exactly one row of the Rate submenu is checked
+        // for any rate — the equal preset, or Custom when none matches.
+        for &rate in &crate::slideshow::RATE_PRESETS {
+            let state = MenuState {
+                slideshow: true,
+                slideshow_rate_ms: rate,
+                ..plain_state()
+            };
+            let rate_cmds: Vec<Cmd> = Cmd::ALL.into_iter().filter(|c| radio(*c)).collect();
+            let on: Vec<Cmd> = rate_cmds
+                .into_iter()
+                .filter(|c| checked(*c, &state))
+                .collect();
+            assert_eq!(on.len(), 1, "rate {rate} checks one radio row");
+            assert_eq!(on[0].slideshow_rate_ms(), Some(rate));
+        }
+        // A custom rate (700 ms — not a preset) checks Custom alone.
+        let state = MenuState {
+            slideshow_rate_ms: 700,
+            ..plain_state()
+        };
+        assert!(checked(Cmd::SlideshowRateCustom, &state));
+        for cmd in Cmd::ALL {
+            if cmd.slideshow_rate_ms().is_some() {
+                assert!(!checked(cmd, &state), "{cmd:?} must stay off for 700 ms");
+            }
+        }
+    }
+
+    fn plain_state() -> MenuState {
+        MenuState {
+            show_menu: false,
+            fullscreen: false,
+            one_to_one: false,
+            slideshow: false,
+            slideshow_rate_ms: 5_000,
+        }
+    }
+
+    #[test]
+    fn the_rate_rows_map_onto_the_preset_table_in_menu_order() {
+        // The 17 preset commands must be exactly the 17 presets, in the
+        // submenu's walk order — ENTRIES order equals RATE_PRESETS order,
+        // so the radio and the table cannot drift apart.
+        let by_menu: Vec<u32> = ENTRIES
+            .iter()
+            .filter_map(|e| match e {
+                Entry::Item {
+                    cmd,
+                    parent: Slot::SlideshowRate,
+                    ..
+                } => cmd.slideshow_rate_ms(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(by_menu, crate::slideshow::RATE_PRESETS.to_vec());
     }
 
     #[test]

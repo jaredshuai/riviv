@@ -84,19 +84,19 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowLongPtrW, GetWindowRect, HICON, HMENU, HWND_TOP, IDC_ARROW, IMAGE_ICON, IsIconic,
     IsZoomed, KillTimer, LR_DEFAULTCOLOR, LoadCursorW, LoadImageW, MB_ICONERROR, MB_OK,
     MENU_ITEM_FLAGS, MF_BYCOMMAND, MF_CHECKED, MF_ENABLED, MF_GRAYED, MF_POPUP, MF_SEPARATOR,
-    MF_STRING, MF_UNCHECKED, MINMAXINFO, MSG, MessageBoxW, PostMessageW, PostQuitMessage,
-    RegisterClassExW, SHOW_WINDOW_CMD, SM_CXICON, SM_CXSMICON, SM_CYICON, SM_CYSMICON, SW_MAXIMIZE,
-    SW_RESTORE, SW_SHOW, SW_SHOWNORMAL, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOCOPYBITS,
-    SWP_NOZORDER, SYSTEM_METRICS_INDEX, SendMessageW, SetForegroundWindow, SetMenu,
-    SetProcessDPIAware, SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowCursor,
-    ShowWindow, TPM_CENTERALIGN, TPM_LEFTBUTTON, TPM_VCENTERALIGN, TrackPopupMenu,
-    TranslateMessage, USER_TIMER_MINIMUM, WINDOW_EX_STYLE, WINDOW_STYLE, WM_ACTIVATE, WM_COMMAND,
-    WM_CONTEXTMENU, WM_COPYDATA, WM_DESTROY, WM_DROPFILES, WM_ENDSESSION, WM_ERASEBKGND,
-    WM_GETMINMAXINFO, WM_INITMENU, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_MOVE, WM_NCCREATE, WM_NCDESTROY, WM_NULL, WM_PAINT,
-    WM_QUERYENDSESSION, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SIZE, WM_SYSKEYDOWN,
-    WM_TIMER, WNDCLASSEXW, WS_CAPTION, WS_EX_ACCEPTFILES, WS_OVERLAPPEDWINDOW, WS_POPUP,
-    WS_THICKFRAME, WS_VISIBLE, WindowFromPoint,
+    MF_STRING, MF_UNCHECKED, MFT_RADIOCHECK, MINMAXINFO, MSG, MessageBoxW, PostMessageW,
+    PostQuitMessage, RegisterClassExW, SC_MONITORPOWER, SHOW_WINDOW_CMD, SM_CXICON, SM_CXSMICON,
+    SM_CYICON, SM_CYSMICON, SW_MAXIMIZE, SW_RESTORE, SW_SHOW, SW_SHOWNORMAL, SWP_FRAMECHANGED,
+    SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOZORDER, SYSTEM_METRICS_INDEX, SendMessageW,
+    SetForegroundWindow, SetMenu, SetProcessDPIAware, SetTimer, SetWindowLongPtrW, SetWindowPos,
+    SetWindowTextW, ShowCursor, ShowWindow, TPM_CENTERALIGN, TPM_LEFTBUTTON, TPM_VCENTERALIGN,
+    TrackPopupMenu, TranslateMessage, USER_TIMER_MINIMUM, WINDOW_EX_STYLE, WINDOW_STYLE,
+    WM_ACTIVATE, WM_COMMAND, WM_CONTEXTMENU, WM_COPYDATA, WM_DESTROY, WM_DROPFILES, WM_ENDSESSION,
+    WM_ERASEBKGND, WM_GETMINMAXINFO, WM_INITMENU, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_MOVE, WM_NCCREATE, WM_NCDESTROY, WM_NULL,
+    WM_PAINT, WM_QUERYENDSESSION, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SIZE,
+    WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_TIMER, WNDCLASSEXW, WS_CAPTION, WS_EX_ACCEPTFILES,
+    WS_OVERLAPPEDWINDOW, WS_POPUP, WS_THICKFRAME, WS_VISIBLE, WindowFromPoint,
 };
 use windows::core::{HSTRING, PCSTR, PCWSTR, w};
 
@@ -104,6 +104,7 @@ use crate::anim::ANIMATION_TIMER_ID;
 use crate::config::Config;
 use crate::copydata;
 use crate::cursor::{self, CursorVisibility};
+use crate::custom_rate_dlg;
 use crate::everything;
 use crate::loader::{LoadedImage, UiAction, apply_reply, map_reply_frame};
 use crate::loadthread::{LoadSession, LoadThread, REPLY_KICK_MESSAGE};
@@ -111,10 +112,14 @@ use crate::loc;
 use crate::menu;
 use crate::paint::paint;
 use crate::playlist::{self, Playlist, PlaylistEntry};
+use crate::slideshow;
 use crate::status;
 use crate::surface::Surface;
 use crate::text::{dialog_filter, title_wide, to_wide};
 use crate::zoom::{FitPolicy, View, Viewport};
+use windows::Win32::System::Power::{
+    ES_CONTINUOUS, ES_DISPLAY_REQUIRED, ES_SYSTEM_REQUIRED, SetThreadExecutionState,
+};
 
 /// Window class name. Deliberately different from upstream's `VOIDIMAGEVIEWER`
 /// (class + mutex) so both viewers can coexist on one machine.
@@ -245,6 +250,22 @@ pub(crate) struct WindowState {
     pub(crate) random_tot_results: u32,
     pub(crate) everything_request_flags: u32,
     pub(crate) random_rand_state: u32,
+    /// A slideshow is running (#37; upstream `_viv_is_slideshow`,
+    /// viv.c:708) — the timer-advance state, the status bar's playing
+    /// line, and both menu checks read it.
+    pub(crate) slideshow: bool,
+    /// The slideshow timer expired but the current animation has not
+    /// looped once yet (upstream `_viv_is_slideshow_timeup`, viv.c:694) —
+    /// the held advance fires from the animation's wrap (viv.c:3243-3248).
+    pub(crate) slideshow_timeup: bool,
+    /// The displayed animation has completed at least one full loop
+    /// (upstream `_viv_frame_looped`, viv.c:693 — reset with every new
+    /// image like `_viv_clear`, viv.c:1278).
+    pub(crate) animation_looped: bool,
+    /// The prevent-sleep execution-state latch (upstream
+    /// `_viv_is_prevent_sleep`, viv.c:789) — SetThreadExecutionState is
+    /// only called on a CHANGE of the derived want (viv.c:7319-7347).
+    pub(crate) prevent_sleep_active: bool,
 }
 
 /// Window state pointer stored in GWLP_USERDATA between WM_NCCREATE and
@@ -290,6 +311,7 @@ fn status_snapshot(state: &WindowState, hwnd: HWND) -> status::StatusSnapshot {
         loading: state.session.is_some(),
         file_not_found: state.status_file_not_found,
         load_failed: state.status_load_failed,
+        slideshow: state.slideshow,
         frame: state
             .image
             .as_ref()
@@ -503,14 +525,16 @@ fn on_double_click(hwnd: HWND, lparam: LPARAM) {
         .map(|s| s.config.left_click_action)
         .unwrap_or(0);
     match action {
-        // 3 = zoom in: repeat at the click point (upstream's default arm
-        // re-runs `_viv_do_left_click_action`).
+        // 3/4 = zoom in / next image: the default arm re-runs the click
+        // action (upstream viv.c:3313-3326).
         3 => zoom_at(hwnd, false, (pt.x, pt.y)),
-        // 4 = next image: the second click advances again.
-        4 => nav_next(hwnd, false),
+        4 => nav_next(hwnd, false, true),
         // 0/1/2/5/6 (scroll, slideshow, animation, 1:1 scroll, move
-        // window): the double-click toggles fullscreen; unknown values
-        // re-run the action, which does nothing (upstream viv.c:3313-3326).
+        // window): the double-click toggles FULLSCREEN — upstream's arm
+        // switches on exactly these values and never re-runs the action,
+        // so action 1's second click presents the run the first click
+        // toggled (cubic round 1); unknown values re-run the action,
+        // which does nothing.
         0 | 1 | 2 | 5 | 6 => toggle_fullscreen(hwnd),
         _ => {}
     }
@@ -540,7 +564,7 @@ fn on_right_button(hwnd: HWND, msg: u32, lparam: LPARAM) -> bool {
         }
         2 => {
             if press {
-                nav_next(hwnd, true);
+                nav_next(hwnd, true, true);
             }
             true
         }
@@ -936,17 +960,17 @@ fn on_mousewheel(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
         // Action 1: wheel up = previous, down = next (viv.c:14063-14074).
         1 => {
             if delta > 0 {
-                nav_next(hwnd, true);
+                nav_next(hwnd, true, true);
             } else if delta < 0 {
-                nav_next(hwnd, false);
+                nav_next(hwnd, false, true);
             }
         }
         // Action 2: wheel up = next, down = previous (viv.c:14075-14086).
         2 => {
             if delta > 0 {
-                nav_next(hwnd, false);
+                nav_next(hwnd, false, true);
             } else if delta < 0 {
-                nav_next(hwnd, true);
+                nav_next(hwnd, true, true);
             }
         }
         // Action 0 (and any hand-edited unknown value, which upstream's
@@ -1172,8 +1196,9 @@ fn on_left_button_down(hwnd: HWND, lparam: LPARAM) {
     let pt = lparam_point(lparam);
     // The action dispatch (upstream `_viv_do_left_click_action`,
     // viv.c:3319-3325 + 6360-6415): 0 scroll starts the drag; 3 zooms in
-    // at the click; 4 advances. Unimplemented values (1/2/5/6) do nothing
-    // — upstream's per-value switch has no default-to-scroll arm.
+    // at the click; 4 advances; 1 toggles the slideshow. Unimplemented
+    // values (2/5/6) do nothing — upstream's per-value switch has no
+    // default-to-scroll arm.
     // SAFETY: the borrow spans only the config read.
     let action = (unsafe { state_of(hwnd) })
         .map(|s| s.config.left_click_action)
@@ -1184,13 +1209,19 @@ fn on_left_button_down(hwnd: HWND, lparam: LPARAM) {
             return;
         }
         4 => {
-            nav_next(hwnd, false);
+            nav_next(hwnd, false, true);
+            return;
+        }
+        // 1 = play/pause slideshow (upstream's action-1 arm is
+        // `_viv_pause`, viv.c:6360-6415) — #37.
+        1 => {
+            slideshow_toggle(hwnd);
             return;
         }
         // 0 falls through to the drag below; values riviv has no
-        // handler for (1 slideshow, 2 animation pause, 5 1:1 scroll,
-        // 6 move-window, hand-edited unknowns) do NOTHING, like
-        // upstream's per-value switch (viv.c:6360-6415).
+        // handler for (2 animation pause, 5 1:1 scroll, 6 move-window,
+        // hand-edited unknowns) do NOTHING, like upstream's per-value
+        // switch (viv.c:6360-6415).
         0 => {}
         _ => return,
     }
@@ -1332,6 +1363,10 @@ fn request_open(hwnd: HWND, path: &OsStr, origin: OpenOrigin<'_>) {
             }
             state.status_file_not_found = true;
             state.status_load_failed = false;
+            // The per-image animation marks die with the open (upstream
+            // `_viv_open` → `_viv_clear`, viv.c:1278-1279).
+            state.animation_looped = false;
+            state.slideshow_timeup = false;
             // Supersede any in-flight load so its late replies are inert.
             state.session = None;
         }
@@ -1347,6 +1382,11 @@ fn request_open(hwnd: HWND, path: &OsStr, origin: OpenOrigin<'_>) {
         // (viv.c:1447-1458).
         state.status_file_not_found = false;
         state.status_load_failed = false;
+        // The per-image animation marks die with the open (upstream
+        // `_viv_open` → `_viv_clear`'s frame_looped/timeup resets,
+        // viv.c:1278-1279).
+        state.animation_looped = false;
+        state.slideshow_timeup = false;
         // The navigation reference follows the request (viv.c:1574-1579) —
         // the entry for a navigation, a fresh id-0 entry for a direct pick
         // (mtime 0 in the unstatable corner, where upstream would not have
@@ -1520,6 +1560,16 @@ fn scan_dir(hwnd: HWND) -> std::path::PathBuf {
 /// In random mode (checked first, `end` ignored like upstream) the call
 /// just draws one more random image (viv.c:6122-6125).
 pub(crate) fn home_open(hwnd: HWND, end: bool) {
+    home_open_inner(hwnd, end);
+    // Upstream `_viv_home`'s tail resets a running slideshow timer
+    // UNCONDITIONALLY — every home path (keys, drop-replace, folder open,
+    // Everything replace, the random first-query) re-arms it (viv.c:
+    // 6257-6261), including its random arm which falls through like the
+    // rest.
+    reset_slideshow_timer(hwnd);
+}
+
+fn home_open_inner(hwnd: HWND, end: bool) {
     // Random mode first (viv.c:6122): borrow only long enough to decide.
     // SAFETY: the read-only borrow ends inside is_some_and.
     if (unsafe { state_of(hwnd) }).is_some_and(|s| s.random_search.is_some()) {
@@ -1554,7 +1604,7 @@ pub(crate) fn home_open(hwnd: HWND, end: bool) {
 /// In random mode every direction draws one more random image (upstream
 /// checks `_viv_random` after its load-wait gate, viv.c:5855-5858; riviv's
 /// gate lives in the keydown route, so the check sits at the top here).
-fn nav_next(hwnd: HWND, prev: bool) {
+fn nav_next(hwnd: HWND, prev: bool, reset_slideshow: bool) {
     enum Mode {
         Random,
         Home,
@@ -1595,6 +1645,224 @@ fn nav_next(hwnd: HWND, prev: bool) {
             }
         }
     }
+    // Upstream `_viv_next`'s tail (viv.c:6107-6113): a MANUAL navigation
+    // re-arms a running slideshow timer so the new image gets the full
+    // rate. The slideshow's own timer tick passes false here (viv.c:3156 —
+    // the timer keeps its period); the auto-repeat gate upstream applies
+    // with the same flag lives in the keydown route instead (an early
+    // return before this function runs).
+    if reset_slideshow {
+        reset_slideshow_timer(hwnd);
+    }
+}
+
+/// Re-arm a RUNNING slideshow timer at the current rate (upstream's
+/// kill-then-set pair, viv.c:6109-6112 / 6258-6261 — the restart is what
+/// gives the just-navigated image its full rate).
+fn reset_slideshow_timer(hwnd: HWND) {
+    // SAFETY: the borrow spans the two reads; nothing below it borrows.
+    let arm = (unsafe { state_of(hwnd) })
+        .filter(|state| state.slideshow)
+        .map(|state| state.config.slideshow_rate as u32);
+    if let Some(rate) = arm {
+        // SAFETY: hwnd is live and owned by this thread; the pair is
+        // fail-soft like upstream's unchecked calls — a failed kill leaves
+        // the stale timer ticking at the OLD rate until the next re-arm.
+        let _ = unsafe { KillTimer(Some(hwnd), slideshow::SLIDESHOW_TIMER_ID) };
+        // SAFETY: same pair as the kill above.
+        let _ = unsafe { SetTimer(Some(hwnd), slideshow::SLIDESHOW_TIMER_ID, rate, None) };
+    }
+}
+
+// ---- Slideshow (#37; upstream viv.c:6821-6841 / 7594-7621 / 7582-7601 /
+// 7594-7630 / 3143-3159 / 7319-7347) ----
+
+/// `_viv_slideshow` (viv.c:6821-6841): the start-only toggle behind
+/// F11/View→Slideshow. A File-not-found verdict blocks the start; a
+/// windowed viewer enters fullscreen FIRST (the slideshow presents); an
+/// already-running slideshow is a no-op. (Upstream also refreshes the
+/// toolbar buttons and the on-top state here — those features are riviv's
+/// #45/#46 and plug into this point.)
+fn slideshow_start(hwnd: HWND) {
+    // SAFETY: the borrow spans the two guards only.
+    // Upstream order (viv.c:6821-6841): the File-not-found verdict is the
+    // only early return; the FULLSCREEN transition comes next — BEFORE the
+    // running check — so F11 over a running WINDOWED slideshow (started
+    // via Space/left-click) still presents; only then does an
+    // already-running slideshow no-op the start (cubic round 1).
+    // SAFETY: the borrow spans only the guard read.
+    if (unsafe { state_of(hwnd) }).is_some_and(|state| state.status_file_not_found) {
+        return;
+    }
+    // SAFETY: the read-only borrow ends inside is_some_and.
+    if !(unsafe { state_of(hwnd) }).is_some_and(|state| state.fullscreen) {
+        toggle_fullscreen(hwnd);
+    }
+    // SAFETY: the borrow spans the running check, the flag flip and the
+    // rate read.
+    let arm = (unsafe { state_of(hwnd) }).and_then(|state| {
+        if state.slideshow {
+            return None; // already running: the start is a no-op (viv.c:6833)
+        }
+        state.slideshow = true;
+        Some(state.config.slideshow_rate as u32)
+    });
+    let Some(rate) = arm else {
+        return;
+    };
+    // SAFETY: hwnd live; fail-soft like upstream's unchecked SetTimer —
+    // the flag is the truth, a failed arm just never advances.
+    let _ = unsafe { SetTimer(Some(hwnd), slideshow::SLIDESHOW_TIMER_ID, rate, None) };
+    refresh_status(hwnd);
+    update_prevent_sleep(hwnd);
+}
+
+/// `_viv_pause` (viv.c:7594-7621): the running-state toggle behind Space,
+/// the Play/Pause row and left-click action 1 — stop when running, resume
+/// when not. Never touches fullscreen (that asymmetry with F11 is
+/// upstream's).
+fn slideshow_toggle(hwnd: HWND) {
+    // SAFETY: the borrow spans the flag flip and the rate read.
+    let arm = (unsafe { state_of(hwnd) }).map(|state| {
+        state.slideshow = !state.slideshow;
+        (state.slideshow, state.config.slideshow_rate as u32)
+    });
+    let Some((running, rate)) = arm else {
+        return;
+    };
+    // SAFETY: hwnd live; the failed-call story is the same as the start
+    // arm (the flag is the truth; a stale timer no-ops in WM_TIMER).
+    if running {
+        // SAFETY: same contract as the start arm.
+        let _ = unsafe { SetTimer(Some(hwnd), slideshow::SLIDESHOW_TIMER_ID, rate, None) };
+    } else {
+        // SAFETY: same contract as the start arm.
+        let _ = unsafe { KillTimer(Some(hwnd), slideshow::SLIDESHOW_TIMER_ID) };
+    }
+    refresh_status(hwnd);
+    update_prevent_sleep(hwnd);
+}
+
+/// `_viv_set_rate` (viv.c:7582-7601): store the rate; a running timer is
+/// re-armed at it. (Upstream ends with the status temp-text readout — the
+/// temp-text line itself lands with #47; the pure decomposition is tested
+/// in slideshow.rs.)
+fn slideshow_set_rate(hwnd: HWND, rate_ms: u32) {
+    // SAFETY: the borrow spans the config store and the running read.
+    let running = (unsafe { state_of(hwnd) }).is_some_and(|state| {
+        state.config.slideshow_rate = rate_ms as i32;
+        state.slideshow
+    });
+    if running {
+        // Kill before set so the period restarts (viv.c:7587-7592).
+        // SAFETY: hwnd live; fail-soft like upstream's unchecked pair.
+        let _ = unsafe { KillTimer(Some(hwnd), slideshow::SLIDESHOW_TIMER_ID) };
+        // SAFETY: same pair as the kill above.
+        let _ = unsafe { SetTimer(Some(hwnd), slideshow::SLIDESHOW_TIMER_ID, rate_ms, None) };
+    }
+}
+
+/// `_viv_increase_rate` (viv.c:7594-7630): step through the preset table;
+/// the clamped ends are no-ops.
+fn slideshow_step(hwnd: HWND, decrease: bool) {
+    // SAFETY: read-only borrow for the current rate.
+    let next = (unsafe { state_of(hwnd) })
+        .and_then(|s| slideshow::step_rate(s.config.slideshow_rate, decrease));
+    if let Some(ms) = next {
+        slideshow_set_rate(hwnd, ms);
+    }
+}
+
+/// The Custom... row (viv.c:1963 → `_viv_set_custom_rate`,
+/// viv.c:7453-7483): the modal collects `(value, unit)`; OK composes and
+/// applies, storing BOTH the composed rate and the dialog's own fields.
+fn slideshow_open_custom_dialog(hwnd: HWND) {
+    // SAFETY: read-only borrow for the dialog seeds.
+    let seeds = (unsafe { state_of(hwnd) }).map(|s| {
+        (
+            s.config.slideshow_custom_rate,
+            s.config.slideshow_custom_rate_type,
+        )
+    });
+    if let Some((value, type_value)) = seeds
+        && let Some(outcome) = custom_rate_dlg::open(hwnd, value, type_value)
+    {
+        // SAFETY: the borrow spans the two config stores.
+        if let Some(state) = unsafe { state_of(hwnd) } {
+            state.config.slideshow_custom_rate = outcome.value as i32;
+            state.config.slideshow_custom_rate_type = outcome.unit.type_value();
+        }
+        slideshow_set_rate(hwnd, slideshow::custom_rate(outcome.value, outcome.unit));
+    }
+}
+
+/// The slideshow WM_TIMER body (viv.c:3143-3159): gate through the pure
+/// model, then advance WITHOUT re-arming (the slideshow's own tick is not
+/// a manual navigation — upstream's `_viv_next(0,0,0,0)`).
+fn on_slideshow_timer(hwnd: HWND) {
+    // SAFETY: the borrow spans the reads and the timeup store.
+    let advance = (unsafe { state_of(hwnd) }).and_then(|state| {
+        if !state.slideshow {
+            // A stale timer (failed KillTimer) after a stop — no-op, the
+            // flag is the truth.
+            return None;
+        }
+        let is_animation = state.image.as_ref().is_some_and(|i| {
+            // Upstream's `_viv_frame_count > 1` reads a PRE-KNOWN total;
+            // riviv's frame_count is the loaded prefix, so an animation's
+            // first frame still counts as "maybe an animation" until the
+            // stream completes — hold those too (cubic round 1). A
+            // genuinely static image flips to advance at its Complete, at
+            // worst delaying the step by the decode.
+            i.is_animated() || !i.decode_complete()
+        });
+        match slideshow::timer_gate(
+            state.config.loop_animations_once != 0,
+            is_animation,
+            state.animation_looped,
+        ) {
+            slideshow::Gate::WaitForLoop => {
+                // Hold the advance until the animation loops once
+                // (viv.c:3146-3153); the wrap performs it.
+                state.slideshow_timeup = true;
+                None
+            }
+            slideshow::Gate::Advance => Some(()),
+        }
+    });
+    if advance.is_some() {
+        nav_next(hwnd, false, false);
+    }
+}
+
+/// `_viv_update_prevent_sleep` (viv.c:7319-7347): with
+/// `config_prevent_sleep` on, a running slideshow or a playing animation
+/// holds the display awake; ES_CONTINUOUS makes the requirement sticky
+/// until the matching release call, so the latch only calls on a CHANGE.
+fn update_prevent_sleep(hwnd: HWND) {
+    // SAFETY: the borrow spans the reads and the latch update.
+    let flip = (unsafe { state_of(hwnd) }).map(|state| {
+        let want =
+            state.config.prevent_sleep != 0 && (state.slideshow || state.animation_timer_running);
+        (
+            want,
+            std::mem::replace(&mut state.prevent_sleep_active, want) != want,
+        )
+    });
+    let Some((want, changed)) = flip else {
+        return;
+    };
+    if !changed {
+        return;
+    }
+    let flags = if want {
+        ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED
+    } else {
+        ES_CONTINUOUS
+    };
+    // SAFETY: adjusts only this thread's execution requirements; the
+    // return value is the previous state, unused like upstream's.
+    let _ = unsafe { SetThreadExecutionState(flags) };
 }
 
 /// Upstream `_viv_blank` (viv.c:7908-7930): clear the display, the
@@ -1624,8 +1892,12 @@ fn blank_display(hwnd: HWND) {
         state.pending_file_bytes = None;
         state.session = None;
         // The zoom/pan view dies with the display (upstream `_viv_blank` →
-        // `_viv_clear`, viv.c:7910 + 1282-1288).
+        // `_viv_clear`, viv.c:7910 + 1282-1288) — and so do the per-image
+        // animation marks (frame_looped/timeup, viv.c:1278/1279). The
+        // slideshow itself keeps running (upstream never stops it here).
         state.view.reset();
+        state.animation_looped = false;
+        state.slideshow_timeup = false;
         stop_timer = state.animation_timer_running;
         state.animation_timer_running = false;
     }
@@ -1638,6 +1910,10 @@ fn blank_display(hwnd: HWND) {
         // SAFETY: hwnd is live; a failed kill leaves a stale timer that the
         // WM_TIMER guard no-ops on.
         let _ = unsafe { KillTimer(Some(hwnd), ANIMATION_TIMER_ID) };
+        // The animation timer stopping is a prevent-sleep transition point
+        // (upstream `_viv_timer_stop` → `_viv_update_prevent_sleep`,
+        // viv.c:9633).
+        update_prevent_sleep(hwnd);
     }
     // SAFETY: hwnd is live; the HSTRING outlives the call. Fail-soft like
     // every other title update (upstream viv.c:1249 ignores it too).
@@ -2132,12 +2408,20 @@ fn on_load_replies(hwnd: HWND) {
         // SAFETY: hwnd is live; a failed kill leaves a stale timer that the
         // WM_TIMER guard no-ops on.
         let _ = unsafe { KillTimer(Some(hwnd), ANIMATION_TIMER_ID) };
+        // The animation timer stopping is a prevent-sleep transition point
+        // (upstream `_viv_timer_stop` → `_viv_update_prevent_sleep`,
+        // viv.c:9633).
+        update_prevent_sleep(hwnd);
     }
     if start_timer {
         // SAFETY: hwnd is live and owned by this thread. Fail-soft like
         // upstream viv.c:9144 (unchecked SetTimer): a failed timer merely
         // freezes the animation.
         let _ = unsafe { SetTimer(Some(hwnd), ANIMATION_TIMER_ID, USER_TIMER_MINIMUM, None) };
+        // The animation timer starting is a prevent-sleep transition point
+        // (upstream `_viv_timer_start` → `_viv_update_prevent_sleep`,
+        // viv.c:9147).
+        update_prevent_sleep(hwnd);
     }
     if let Some(title) = title.as_ref() {
         // SAFETY: hwnd is live; the HSTRING outlives the call. Fail-soft on
@@ -2159,21 +2443,45 @@ fn on_animation_timer(hwnd: HWND) {
     // Read the clock before any state borrow — its failure path is the fatal
     // modal (see open_image).
     let now = qpc_now();
-    // SAFETY: the borrow spans only scheduler/position field updates and a
-    // final InvalidateRect; nothing here pumps messages, so no second
-    // state_of borrow can alias this one.
-    let repaint = match unsafe { state_of(hwnd) } {
+    // SAFETY: the borrow spans only scheduler/position field updates; the
+    // nav_next call below runs after it drops (its own paths re-borrow).
+    let (repaint, held_advance) = match unsafe { state_of(hwnd) } {
         Some(state) => {
             let freq = state.timer_freq;
+            // The held-advance gate (upstream viv.c:3243-3248: loop-once on
+            // + the slideshow timer already expired). Deliberately WITHOUT
+            // a running check: upstream's `_viv_pause` does not clear
+            // `_viv_is_slideshow_timeup` (viv.c:7594-7621 — only
+            // `_viv_clear` resets it, viv.c:1279), so pausing between the
+            // timer expiry and the loop still lets the wrap's ONE advance
+            // through — at most a single stray step per pause, exactly the
+            // upstream quirk (cubic round 1, declined).
+            let gate = state.slideshow_timeup && state.config.loop_animations_once != 0;
             match state.image.as_mut() {
                 // The timer only runs while an animation is displayed; the
                 // guard also makes a stale timer (failed KillTimer) harmless.
-                Some(image) if image.is_animated() => image.advance_on_timer(now, freq),
-                _ => false,
+                Some(image) if image.is_animated() => {
+                    let adv = image.advance_on_timer(now, freq, gate);
+                    if adv.looped {
+                        // Upstream raises _viv_frame_looped on the wrap
+                        // (viv.c:3243) — the slideshow gate's wait ends
+                        // with it, and the loop-once STOP behavior (#38)
+                        // will read it too.
+                        state.animation_looped = true;
+                    }
+                    (adv.repaint, adv.looped && gate)
+                }
+                _ => (false, false),
             }
         }
-        None => false,
+        None => (false, false),
     };
+    if held_advance {
+        // The gate held the slideshow's advance until this animation
+        // looped once — fire it now, as a MANUAL advance (the timer
+        // re-arms, viv.c:3245's `_viv_next(0,1,0,0)`).
+        nav_next(hwnd, false, true);
+    }
     if repaint {
         // The frame counter part ("n / m") tracks the displayed frame
         // (upstream refreshes it in the timer body, viv.c:3277).
@@ -2608,6 +2916,8 @@ fn on_initmenu(hwnd: HWND) {
             show_menu: state.config.show_menu != 0,
             fullscreen: state.fullscreen,
             one_to_one,
+            slideshow: state.slideshow,
+            slideshow_rate_ms: state.config.slideshow_rate as u32,
         }
     });
     let Some(state) = snapshot else {
@@ -2619,10 +2929,17 @@ fn on_initmenu(hwnd: HWND) {
         return;
     }
     for cmd in menu::Cmd::ALL {
-        let flags: u32 = if menu::checked(cmd, &state) {
-            (MF_CHECKED | MF_BYCOMMAND).0
+        // The Rate submenu's checks render as radio dots (upstream passes
+        // MFT_RADIOCHECK in the flags for that family, viv.c:7165-7189).
+        let radio: u32 = if menu::radio(cmd) {
+            MFT_RADIOCHECK.0
         } else {
-            (MF_UNCHECKED | MF_BYCOMMAND).0
+            0
+        };
+        let flags: u32 = if menu::checked(cmd, &state) {
+            (MF_CHECKED | MF_BYCOMMAND).0 | radio
+        } else {
+            (MF_UNCHECKED | MF_BYCOMMAND).0 | radio
         };
         // SAFETY: bar is the window's own live menu.
         let _ = unsafe { CheckMenuItem(bar, u32::from(cmd.id()), flags) };
@@ -2759,8 +3076,39 @@ fn on_command(hwnd: HWND, cmd: menu::Cmd) {
         // The Options dialog (#24) — modal over the viewer; commits into
         // the live config on OK (instant effect + save).
         menu::Cmd::ViewOptions => crate::options_dlg::open(hwnd),
-        menu::Cmd::NavNext => nav_next(hwnd, false),
-        menu::Cmd::NavPrev => nav_next(hwnd, true),
+        // The slideshow family (#37; upstream viv.c:2072/1838-1851/1947-
+        // 1963): the start-only toggle, the running toggle, the preset
+        // steps and rows, and the Custom dialog.
+        menu::Cmd::ViewSlideshow => slideshow_start(hwnd),
+        menu::Cmd::SlideshowPause => slideshow_toggle(hwnd),
+        menu::Cmd::SlideshowRateDecrease => slideshow_step(hwnd, true),
+        menu::Cmd::SlideshowRateIncrease => slideshow_step(hwnd, false),
+        menu::Cmd::SlideshowRateCustom => slideshow_open_custom_dialog(hwnd),
+        // The 17 preset rows (upstream viv.c:1947-1962) — the ms value is
+        // part of the command itself.
+        cmd @ (menu::Cmd::SlideshowRate250
+        | menu::Cmd::SlideshowRate500
+        | menu::Cmd::SlideshowRate1000
+        | menu::Cmd::SlideshowRate2000
+        | menu::Cmd::SlideshowRate3000
+        | menu::Cmd::SlideshowRate4000
+        | menu::Cmd::SlideshowRate5000
+        | menu::Cmd::SlideshowRate6000
+        | menu::Cmd::SlideshowRate7000
+        | menu::Cmd::SlideshowRate8000
+        | menu::Cmd::SlideshowRate9000
+        | menu::Cmd::SlideshowRate10000
+        | menu::Cmd::SlideshowRate20000
+        | menu::Cmd::SlideshowRate30000
+        | menu::Cmd::SlideshowRate40000
+        | menu::Cmd::SlideshowRate50000
+        | menu::Cmd::SlideshowRate60000) => {
+            if let Some(rate_ms) = cmd.slideshow_rate_ms() {
+                slideshow_set_rate(hwnd, rate_ms);
+            }
+        }
+        menu::Cmd::NavNext => nav_next(hwnd, false, true),
+        menu::Cmd::NavPrev => nav_next(hwnd, true, true),
         menu::Cmd::NavHome => home_open(hwnd, false),
         menu::Cmd::NavEnd => home_open(hwnd, true),
         menu::Cmd::HelpAbout => show_about(hwnd),
@@ -2893,9 +3241,9 @@ fn on_keydown(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
     // ESC cancels an in-progress drag, or leaves fullscreen (upstream
     // viv.c:6367-6382: an unmodified ESC with a mouse action active
     // releases the capture FIRST; only otherwise does it exit fullscreen —
-    // the slideshow pause arm of that block lands with the slideshow
-    // work). This arm is NOT a binding: it stands even when the ini
-    // binds ESC somewhere.
+    // and leaving fullscreen that way ALSO pauses a running slideshow, the
+    // "stop presenting" gesture, viv.c:6376-6382). This arm is NOT a
+    // binding: it stands even when the ini binds ESC somewhere.
     if vk == VK_ESCAPE.0 && !ctrl && !shift && !alt {
         // SAFETY: the borrow spans only the Option take.
         let was_dragging =
@@ -2910,6 +3258,11 @@ fn on_keydown(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
         let fullscreen = (unsafe { state_of(hwnd) }).is_some_and(|state| state.fullscreen);
         if fullscreen {
             toggle_fullscreen(hwnd);
+            // ...and pause the slideshow (viv.c:6376-6382).
+            // SAFETY: the read-only borrow ends inside is_some_and.
+            if (unsafe { state_of(hwnd) }).is_some_and(|state| state.slideshow) {
+                slideshow_toggle(hwnd);
+            }
         }
         return;
     }
@@ -3054,6 +3407,11 @@ fn on_size(hwnd: HWND) {
         repaint(hwnd);
     }
 }
+
+/// The screensaver system-command value (winuser.h 0xF140 — the windows
+/// crate ships SC_MONITORPOWER but not this one; upstream switches on both
+/// raw, viv.c:3913-3914).
+const SC_SCREENSAVE_CMD: isize = 0xf140;
 
 unsafe extern "system" fn wnd_proc(
     hwnd: HWND,
@@ -3317,12 +3675,38 @@ unsafe extern "system" fn wnd_proc(
             if wparam.0 == ANIMATION_TIMER_ID {
                 on_animation_timer(hwnd);
                 LRESULT(0)
+            } else if wparam.0 == slideshow::SLIDESHOW_TIMER_ID {
+                on_slideshow_timer(hwnd);
+                LRESULT(0)
             } else if wparam.0 == cursor::HIDE_CURSOR_TIMER_ID {
                 on_hide_cursor_timer(hwnd);
                 LRESULT(0)
             } else {
                 // SAFETY: hwnd/msg are exactly what this callback received;
                 // the default procedure handles everything we do not.
+                unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+            }
+        }
+        // Upstream viv.c:3907-3938: with prevent_sleep on, a running
+        // slideshow or a PLAYING animation swallows the monitor-power /
+        // screensaver system commands (return 0, no DefWindowProc);
+        // everything else falls through. The raw compare (no 0xFFF0 mask)
+        // is upstream's own; riviv's `animation_timer_running` stands in
+        // for its `_viv_is_animation_timer && _viv_animation_play` — the
+        // pause flag only arrives with the animation-menu work (#38), and
+        // a running timer always plays today.
+        WM_SYSCOMMAND
+            if wparam.0 == SC_MONITORPOWER as usize || wparam.0 == SC_SCREENSAVE_CMD as usize =>
+        {
+            // SAFETY: the read-only borrow ends inside is_some_and.
+            let block = (unsafe { state_of(hwnd) }).is_some_and(|s| {
+                s.config.prevent_sleep != 0 && (s.slideshow || s.animation_timer_running)
+            });
+            if block {
+                LRESULT(0)
+            } else {
+                // SAFETY: hwnd/msg are exactly what this callback received;
+                // the default procedure owns the system command.
                 unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
             }
         }
@@ -3846,6 +4230,10 @@ pub(crate) fn run(args: Vec<OsString>) -> Result<(), String> {
         random_tot_results: 0,
         everything_request_flags: 0,
         random_rand_state: 0,
+        slideshow: false,
+        slideshow_timeup: false,
+        animation_looped: false,
+        prevent_sleep_active: false,
     };
 
     // SAFETY: returns the module handle of this exe; no side effects.

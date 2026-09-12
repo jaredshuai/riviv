@@ -55,17 +55,24 @@ pub(crate) fn dialog_filter() -> Vec<u16> {
 // ---------------------------------------------------------------------------
 
 /// Main-part (part 0) text by priority, first match wins
-/// (viv.c:11346-11380 minus temp text and slideshow, which are later
-/// milestones): Loading > File not found > Failed to load > empty. The
-/// strings come from the loc tables (viv.c:11358/11364/11370) — English
-/// until `loc::init` detects a Chinese UI language.
-pub(crate) fn status_main_text(loading: bool, not_found: bool, failed: bool) -> &'static str {
+/// (viv.c:11346-11380 minus temp text, which is a later milestone):
+/// Loading > File not found > Failed to load > Slideshow playing > empty.
+/// The strings come from the loc tables (viv.c:11358/11364/11370/11376) —
+/// English until `loc::init` detects a Chinese UI language.
+pub(crate) fn status_main_text(
+    loading: bool,
+    not_found: bool,
+    failed: bool,
+    slideshow: bool,
+) -> &'static str {
     if loading {
         loc::get(Id::StatusBarLoading)
     } else if not_found {
         loc::get(Id::StatusBarFileNotFound)
     } else if failed {
         loc::get(Id::StatusBarFailedToLoadImage)
+    } else if slideshow {
+        loc::get(Id::StatusBarSlideshowPlaying)
     } else {
         ""
     }
@@ -231,18 +238,40 @@ mod tests {
         // Loading outranks a sticky failure from the previous open
         // (viv.c:11354-11362 order) — a replacement load of a bad file must
         // not flash the failure text while decoding.
-        assert_eq!(status_main_text(true, true, true), "Loading...");
-        assert_eq!(status_main_text(true, false, false), "Loading...");
+        assert_eq!(status_main_text(true, true, true, true), "Loading...");
+        assert_eq!(status_main_text(true, false, false, false), "Loading...");
     }
 
     #[test]
     fn main_part_prefers_not_found_over_decode_failure() {
-        assert_eq!(status_main_text(false, true, true), "File not found.");
         assert_eq!(
-            status_main_text(false, false, true),
+            status_main_text(false, true, true, false),
+            "File not found."
+        );
+        assert_eq!(
+            status_main_text(false, false, true, false),
             "Failed to load image."
         );
-        assert_eq!(status_main_text(false, false, false), "");
+        assert_eq!(status_main_text(false, false, false, false), "");
+    }
+
+    #[test]
+    fn main_part_shows_slideshow_playing_below_every_verdict() {
+        // viv.c:11374-11377: the slideshow line shows only when no verdict
+        // outranks it (the loading/FNF/FAILED chain all come first).
+        assert_eq!(
+            status_main_text(false, false, false, true),
+            "Slideshow playing"
+        );
+        assert_eq!(status_main_text(true, false, false, true), "Loading...");
+        assert_eq!(
+            status_main_text(false, true, false, true),
+            "File not found."
+        );
+        assert_eq!(
+            status_main_text(false, false, true, true),
+            "Failed to load image."
+        );
     }
 
     #[test]

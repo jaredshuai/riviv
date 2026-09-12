@@ -205,12 +205,56 @@ pub(crate) enum Id {
     EverythingRandomize,
     /// "Everything not available" error box (#22; en_us.h:280).
     EverythingNotAvailable,
+    /// View → "Slideshow" (#37; en_us.h:78).
+    MenuSlideshow,
+    /// "&Slideshow" top-level caption (#37; en_us.h:118).
+    MenuSlideshowMenu,
+    /// Slideshow → "&Play/Pause" (#37; en_us.h:119).
+    MenuSlideshowPlayPause,
+    /// Slideshow → Rate popup caption (#37; en_us.h:120).
+    MenuSlideshowRate,
+    /// Slideshow → Rate → "&Decrease Rate" (#37; en_us.h:121).
+    MenuSlideshowRateDecrease,
+    /// Slideshow → Rate → "&Increase Rate" (#37; en_us.h:122).
+    MenuSlideshowRateIncrease,
+    /// The 17 preset rows + Custom (#37; en_us.h:123-140).
+    MenuRate250Milliseconds,
+    MenuRate500Milliseconds,
+    MenuRate1Second,
+    MenuRate2Seconds,
+    MenuRate3Seconds,
+    MenuRate4Seconds,
+    MenuRate5Seconds,
+    MenuRate6Seconds,
+    MenuRate7Seconds,
+    MenuRate8Seconds,
+    MenuRate9Seconds,
+    MenuRate10Seconds,
+    MenuRate20Seconds,
+    MenuRate30Seconds,
+    MenuRate40Seconds,
+    MenuRate50Seconds,
+    MenuRate1Minute,
+    MenuRateCustom,
+    /// Set Custom Rate dialog caption (#37; en_us.h:248).
+    CustomRateCaption,
+    /// "&Custom rate:" label (#37; en_us.h:249).
+    CustomRateLabel,
+    /// The dialog's unit combo rows (#37; en_us.h:250-252 — milliseconds,
+    /// seconds, minutes in type order 0/1/2).
+    CustomRateMilliseconds,
+    CustomRateSeconds,
+    CustomRateMinutes,
+    /// Status-bar main part while a slideshow runs (#37; en_us.h:200).
+    StatusBarSlideshowPlaying,
+    /// Left-click action value 1 (#37; en_us.h:264).
+    ActionPlayPauseSlideshow,
 }
 
 impl Id {
     /// Variant count; array-typing both tables against this keeps them
     /// length-locked to the enum by construction.
-    pub(crate) const COUNT: usize = Self::EverythingNotAvailable as usize + 1;
+    pub(crate) const COUNT: usize = Self::ActionPlayPauseSlideshow as usize + 1;
 }
 
 /// Table choice (upstream `LOCALIZATION_LANGUAGE_*`, localization.h:30-32).
@@ -309,6 +353,38 @@ const EN_US: [&str; Id::COUNT] = [
     "Add Everything Search",      // EverythingAddCaption
     "Randomize",                  // EverythingRandomize
     "Everything not available",   // EverythingNotAvailable
+    // Slideshow block (#37; en_us.h:78/118-140/200/248-252/264).
+    "&Slideshow",           // MenuSlideshow
+    "&Slideshow",           // MenuSlideshowMenu
+    "&Play/Pause",          // MenuSlideshowPlayPause
+    "&Rate",                // MenuSlideshowRate
+    "&Decrease Rate",       // MenuSlideshowRateDecrease
+    "&Increase Rate",       // MenuSlideshowRateIncrease
+    "250 Milliseconds",     // MenuRate250Milliseconds
+    "500 Milliseconds",     // MenuRate500Milliseconds
+    "&1 Second",            // MenuRate1Second
+    "&2 Seconds",           // MenuRate2Seconds
+    "&3 Seconds",           // MenuRate3Seconds
+    "&4 Seconds",           // MenuRate4Seconds
+    "&5 Seconds",           // MenuRate5Seconds
+    "&6 Seconds",           // MenuRate6Seconds
+    "&7 Seconds",           // MenuRate7Seconds
+    "&8 Seconds",           // MenuRate8Seconds
+    "&9 Seconds",           // MenuRate9Seconds
+    "1&0 Seconds",          // MenuRate10Seconds
+    "20 Seconds",           // MenuRate20Seconds
+    "30 Seconds",           // MenuRate30Seconds
+    "40 Seconds",           // MenuRate40Seconds
+    "50 Seconds",           // MenuRate50Seconds
+    "1 Minute",             // MenuRate1Minute
+    "Custom...",            // MenuRateCustom
+    "Set Custom Rate",      // CustomRateCaption
+    "&Custom rate:",        // CustomRateLabel
+    "milliseconds",         // CustomRateMilliseconds
+    "seconds",              // CustomRateSeconds
+    "minutes",              // CustomRateMinutes
+    "Slideshow playing",    // StatusBarSlideshowPlaying
+    "Play/Pause Slideshow", // ActionPlayPauseSlideshow
 ];
 
 /// zh-CN table — upstream localization_zh_cn.h:31/197-199/261-263.
@@ -399,6 +475,38 @@ const ZH_CN: [&str; Id::COUNT] = [
     "添加 Everything 搜索",        // EverythingAddCaption
     "随机化",                      // EverythingRandomize
     "Everything 不可用",           // EverythingNotAvailable
+    // Slideshow block (#37; zh_cn.h:78/118-140/200/203-206/249-253/265).
+    "幻灯片(&S)",      // MenuSlideshow
+    "幻灯片(&S)",      // MenuSlideshowMenu
+    "播放/暂停(&P)",   // MenuSlideshowPlayPause
+    "速率(&R)",        // MenuSlideshowRate
+    "降低速率(&D)",    // MenuSlideshowRateDecrease
+    "提高速率(&I)",    // MenuSlideshowRateIncrease
+    "250 毫秒",        // MenuRate250Milliseconds
+    "500 毫秒",        // MenuRate500Milliseconds
+    "&1 秒",           // MenuRate1Second
+    "&2 秒",           // MenuRate2Seconds
+    "&3 秒",           // MenuRate3Seconds
+    "&4 秒",           // MenuRate4Seconds
+    "&5 秒",           // MenuRate5Seconds
+    "&6 秒",           // MenuRate6Seconds
+    "&7 秒",           // MenuRate7Seconds
+    "&8 秒",           // MenuRate8Seconds
+    "&9 秒",           // MenuRate9Seconds
+    "1&0 秒",          // MenuRate10Seconds
+    "20 秒",           // MenuRate20Seconds
+    "30 秒",           // MenuRate30Seconds
+    "40 秒",           // MenuRate40Seconds
+    "50 秒",           // MenuRate50Seconds
+    "1 分钟",          // MenuRate1Minute
+    "自定义...",       // MenuRateCustom
+    "设置自定义速率",  // CustomRateCaption
+    "自定义速率(&C):", // CustomRateLabel
+    "毫秒",            // CustomRateMilliseconds
+    "秒",              // CustomRateSeconds
+    "分钟",            // CustomRateMinutes
+    "幻灯片播放中",    // StatusBarSlideshowPlaying
+    "播放/暂停幻灯片", // ActionPlayPauseSlideshow
 ];
 
 /// Map a `GetUserDefaultUILanguage` LANGID onto the table choice
