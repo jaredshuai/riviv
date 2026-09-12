@@ -29,16 +29,22 @@ pub(crate) const RATE_PRESETS: [u32; 17] = [
 /// Decrease scans from the LARGEST preset for the first one strictly below
 /// `current_ms`; Increase scans from the smallest for the first strictly
 /// above. Already at (or past) the end in that direction → `None` (no
-/// change, no wrap — the upstream walk simply finds nothing).
-pub(crate) fn step_rate(current_ms: u32, decrease: bool) -> Option<u32> {
+/// change, no wrap — the upstream walk simply finds nothing). The compare
+/// is SIGNED like upstream's int (cubic round 1): a negative hand-edited
+/// ini rate sits below every preset, so Increase reaches for 250 — the
+/// corrupted rate stays recoverable through the keyboard.
+pub(crate) fn step_rate(current_ms: i32, decrease: bool) -> Option<u32> {
     if decrease {
         RATE_PRESETS
             .iter()
             .rev()
-            .find(|&&p| p < current_ms)
+            .find(|&&p| (p as i32) < current_ms)
             .copied()
     } else {
-        RATE_PRESETS.iter().find(|&&p| p > current_ms).copied()
+        RATE_PRESETS
+            .iter()
+            .find(|&&p| (p as i32) > current_ms)
+            .copied()
     }
 }
 
@@ -146,6 +152,16 @@ mod tests {
         assert_eq!(step_rate(60_000, false), None);
         // A custom rate past the slow end is equally stuck.
         assert_eq!(step_rate(90_000, false), None);
+    }
+
+    #[test]
+    fn a_negative_rate_steps_like_the_upstream_int_compare() {
+        // viv.c:7594-7630 compares config_slideshow_rate (an int) against
+        // the positive presets: negative sits below every one, so Increase
+        // reaches for the fastest preset and Decrease finds nothing.
+        assert_eq!(step_rate(-5_000, false), Some(250));
+        assert_eq!(step_rate(-1, false), Some(250));
+        assert_eq!(step_rate(-5_000, true), None);
     }
 
     #[test]

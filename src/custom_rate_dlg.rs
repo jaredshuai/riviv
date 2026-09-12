@@ -220,15 +220,14 @@ unsafe fn collect(dlg: HWND) -> (u32, CustomRateUnit) {
     (value, unit)
 }
 
-/// GetDlgItemInt's parse: leading digits only, empty or non-numeric → 0,
-/// u32 overflow → 0.
+/// GetDlgItemInt's parse (bSigned = FALSE, the upstream call at viv.c:7490):
+/// leading whitespace is skipped, then the FIRST character must be a digit
+/// — any other prefix reads 0 (not the digits that may follow it, Codex
+/// round 1); digits accumulate until the first non-digit; an u32 overflow
+/// collapses to 0.
 fn parse_dialog_uint(text: &str) -> u32 {
     let mut acc: u64 = 0;
-    for ch in text
-        .chars()
-        .skip_while(|c| !c.is_ascii_digit())
-        .take_while(|c| c.is_ascii_digit())
-    {
+    for ch in text.trim_start().chars().take_while(|c| c.is_ascii_digit()) {
         acc = acc * 10 + u64::from(ch as u8 - b'0');
         if acc > u64::from(u32::MAX) {
             return 0;
@@ -543,16 +542,20 @@ mod tests {
     use super::*;
 
     /// GetDlgItemInt's lenient parse (upstream passes NULL for the
-    /// success flag, viv.c:7490): leading digits only, empty or garbage →
-    /// 0, overflow → 0.
+    /// success flag, viv.c:7490): after leading whitespace the first
+    /// character must be a digit — a non-numeric prefix reads 0 (not the
+    /// digits that follow, Codex round 1); digits stop at the first
+    /// non-digit; overflow → 0.
     #[test]
     fn dialog_uint_parses_like_getdlgitemint() {
         assert_eq!(parse_dialog_uint("3"), 3);
         assert_eq!(parse_dialog_uint("012"), 12);
         assert_eq!(parse_dialog_uint(""), 0);
         assert_eq!(parse_dialog_uint("abc"), 0);
+        assert_eq!(parse_dialog_uint("abc12"), 0, "non-digit prefix reads 0");
         assert_eq!(parse_dialog_uint("12abc34"), 12);
         assert_eq!(parse_dialog_uint(" 7"), 7);
+        assert_eq!(parse_dialog_uint("-5"), 0, "bSigned=FALSE rejects the sign");
         assert_eq!(parse_dialog_uint("4294967295"), 4_294_967_295);
         assert_eq!(parse_dialog_uint("4294967296"), 0, "overflow reads 0");
         assert_eq!(parse_dialog_uint("99999999999999"), 0);

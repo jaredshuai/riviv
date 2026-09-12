@@ -1764,7 +1764,7 @@ fn slideshow_set_rate(hwnd: HWND, rate_ms: u32) {
 fn slideshow_step(hwnd: HWND, decrease: bool) {
     // SAFETY: read-only borrow for the current rate.
     let next = (unsafe { state_of(hwnd) })
-        .and_then(|s| slideshow::step_rate(s.config.slideshow_rate as u32, decrease));
+        .and_then(|s| slideshow::step_rate(s.config.slideshow_rate, decrease));
     if let Some(ms) = next {
         slideshow_set_rate(hwnd, ms);
     }
@@ -2440,15 +2440,20 @@ fn on_animation_timer(hwnd: HWND) {
     let (repaint, held_advance) = match unsafe { state_of(hwnd) } {
         Some(state) => {
             let freq = state.timer_freq;
-            // The held slideshow advance only fires while loop-once is on
-            // (upstream wraps the check in config_loop_animations_once,
-            // viv.c:3243-3248).
-            let should_advance = state.slideshow_timeup && state.config.loop_animations_once != 0;
+            // The held-advance gate (upstream viv.c:3243-3248: loop-once on
+            // + the slideshow timer already expired). Deliberately WITHOUT
+            // a running check: upstream's `_viv_pause` does not clear
+            // `_viv_is_slideshow_timeup` (viv.c:7594-7621 — only
+            // `_viv_clear` resets it, viv.c:1279), so pausing between the
+            // timer expiry and the loop still lets the wrap's ONE advance
+            // through — at most a single stray step per pause, exactly the
+            // upstream quirk (cubic round 1, declined).
+            let gate = state.slideshow_timeup && state.config.loop_animations_once != 0;
             match state.image.as_mut() {
                 // The timer only runs while an animation is displayed; the
                 // guard also makes a stale timer (failed KillTimer) harmless.
                 Some(image) if image.is_animated() => {
-                    let adv = image.advance_on_timer(now, freq);
+                    let adv = image.advance_on_timer(now, freq, gate);
                     if adv.looped {
                         // Upstream raises _viv_frame_looped on the wrap
                         // (viv.c:3243) — the slideshow gate's wait ends
@@ -2456,7 +2461,7 @@ fn on_animation_timer(hwnd: HWND) {
                         // will read it too.
                         state.animation_looped = true;
                     }
-                    (adv.repaint, adv.looped && should_advance)
+                    (adv.repaint, adv.looped && gate)
                 }
                 _ => (false, false),
             }
