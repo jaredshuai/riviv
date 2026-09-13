@@ -249,12 +249,43 @@ pub(crate) enum Id {
     StatusBarSlideshowPlaying,
     /// Left-click action value 1 (#37; en_us.h:264).
     ActionPlayPauseSlideshow,
+    /// Left-click action value 2 (#38; en_us.h:265).
+    ActionPlayPauseAnimation,
+    /// "&Animation" top-level caption (#38; en_us.h:142).
+    MenuAnimation,
+    /// Animation → "&Play/Pause" (#38; en_us.h:144).
+    MenuAnimationPlayPause,
+    /// Animation → "Jump &Forward" / "Jump &Backward" (medium, #38;
+    /// en_us.h:145-146).
+    MenuAnimationJumpForward,
+    MenuAnimationJumpBackward,
+    /// The MF_OWNERDRAW short/long jump quartet (#38; en_us.h:147-150 —
+    /// never in the menu bar, named for the Controls list + ini).
+    MenuAnimationShortJumpForward,
+    MenuAnimationShortJumpBackward,
+    MenuAnimationLongJumpForward,
+    MenuAnimationLongJumpBackward,
+    /// Animation → "F&rame Step" / "Pre&vious Frame" (#38; en_us.h:151-152).
+    MenuAnimationFrameStep,
+    MenuAnimationPreviousFrame,
+    /// Animation → "F&irst Frame" / "&Last Frame" (#38; en_us.h:153-154).
+    MenuAnimationFirstFrame,
+    MenuAnimationLastFrame,
+    /// Animation → "&Decrease Rate" / "&Increase Rate" / "R&eset Rate"
+    /// (#38; en_us.h:155-157).
+    MenuAnimationRateDecrease,
+    MenuAnimationRateIncrease,
+    MenuAnimationRateReset,
+    /// Options View page: loop-once checkbox (#38; en_us.h:230 — the
+    /// slideshow-scoped "advance waits for one full animation pass"
+    /// setting).
+    OptionsLoopAnimationsOnce,
 }
 
 impl Id {
     /// Variant count; array-typing both tables against this keeps them
     /// length-locked to the enum by construction.
-    pub(crate) const COUNT: usize = Self::ActionPlayPauseSlideshow as usize + 1;
+    pub(crate) const COUNT: usize = Self::OptionsLoopAnimationsOnce as usize + 1;
 }
 
 /// Table choice (upstream `LOCALIZATION_LANGUAGE_*`, localization.h:30-32).
@@ -385,6 +416,24 @@ const EN_US: [&str; Id::COUNT] = [
     "minutes",              // CustomRateMinutes
     "Slideshow playing",    // StatusBarSlideshowPlaying
     "Play/Pause Slideshow", // ActionPlayPauseSlideshow
+    "Play/Pause Animation", // ActionPlayPauseAnimation
+    // Animation menu block (#38; en_us.h:142/144-157).
+    "&Animation",                                  // MenuAnimation
+    "&Play/Pause",                                 // MenuAnimationPlayPause
+    "Jump &Forward",                               // MenuAnimationJumpForward
+    "Jump &Backward",                              // MenuAnimationJumpBackward
+    "Short Jump &Forward",                         // MenuAnimationShortJumpForward
+    "Short Jump &Backward",                        // MenuAnimationShortJumpBackward
+    "Long Jump &Forward",                          // MenuAnimationLongJumpForward
+    "Long Jump &Backward",                         // MenuAnimationLongJumpBackward
+    "F&rame Step",                                 // MenuAnimationFrameStep
+    "Pre&vious Frame",                             // MenuAnimationPreviousFrame
+    "F&irst Frame",                                // MenuAnimationFirstFrame
+    "&Last Frame",                                 // MenuAnimationLastFrame
+    "&Decrease Rate",                              // MenuAnimationRateDecrease
+    "&Increase Rate",                              // MenuAnimationRateIncrease
+    "R&eset Rate",                                 // MenuAnimationRateReset
+    "&Play animations at least once in slideshow", // OptionsLoopAnimationsOnce (en_us.h:230)
 ];
 
 /// zh-CN table — upstream localization_zh_cn.h:31/197-199/261-263.
@@ -507,6 +556,24 @@ const ZH_CN: [&str; Id::COUNT] = [
     "分钟",            // CustomRateMinutes
     "幻灯片播放中",    // StatusBarSlideshowPlaying
     "播放/暂停幻灯片", // ActionPlayPauseSlideshow
+    "播放/暂停动画",   // ActionPlayPauseAnimation
+    // Animation menu block (#38; zh_cn.h:143/144-157/231).
+    "动画(&A)",                       // MenuAnimation
+    "播放/暂停(&P)",                  // MenuAnimationPlayPause
+    "向前跳转(&F)",                   // MenuAnimationJumpForward
+    "向后跳转(&B)",                   // MenuAnimationJumpBackward
+    "短距离向前跳转(&F)",             // MenuAnimationShortJumpForward
+    "短距离向后跳转(&B)",             // MenuAnimationShortJumpBackward
+    "长距离向前跳转(&F)",             // MenuAnimationLongJumpForward
+    "长距离向后跳转(&B)",             // MenuAnimationLongJumpBackward
+    "下一帧(&S)",                     // MenuAnimationFrameStep
+    "上一帧(&V)",                     // MenuAnimationPreviousFrame
+    "第一帧(&I)",                     // MenuAnimationFirstFrame
+    "最后一帧(&L)",                   // MenuAnimationLastFrame
+    "降低速率(&D)",                   // MenuAnimationRateDecrease
+    "提高速率(&I)",                   // MenuAnimationRateIncrease
+    "重置速率(&E)",                   // MenuAnimationRateReset
+    "在幻灯片中至少播放一次动画(&P)", // OptionsLoopAnimationsOnce (zh_cn.h:231)
 ];
 
 /// Map a `GetUserDefaultUILanguage` LANGID onto the table choice
