@@ -180,12 +180,17 @@ pub(crate) fn compute_request_flags(
 }
 
 /// One parsed LIST2 item: the full path (when it survived upstream's
-/// filters) and the mtime in riviv's unix ticks — `None` when the query did
-/// not request DATE_MODIFIED (upstream's zeroed FILETIME becomes 0 at the
-/// playlist, matching `Playlist::add`'s unstatable corner).
+/// filters) and the requested trailers in riviv's tick model — `None`
+/// for a trailer the query did not request (upstream's zeroed FILETIME /
+/// size becomes 0 at the playlist, matching `Playlist::add`'s
+/// unstatable corner). SIZE and DATE_CREATED ride along since #39 (the
+/// Size / Date Created sorts); upstream fills all of them into the fd
+/// (viv.c:3866-3890).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct List2Item {
     pub(crate) path: Vec<u16>,
+    pub(crate) size: Option<u64>,
+    pub(crate) created_ticks: Option<i64>,
     pub(crate) modified_ticks: Option<i64>,
 }
 
@@ -264,11 +269,11 @@ pub(crate) fn parse_list2(bytes: &[u8], stored_request_flags: u32) -> List2Reply
             continue; // upstream `_viv_is_valid_filename` (viv.c:3861)
         }
         // The trailer walk consumes SIZE, DATE_CREATED, DATE_MODIFIED in
-        // wire order (viv.c:3866-3890) — only MODIFIED is kept, the others
-        // are stepped over to reach it. A REQUESTED trailer cut short means
-        // the item's data is incomplete: the whole item drops (the same
-        // fail-soft skip as a malformed data area), never a half-parsed
-        // path with invented mtimes (cubic P2).
+        // wire order (viv.c:3866-3890) — each REQUESTED trailer is kept
+        // (the sort keys) and the walk steps to the next. A REQUESTED
+        // trailer cut short means the item's data is incomplete: the whole
+        // item drops (the same fail-soft skip as a malformed data area),
+        // never a half-parsed path with invented values (cubic P2).
         let mut trailer = str_end;
         let mut read_trailer = || -> Option<u64> {
             let lo = u64::from(read_dword(trailer)?);
@@ -276,11 +281,19 @@ pub(crate) fn parse_list2(bytes: &[u8], stored_request_flags: u32) -> List2Reply
             trailer += 8;
             Some(lo | (hi << 32))
         };
-        if stored_request_flags & REQ_SIZE != 0 && read_trailer().is_none() {
-            continue;
+        let mut size = None;
+        if stored_request_flags & REQ_SIZE != 0 {
+            match read_trailer() {
+                Some(value) => size = Some(value),
+                None => continue,
+            }
         }
-        if stored_request_flags & REQ_DATE_CREATED != 0 && read_trailer().is_none() {
-            continue;
+        let mut created_ticks = None;
+        if stored_request_flags & REQ_DATE_CREATED != 0 {
+            match read_trailer() {
+                Some(ft) => created_ticks = Some(filetime_to_unix_ticks(ft)),
+                None => continue,
+            }
         }
         let modified_ticks = if stored_request_flags & REQ_DATE_MODIFIED != 0 {
             match read_trailer() {
@@ -292,6 +305,8 @@ pub(crate) fn parse_list2(bytes: &[u8], stored_request_flags: u32) -> List2Reply
         };
         items.push(List2Item {
             path,
+            size,
+            created_ticks,
             modified_ticks,
         });
     }

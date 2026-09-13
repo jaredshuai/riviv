@@ -1335,7 +1335,7 @@ fn on_left_button_up(hwnd: HWND) {
 /// How an open request came about — whether the navigation reference
 /// (`nav_current`) follows it (upstream `_viv_open` copies `_viv_current_fd`
 /// synchronously, viv.c:1574-1579).
-enum OpenOrigin<'a> {
+pub(crate) enum OpenOrigin<'a> {
     /// A direct pick (drop of one file, dialog, CLI argument): the
     /// reference becomes a fresh id-0 entry (upstream zeroes dwReserved for
     /// direct opens, viv.c:1375-1376).
@@ -1349,22 +1349,23 @@ enum OpenOrigin<'a> {
 /// CreateThread arm, viv.c:1569). The current display stays up until this
 /// load's first frame replies in; storing a new session supersedes
 /// (flags) any in-flight one.
-fn request_open(hwnd: HWND, path: &OsStr, origin: OpenOrigin<'_>) {
+pub(crate) fn request_open(hwnd: HWND, path: &OsStr, origin: OpenOrigin<'_>) {
     // Existence check BEFORE queueing a decode (upstream
     // `_viv_open_from_filename`'s GetFileAttributesEx arm, viv.c:1359 —
     // the status bar's "File not found." is a pre-open verdict, not a
-    // decode failure, viv.c:5094-5098). The byte size and mtime ride along
-    // for the status bar and the navigation reference; directories and
-    // unreadable files fall through to the loader as user-level failures
-    // like upstream.
-    let (not_found, file_bytes, modified) = match std::fs::metadata(Path::new(path)) {
+    // decode failure, viv.c:5094-5098). The byte size and the timestamps
+    // ride along for the status bar and the navigation reference (#39:
+    // Date Created sorts on them); directories and unreadable files fall
+    // through to the loader as user-level failures like upstream.
+    let (not_found, file_bytes, modified, created) = match std::fs::metadata(Path::new(path)) {
         Ok(meta) => (
             false,
             Some(meta.len()),
             Some(playlist::modified_ticks(&meta)),
+            Some(playlist::created_ticks(&meta)),
         ),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (true, None, None),
-        Err(_) => (false, None, None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (true, None, None, None),
+        Err(_) => (false, None, None, None),
     };
     if not_found {
         // A missing file never reaches the loader (no session, no
@@ -1425,6 +1426,8 @@ fn request_open(hwnd: HWND, path: &OsStr, origin: OpenOrigin<'_>) {
             OpenOrigin::Direct => PlaylistEntry {
                 path: path.to_os_string(),
                 modified: modified.unwrap_or(0),
+                created: created.unwrap_or(0),
+                size: file_bytes.unwrap_or(0),
                 id: 0,
             },
         });
@@ -1555,6 +1558,8 @@ fn scan_entries(dir: &Path) -> Vec<PlaylistEntry> {
             entries.push(PlaylistEntry {
                 path: path.into_os_string(),
                 modified: playlist::modified_ticks(&metadata),
+                created: playlist::created_ticks(&metadata),
+                size: metadata.len(),
                 id: 0,
             });
         }
@@ -1580,13 +1585,78 @@ fn scan_dir(hwnd: HWND) -> std::path::PathBuf {
     }
 }
 
-/// Home/End (upstream `_viv_home`, viv.c:6120-6263): over the playlist,
-/// the sort extreme (current included — re-opening it is allowed); with no
-/// playlist, the folder scan of `scan_dir` — and a scan that finds
-/// NOTHING blanks the display (`_viv_blank`, viv.c:6245-6253; unreachable
-/// while the playlist is non-empty, its first node always qualifies).
-/// In random mode (checked first, `end` ignored like upstream) the call
-/// just draws one more random image (viv.c:6122-6125).
+/// `_viv_do_initial_shuffle` (viv.c:13569-13588) — runs at the top of the
+/// shuffle navigation arms only: with shuffle on and no playlist, a live
+/// current adopts its whole directory as the playlist (`_viv_add_current_
+/// path_to_playlist` — a FLAT scan, no recursion, extension-filtered) and
+/// the current then ADOPTS ITS OWN NODE'S ID (the copy-back at
+/// viv.c:13511-13517 — the reverse direction of what the comment suggests:
+/// `_viv_current_fd` takes the node's id, so the shuffle lookup finds it);
+/// with a playlist and no order, the order builds (seeded like upstream's
+/// srand(QueryPerformanceCounter), viv.c:12821-12826). FS scans never pump
+/// messages, so the whole mutation is safe inside one `state_of` borrow.
+fn ensure_shuffle_ready(state: &mut WindowState) {
+    if state.config.shuffle == 0 {
+        return;
+    }
+    let current_path = state.nav_current.as_ref().map(|e| e.path.clone());
+    if state.playlist.is_empty() {
+        let Some(current) = current_path else {
+            return;
+        };
+        let Some(dir) = Path::new(&current).parent().map(|d| d.to_path_buf()) else {
+            return;
+        };
+        let Ok(read) = std::fs::read_dir(&dir) else {
+            return; // upstream's INVALID_HANDLE_VALUE arm: nothing added
+        };
+        for entry in read.flatten() {
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            if metadata.is_dir() {
+                continue; // _viv_is_valid_filename's directory gate
+            }
+            let path = entry.path();
+            if playlist::is_valid_path(path.as_os_str()) {
+                let added = state.playlist.add(
+                    path.into_os_string(),
+                    playlist::modified_ticks(&metadata),
+                    playlist::created_ticks(&metadata),
+                    metadata.len(),
+                );
+                if added.path == current {
+                    // The copy-back: the CURRENT adopts the node's id.
+                    if let Some(nav) = state.nav_current.as_mut() {
+                        nav.id = added.id;
+                    }
+                }
+            }
+        }
+    }
+    state.playlist.ensure_shuffle(perf_counter());
+}
+
+/// A QueryPerformanceCounter read as the shuffle seed (upstream
+/// `srand(counter.LowPart)`, viv.c:12821-12826 — any time-varying seed
+/// matches behaviorally).
+fn perf_counter() -> u64 {
+    let mut now = i64::default();
+    // SAFETY: pure counter query; the out-pointer is a valid local.
+    unsafe {
+        let _ = QueryPerformanceCounter(&mut now);
+    }
+    now as u64
+}
+
+/// Home/End (upstream `_viv_home`, viv.c:6120-6263): under shuffle the
+/// order's first/last slot (after `_viv_do_initial_shuffle`); over the
+/// playlist otherwise, the sort extreme (current included — re-opening it
+/// is allowed); with no playlist, the folder scan of `scan_dir` — and a
+/// scan that finds NOTHING blanks the display (`_viv_blank`, viv.c:6245-
+/// 6253; unreachable while the playlist is non-empty, its first node
+/// always qualifies). In random mode (checked first, `end` ignored like
+/// upstream) the call just draws one more random image (viv.c:6122-6125).
 pub(crate) fn home_open(hwnd: HWND, end: bool) {
     home_open_inner(hwnd, end);
     // Upstream `_viv_home`'s tail resets a running slideshow timer
@@ -1604,71 +1674,158 @@ fn home_open_inner(hwnd: HWND, end: bool) {
         everything::send_random(hwnd);
         return;
     }
-    // SAFETY: the borrow ends at the end of this statement (the entry is
-    // cloned out); nothing below pumps.
-    let playlist_target = (unsafe { state_of(hwnd) }).and_then(|s| {
-        if s.playlist.is_empty() {
+    // The live sort config — the scan fallback sorts with it too
+    // (upstream's FindFirstFile arm compares through the same
+    // `_viv_fd_compare` globals, viv.c:6214-6231).
+    // SAFETY: the borrow ends inside the map (plain copies out).
+    let (mode, ascending, shuffle_on) = (unsafe { state_of(hwnd) })
+        .map(|s| {
+            (
+                playlist::SortMode::from_config(s.config.nav_sort),
+                s.config.nav_sort_ascending != 0,
+                s.config.shuffle != 0,
+            )
+        })
+        .unwrap_or((playlist::SortMode::DateModified, false, false));
+    // SAFETY: the borrow spans the shuffle bookkeeping (FS scans, no
+    // pumping) and ends with the entry cloned out.
+    let target = (unsafe { state_of(hwnd) }).and_then(|state| {
+        if shuffle_on {
+            ensure_shuffle_ready(state);
+            if let Some(entry) = state.playlist.shuffle_edge(end) {
+                return Some(entry.clone());
+            }
+            // No playlist even after the initial shuffle (no current, or
+            // its directory has nothing): fall to the scan below, the
+            // upstream else-branch.
+        }
+        if state.playlist.is_empty() {
             None
         } else {
-            playlist::home(s.playlist.entries(), end).cloned()
+            playlist::home(state.playlist.entries(), end, mode, ascending).cloned()
         }
     });
-    if let Some(entry) = playlist_target {
+    if let Some(entry) = target {
         request_open(hwnd, &entry.path, OpenOrigin::Nav(&entry));
         return;
     }
     let entries = scan_entries(&scan_dir(hwnd));
-    match playlist::home(&entries, end) {
+    match playlist::home(&entries, end, mode, ascending) {
         Some(entry) => request_open(hwnd, &entry.path, OpenOrigin::Nav(entry)),
         None => blank_display(hwnd),
     }
 }
 
 /// Next/Prev for the navigation keys (upstream `_viv_next`,
-/// viv.c:5817-6118): playlist arm when a playlist exists (node exclusion
-/// by id), folder-scan arm over the current file's parent otherwise, and
-/// no current at all becomes home(0) — for prev too (viv.c:6101-6104).
-/// next/prev NEVER blanks: no candidate is a no-op (viv.c:6093-6099).
-/// In random mode every direction draws one more random image (upstream
-/// checks `_viv_random` after its load-wait gate, viv.c:5855-5858; riviv's
-/// gate lives in the keydown route, so the check sits at the top here).
+/// viv.c:5817-6118): random mode draws one more image (checked after the
+/// load-wait gate upstream, riviv's gate lives in the keydown route, so
+/// the check sits at the top here); with shuffle on, `_viv_do_initial_
+/// shuffle` then the order's neighbor (viv.c:5881-5923 — the shuffle arm
+/// replaces the fd_compare scan whenever a playlist exists); otherwise
+/// the playlist arm when a playlist exists (node exclusion by id), the
+/// folder-scan arm over the current file's parent, and no current at all
+/// becomes home(0) — for prev too (viv.c:6101-6104). next/prev NEVER
+/// blanks: no candidate is a no-op (viv.c:6093-6099).
 fn nav_next(hwnd: HWND, prev: bool, reset_slideshow: bool) {
-    enum Mode {
+    enum Action {
         Random,
         Home,
-        Playlist,
+        /// A resolved shuffle target — open directly.
+        Open(PlaylistEntry),
+        /// The fd_compare scan over the playlist.
+        PlaylistSorted,
+        /// The fd_compare scan over the current file's directory.
         Scan,
     }
-    // SAFETY: the borrow ends at the end of this statement (only the mode
-    // is taken out); nothing below pumps.
-    let mode = match unsafe { state_of(hwnd) } {
-        Some(state) if state.random_search.is_some() => Mode::Random,
-        Some(state) => match state.nav_current.as_ref() {
-            None => Mode::Home,
-            Some(_) if state.playlist.is_empty() => Mode::Scan,
-            Some(_) => Mode::Playlist,
-        },
-        None => return,
+    // One borrow for classification AND the shuffle bookkeeping: the FS
+    // scans inside `ensure_shuffle_ready` never pump messages, and only
+    // cloned data leaves the borrow.
+    let action = {
+        // SAFETY: see above; nothing below runs inside this borrow.
+        let Some(state) = (unsafe { state_of(hwnd) }) else {
+            return;
+        };
+        if state.random_search.is_some() {
+            Action::Random
+        } else if state.config.shuffle != 0 {
+            ensure_shuffle_ready(state);
+            if state.playlist.is_empty() {
+                // The initial shuffle built nothing (no current, or its
+                // directory holds no images): upstream lands home(0) with
+                // no current and the plain directory-scan arm with one
+                // (viv.c:5863-6104's control flow).
+                if state.nav_current.is_none() {
+                    Action::Home
+                } else {
+                    Action::Scan
+                }
+            } else {
+                // The order neighbor. A pathless current matches no id, so
+                // upstream's lookup returns -1 and the front/back row
+                // serves (viv.c:5908-5918) — `shuffle_edge(!prev)` is the
+                // same read.
+                let target = match state.nav_current.as_ref() {
+                    Some(current) => state.playlist.shuffle_target(current, prev),
+                    None => state.playlist.shuffle_edge(!prev),
+                };
+                match target {
+                    Some(entry) => Action::Open(entry.clone()),
+                    // Unreachable with a non-empty playlist (ensure built
+                    // the order); the sorted scan keeps it total.
+                    None => Action::PlaylistSorted,
+                }
+            }
+        } else {
+            match state.nav_current.as_ref() {
+                None => Action::Home,
+                Some(_) if state.playlist.is_empty() => Action::Scan,
+                Some(_) => Action::PlaylistSorted,
+            }
+        }
     };
-    match mode {
-        Mode::Random => everything::send_random(hwnd),
-        Mode::Home => home_open(hwnd, false),
-        Mode::Playlist => {
-            // SAFETY: the borrow ends at the end of this statement (the
-            // entry is cloned out).
+    match action {
+        Action::Random => everything::send_random(hwnd),
+        Action::Home => home_open(hwnd, false),
+        Action::Open(entry) => request_open(hwnd, &entry.path, OpenOrigin::Nav(&entry)),
+        Action::PlaylistSorted => {
+            // SAFETY: the borrow ends at the end of the statement (the
+            // entry is cloned out); nothing below pumps.
             let target = (unsafe { state_of(hwnd) }).and_then(|s| {
-                playlist::next(s.playlist.entries(), s.nav_current.as_ref(), prev, true).cloned()
+                playlist::next(
+                    s.playlist.entries(),
+                    s.nav_current.as_ref(),
+                    prev,
+                    true,
+                    playlist::SortMode::from_config(s.config.nav_sort),
+                    s.config.nav_sort_ascending != 0,
+                )
+                .cloned()
             });
             if let Some(entry) = target {
                 request_open(hwnd, &entry.path, OpenOrigin::Nav(&entry));
             }
         }
-        Mode::Scan => {
+        Action::Scan => {
+            // The scan arm sorts by the live config too (upstream's
+            // FindFirstFile loop compares through `_viv_fd_compare`'s
+            // globals, viv.c:6016-6069).
+            // SAFETY: the borrow ends inside the map (plain copies out).
+            let sort = (unsafe { state_of(hwnd) }).map(|s| {
+                (
+                    playlist::SortMode::from_config(s.config.nav_sort),
+                    s.config.nav_sort_ascending != 0,
+                )
+            });
             let entries = scan_entries(&scan_dir(hwnd));
-            // SAFETY: the borrow ends at the end of this statement (the
+            // SAFETY: the borrow ends at the end of the statement (the
             // entry is cloned out).
             let current = (unsafe { state_of(hwnd) }).and_then(|s| s.nav_current.clone());
-            if let Some(entry) = playlist::next(&entries, current.as_ref(), prev, false) {
+            let Some((sort, ascending)) = sort else {
+                return;
+            };
+            if let Some(entry) =
+                playlist::next(&entries, current.as_ref(), prev, false, sort, ascending)
+            {
                 request_open(hwnd, &entry.path, OpenOrigin::Nav(entry));
             }
         }
@@ -1993,7 +2150,12 @@ fn playlist_add_current_if_empty(state: &mut WindowState) {
         && let Some(current) = state.nav_current.as_ref()
     {
         let current = current.clone();
-        state.playlist.add(current.path, current.modified);
+        state.playlist.add(
+            current.path,
+            current.modified,
+            current.created,
+            current.size,
+        );
     }
 }
 
@@ -2173,7 +2335,12 @@ fn on_everything_reply(hwnd: HWND, cds: &COPYDATASTRUCT, add: bool) {
         let reply = everything::parse_list2(bytes, flags);
         for item in &reply.items {
             let path = OsString::from_wide(&item.path);
-            state.playlist.add(path, item.modified_ticks.unwrap_or(0));
+            state.playlist.add(
+                path,
+                item.modified_ticks.unwrap_or(0),
+                item.created_ticks.unwrap_or(0),
+                item.size.unwrap_or(0),
+            );
         }
         reply
     });
@@ -3088,6 +3255,9 @@ fn on_initmenu(hwnd: HWND) {
             slideshow: state.slideshow,
             slideshow_rate_ms: state.config.slideshow_rate as u32,
             animation_playing: state.animation_playing,
+            nav_sort: playlist::SortMode::from_config(state.config.nav_sort),
+            nav_sort_ascending: state.config.nav_sort_ascending != 0,
+            shuffle: state.config.shuffle != 0,
         }
     });
     let Some(state) = snapshot else {
@@ -3299,7 +3469,68 @@ fn on_command(hwnd: HWND, cmd: menu::Cmd) {
         menu::Cmd::NavPrev => nav_next(hwnd, true, true),
         menu::Cmd::NavHome => home_open(hwnd, false),
         menu::Cmd::NavEnd => home_open(hwnd, true),
+        // The #39 sort family (upstream viv.c:1750-1816): the five mode
+        // rows re-click the active mode into a direction flip and pick a
+        // new mode with its default direction; the direction pair sets the
+        // flag outright. Upstream also clears the preload/last caches on
+        // every sort change (viv.c:1791-1794) — those caches are #40 and
+        // plug in here when it lands.
+        cmd @ (menu::Cmd::NavSortName
+        | menu::Cmd::NavSortFullPath
+        | menu::Cmd::NavSortSize
+        | menu::Cmd::NavSortDateModified
+        | menu::Cmd::NavSortDateCreated) => {
+            if let Some(mode) = cmd.sort_mode() {
+                sort_click(hwnd, mode);
+            }
+        }
+        menu::Cmd::NavSortAscending => sort_set_direction(hwnd, true),
+        menu::Cmd::NavSortDescending => sort_set_direction(hwnd, false),
+        // Toggle shuffle (upstream viv.c:1723-1748): turning it OFF frees
+        // the shuffle order (the index array); on stays lazy — the next
+        // navigation builds a fresh order (`_viv_do_initial_shuffle`).
+        menu::Cmd::NavShuffle => shuffle_toggle(hwnd),
+        menu::Cmd::NavJumpTo => crate::jumpto_dlg::open(hwnd),
         menu::Cmd::HelpAbout => show_about(hwnd),
+    }
+}
+
+/// A sort-mode menu click (upstream viv.c:1756-1789): same mode flips the
+/// direction, a different mode lands on its default direction. The config
+/// write persists through the exit save (the `sort`/`sort_ascending` ini
+/// keys).
+fn sort_click(hwnd: HWND, mode: playlist::SortMode) {
+    // SAFETY: the borrow spans only the two config stores — nothing pumps.
+    if let Some(state) = unsafe { state_of(hwnd) } {
+        let (mode, ascending) = playlist::apply_sort_click(
+            mode,
+            playlist::SortMode::from_config(state.config.nav_sort),
+            state.config.nav_sort_ascending != 0,
+        );
+        state.config.nav_sort = mode as i32;
+        state.config.nav_sort_ascending = i32::from(ascending);
+    }
+}
+
+/// The Ascending/Descending rows (upstream viv.c:1798-1816): set the flag
+/// directly — no mode change, no toggle.
+fn sort_set_direction(hwnd: HWND, ascending: bool) {
+    // SAFETY: the borrow spans only the config store — nothing pumps.
+    if let Some(state) = unsafe { state_of(hwnd) } {
+        state.config.nav_sort_ascending = i32::from(ascending);
+    }
+}
+
+/// The Shuffle row (upstream viv.c:1723-1748): flip the config; OFF frees
+/// the shuffle order so a later ON re-shuffles fresh.
+fn shuffle_toggle(hwnd: HWND) {
+    // SAFETY: the borrow spans the flag flip and the order drop — nothing
+    // pumps.
+    if let Some(state) = unsafe { state_of(hwnd) } {
+        state.config.shuffle = i32::from(state.config.shuffle == 0);
+        if state.config.shuffle == 0 {
+            state.playlist.drop_shuffle();
+        }
     }
 }
 
