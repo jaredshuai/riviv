@@ -84,6 +84,7 @@
 
 mod anim;
 mod assoc;
+mod clipboard;
 mod config;
 mod copydata;
 mod cursor;

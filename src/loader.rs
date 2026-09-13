@@ -551,8 +551,7 @@ impl<F> LoadedImage<F> {
 
     /// The frame currently displayed (frame 0 until the timer advances).
     /// Production paint goes through `surface_mut` (mip extension); the
-    /// immutable read is test-only today.
-    #[cfg(test)]
+    /// immutable read serves the clipboard image blit (#41) and tests.
     pub(crate) fn surface(&self) -> &F {
         &self.frames[self.position]
     }

@@ -37,6 +37,18 @@ pub(crate) enum Cmd {
     FileAddEverythingSearch,
     /// File → Exit (`VIV_ID_FILE_EXIT`).
     FileExit,
+    /// Edit → Cu&t (#41; `VIV_ID_EDIT_CUT`, viv.c:826).
+    EditCut,
+    /// Edit → &Copy (#41; `VIV_ID_EDIT_COPY`, viv.c:827).
+    EditCopy,
+    /// Edit → Copy Filename (#41; `VIV_ID_EDIT_COPY_FILENAME`, viv.c:828
+    /// — MF_OWNERDRAW upstream, keyboard Ctrl+Shift+C).
+    EditCopyFilename,
+    /// Edit → Cop&y Image (#41; `VIV_ID_EDIT_COPY_IMAGE`, viv.c:829).
+    EditCopyImage,
+    /// Edit → &Paste (#41; `VIV_ID_EDIT_PASTE`, viv.c:830 — MF_OWNERDRAW
+    /// upstream, keyboard Ctrl+V).
+    EditPaste,
     /// View → Menu toggle (`VIV_ID_VIEW_MENU`).
     ViewMenu,
     /// View → Fullscreen (`VIV_ID_VIEW_FULLSCREEN`).
@@ -230,6 +242,11 @@ impl Cmd {
         Self::FileAddFile,
         Self::FileAddEverythingSearch,
         Self::FileExit,
+        Self::EditCut,
+        Self::EditCopy,
+        Self::EditCopyFilename,
+        Self::EditCopyImage,
+        Self::EditPaste,
         Self::ViewMenu,
         Self::ViewFullscreen,
         Self::ViewSlideshow,
@@ -297,6 +314,9 @@ impl Cmd {
 pub(crate) enum Slot {
     Root,
     File,
+    /// The Edit top-level menu (#41; upstream `_VIV_MENU_EDIT`, viv.c:824
+    /// — between File and View in the root order).
+    Edit,
     View,
     ViewZoom,
     /// The Slideshow top-level menu (#37; upstream `_VIV_MENU_SLIDESHOW`,
@@ -415,6 +435,41 @@ pub(crate) const ENTRIES: &[Entry] = &[
         loc: loc::Id::MenuExit,
         parent: Slot::File,
         cmd: Cmd::FileExit,
+    },
+    // Edit (viv.c:824-830) — #41: the clipboard family. Copy Filename and
+    // Paste are MF_OWNERDRAW upstream (keyboard Ctrl+Shift+C / Ctrl+V
+    // only); the rotate/copy-to rows below them (viv.c:832-835+) wait for
+    // #43, so the menu ends after Paste (upstream's trailing separators
+    // drop with their unimplemented tails).
+    Entry::Popup {
+        loc: loc::Id::MenuEdit,
+        parent: Slot::Root,
+        slot: Slot::Edit,
+    },
+    Entry::Item {
+        loc: loc::Id::MenuCut,
+        parent: Slot::Edit,
+        cmd: Cmd::EditCut,
+    },
+    Entry::Item {
+        loc: loc::Id::MenuCopy,
+        parent: Slot::Edit,
+        cmd: Cmd::EditCopy,
+    },
+    Entry::HiddenItem {
+        loc: loc::Id::MenuCopyFilename,
+        parent: Slot::Edit,
+        cmd: Cmd::EditCopyFilename,
+    },
+    Entry::Item {
+        loc: loc::Id::MenuCopyImage,
+        parent: Slot::Edit,
+        cmd: Cmd::EditCopyImage,
+    },
+    Entry::HiddenItem {
+        loc: loc::Id::MenuPaste,
+        parent: Slot::Edit,
+        cmd: Cmd::EditPaste,
     },
     // View (viv.c:839-935): Menu toggle, fullscreen, 1:1 / Best Fit, the
     // Zoom submenu, Options last — upstream's relative order, gaps dropped.
@@ -853,6 +908,12 @@ pub(crate) struct MenuState {
     pub(crate) nav_sort_ascending: bool,
     /// The shuffle flag (#39; upstream viv.c:7186 — a plain check).
     pub(crate) shuffle: bool,
+    /// Whether an image is currently shown and loadable (#41; upstream's
+    /// `is_image_enabled` for the EnableMenuItem family, viv.c:7103 — the
+    /// current file is set and neither a not-found nor a failed verdict
+    /// stands). Gates the clipboard quartet; Paste stays ungated (upstream
+    /// has no EnableMenuItem row for it).
+    pub(crate) image_enabled: bool,
 }
 
 /// Whether `cmd`'s menu item carries a check in `state` (upstream
@@ -904,8 +965,16 @@ pub(crate) fn radio(cmd: Cmd) -> bool {
 /// always available (upstream never gates zoom/navigation on image state
 /// either — its EnableMenuItem list, viv.c:7103-7121, covers clipboard/
 /// delete/print commands riviv does not register).
-pub(crate) fn enabled(_cmd: Cmd) -> bool {
-    true
+pub(crate) fn enabled(cmd: Cmd, state: &MenuState) -> bool {
+    match cmd {
+        // The clipboard quartet (#41): upstream grays all four through the
+        // same `is_image_enabled` gate (viv.c:7104-7108). Paste is not in
+        // that list — an empty clipboard just makes the handler a no-op.
+        Cmd::EditCut | Cmd::EditCopy | Cmd::EditCopyFilename | Cmd::EditCopyImage => {
+            state.image_enabled
+        }
+        _ => true,
+    }
 }
 
 #[cfg(test)]
@@ -976,42 +1045,51 @@ mod tests {
     fn slideshow_and_animation_command_ids_are_pinned_for_the_wire() {
         // smoke37/smoke38 post these as raw WM_COMMAND wparams; inserting a
         // command ahead of the block would silently shift every wire id.
-        assert_eq!(Cmd::ViewSlideshow.id(), 9);
-        assert_eq!(Cmd::SlideshowPause.id(), 16);
-        assert_eq!(Cmd::SlideshowRateDecrease.id(), 17);
-        assert_eq!(Cmd::SlideshowRateIncrease.id(), 18);
-        assert_eq!(Cmd::SlideshowRate250.id(), 19);
-        assert_eq!(Cmd::SlideshowRate500.id(), 20);
-        assert_eq!(Cmd::SlideshowRateCustom.id(), 36);
-        // The #38 Animation block runs 37-50 (#37's NavNext was 37; the
-        // 14 new commands push it to 51).
-        assert_eq!(Cmd::AnimationPlayPause.id(), 37);
-        assert_eq!(Cmd::AnimationJumpForwardMedium.id(), 38);
-        assert_eq!(Cmd::AnimationJumpBackwardMedium.id(), 39);
-        assert_eq!(Cmd::AnimationJumpForwardShort.id(), 40);
-        assert_eq!(Cmd::AnimationJumpBackwardShort.id(), 41);
-        assert_eq!(Cmd::AnimationJumpForwardLong.id(), 42);
-        assert_eq!(Cmd::AnimationJumpBackwardLong.id(), 43);
-        assert_eq!(Cmd::AnimationFrameStep.id(), 44);
-        assert_eq!(Cmd::AnimationFramePrev.id(), 45);
-        assert_eq!(Cmd::AnimationFirstFrame.id(), 46);
-        assert_eq!(Cmd::AnimationLastFrame.id(), 47);
-        assert_eq!(Cmd::AnimationRateDecrease.id(), 48);
-        assert_eq!(Cmd::AnimationRateIncrease.id(), 49);
-        assert_eq!(Cmd::AnimationRateReset.id(), 50);
-        assert_eq!(Cmd::NavNext.id(), 51);
-        // The #39 sort/shuffle/jumpto block runs 52-63 (menu-table order,
-        // viv.c:946-956); HelpAbout moves 55 → 64.
-        assert_eq!(Cmd::NavSortName.id(), 55);
-        assert_eq!(Cmd::NavSortFullPath.id(), 56);
-        assert_eq!(Cmd::NavSortSize.id(), 57);
-        assert_eq!(Cmd::NavSortDateModified.id(), 58);
-        assert_eq!(Cmd::NavSortDateCreated.id(), 59);
-        assert_eq!(Cmd::NavSortAscending.id(), 60);
-        assert_eq!(Cmd::NavSortDescending.id(), 61);
-        assert_eq!(Cmd::NavShuffle.id(), 62);
-        assert_eq!(Cmd::NavJumpTo.id(), 63);
-        assert_eq!(Cmd::HelpAbout.id(), 64);
+        // The #41 Edit block runs 7-11 (viv.c:826-830 table order), pushing
+        // every later id by 5: ViewSlideshow 9 → 14, NavNext 51 → 56,
+        // HelpAbout 64 → 69.
+        assert_eq!(Cmd::EditCut.id(), 7);
+        assert_eq!(Cmd::EditCopy.id(), 8);
+        assert_eq!(Cmd::EditCopyFilename.id(), 9);
+        assert_eq!(Cmd::EditCopyImage.id(), 10);
+        assert_eq!(Cmd::EditPaste.id(), 11);
+        assert_eq!(Cmd::ViewSlideshow.id(), 14);
+        assert_eq!(Cmd::SlideshowPause.id(), 21);
+        assert_eq!(Cmd::SlideshowRateDecrease.id(), 22);
+        assert_eq!(Cmd::SlideshowRateIncrease.id(), 23);
+        assert_eq!(Cmd::SlideshowRate250.id(), 24);
+        assert_eq!(Cmd::SlideshowRate500.id(), 25);
+        assert_eq!(Cmd::SlideshowRateCustom.id(), 41);
+        // The #38 Animation block runs 37-50 upstream-side (#37's NavNext
+        // was 37; the 14 Animation commands pushed it to 51) — with the
+        // #41 shift it lands 42-55.
+        assert_eq!(Cmd::AnimationPlayPause.id(), 42);
+        assert_eq!(Cmd::AnimationJumpForwardMedium.id(), 43);
+        assert_eq!(Cmd::AnimationJumpBackwardMedium.id(), 44);
+        assert_eq!(Cmd::AnimationJumpForwardShort.id(), 45);
+        assert_eq!(Cmd::AnimationJumpBackwardShort.id(), 46);
+        assert_eq!(Cmd::AnimationJumpForwardLong.id(), 47);
+        assert_eq!(Cmd::AnimationJumpBackwardLong.id(), 48);
+        assert_eq!(Cmd::AnimationFrameStep.id(), 49);
+        assert_eq!(Cmd::AnimationFramePrev.id(), 50);
+        assert_eq!(Cmd::AnimationFirstFrame.id(), 51);
+        assert_eq!(Cmd::AnimationLastFrame.id(), 52);
+        assert_eq!(Cmd::AnimationRateDecrease.id(), 53);
+        assert_eq!(Cmd::AnimationRateIncrease.id(), 54);
+        assert_eq!(Cmd::AnimationRateReset.id(), 55);
+        assert_eq!(Cmd::NavNext.id(), 56);
+        // The #39 sort/shuffle/jumpto block (menu-table order,
+        // viv.c:946-956); HelpAbout lands 69.
+        assert_eq!(Cmd::NavSortName.id(), 60);
+        assert_eq!(Cmd::NavSortFullPath.id(), 61);
+        assert_eq!(Cmd::NavSortSize.id(), 62);
+        assert_eq!(Cmd::NavSortDateModified.id(), 63);
+        assert_eq!(Cmd::NavSortDateCreated.id(), 64);
+        assert_eq!(Cmd::NavSortAscending.id(), 65);
+        assert_eq!(Cmd::NavSortDescending.id(), 66);
+        assert_eq!(Cmd::NavShuffle.id(), 67);
+        assert_eq!(Cmd::NavJumpTo.id(), 68);
+        assert_eq!(Cmd::HelpAbout.id(), 69);
     }
 
     #[test]
@@ -1095,6 +1173,7 @@ mod tests {
             nav_sort: crate::playlist::SortMode::Name,
             nav_sort_ascending: true,
             shuffle: true,
+            image_enabled: true,
         };
         let off = MenuState {
             show_menu: false,
@@ -1106,6 +1185,7 @@ mod tests {
             nav_sort: crate::playlist::SortMode::FullPath,
             nav_sort_ascending: false,
             shuffle: false,
+            image_enabled: true,
         };
         for cmd in Cmd::ALL {
             let expected_on = matches!(
@@ -1252,6 +1332,7 @@ mod tests {
             nav_sort: crate::playlist::SortMode::DateModified,
             nav_sort_ascending: false,
             shuffle: false,
+            image_enabled: true,
         }
     }
 
@@ -1275,13 +1356,35 @@ mod tests {
     }
 
     #[test]
-    fn every_registered_item_is_selectable() {
-        // #24 wired the Options dialog: nothing riviv registers is ever
-        // greyed (upstream gates only clipboard/delete/print-style
-        // commands, none registered).
+    fn only_the_clipboard_quartet_gates_and_only_on_the_image_flag() {
+        // #41: upstream grays exactly Cut/Copy/Copy Filename/Copy Image
+        // through `is_image_enabled` (viv.c:7104-7108) — Paste has NO
+        // EnableMenuItem row (an empty clipboard is just a no-op). Every
+        // other riviv command stays always-selectable.
         for cmd in Cmd::ALL {
-            assert!(enabled(cmd), "{cmd:?}");
+            if matches!(
+                cmd,
+                Cmd::EditCut | Cmd::EditCopy | Cmd::EditCopyFilename | Cmd::EditCopyImage
+            ) {
+                continue;
+            }
+            assert!(enabled(cmd, &plain_state()), "{cmd:?}");
         }
+        let mut gated = plain_state();
+        gated.image_enabled = false;
+        assert!(!enabled(Cmd::EditCut, &gated), "{:?}", Cmd::EditCut);
+        assert!(!enabled(Cmd::EditCopy, &gated), "{:?}", Cmd::EditCopy);
+        assert!(
+            !enabled(Cmd::EditCopyFilename, &gated),
+            "{:?}",
+            Cmd::EditCopyFilename
+        );
+        assert!(
+            !enabled(Cmd::EditCopyImage, &gated),
+            "{:?}",
+            Cmd::EditCopyImage
+        );
+        assert!(enabled(Cmd::EditPaste, &gated), "{:?}", Cmd::EditPaste);
     }
 
     #[test]
@@ -1301,11 +1404,13 @@ mod tests {
     }
 
     #[test]
-    fn the_animation_short_and_long_jumps_hide_from_the_menu_bar_only() {
-        // Upstream's MF_OWNERDRAW quartet (viv.c:925-928): present in the
-        // command table (Controls list + WM_COMMAND + ini names), absent
-        // from the menu bar build (viv.c:12328). The table here marks them
-        // HiddenItem; the visible Jump pair stays Item.
+    fn the_owner_draw_rows_hide_from_the_menu_bar_only() {
+        // Upstream's MF_OWNERDRAW rows: present in the command table
+        // (Controls list + WM_COMMAND + ini names), absent from the menu
+        // bar build (viv.c:12328). The animation quartet (viv.c:925-928)
+        // plus the #41 clipboard pair — Copy Filename (viv.c:828) and
+        // Paste (viv.c:830), keyboard Ctrl+Shift+C / Ctrl+V upstream. The
+        // table marks them HiddenItem; the visible Jump pair stays Item.
         let hidden: Vec<Cmd> = ENTRIES
             .iter()
             .filter_map(|e| match e {
@@ -1316,6 +1421,8 @@ mod tests {
         assert_eq!(
             hidden,
             vec![
+                Cmd::EditCopyFilename,
+                Cmd::EditPaste,
                 Cmd::AnimationJumpForwardShort,
                 Cmd::AnimationJumpBackwardShort,
                 Cmd::AnimationJumpForwardLong,

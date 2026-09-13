@@ -53,6 +53,20 @@ pub(crate) enum Id {
     MenuAddFile,
     /// "Exit" (viv.c:821).
     MenuExit,
+    /// "&Edit" top-level caption (#41; viv.c:824).
+    MenuEdit,
+    /// Edit → "Cu&t" (#41; viv.c:826).
+    MenuCut,
+    /// Edit → "&Copy" (#41; viv.c:827).
+    MenuCopy,
+    /// Edit → "Copy Filename" (#41; viv.c:828 — MF_OWNERDRAW upstream,
+    /// keyboard Ctrl+Shift+C).
+    MenuCopyFilename,
+    /// Edit → "Cop&y Image" (#41; viv.c:829).
+    MenuCopyImage,
+    /// Edit → "&Paste" (#41; viv.c:830 — MF_OWNERDRAW upstream, keyboard
+    /// Ctrl+V).
+    MenuPaste,
     /// "&View" top-level caption (viv.c:839).
     MenuView,
     /// View → "Menu" toggle (viv.c:842).
@@ -336,6 +350,12 @@ const EN_US: [&str; Id::COUNT] = [
     "Open &Folder...", // MenuOpenFolder
     "&Add File...",    // MenuAddFile
     "E&xit",           // MenuExit
+    "&Edit",           // MenuEdit (#41)
+    "Cu&t",            // MenuCut
+    "&Copy",           // MenuCopy
+    "Copy Filename",   // MenuCopyFilename — no mnemonic upstream
+    "Cop&y Image",     // MenuCopyImage
+    "&Paste",          // MenuPaste
     "&View",           // MenuView
     "&Menu",           // MenuMenu
     "F&ullscreen",     // MenuFullscreen
@@ -491,6 +511,12 @@ const ZH_CN: [&str; Id::COUNT] = [
     "打开文件夹(&F)...", // MenuOpenFolder
     "添加文件(&A)...",   // MenuAddFile
     "退出(&X)",          // MenuExit
+    "编辑(&E)",          // MenuEdit (#41)
+    "剪切(&T)",          // MenuCut
+    "复制(&C)",          // MenuCopy
+    "复制文件名",        // MenuCopyFilename — no mnemonic upstream
+    "复制图像(&Y)",      // MenuCopyImage
+    "粘贴(&P)",          // MenuPaste
     "视图(&V)",          // MenuView
     "菜单(&M)",          // MenuMenu
     "全屏(&F)",          // MenuFullscreen
