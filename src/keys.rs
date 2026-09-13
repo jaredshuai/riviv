@@ -130,6 +130,44 @@ const DEFAULT_KEYS: &[(Cmd, &[KeyDef])] = &[
         Cmd::SlideshowRateIncrease,
         &[key(false, false, false, VK_UP)],
     ),
+    // The animation block (#38; upstream viv.c:1030-1039, between the
+    // slideshow rows and the navigation rows). The short/long jumps have
+    // NO default binding — upstream registers none (keyboard-reachable
+    // only through the Controls custom-shortcut editor).
+    (
+        Cmd::AnimationPlayPause,
+        &[key(true, false, false, VK_SPACE)],
+    ),
+    (
+        Cmd::AnimationJumpForwardMedium,
+        &[key(true, false, false, VK_NEXT)],
+    ),
+    (
+        Cmd::AnimationJumpBackwardMedium,
+        &[key(true, false, false, VK_PRIOR)],
+    ),
+    (
+        Cmd::AnimationFrameStep,
+        &[key(true, false, false, VK_RIGHT)],
+    ),
+    (Cmd::AnimationFramePrev, &[key(true, false, false, VK_LEFT)]),
+    (
+        Cmd::AnimationFirstFrame,
+        &[key(true, false, false, VK_HOME)],
+    ),
+    (Cmd::AnimationLastFrame, &[key(true, false, false, VK_END)]),
+    (
+        Cmd::AnimationRateDecrease,
+        &[key(true, false, false, VK_DOWN)],
+    ),
+    (
+        Cmd::AnimationRateIncrease,
+        &[key(true, false, false, VK_UP)],
+    ),
+    (
+        Cmd::AnimationRateReset,
+        &[key(true, false, false, b'R' as u16)],
+    ),
     (
         Cmd::NavNext,
         &[
@@ -327,24 +365,39 @@ fn push_slot_path(name: &mut String, slot: Slot) {
 }
 
 /// The menu entry of `cmd` (its caption + parent slot). Every command has
-/// exactly one row (the menu table's tested invariant).
+/// exactly one row — Item or HiddenItem, both register the command (the
+/// menu table's tested invariant).
 fn entry_of(cmd: Cmd) -> menu::Entry {
     *menu::ENTRIES
         .iter()
-        .find(|e| matches!(e, menu::Entry::Item { cmd: c, .. } if *c == cmd))
-        .expect("every command has a menu row")
+        .find(|e| {
+            matches!(
+                e,
+                menu::Entry::Item {
+                    cmd: c, ..
+                }
+                    if *c == cmd
+            ) || matches!(
+                e,
+                menu::Entry::HiddenItem {
+                    cmd: c, ..
+                }
+                    if *c == cmd
+            )
+        })
+        .expect("every command has a table row")
 }
 
 fn command_loc(cmd: Cmd) -> loc::Id {
     match entry_of(cmd) {
-        menu::Entry::Item { loc, .. } => loc,
-        _ => unreachable!("entry_of only returns Item rows"),
+        menu::Entry::Item { loc, .. } | menu::Entry::HiddenItem { loc, .. } => loc,
+        _ => unreachable!("entry_of only returns Item/HiddenItem rows"),
     }
 }
 
 fn parent_slot_of(cmd: Cmd) -> Slot {
     match entry_of(cmd) {
-        menu::Entry::Item { parent, .. } => parent,
+        menu::Entry::Item { parent, .. } | menu::Entry::HiddenItem { parent, .. } => parent,
         _ => unreachable!(),
     }
 }
@@ -467,6 +520,24 @@ mod tests {
         // No default binding (absent from upstream's table).
         assert!(vks(Cmd::ViewMenu).is_empty());
         assert!(vks(Cmd::ViewBestFit).is_empty());
+        // The #38 animation block (viv.c:1030-1039): the ten registered
+        // chords; the short/long jump quartet has none.
+        assert_eq!(
+            vks(Cmd::AnimationPlayPause),
+            vec![k(true, false, false, 0x20)]
+        );
+        assert_eq!(
+            vks(Cmd::AnimationFrameStep),
+            vec![k(true, false, false, 0x27)]
+        );
+        assert_eq!(
+            vks(Cmd::AnimationRateReset),
+            vec![k(true, false, false, b'R' as u16)]
+        );
+        assert!(vks(Cmd::AnimationJumpForwardShort).is_empty());
+        assert!(vks(Cmd::AnimationJumpBackwardShort).is_empty());
+        assert!(vks(Cmd::AnimationJumpForwardLong).is_empty());
+        assert!(vks(Cmd::AnimationJumpBackwardLong).is_empty());
         // Every command has a slot in the map.
         assert_eq!(m.per_cmd.len(), Cmd::COUNT);
     }
@@ -577,10 +648,15 @@ mod tests {
             Some(Cmd::ViewOptions),
             "old router ignored the Options key; upstream registers it"
         );
-        // And the chords the old router deliberately swallowed as no-ops
-        // (its trailing any-modifier bail before navigation) stay no-ops.
-        assert_eq!(m.lookup(true, false, false, 0x27), None);
+        // And Shift+Home — a chord the old router deliberately swallowed
+        // as a no-op — stays a no-op (nothing registers it). Ctrl+Right
+        // used to sit here too, but #38 registers it behind Frame Step
+        // (viv.c:1033), so it routes now.
         assert_eq!(m.lookup(false, false, true, 0x24), None);
+        assert_eq!(
+            m.lookup(true, false, false, 0x27),
+            Some(Cmd::AnimationFrameStep)
+        );
     }
 
     #[test]
@@ -715,6 +791,41 @@ mod tests {
             (Cmd::SlideshowRate50000, "slideshow_rate_50_seconds_keys"),
             (Cmd::SlideshowRate60000, "slideshow_rate_1_minute_keys"),
             (Cmd::SlideshowRateCustom, "slideshow_rate_custom_keys"),
+            // The #38 animation block: "Play/Pause" filters like the
+            // slideshow one (playpause), the mnemonics drop, spaces become
+            // '_' (en_us.h:143-157).
+            (Cmd::AnimationPlayPause, "animation_playpause_keys"),
+            (
+                Cmd::AnimationJumpForwardMedium,
+                "animation_jump_forward_keys",
+            ),
+            (
+                Cmd::AnimationJumpBackwardMedium,
+                "animation_jump_backward_keys",
+            ),
+            (
+                Cmd::AnimationJumpForwardShort,
+                "animation_short_jump_forward_keys",
+            ),
+            (
+                Cmd::AnimationJumpBackwardShort,
+                "animation_short_jump_backward_keys",
+            ),
+            (
+                Cmd::AnimationJumpForwardLong,
+                "animation_long_jump_forward_keys",
+            ),
+            (
+                Cmd::AnimationJumpBackwardLong,
+                "animation_long_jump_backward_keys",
+            ),
+            (Cmd::AnimationFrameStep, "animation_frame_step_keys"),
+            (Cmd::AnimationFramePrev, "animation_previous_frame_keys"),
+            (Cmd::AnimationFirstFrame, "animation_first_frame_keys"),
+            (Cmd::AnimationLastFrame, "animation_last_frame_keys"),
+            (Cmd::AnimationRateDecrease, "animation_decrease_rate_keys"),
+            (Cmd::AnimationRateIncrease, "animation_increase_rate_keys"),
+            (Cmd::AnimationRateReset, "animation_reset_rate_keys"),
             (Cmd::NavNext, "navigate_next_keys"),
             (Cmd::NavPrev, "navigate_previous_keys"),
             (Cmd::NavHome, "navigate_home_keys"),

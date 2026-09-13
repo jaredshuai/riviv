@@ -12,8 +12,9 @@
 //!
 //! Scope vs upstream's pages: only implemented features get controls — the
 //! General page drops start-menu shortcuts and associations (#26), the View
-//! page drops title-bar-format / loop-once / preload / cache (features not
-//! implemented), and keeps-aspect / fill / fullscreen-fill / frame-minus
+//! page drops title-bar-format / preload / cache (features not implemented;
+//! loop-once landed with #38), and keeps-aspect / fill / fullscreen-fill /
+//! frame-minus
 //! move here from upstream's MENU surface (viv.c:2032-2060 / 3994-3999),
 //! which riviv's menu does not register. The Controls page's key-binding
 //! editor lives in `keys.rs` + the hand-built area of `options_dlg.rs`
@@ -33,7 +34,7 @@ pub(crate) struct ComboEntry {
 /// 0 scroll, 1 slideshow, 2 animation pause, 3 zoom in, 4 next, 5 1:1
 /// scroll, 6 move-window). Unimplemented values stay valid INI values — they
 /// just have no combo row, so the combo shows blank and OK preserves them.
-/// Value 1 landed with #37.
+/// Value 1 landed with #37; value 2 with #38.
 pub(crate) const LEFT_CLICK_ACTIONS: &[ComboEntry] = &[
     ComboEntry {
         label: loc::Id::ActionScroll,
@@ -42,6 +43,10 @@ pub(crate) const LEFT_CLICK_ACTIONS: &[ComboEntry] = &[
     ComboEntry {
         label: loc::Id::ActionPlayPauseSlideshow,
         value: 1,
+    },
+    ComboEntry {
+        label: loc::Id::ActionPlayPauseAnimation,
+        value: 2,
     },
     ComboEntry {
         label: loc::Id::ActionZoomIn,
@@ -143,6 +148,11 @@ pub(crate) enum Field {
     AutoZoom,
     AutoZoomType,
     FrameMinus,
+    /// The loop-animations-once checkbox (#38; upstream
+    /// IDC_LOOP_ANIMATIONS_ONCE_STATIC, viv.c:8388-8389/8774 — the
+    /// slideshow-scoped "advance waits for one full animation pass"
+    /// setting; the runtime gate itself landed with #37).
+    LoopAnimationsOnce,
     WindowedBg,
     FullscreenBg,
     LeftClickAction,
@@ -287,13 +297,25 @@ pub(crate) const VIEW: &[Ctrl] = &[
         w: 60,
         h: 100,
     },
+    // Loop animations once (rc:81-82: (0,70) 192x10 — right after the
+    // auto-size pair, upstream IDD_VIEW's own order; #38).
+    Ctrl {
+        kind: Kind::Checkbox,
+        label: loc::Id::OptionsLoopAnimationsOnce,
+        field: Field::LoopAnimationsOnce,
+        label_w: 0,
+        x: 0,
+        y: 104,
+        w: 186,
+        h: 10,
+    },
     Ctrl {
         kind: Kind::Checkbox,
         label: loc::Id::OptionsFrameMinus,
         field: Field::FrameMinus,
         label_w: 0,
         x: 0,
-        y: 104,
+        y: 121,
         w: 186,
         h: 10,
     },
@@ -303,7 +325,7 @@ pub(crate) const VIEW: &[Ctrl] = &[
         field: Field::WindowedBg,
         label_w: 96,
         x: 0,
-        y: 122,
+        y: 139,
         w: 50,
         h: 14,
     },
@@ -313,7 +335,7 @@ pub(crate) const VIEW: &[Ctrl] = &[
         field: Field::FullscreenBg,
         label_w: 96,
         x: 0,
-        y: 140,
+        y: 157,
         w: 50,
         h: 14,
     },
@@ -386,6 +408,7 @@ pub(crate) struct OptionsModel {
     pub(crate) auto_zoom: bool,
     pub(crate) auto_zoom_type: Option<i32>,
     pub(crate) frame_minus: bool,
+    pub(crate) loop_animations_once: bool,
     pub(crate) windowed_bg: [u8; 3],
     pub(crate) fullscreen_bg: [u8; 3],
     pub(crate) left_click_action: Option<i32>,
@@ -408,6 +431,7 @@ impl OptionsModel {
             Field::FullscreenFillWindow => self.fullscreen_fill_window,
             Field::AutoZoom => self.auto_zoom,
             Field::FrameMinus => self.frame_minus,
+            Field::LoopAnimationsOnce => self.loop_animations_once,
             _ => return None,
         })
     }
@@ -421,6 +445,7 @@ impl OptionsModel {
             Field::FullscreenFillWindow => self.fullscreen_fill_window = value,
             Field::AutoZoom => self.auto_zoom = value,
             Field::FrameMinus => self.frame_minus = value,
+            Field::LoopAnimationsOnce => self.loop_animations_once = value,
             _ => {}
         }
     }
@@ -482,6 +507,7 @@ impl OptionsModel {
             auto_zoom: to_bool(config.auto_zoom),
             auto_zoom_type: Some(config.auto_zoom_type),
             frame_minus: to_bool(config.frame_minus),
+            loop_animations_once: to_bool(config.loop_animations_once),
             windowed_bg: config.windowed_bg(),
             fullscreen_bg: config.fullscreen_bg(),
             left_click_action: Some(config.left_click_action),
@@ -528,6 +554,7 @@ impl OptionsModel {
         config.fullscreen_fill_window = i32::from(self.fullscreen_fill_window);
         config.auto_zoom = i32::from(self.auto_zoom);
         config.frame_minus = i32::from(self.frame_minus);
+        config.loop_animations_once = i32::from(self.loop_animations_once);
         config.windowed_background_color_r = i32::from(self.windowed_bg[0]);
         config.windowed_background_color_g = i32::from(self.windowed_bg[1]);
         config.windowed_background_color_b = i32::from(self.windowed_bg[2]);
@@ -607,16 +634,17 @@ mod tests {
                 }
             }
         }
-        assert_eq!((bools, values, colors), (7, 6, 2));
+        assert_eq!((bools, values, colors), (8, 6, 2));
     }
 
     #[test]
     fn action_tables_carry_only_implemented_values_in_upstream_order() {
         // The values are upstream's action numbering; the ORDER is the
         // combo order (upstream's AddString order, viv.c:8225-8252). The
-        // left-click slideshow row landed with #37.
+        // left-click slideshow row landed with #37; the animation row
+        // with #38.
         let values = |t: &[ComboEntry]| t.iter().map(|e| e.value).collect::<Vec<_>>();
-        assert_eq!(values(LEFT_CLICK_ACTIONS), vec![0, 1, 3, 4]);
+        assert_eq!(values(LEFT_CLICK_ACTIONS), vec![0, 1, 2, 3, 4]);
         assert_eq!(values(RIGHT_CLICK_ACTIONS), vec![0, 1, 2]);
         assert_eq!(values(WHEEL_ACTIONS), vec![0, 1, 2]);
         assert_eq!(values(AUTO_ZOOM_TYPES), vec![0, 1, 2, 3]);
@@ -627,10 +655,10 @@ mod tests {
     fn combo_index_maps_values_and_rejects_the_unimplemented() {
         assert_eq!(combo_index(LEFT_CLICK_ACTIONS, 0), Some(0));
         assert_eq!(combo_index(LEFT_CLICK_ACTIONS, 1), Some(1));
-        assert_eq!(combo_index(LEFT_CLICK_ACTIONS, 4), Some(3));
-        // The animation/1:1/move values have no row (not implemented):
-        // the combo shows blank and OK must preserve them.
-        assert_eq!(combo_index(LEFT_CLICK_ACTIONS, 2), None);
+        assert_eq!(combo_index(LEFT_CLICK_ACTIONS, 4), Some(4));
+        // The 1:1/move values have no row (not implemented): the combo
+        // shows blank and OK must preserve them.
+        assert_eq!(combo_index(LEFT_CLICK_ACTIONS, 5), None);
         assert_eq!(combo_index(LEFT_CLICK_ACTIONS, 5), None);
         assert_eq!(combo_index(AUTO_ZOOM_TYPES, 7), None);
         assert_eq!(combo_index(BLIT_MODES, 2), None);
@@ -652,7 +680,7 @@ mod tests {
                 );
             }
         }
-        assert_eq!(seen.len(), 15);
+        assert_eq!(seen.len(), 16);
     }
 
     #[test]
@@ -713,6 +741,7 @@ mod tests {
             auto_zoom: true,
             auto_zoom_type: Some(2),
             frame_minus: true,
+            loop_animations_once: false,
             windowed_bg: [10, 20, 30],
             fullscreen_bg: [1, 2, 3],
             left_click_action: Some(3),

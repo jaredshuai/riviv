@@ -100,7 +100,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{HSTRING, PCSTR, PCWSTR, w};
 
-use crate::anim::ANIMATION_TIMER_ID;
+use crate::anim::{ANIMATION_TIMER_ID, RATE_ONE, rate_step};
 use crate::config::Config;
 use crate::copydata;
 use crate::cursor::{self, CursorVisibility};
@@ -262,6 +262,18 @@ pub(crate) struct WindowState {
     /// (upstream `_viv_frame_looped`, viv.c:693 — reset with every new
     /// image like `_viv_clear`, viv.c:1278).
     pub(crate) animation_looped: bool,
+    /// The animation plays or is paused (#38; upstream `_viv_animation_
+    /// play`, viv.c:673 — default 1, reset per image at `_viv_clear`,
+    /// viv.c:1291; Frame Step/Previous/First/Last pause it, Play/Pause
+    /// toggles it, the jump commands leave it alone). Read by the timer
+    /// gate, the menu check (viv.c:7184) and the prevent-sleep decision
+    /// (viv.c:3929-3936).
+    pub(crate) animation_playing: bool,
+    /// The animation rate table position (#38; upstream
+    /// `_viv_animation_rate_pos`, viv.c:672): index into
+    /// [`crate::anim::RATE_TABLE`], 10 = 1.0×. Unlike the pause flag it
+    /// PERSISTS across images (upstream only the rate commands move it).
+    pub(crate) animation_rate_pos: usize,
     /// The prevent-sleep execution-state latch (upstream
     /// `_viv_is_prevent_sleep`, viv.c:789) — SetThreadExecutionState is
     /// only called on a CHANGE of the derived want (viv.c:7319-7347).
@@ -1196,9 +1208,9 @@ fn on_left_button_down(hwnd: HWND, lparam: LPARAM) {
     let pt = lparam_point(lparam);
     // The action dispatch (upstream `_viv_do_left_click_action`,
     // viv.c:3319-3325 + 6360-6415): 0 scroll starts the drag; 3 zooms in
-    // at the click; 4 advances; 1 toggles the slideshow. Unimplemented
-    // values (2/5/6) do nothing — upstream's per-value switch has no
-    // default-to-scroll arm.
+    // at the click; 4 advances; 1 toggles the slideshow; 2 toggles the
+    // animation pause. Unimplemented values (5/6) do nothing — upstream's
+    // per-value switch has no default-to-scroll arm.
     // SAFETY: the borrow spans only the config read.
     let action = (unsafe { state_of(hwnd) })
         .map(|s| s.config.left_click_action)
@@ -1218,10 +1230,16 @@ fn on_left_button_down(hwnd: HWND, lparam: LPARAM) {
             slideshow_toggle(hwnd);
             return;
         }
+        // 2 = play/pause animation (upstream's action-2 arm is
+        // `_viv_animation_pause`, viv.c:14699-14703) — #38.
+        2 => {
+            animation_pause(hwnd);
+            return;
+        }
         // 0 falls through to the drag below; values riviv has no
-        // handler for (2 animation pause, 5 1:1 scroll, 6 move-window,
-        // hand-edited unknowns) do NOTHING, like upstream's per-value
-        // switch (viv.c:6360-6415).
+        // handler for (5 1:1 scroll, 6 move-window, hand-edited
+        // unknowns) do NOTHING, like upstream's per-value switch
+        // (viv.c:6360-6415).
         0 => {}
         _ => return,
     }
@@ -1363,8 +1381,14 @@ fn request_open(hwnd: HWND, path: &OsStr, origin: OpenOrigin<'_>) {
             }
             state.status_file_not_found = true;
             state.status_load_failed = false;
-            // The per-image animation marks die with the open (upstream
-            // `_viv_open` → `_viv_clear`, viv.c:1278-1279).
+            // The per-image animation marks die with the open (upstream's
+            // nav flavor reaches `_viv_clear`'s resets at the FAILED reply,
+            // viv.c:1278-1279). Playback is deliberately NOT reset here:
+            // this verdict keeps the old display, and upstream resets play
+            // only inside `_viv_clear` — where the old display dies (the
+            // command-line not-found runs no `_viv_open`/`_viv_clear` at
+            // all, viv.c:5094-5098), so a paused animation stays paused
+            // until a new image is actually adopted (cubic round 1).
             state.animation_looped = false;
             state.slideshow_timeup = false;
             // Supersede any in-flight load so its late replies are inert.
@@ -1384,7 +1408,11 @@ fn request_open(hwnd: HWND, path: &OsStr, origin: OpenOrigin<'_>) {
         state.status_load_failed = false;
         // The per-image animation marks die with the open (upstream
         // `_viv_open` → `_viv_clear`'s frame_looped/timeup resets,
-        // viv.c:1278-1279).
+        // viv.c:1278-1279). Playback resets only at the reply that swaps
+        // the display — upstream's `_viv_clear` runs at the first-frame/
+        // FAILED replies (viv.c:2951/2804), which the drain applies as
+        // UiAction::ResetPlayback — so a paused old animation stays paused
+        // while Loading shows (cubic round 1).
         state.animation_looped = false;
         state.slideshow_timeup = false;
         // The navigation reference follows the request (viv.c:1574-1579) —
@@ -1842,8 +1870,11 @@ fn on_slideshow_timer(hwnd: HWND) {
 fn update_prevent_sleep(hwnd: HWND) {
     // SAFETY: the borrow spans the reads and the latch update.
     let flip = (unsafe { state_of(hwnd) }).map(|state| {
-        let want =
-            state.config.prevent_sleep != 0 && (state.slideshow || state.animation_timer_running);
+        // A paused animation does not hold the display awake (upstream
+        // viv.c:3926-3934: `_viv_is_animation_timer && _viv_animation_
+        // play`); #38 carries the real pause flag.
+        let want = state.config.prevent_sleep != 0
+            && (state.slideshow || (state.animation_timer_running && state.animation_playing));
         (
             want,
             std::mem::replace(&mut state.prevent_sleep_active, want) != want,
@@ -1897,6 +1928,7 @@ fn blank_display(hwnd: HWND) {
         // slideshow itself keeps running (upstream never stops it here).
         state.view.reset();
         state.animation_looped = false;
+        state.animation_playing = true;
         state.slideshow_timeup = false;
         stop_timer = state.animation_timer_running;
         state.animation_timer_running = false;
@@ -2312,12 +2344,14 @@ fn on_load_replies(hwnd: HWND) {
             // frame; the completing reply's title refresh must not size
             // the window again).
             let displayed_before_reply = state.displayed_from == Some(session_id);
+            let playback = anim_playback(state);
             let outcome = apply_reply(
                 &mut state.image,
                 &mut state.displayed_from,
                 session_id,
                 now,
                 state.timer_freq,
+                playback,
                 reply,
             );
             // The status bar's Loading/Failed flags follow the protocol
@@ -2337,6 +2371,14 @@ fn on_load_replies(hwnd: HWND) {
             for action in outcome.actions {
                 match action {
                     UiAction::Invalidate => invalidate = true,
+                    UiAction::ResetPlayback => {
+                        // Upstream's `_viv_clear` sets
+                        // `_viv_animation_play = 1` (viv.c:1291): every
+                        // display swap starts playing. The open request
+                        // deliberately leaves the old pause alone until
+                        // this moment (cubic round 1).
+                        state.animation_playing = true;
+                    }
                     UiAction::SetWindowTitle => {
                         // The display adopted this session's image (or
                         // cleared it): the zoom/pan view resets with it
@@ -2436,6 +2478,17 @@ fn on_load_replies(hwnd: HWND) {
     }
 }
 
+/// The playback knobs snapshot from the window state (#38) — the pause
+/// flag and the rate table position the timer loop and the streaming
+/// re-anchor read (upstream's globals `_viv_animation_play` /
+/// `_viv_animation_rate_pos`, viv.c:672-673).
+fn anim_playback(state: &WindowState) -> crate::anim::Playback {
+    crate::anim::Playback {
+        playing: state.animation_playing,
+        rate_pos: state.animation_rate_pos,
+    }
+}
+
 /// WM_TIMER for the animation timer: advance the animation by the time
 /// elapsed since the previous event and repaint when the displayed frame
 /// changed (upstream viv.c:3171-3292).
@@ -2457,11 +2510,12 @@ fn on_animation_timer(hwnd: HWND) {
             // through — at most a single stray step per pause, exactly the
             // upstream quirk (cubic round 1, declined).
             let gate = state.slideshow_timeup && state.config.loop_animations_once != 0;
+            let playback = anim_playback(state);
             match state.image.as_mut() {
                 // The timer only runs while an animation is displayed; the
                 // guard also makes a stale timer (failed KillTimer) harmless.
                 Some(image) if image.is_animated() => {
-                    let adv = image.advance_on_timer(now, freq, gate);
+                    let adv = image.advance_on_timer(now, freq, gate, playback);
                     if adv.looped {
                         // Upstream raises _viv_frame_looped on the wrap
                         // (viv.c:3243) — the slideshow gate's wait ends
@@ -2488,6 +2542,117 @@ fn on_animation_timer(hwnd: HWND) {
         refresh_status(hwnd);
         // SAFETY: queues a WM_PAINT; never pumps messages. Erase is FALSE
         // like upstream viv.c:3284 — WM_PAINT fills the whole client itself.
+        let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+    }
+}
+
+/// Animation → Play/Pause (#38; upstream `_viv_animation_pause`, viv.c:
+/// 9250-9253): flip the playing flag and nothing else — the timer keeps
+/// running (paused events discard their time), the menu check follows the
+/// flag (viv.c:7184), and the prevent-sleep hold drops with it (viv.c:
+/// 3929-3936).
+fn animation_pause(hwnd: HWND) {
+    // SAFETY: the borrow spans the flag flip.
+    let flipped = (unsafe { state_of(hwnd) }).is_some_and(|state| {
+        state.animation_playing = !state.animation_playing;
+        true
+    });
+    if flipped {
+        // A playing⇄paused transition is a prevent-sleep decision point.
+        update_prevent_sleep(hwnd);
+    }
+}
+
+/// The Frame Step / Previous Frame / First Frame / Last Frame commands'
+/// shared shape (#38; upstream `_viv_frame_step`/`_viv_frame_prev` and the
+/// inline FRAME_HOME/FRAME_END cases, viv.c:9255-9315/1887-1932): the
+/// looped-mark reset and the pause run UNCONDITIONALLY — even for a static
+/// image, where the walk then does nothing (the upstream guards wrap only
+/// the position walk). A successful walk repaints and refreshes the frame
+/// counter.
+fn frame_command(hwnd: HWND, walk: impl Fn(&mut LoadedImage, u64) -> bool) {
+    // Read the clock before any state borrow — the same discipline as the
+    // timer path.
+    let now = qpc_now();
+    // SAFETY: the borrow spans the flag resets and the position walk; the
+    // GDI calls below run after it drops.
+    let walked = (unsafe { state_of(hwnd) }).and_then(|state| {
+        state.animation_looped = false;
+        state.animation_playing = false;
+        state.image.as_mut().map(|image| walk(image, now))
+    });
+    // The unconditional pause is a prevent-sleep transition (viv.c:
+    // 3929-3936) whether or not the walk moved.
+    update_prevent_sleep(hwnd);
+    if walked.unwrap_or(false) {
+        // The frame counter ("n / m") tracks the walk (upstream
+        // `_viv_status_update` in the handler body, viv.c:9278).
+        refresh_status(hwnd);
+        // SAFETY: queues a WM_PAINT; never pumps messages.
+        let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+    }
+}
+
+/// The Animation rate commands (#38; upstream
+/// `_viv_increase_animation_rate`/`_viv_reset_animation_rate`, viv.c:
+/// 7656-7681): step the table position (clamped, no wrap) or return to
+/// 1.0×. The position persists across images; the status-bar temp-text
+/// readout lands with the status work (#47).
+fn animation_rate_step(hwnd: HWND, decrease: bool) {
+    // SAFETY: the borrow spans the one-field update.
+    let _ = (unsafe { state_of(hwnd) }).map(|state| {
+        state.animation_rate_pos = rate_step(state.animation_rate_pos, decrease);
+    });
+}
+
+fn animation_rate_reset(hwnd: HWND) {
+    // SAFETY: the borrow spans the one-field update.
+    let _ = (unsafe { state_of(hwnd) }).map(|state| {
+        state.animation_rate_pos = RATE_ONE;
+    });
+}
+
+/// The jump budget a command spends (upstream `config_short_jump` /
+/// `config_medium_jump` / `config_long_jump`, config.c:72-74 — 500/1000/
+/// 2000 ms defaults; ini-overridable).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JumpKind {
+    Short,
+    Medium,
+    Long,
+}
+
+impl JumpKind {
+    fn budget_ms(self, config: &crate::config::Config) -> i32 {
+        match self {
+            Self::Short => config.short_jump,
+            Self::Medium => config.medium_jump,
+            Self::Long => config.long_jump,
+        }
+    }
+}
+
+/// The Animation jump commands (#38; upstream `_viv_frame_skip`, viv.c:
+/// 10056-10103): walk `budget` milliseconds of RAW frame delays forward or
+/// backward. Unlike the step family this neither pauses playback nor
+/// resets the looped mark (the upstream handler touches neither), and it
+/// re-anchors the timeline per step (the walk's own bookkeeping,
+/// viv.c:10072-10073).
+fn animation_jump(hwnd: HWND, kind: JumpKind, backward: bool) {
+    let now = qpc_now();
+    // SAFETY: the borrow spans the config read and the position walk; the
+    // GDI calls below run after it drops.
+    let walked = (unsafe { state_of(hwnd) }).and_then(|state| {
+        let budget = kind.budget_ms(&state.config);
+        let direction = if backward { -budget } else { budget };
+        state
+            .image
+            .as_mut()
+            .map(|image| image.frame_skip(now, direction))
+    });
+    if walked.unwrap_or(false) {
+        refresh_status(hwnd);
+        // SAFETY: queues a WM_PAINT; never pumps messages.
         let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
     }
 }
@@ -2804,6 +2969,10 @@ fn create_menu_bar(keys: &crate::keys::KeyMap) -> HMENU {
                     )
                 };
             }
+            // MF_OWNERDRAW rows never reach the menu bar (upstream's
+            // build filter, viv.c:12328-12377) — the command stays
+            // dispatchable and shortcut-bindable, just invisible here.
+            menu::Entry::HiddenItem { .. } => {}
         }
     }
     bar
@@ -2918,6 +3087,7 @@ fn on_initmenu(hwnd: HWND) {
             one_to_one,
             slideshow: state.slideshow,
             slideshow_rate_ms: state.config.slideshow_rate as u32,
+            animation_playing: state.animation_playing,
         }
     });
     let Some(state) = snapshot else {
@@ -3107,6 +3277,24 @@ fn on_command(hwnd: HWND, cmd: menu::Cmd) {
                 slideshow_set_rate(hwnd, rate_ms);
             }
         }
+        // The animation family (#38; upstream viv.c:1851-1944 — the pause
+        // toggle, the six jumps (the short/long quartet has no menu row
+        // but the same WM_COMMAND path, keyboard-only), the four frame
+        // commands, and the three rate commands).
+        menu::Cmd::AnimationPlayPause => animation_pause(hwnd),
+        menu::Cmd::AnimationJumpForwardMedium => animation_jump(hwnd, JumpKind::Medium, false),
+        menu::Cmd::AnimationJumpBackwardMedium => animation_jump(hwnd, JumpKind::Medium, true),
+        menu::Cmd::AnimationJumpForwardShort => animation_jump(hwnd, JumpKind::Short, false),
+        menu::Cmd::AnimationJumpBackwardShort => animation_jump(hwnd, JumpKind::Short, true),
+        menu::Cmd::AnimationJumpForwardLong => animation_jump(hwnd, JumpKind::Long, false),
+        menu::Cmd::AnimationJumpBackwardLong => animation_jump(hwnd, JumpKind::Long, true),
+        menu::Cmd::AnimationFrameStep => frame_command(hwnd, |image, now| image.frame_step(now)),
+        menu::Cmd::AnimationFramePrev => frame_command(hwnd, |image, now| image.frame_prev(now)),
+        menu::Cmd::AnimationFirstFrame => frame_command(hwnd, |image, now| image.frame_first(now)),
+        menu::Cmd::AnimationLastFrame => frame_command(hwnd, |image, now| image.frame_last(now)),
+        menu::Cmd::AnimationRateDecrease => animation_rate_step(hwnd, true),
+        menu::Cmd::AnimationRateIncrease => animation_rate_step(hwnd, false),
+        menu::Cmd::AnimationRateReset => animation_rate_reset(hwnd),
         menu::Cmd::NavNext => nav_next(hwnd, false, true),
         menu::Cmd::NavPrev => nav_next(hwnd, true, true),
         menu::Cmd::NavHome => home_open(hwnd, false),
@@ -3691,16 +3879,16 @@ unsafe extern "system" fn wnd_proc(
         // slideshow or a PLAYING animation swallows the monitor-power /
         // screensaver system commands (return 0, no DefWindowProc);
         // everything else falls through. The raw compare (no 0xFFF0 mask)
-        // is upstream's own; riviv's `animation_timer_running` stands in
-        // for its `_viv_is_animation_timer && _viv_animation_play` — the
-        // pause flag only arrives with the animation-menu work (#38), and
-        // a running timer always plays today.
+        // is upstream's own; the animation arm needs BOTH the running
+        // timer and the playing flag (viv.c:3929-3936 — #38 carries the
+        // real pause flag).
         WM_SYSCOMMAND
             if wparam.0 == SC_MONITORPOWER as usize || wparam.0 == SC_SCREENSAVE_CMD as usize =>
         {
             // SAFETY: the read-only borrow ends inside is_some_and.
             let block = (unsafe { state_of(hwnd) }).is_some_and(|s| {
-                s.config.prevent_sleep != 0 && (s.slideshow || s.animation_timer_running)
+                s.config.prevent_sleep != 0
+                    && (s.slideshow || (s.animation_timer_running && s.animation_playing))
             });
             if block {
                 LRESULT(0)
@@ -4233,6 +4421,8 @@ pub(crate) fn run(args: Vec<OsString>) -> Result<(), String> {
         slideshow: false,
         slideshow_timeup: false,
         animation_looped: false,
+        animation_playing: true,
+        animation_rate_pos: crate::anim::RATE_ONE,
         prevent_sleep_active: false,
     };
 

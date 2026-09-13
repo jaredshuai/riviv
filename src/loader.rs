@@ -458,15 +458,37 @@ impl<F> LoadedImage<F> {
     /// while no timer ran), the anchor resets to the arrival — the first
     /// timer event must not credit the whole decode gap against frames
     /// that just landed. Before the edge, the anchor stands and playback
-    /// advances on schedule.
-    fn second_frame(&mut self, frame: F, delay_ms: u32, now: u64, freq: u64) {
+    /// advances on schedule. The probe only applies while PLAYING and
+    /// compares the rate-scaled delay (#38): upstream's stall branch —
+    /// what this synthesizes — lives inside the play gate (viv.c:3195-
+    /// 3240) and consumes the scaled delay (viv.c:3209). While PAUSED
+    /// the arrival always re-anchors: upstream's timer has been running
+    /// since the first frame, re-anchoring while discarding time every
+    /// event (viv.c:3195), but riviv's timer only starts at this second
+    /// frame — without the reset, a resume landing between the timer
+    /// start and its first event would credit the whole paused/decode
+    /// gap and skip frames (cubic round 1). `timer_tick` is still zero
+    /// here (no timer ever ran), so the reset loses nothing.
+    fn second_frame(
+        &mut self,
+        frame: F,
+        delay_ms: u32,
+        now: u64,
+        freq: u64,
+        playback: anim::Playback,
+    ) {
         if self.decode_complete {
             // Defensive, same as push_frame: a completed frame set is final.
             return;
         }
-        if self
-            .scheduler
-            .at_frame_edge(now, freq, &self.delays_ms, self.position)
+        if !playback.playing
+            || self.scheduler.at_frame_edge(
+                now,
+                freq,
+                &self.delays_ms,
+                self.position,
+                playback.rate_pos,
+            )
         {
             self.scheduler = FrameScheduler::new(now);
         }
@@ -540,12 +562,15 @@ impl<F> LoadedImage<F> {
     /// report the result (the repaint need and the wrap-past-the-last-frame
     /// mark — #37's slideshow gate waits on that loop completion, upstream
     /// `_viv_frame_looped`, viv.c:3243). `stop_at_loop` is that gate: break
-    /// the catch-up at the wrap (viv.c:3245-3250).
+    /// the catch-up at the wrap (viv.c:3245-3250). `playback` is the pause
+    /// flag + rate position the loop reads (#38; upstream globals, viv.c:
+    /// 3195/3209).
     pub(crate) fn advance_on_timer(
         &mut self,
         now: u64,
         freq: u64,
         stop_at_loop: bool,
+        playback: anim::Playback,
     ) -> anim::FrameAdvance {
         debug_assert!(self.is_animated(), "static images are never on a timer");
         let advance = self.scheduler.on_timer(
@@ -555,9 +580,84 @@ impl<F> LoadedImage<F> {
             self.position,
             self.decode_complete,
             stop_at_loop,
+            playback,
         );
         self.position = advance.position;
         advance
+    }
+
+    /// Animation → Frame Step (upstream `_viv_frame_step`, viv.c:9255-9284):
+    /// advance one frame with the streaming edge guard, re-anchoring the
+    /// timeline to the command moment (the handler's
+    /// `_viv_animation_timer_tick_start = now; _viv_timer_tick = 0` pair,
+    /// viv.c:9274-9275). `false` = the guard held (or a static image): no
+    /// move, no repaint. The looped-mark reset and the pause flip live in
+    /// the caller — they happen even when this returns `false` (viv.c:
+    /// 9257-9262 run before the frame-count guard).
+    pub(crate) fn frame_step(&mut self, now: u64) -> bool {
+        let Some(next) = anim::step_position(&self.delays_ms, self.position, self.decode_complete)
+        else {
+            return false;
+        };
+        self.position = next;
+        self.scheduler = FrameScheduler::new(now);
+        true
+    }
+
+    /// Animation → Previous Frame (upstream `_viv_frame_prev`, viv.c:9286-
+    /// 9315): retreat one frame, wrapping to the last LOADED frame from
+    /// frame 0, re-anchoring to the command moment. `false` = static image.
+    pub(crate) fn frame_prev(&mut self, now: u64) -> bool {
+        if self.delays_ms.len() <= 1 {
+            return false;
+        }
+        self.position = anim::prev_position(&self.delays_ms, self.position);
+        self.scheduler = FrameScheduler::new(now);
+        true
+    }
+
+    /// Animation → First Frame (upstream `VIV_ID_ANIMATION_FRAME_HOME`,
+    /// viv.c:1887-1908): jump to frame 0, re-anchoring to the command
+    /// moment. `false` = static image.
+    pub(crate) fn frame_first(&mut self, now: u64) -> bool {
+        if self.delays_ms.len() <= 1 {
+            return false;
+        }
+        self.position = 0;
+        self.scheduler = FrameScheduler::new(now);
+        true
+    }
+
+    /// Animation → Last Frame (upstream `VIV_ID_ANIMATION_FRAME_END`,
+    /// viv.c:1910-1932): jump to the last LOADED frame (`loaded_count - 1`,
+    /// viv.c:1921 — during a streamed decode that is the prefix's tail),
+    /// re-anchoring to the command moment. `false` = static image.
+    pub(crate) fn frame_last(&mut self, now: u64) -> bool {
+        if self.delays_ms.len() <= 1 {
+            return false;
+        }
+        self.position = self.delays_ms.len() - 1;
+        self.scheduler = FrameScheduler::new(now);
+        true
+    }
+
+    /// The Animation jump commands (upstream `_viv_frame_skip`, viv.c:
+    /// 10056-10103): walk `direction_ms` of RAW frame delays forward or
+    /// backward and re-anchor to the command moment. Unlike the step
+    /// family this neither pauses playback nor resets the looped mark
+    /// (the upstream handler touches neither). `false` = static image.
+    pub(crate) fn frame_skip(&mut self, now: u64, direction_ms: i32) -> bool {
+        if self.delays_ms.len() <= 1 {
+            return false;
+        }
+        self.position = anim::skip_position(
+            &self.delays_ms,
+            self.position,
+            self.decode_complete,
+            direction_ms,
+        );
+        self.scheduler = FrameScheduler::new(now);
+        true
     }
 }
 
@@ -573,6 +673,16 @@ pub(crate) enum UiAction {
     Invalidate,
     /// Adopt the session's path (window title + Ctrl+O initial dir).
     SetWindowTitle,
+    /// Reset playback to playing — upstream's `_viv_clear` sets
+    /// `_viv_animation_play = 1` (viv.c:1291) and runs at exactly the
+    /// display-death moments that emit this: the first-frame adoption
+    /// (viv.c:2951) and the failed-load clear (viv.c:2804/2835). The
+    /// window layer's open request deliberately does NOT reset playback:
+    /// upstream's not-found verdict runs no `_viv_open`/`_viv_clear` at
+    /// all (viv.c:5094-5098) and a queued load keeps the old display up
+    /// until its reply, so a paused animation must stay paused while its
+    /// image is still the one on screen (cubic round 1).
+    ResetPlayback,
 }
 
 #[derive(Default, Debug)]
@@ -606,12 +716,17 @@ pub(crate) struct ReplyOutcome {
 /// fatal path must not run across a borrow — PR #10 P1); `freq` is the
 /// same QPC frequency, needed to judge whether a late second frame
 /// arrived past the loaded edge (see `LoadedImage::second_frame`).
+/// `playback` carries the animation pause flag and rate position (#38):
+/// the re-anchor probe compares against the rate-scaled delay (viv.c:
+/// 3209) and a paused arrival re-anchors unconditionally (cubic round 1
+/// — see `second_frame`).
 pub(crate) fn apply_reply<F>(
     image: &mut Option<LoadedImage<F>>,
     displayed_from: &mut Option<u64>,
     session_id: u64,
     now: u64,
     freq: u64,
+    playback: anim::Playback,
     reply: LoadReply<F>,
 ) -> ReplyOutcome {
     match reply {
@@ -624,7 +739,11 @@ pub(crate) fn apply_reply<F>(
             *image = Some(LoadedImage::first_frame(frame, delay_ms, now));
             *displayed_from = Some(session_id);
             ReplyOutcome {
-                actions: vec![UiAction::Invalidate, UiAction::SetWindowTitle],
+                actions: vec![
+                    UiAction::Invalidate,
+                    UiAction::SetWindowTitle,
+                    UiAction::ResetPlayback,
+                ],
                 ..Default::default()
             }
         }
@@ -638,7 +757,7 @@ pub(crate) fn apply_reply<F>(
                 if img.is_animated() {
                     img.push_frame(frame, delay_ms);
                 } else {
-                    img.second_frame(frame, delay_ms, now, freq);
+                    img.second_frame(frame, delay_ms, now, freq, playback);
                 }
             }
             ReplyOutcome::default()
@@ -662,7 +781,11 @@ pub(crate) fn apply_reply<F>(
                 *image = None;
                 *displayed_from = None;
                 ReplyOutcome {
-                    actions: vec![UiAction::Invalidate, UiAction::SetWindowTitle],
+                    actions: vec![
+                        UiAction::Invalidate,
+                        UiAction::SetWindowTitle,
+                        UiAction::ResetPlayback,
+                    ],
                     load_ended: true,
                     load_failed: true,
                     ..Default::default()
@@ -725,10 +848,22 @@ mod tests {
         let mut image = Some(Img::first_frame(7, 100, 0));
         image.as_mut().unwrap().push_frame(8, 100); // old image animated
         let mut displayed_from = Some(99);
-        let out = apply_reply(&mut image, &mut displayed_from, 1, 0, FREQ, frame(1));
+        let out = apply_reply(
+            &mut image,
+            &mut displayed_from,
+            1,
+            0,
+            FREQ,
+            anim::Playback::new(),
+            frame(1),
+        );
         assert_eq!(
             out.actions,
-            vec![UiAction::Invalidate, UiAction::SetWindowTitle]
+            vec![
+                UiAction::Invalidate,
+                UiAction::SetWindowTitle,
+                UiAction::ResetPlayback
+            ]
         );
         assert_eq!(displayed_from, Some(1));
         let img = image.unwrap();
@@ -740,19 +875,41 @@ mod tests {
     fn the_second_frame_arriving_early_keeps_the_first_frame_anchor() {
         let mut image = None;
         let mut displayed_from = None;
-        apply_reply(&mut image, &mut displayed_from, 1, 0, FREQ, frame(1));
+        apply_reply(
+            &mut image,
+            &mut displayed_from,
+            1,
+            0,
+            FREQ,
+            anim::Playback::new(),
+            frame(1),
+        );
         // Frame 2 arrives at t=80, before frame 1's 100 ms delay expires:
         // playback must advance on schedule at t=100, not restart the
         // clock at the arrival (upstream runs the timer from the first
         // frame; the stall branch only discards time once the edge is
         // actually reached, viv.c:3233-3240).
-        let out = apply_reply(&mut image, &mut displayed_from, 1, 80, FREQ, additional(2));
+        let out = apply_reply(
+            &mut image,
+            &mut displayed_from,
+            1,
+            80,
+            FREQ,
+            anim::Playback::new(),
+            additional(2),
+        );
         assert_eq!(out.actions, Vec::<UiAction>::new());
         let mut img = image.unwrap();
         assert!(img.is_animated());
-        assert!(!img.advance_on_timer(99, FREQ, false).repaint);
+        assert!(
+            !img.advance_on_timer(99, FREQ, false, anim::Playback::new())
+                .repaint
+        );
         assert_eq!(*img.surface(), 1);
-        assert!(img.advance_on_timer(100, FREQ, false).repaint);
+        assert!(
+            img.advance_on_timer(100, FREQ, false, anim::Playback::new())
+                .repaint
+        );
         assert_eq!(*img.surface(), 2);
     }
 
@@ -760,7 +917,15 @@ mod tests {
     fn the_second_frame_arriving_late_reanchors_to_the_arrival() {
         let mut image = None;
         let mut displayed_from = None;
-        apply_reply(&mut image, &mut displayed_from, 1, 0, FREQ, frame(1));
+        apply_reply(
+            &mut image,
+            &mut displayed_from,
+            1,
+            0,
+            FREQ,
+            anim::Playback::new(),
+            frame(1),
+        );
         // Frame 2 arrives 5 s after frame 1's display: playback had long
         // reached the loaded edge with no timer running (a one-frame prefix
         // is static), so the anchor resets to the arrival — the decode gap
@@ -774,18 +939,79 @@ mod tests {
             1,
             5_000,
             FREQ,
+            anim::Playback::new(),
             additional(2),
         );
         let mut img = image.unwrap();
         assert!(
-            !img.advance_on_timer(5_099, FREQ, false).repaint,
+            !img.advance_on_timer(5_099, FREQ, false, anim::Playback::new())
+                .repaint,
             "99 ms since arrival"
         );
         assert_eq!(*img.surface(), 1);
-        assert!(img.advance_on_timer(5_100, FREQ, false).repaint);
+        assert!(
+            img.advance_on_timer(5_100, FREQ, false, anim::Playback::new())
+                .repaint
+        );
         assert_eq!(*img.surface(), 2);
         // No frame 3: hold at the edge without accumulating.
-        assert!(!img.advance_on_timer(8_000, FREQ, false).repaint);
+        assert!(
+            !img.advance_on_timer(8_000, FREQ, false, anim::Playback::new())
+                .repaint
+        );
+        assert_eq!(*img.surface(), 2);
+    }
+
+    #[test]
+    fn a_paused_second_frame_reanchors_so_a_fast_resume_cannot_skip() {
+        // cubic round 1: pausing before the second frame arrives freezes
+        // the anchor at the first frame — and riviv's timer only starts AT
+        // the second frame, so nothing has been re-anchoring while paused
+        // the way upstream's always-running timer does (viv.c:3195). The
+        // arrival must therefore re-anchor unconditionally while paused:
+        // a resume landing between the timer start and its first event
+        // would otherwise credit the whole paused/decode gap (capped at
+        // one second) and skip frames immediately.
+        let mut image = None;
+        let mut displayed_from = None;
+        apply_reply(
+            &mut image,
+            &mut displayed_from,
+            1,
+            0,
+            FREQ,
+            anim::Playback::new(),
+            frame(1),
+        );
+        let paused = anim::Playback {
+            playing: false,
+            ..anim::Playback::new()
+        };
+        // Frame 2 arrives 5 s into the pause — far past the loaded edge
+        // AND paused, so the re-anchor must come from the paused arm.
+        apply_reply(
+            &mut image,
+            &mut displayed_from,
+            1,
+            5_000,
+            FREQ,
+            paused,
+            additional(2),
+        );
+        let mut img = image.unwrap();
+        // Resume 10 ms after the arrival: the first timer event measures
+        // from the arrival, so nothing advances yet...
+        assert!(
+            !img.advance_on_timer(5_010, FREQ, false, anim::Playback::new())
+                .repaint,
+            "10 ms since the arrival"
+        );
+        assert_eq!(*img.surface(), 1);
+        // ...and frame 2 shows on schedule 100 ms after the arrival.
+        assert!(
+            img.advance_on_timer(5_100, FREQ, false, anim::Playback::new())
+                .repaint
+        );
         assert_eq!(*img.surface(), 2);
     }
 
@@ -799,24 +1025,49 @@ mod tests {
         // edge instead of stalling forever.
         let mut image = None;
         let mut displayed_from = None;
-        apply_reply(&mut image, &mut displayed_from, 1, 0, FREQ, frame(1));
-        apply_reply(&mut image, &mut displayed_from, 1, 100, FREQ, additional(2));
-        // Session 2 superseded session 1 and failed pre-first-frame.
         apply_reply(
+            &mut image,
+            &mut displayed_from,
+            1,
+            0,
+            FREQ,
+            anim::Playback::new(),
+            frame(1),
+        );
+        apply_reply(
+            &mut image,
+            &mut displayed_from,
+            1,
+            100,
+            FREQ,
+            anim::Playback::new(),
+            additional(2),
+        );
+        // Session 2 superseded session 1 and failed pre-first-frame.
+        let out = apply_reply(
             &mut image,
             &mut displayed_from,
             2,
             150,
             FREQ,
+            anim::Playback::new(),
             Reply::FailedUser("bad file".into()),
         );
+        // The kept display must NOT reset playback (cubic round 1): the
+        // paused old animation stays paused — upstream resets play only in
+        // `_viv_clear`, which never runs while the old image survives.
+        assert!(!out.actions.contains(&UiAction::ResetPlayback));
         let mut img = image.unwrap();
         assert!(img.is_animated(), "old animation kept");
         // The kept prefix plays and wraps — not stalled at the edge.
-        assert!(img.advance_on_timer(200, FREQ, false).repaint);
+        assert!(
+            img.advance_on_timer(200, FREQ, false, anim::Playback::new())
+                .repaint
+        );
         assert_eq!(*img.surface(), 2);
         assert!(
-            img.advance_on_timer(300, FREQ, false).repaint,
+            img.advance_on_timer(300, FREQ, false, anim::Playback::new())
+                .repaint,
             "wraps at the edge"
         );
         assert_eq!(*img.surface(), 1);
@@ -826,14 +1077,41 @@ mod tests {
     fn frames_beyond_the_second_do_not_disturb_the_running_timeline() {
         let mut image = None;
         let mut displayed_from = None;
-        apply_reply(&mut image, &mut displayed_from, 1, 0, FREQ, frame(1));
-        apply_reply(&mut image, &mut displayed_from, 1, 100, FREQ, additional(2));
+        apply_reply(
+            &mut image,
+            &mut displayed_from,
+            1,
+            0,
+            FREQ,
+            anim::Playback::new(),
+            frame(1),
+        );
+        apply_reply(
+            &mut image,
+            &mut displayed_from,
+            1,
+            100,
+            FREQ,
+            anim::Playback::new(),
+            additional(2),
+        );
         // Frame 3 arrives 100 ms later, mid-playback: the anchor stays at
         // the first frame — 350 ms of elapsed playback crosses the delays
         // of frames 1 and 2 (100 + 100) and stops at frame 3's.
-        apply_reply(&mut image, &mut displayed_from, 1, 200, FREQ, additional(3));
+        apply_reply(
+            &mut image,
+            &mut displayed_from,
+            1,
+            200,
+            FREQ,
+            anim::Playback::new(),
+            additional(3),
+        );
         let mut img = image.unwrap();
-        assert!(img.advance_on_timer(350, FREQ, false).repaint);
+        assert!(
+            img.advance_on_timer(350, FREQ, false, anim::Playback::new())
+                .repaint
+        );
         assert_eq!(*img.surface(), 3);
     }
 
@@ -845,7 +1123,15 @@ mod tests {
         // display is dropped. Per-session queues make this unreachable in
         // practice (the handler drains one queue in delivery order); the
         // guard pins the protocol against future plumbing changes.
-        let out = apply_reply(&mut image, &mut displayed_from, 2, 10, FREQ, additional(2));
+        let out = apply_reply(
+            &mut image,
+            &mut displayed_from,
+            2,
+            10,
+            FREQ,
+            anim::Playback::new(),
+            additional(2),
+        );
         assert_eq!(out.actions, Vec::<UiAction>::new());
         assert_eq!(displayed_from, Some(1));
         assert!(!image.as_ref().unwrap().is_animated(), "frame dropped");
@@ -855,17 +1141,42 @@ mod tests {
     fn completion_unlocks_wrapping_at_the_loaded_edge() {
         let mut image = None;
         let mut displayed_from = None;
-        apply_reply(&mut image, &mut displayed_from, 1, 0, FREQ, frame(1));
-        apply_reply(&mut image, &mut displayed_from, 1, 0, FREQ, additional(2));
+        apply_reply(
+            &mut image,
+            &mut displayed_from,
+            1,
+            0,
+            FREQ,
+            anim::Playback::new(),
+            frame(1),
+        );
+        apply_reply(
+            &mut image,
+            &mut displayed_from,
+            1,
+            0,
+            FREQ,
+            anim::Playback::new(),
+            additional(2),
+        );
         let img = image.as_mut().unwrap();
-        assert!(img.advance_on_timer(100, FREQ, false).repaint);
+        assert!(
+            img.advance_on_timer(100, FREQ, false, anim::Playback::new())
+                .repaint
+        );
         assert_eq!(*img.surface(), 2);
         // At the edge with the decode still in flight: hold frame 2.
-        assert!(!img.advance_on_timer(5_000, FREQ, false).repaint);
+        assert!(
+            !img.advance_on_timer(5_000, FREQ, false, anim::Playback::new())
+                .repaint
+        );
         assert_eq!(*img.surface(), 2);
         img.mark_complete();
         // Same edge after completion: wrap to frame 0.
-        assert!(img.advance_on_timer(5_100, FREQ, false).repaint);
+        assert!(
+            img.advance_on_timer(5_100, FREQ, false, anim::Playback::new())
+                .repaint
+        );
         assert_eq!(*img.surface(), 1);
     }
 
@@ -878,12 +1189,28 @@ mod tests {
         // its Complete, one reply later).
         let mut image = None;
         let mut displayed_from = None;
-        let out = apply_reply(&mut image, &mut displayed_from, 1, 0, FREQ, frame(1));
+        let out = apply_reply(
+            &mut image,
+            &mut displayed_from,
+            1,
+            0,
+            FREQ,
+            anim::Playback::new(),
+            frame(1),
+        );
         assert!(!out.load_ended, "the first frame is not the stream's end");
         assert!(!out.load_failed);
 
         // Mid-stream replies keep Loading up.
-        let out = apply_reply(&mut image, &mut displayed_from, 1, 5, FREQ, additional(2));
+        let out = apply_reply(
+            &mut image,
+            &mut displayed_from,
+            1,
+            5,
+            FREQ,
+            anim::Playback::new(),
+            additional(2),
+        );
         assert!(!out.load_ended);
         assert!(!out.load_failed);
 
@@ -893,6 +1220,7 @@ mod tests {
             1,
             10,
             FREQ,
+            anim::Playback::new(),
             Reply::Complete,
         );
         assert!(out.load_ended, "the terminal reply ends the load");
@@ -904,6 +1232,7 @@ mod tests {
             1,
             20,
             FREQ,
+            anim::Playback::new(),
             Reply::FailedUser("bad file".into()),
         );
         assert!(out.load_ended);
@@ -915,6 +1244,7 @@ mod tests {
             1,
             30,
             FREQ,
+            anim::Playback::new(),
             Reply::FatalSystem("GDI gone".into()),
         );
         assert!(out.load_ended);
@@ -929,9 +1259,15 @@ mod tests {
         img.push_frame(2, 100);
         img.push_frame(3, 100);
         assert_eq!(img.frame_count(), 3);
-        assert!(img.advance_on_timer(100, FREQ, false).repaint);
+        assert!(
+            img.advance_on_timer(100, FREQ, false, anim::Playback::new())
+                .repaint
+        );
         assert_eq!(img.frame_position_1based(), 2);
-        assert!(img.advance_on_timer(200, FREQ, false).repaint);
+        assert!(
+            img.advance_on_timer(200, FREQ, false, anim::Playback::new())
+                .repaint
+        );
         assert_eq!(img.frame_position_1based(), 3);
     }
 
@@ -945,6 +1281,7 @@ mod tests {
             1,
             10,
             FREQ,
+            anim::Playback::new(),
             Reply::FailedUser("bad file".into()),
         );
         assert_eq!(out.actions, Vec::<UiAction>::new());
@@ -960,6 +1297,7 @@ mod tests {
             1,
             10,
             FREQ,
+            anim::Playback::new(),
             Reply::FailedUser("bad file".into()),
         );
         assert_eq!(out.actions, Vec::<UiAction>::new());
@@ -971,18 +1309,31 @@ mod tests {
         // Static partial (first frame only).
         let mut image = None;
         let mut displayed_from = None;
-        apply_reply(&mut image, &mut displayed_from, 1, 0, FREQ, frame(1));
+        apply_reply(
+            &mut image,
+            &mut displayed_from,
+            1,
+            0,
+            FREQ,
+            anim::Playback::new(),
+            frame(1),
+        );
         let out = apply_reply(
             &mut image,
             &mut displayed_from,
             1,
             10,
             FREQ,
+            anim::Playback::new(),
             Reply::FailedUser("over budget".into()),
         );
         assert_eq!(
             out.actions,
-            vec![UiAction::Invalidate, UiAction::SetWindowTitle]
+            vec![
+                UiAction::Invalidate,
+                UiAction::SetWindowTitle,
+                UiAction::ResetPlayback
+            ]
         );
         assert!(image.is_none(), "partial image cleared");
         assert_eq!(displayed_from, None);
@@ -991,19 +1342,40 @@ mod tests {
         // from the cleared image state).
         let mut image = None;
         let mut displayed_from = None;
-        apply_reply(&mut image, &mut displayed_from, 1, 0, FREQ, frame(1));
-        apply_reply(&mut image, &mut displayed_from, 1, 0, FREQ, additional(2));
+        apply_reply(
+            &mut image,
+            &mut displayed_from,
+            1,
+            0,
+            FREQ,
+            anim::Playback::new(),
+            frame(1),
+        );
+        apply_reply(
+            &mut image,
+            &mut displayed_from,
+            1,
+            0,
+            FREQ,
+            anim::Playback::new(),
+            additional(2),
+        );
         let out = apply_reply(
             &mut image,
             &mut displayed_from,
             1,
             10,
             FREQ,
+            anim::Playback::new(),
             Reply::FailedUser("over budget".into()),
         );
         assert_eq!(
             out.actions,
-            vec![UiAction::Invalidate, UiAction::SetWindowTitle]
+            vec![
+                UiAction::Invalidate,
+                UiAction::SetWindowTitle,
+                UiAction::ResetPlayback
+            ]
         );
         assert!(image.is_none());
     }
@@ -1018,6 +1390,7 @@ mod tests {
             1,
             0,
             FREQ,
+            anim::Playback::new(),
             Reply::FatalSystem("CreateDIBSection failed".into()),
         );
         assert_eq!(out.fatal.as_deref(), Some("CreateDIBSection failed"));
@@ -1028,14 +1401,41 @@ mod tests {
     fn complete_for_a_stale_session_leaves_the_displayed_stream_open() {
         let mut image = None;
         let mut displayed_from = None;
-        apply_reply(&mut image, &mut displayed_from, 1, 0, FREQ, frame(1));
-        apply_reply(&mut image, &mut displayed_from, 1, 0, FREQ, additional(2));
+        apply_reply(
+            &mut image,
+            &mut displayed_from,
+            1,
+            0,
+            FREQ,
+            anim::Playback::new(),
+            frame(1),
+        );
+        apply_reply(
+            &mut image,
+            &mut displayed_from,
+            1,
+            0,
+            FREQ,
+            anim::Playback::new(),
+            additional(2),
+        );
         // Session 2's Complete must not freeze session 1's frame set.
-        apply_reply(&mut image, &mut displayed_from, 2, 0, FREQ, Reply::Complete);
+        apply_reply(
+            &mut image,
+            &mut displayed_from,
+            2,
+            0,
+            FREQ,
+            anim::Playback::new(),
+            Reply::Complete,
+        );
         let mut img = image.unwrap();
-        img.advance_on_timer(100, FREQ, false);
+        img.advance_on_timer(100, FREQ, false, anim::Playback::new());
         // Still open at the edge: holds instead of wrapping.
-        assert!(!img.advance_on_timer(5_000, FREQ, false).repaint);
+        assert!(
+            !img.advance_on_timer(5_000, FREQ, false, anim::Playback::new())
+                .repaint
+        );
         assert_eq!(*img.surface(), 2);
     }
 

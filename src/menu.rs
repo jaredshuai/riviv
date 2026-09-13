@@ -104,6 +104,32 @@ pub(crate) enum Cmd {
     /// Slideshow → Rate → Custom... (`VIV_ID_SLIDESHOW_RATE_CUSTOM`,
     /// viv.c:918 rate block tail) — the value dialog.
     SlideshowRateCustom,
+    /// Animation → Play/Pause (`VIV_ID_ANIMATION_PLAY_PAUSE`, viv.c:921)
+    /// — #38: the pause toggle; its menu check reads the playing flag
+    /// (viv.c:7184).
+    AnimationPlayPause,
+    /// Animation → Jump Forward / Jump Backward (medium, viv.c:923-924)
+    /// — the menu-visible pair.
+    AnimationJumpForwardMedium,
+    AnimationJumpBackwardMedium,
+    /// The short/long jump quartet (viv.c:925-928): MF_OWNERDRAW upstream
+    /// — never appended to the menu bar (viv.c:12328) but a real command
+    /// (custom-shortcut-bindable, viv.c:8269-8290 lists it).
+    AnimationJumpForwardShort,
+    AnimationJumpBackwardShort,
+    AnimationJumpForwardLong,
+    AnimationJumpBackwardLong,
+    /// Animation → Frame Step / Previous Frame (viv.c:930-931).
+    AnimationFrameStep,
+    AnimationFramePrev,
+    /// Animation → First Frame / Last Frame (viv.c:932-933).
+    AnimationFirstFrame,
+    AnimationLastFrame,
+    /// Animation → Decrease / Increase / Reset Rate (viv.c:935-937) — the
+    /// 21-entry speed table (`anim::RATE_TABLE`).
+    AnimationRateDecrease,
+    AnimationRateIncrease,
+    AnimationRateReset,
     /// Navigate → Next (`VIV_ID_NAV_NEXT`).
     NavNext,
     /// Navigate → Previous (`VIV_ID_NAV_PREV`).
@@ -204,6 +230,20 @@ impl Cmd {
         Self::SlideshowRate50000,
         Self::SlideshowRate60000,
         Self::SlideshowRateCustom,
+        Self::AnimationPlayPause,
+        Self::AnimationJumpForwardMedium,
+        Self::AnimationJumpBackwardMedium,
+        Self::AnimationJumpForwardShort,
+        Self::AnimationJumpBackwardShort,
+        Self::AnimationJumpForwardLong,
+        Self::AnimationJumpBackwardLong,
+        Self::AnimationFrameStep,
+        Self::AnimationFramePrev,
+        Self::AnimationFirstFrame,
+        Self::AnimationLastFrame,
+        Self::AnimationRateDecrease,
+        Self::AnimationRateIncrease,
+        Self::AnimationRateReset,
         Self::NavNext,
         Self::NavPrev,
         Self::NavHome,
@@ -226,6 +266,9 @@ pub(crate) enum Slot {
     /// The Slideshow → Rate popup (#37; upstream `_VIV_MENU_SLIDESHOW_RATE`,
     /// viv.c:897).
     SlideshowRate,
+    /// The Animation top-level menu (#38; upstream `_VIV_MENU_ANIMATION`,
+    /// viv.c:920 — between Slideshow and Navigate in the root order).
+    Animation,
     Navigate,
     Help,
 }
@@ -269,12 +312,24 @@ pub(crate) enum Entry {
         parent: Slot,
         cmd: Cmd,
     },
+    /// An MF_OWNERDRAW row (#38; upstream's short/long jumps, viv.c:925-928):
+    /// a real command-table entry — custom-shortcut-bindable, listed on the
+    /// Controls page (upstream's list skips only POPUP/SEPARATOR/DELETE
+    /// rows, viv.c:8269-8290) and dispatched by id — that the MENU BAR
+    /// build skips (upstream `_viv_create_menu`'s MF_OWNERDRAW filter,
+    /// viv.c:12328). Its localization id names the command for the ini
+    /// key and the Controls list.
+    HiddenItem {
+        loc: loc::Id,
+        parent: Slot,
+        cmd: Cmd,
+    },
 }
 
 /// The command table (upstream `_viv_commands[]`, viv.c:798-965, pruned to
-/// riviv's implemented commands; the unimplemented menus — Edit, Animation
-/// and the dead rows inside File/View/Navigate/Help — wait for their
-/// features). Order is upstream order.
+/// riviv's implemented commands; the unimplemented menus — Edit and the
+/// dead rows inside File/View/Navigate/Help — wait for their features).
+/// Order is upstream order.
 pub(crate) const ENTRIES: &[Entry] = &[
     // File (viv.c:800-821).
     Entry::Popup {
@@ -502,6 +557,95 @@ pub(crate) const ENTRIES: &[Entry] = &[
         parent: Slot::SlideshowRate,
         cmd: Cmd::SlideshowRateCustom,
     },
+    // Animation (#38; upstream viv.c:920-937 — a root menu between
+    // Slideshow and Navigate). The short/long jump quartet rides as
+    // HiddenItem rows: command-table citizens, menu-bar invisible
+    // (upstream's MF_OWNERDRAW, viv.c:925-928 vs the build filter at
+    // viv.c:12328).
+    Entry::Popup {
+        loc: loc::Id::MenuAnimation,
+        parent: Slot::Root,
+        slot: Slot::Animation,
+    },
+    Entry::Item {
+        loc: loc::Id::MenuAnimationPlayPause,
+        parent: Slot::Animation,
+        cmd: Cmd::AnimationPlayPause,
+    },
+    Entry::Separator {
+        parent: Slot::Animation,
+    },
+    Entry::Item {
+        loc: loc::Id::MenuAnimationJumpForward,
+        parent: Slot::Animation,
+        cmd: Cmd::AnimationJumpForwardMedium,
+    },
+    Entry::Item {
+        loc: loc::Id::MenuAnimationJumpBackward,
+        parent: Slot::Animation,
+        cmd: Cmd::AnimationJumpBackwardMedium,
+    },
+    Entry::HiddenItem {
+        loc: loc::Id::MenuAnimationShortJumpForward,
+        parent: Slot::Animation,
+        cmd: Cmd::AnimationJumpForwardShort,
+    },
+    Entry::HiddenItem {
+        loc: loc::Id::MenuAnimationShortJumpBackward,
+        parent: Slot::Animation,
+        cmd: Cmd::AnimationJumpBackwardShort,
+    },
+    Entry::HiddenItem {
+        loc: loc::Id::MenuAnimationLongJumpForward,
+        parent: Slot::Animation,
+        cmd: Cmd::AnimationJumpForwardLong,
+    },
+    Entry::HiddenItem {
+        loc: loc::Id::MenuAnimationLongJumpBackward,
+        parent: Slot::Animation,
+        cmd: Cmd::AnimationJumpBackwardLong,
+    },
+    Entry::Separator {
+        parent: Slot::Animation,
+    },
+    Entry::Item {
+        loc: loc::Id::MenuAnimationFrameStep,
+        parent: Slot::Animation,
+        cmd: Cmd::AnimationFrameStep,
+    },
+    Entry::Item {
+        loc: loc::Id::MenuAnimationPreviousFrame,
+        parent: Slot::Animation,
+        cmd: Cmd::AnimationFramePrev,
+    },
+    Entry::Item {
+        loc: loc::Id::MenuAnimationFirstFrame,
+        parent: Slot::Animation,
+        cmd: Cmd::AnimationFirstFrame,
+    },
+    Entry::Item {
+        loc: loc::Id::MenuAnimationLastFrame,
+        parent: Slot::Animation,
+        cmd: Cmd::AnimationLastFrame,
+    },
+    Entry::Separator {
+        parent: Slot::Animation,
+    },
+    Entry::Item {
+        loc: loc::Id::MenuAnimationRateDecrease,
+        parent: Slot::Animation,
+        cmd: Cmd::AnimationRateDecrease,
+    },
+    Entry::Item {
+        loc: loc::Id::MenuAnimationRateIncrease,
+        parent: Slot::Animation,
+        cmd: Cmd::AnimationRateIncrease,
+    },
+    Entry::Item {
+        loc: loc::Id::MenuAnimationRateReset,
+        parent: Slot::Animation,
+        cmd: Cmd::AnimationRateReset,
+    },
     // Navigate (viv.c:952-959).
     Entry::Popup {
         loc: loc::Id::MenuNavigate,
@@ -594,6 +738,9 @@ pub(crate) struct MenuState {
     /// The current rate in ms (#37; the Rate submenu's radio — the preset
     /// row whose value matches, or Custom when none does, viv.c:7140-7189).
     pub(crate) slideshow_rate_ms: u32,
+    /// The animation playing flag (#38; upstream viv.c:7184 — Play/Pause
+    /// CHECKES while playing, the pause being the unchecked state).
+    pub(crate) animation_playing: bool,
 }
 
 /// Whether `cmd`'s menu item carries a check in `state` (upstream
@@ -604,6 +751,7 @@ pub(crate) fn checked(cmd: Cmd, state: &MenuState) -> bool {
         Cmd::ViewFullscreen => state.fullscreen,
         Cmd::ViewOneToOne => state.one_to_one,
         Cmd::ViewSlideshow | Cmd::SlideshowPause => state.slideshow,
+        Cmd::AnimationPlayPause => state.animation_playing,
         // The radio's checked row: the preset that equals the rate, or
         // Custom when the rate is no preset (viv.c:7140-7189's switch
         // default).
@@ -645,6 +793,7 @@ mod tests {
                 Entry::Separator { parent } => *parent,
                 Entry::Popup { parent, .. } => *parent,
                 Entry::Item { parent, .. } => *parent,
+                Entry::HiddenItem { parent, .. } => *parent,
             };
             assert!(
                 seen[parent as usize],
@@ -663,15 +812,17 @@ mod tests {
     fn item_commands_are_unique() {
         // WM_COMMAND dispatches by id; a duplicated command would be two
         // menu rows sharing one action id (upstream's table keeps them
-        // distinct, viv.c:798-965).
+        // distinct, viv.c:798-965). HiddenItem rows register their command
+        // the same way — they only skip the menu bar, not the command
+        // table.
         let mut seen = [false; Cmd::COUNT];
         for entry in ENTRIES {
-            if let Entry::Item { cmd, .. } = entry {
+            if let Entry::Item { cmd, .. } | Entry::HiddenItem { cmd, .. } = entry {
                 assert!(!seen[usize::from(cmd.id() - 1)], "{cmd:?} registered twice");
                 seen[usize::from(cmd.id() - 1)] = true;
             }
         }
-        // Every command the enum declares has a menu row.
+        // Every command the enum declares has a table row.
         assert!(seen.iter().all(|&s| s), "declared command never registered");
     }
 
@@ -689,9 +840,9 @@ mod tests {
     }
 
     #[test]
-    fn slideshow_command_ids_are_pinned_for_the_wire() {
-        // smoke37 posts these as raw WM_COMMAND wparams; inserting a command
-        // ahead of the slideshow block would silently shift every wire id.
+    fn slideshow_and_animation_command_ids_are_pinned_for_the_wire() {
+        // smoke37/smoke38 post these as raw WM_COMMAND wparams; inserting a
+        // command ahead of the block would silently shift every wire id.
         assert_eq!(Cmd::ViewSlideshow.id(), 9);
         assert_eq!(Cmd::SlideshowPause.id(), 16);
         assert_eq!(Cmd::SlideshowRateDecrease.id(), 17);
@@ -699,7 +850,23 @@ mod tests {
         assert_eq!(Cmd::SlideshowRate250.id(), 19);
         assert_eq!(Cmd::SlideshowRate500.id(), 20);
         assert_eq!(Cmd::SlideshowRateCustom.id(), 36);
-        assert_eq!(Cmd::NavNext.id(), 37);
+        // The #38 Animation block runs 37-50 (#37's NavNext was 37; the
+        // 14 new commands push it to 51).
+        assert_eq!(Cmd::AnimationPlayPause.id(), 37);
+        assert_eq!(Cmd::AnimationJumpForwardMedium.id(), 38);
+        assert_eq!(Cmd::AnimationJumpBackwardMedium.id(), 39);
+        assert_eq!(Cmd::AnimationJumpForwardShort.id(), 40);
+        assert_eq!(Cmd::AnimationJumpBackwardShort.id(), 41);
+        assert_eq!(Cmd::AnimationJumpForwardLong.id(), 42);
+        assert_eq!(Cmd::AnimationJumpBackwardLong.id(), 43);
+        assert_eq!(Cmd::AnimationFrameStep.id(), 44);
+        assert_eq!(Cmd::AnimationFramePrev.id(), 45);
+        assert_eq!(Cmd::AnimationFirstFrame.id(), 46);
+        assert_eq!(Cmd::AnimationLastFrame.id(), 47);
+        assert_eq!(Cmd::AnimationRateDecrease.id(), 48);
+        assert_eq!(Cmd::AnimationRateIncrease.id(), 49);
+        assert_eq!(Cmd::AnimationRateReset.id(), 50);
+        assert_eq!(Cmd::NavNext.id(), 51);
     }
 
     #[test]
@@ -767,14 +934,16 @@ mod tests {
     #[test]
     fn check_marks_mirror_the_upstream_conditions() {
         // viv.c:7125/7131/7132 — the Menu/Fullscreen/1:1 checks; viv.c:
-        // 7133/7138 — both slideshow rows check with the running flag.
-        // Every non-rate item is unchecked with the toggles off.
+        // 7133/7138 — both slideshow rows check with the running flag;
+        // viv.c:7184 — Play/Pause checks with the playing flag. Every
+        // non-rate item is unchecked with the toggles off.
         let on = MenuState {
             show_menu: true,
             fullscreen: true,
             one_to_one: true,
             slideshow: true,
             slideshow_rate_ms: 5_000,
+            animation_playing: true,
         };
         let off = MenuState {
             show_menu: false,
@@ -782,6 +951,7 @@ mod tests {
             one_to_one: false,
             slideshow: false,
             slideshow_rate_ms: 5_000,
+            animation_playing: false,
         };
         for cmd in Cmd::ALL {
             let expected_on = matches!(
@@ -792,6 +962,7 @@ mod tests {
                     | Cmd::ViewSlideshow
                     | Cmd::SlideshowPause
                     | Cmd::SlideshowRate5000
+                    | Cmd::AnimationPlayPause
             );
             assert_eq!(checked(cmd, &on), expected_on, "{cmd:?} with everything on");
             assert_eq!(
@@ -840,6 +1011,7 @@ mod tests {
             one_to_one: false,
             slideshow: false,
             slideshow_rate_ms: 5_000,
+            animation_playing: true,
         }
     }
 
@@ -875,15 +1047,40 @@ mod tests {
     #[test]
     fn menu_strings_are_non_empty_in_both_languages_for_every_entry() {
         // Every localized row must resolve to real text in BOTH tables —
-        // an empty caption would append a blank menu row.
+        // an empty caption would append a blank menu row (or, for the
+        // hidden rows, a blank Controls-list entry).
         for entry in ENTRIES {
             let id = match entry {
                 Entry::Separator { .. } => continue,
                 Entry::Popup { loc, .. } => *loc,
-                Entry::Item { loc, .. } => *loc,
+                Entry::Item { loc, .. } | Entry::HiddenItem { loc, .. } => *loc,
             };
             assert!(!loc::get_for(loc::Language::English, id).is_empty());
             assert!(!loc::get_for(loc::Language::ChineseSimplified, id).is_empty());
         }
+    }
+
+    #[test]
+    fn the_animation_short_and_long_jumps_hide_from_the_menu_bar_only() {
+        // Upstream's MF_OWNERDRAW quartet (viv.c:925-928): present in the
+        // command table (Controls list + WM_COMMAND + ini names), absent
+        // from the menu bar build (viv.c:12328). The table here marks them
+        // HiddenItem; the visible Jump pair stays Item.
+        let hidden: Vec<Cmd> = ENTRIES
+            .iter()
+            .filter_map(|e| match e {
+                Entry::HiddenItem { cmd, .. } => Some(*cmd),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            hidden,
+            vec![
+                Cmd::AnimationJumpForwardShort,
+                Cmd::AnimationJumpBackwardShort,
+                Cmd::AnimationJumpForwardLong,
+                Cmd::AnimationJumpBackwardLong,
+            ]
+        );
     }
 }
