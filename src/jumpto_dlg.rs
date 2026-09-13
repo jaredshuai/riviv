@@ -537,7 +537,9 @@ fn on_search(dlg: HWND) {
         if edit.is_invalid() || list.is_invalid() {
             return;
         }
-        let mut buf = [0u16; 512];
+        // Upstream reads the edit into a STRING_SIZE (1024) buffer
+        // (viv.c:12924) — a longer paste truncates identically there.
+        let mut buf = [0u16; 1024];
         let len = GetWindowTextW(edit, &mut buf).max(0) as usize;
         let search = String::from_utf16_lossy(&buf[..len]);
         let path_search = is_path_search(&search);
