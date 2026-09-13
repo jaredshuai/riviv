@@ -432,7 +432,11 @@ impl Surface {
 
     /// The memory DC the frame DIB is selected into — read-only use (the
     /// clipboard image blit sources from it, #41). Never select into or
-    /// delete: the Surface owns both the DC and the selection.
+    /// delete: the Surface owns both the DC and the selection. The raw
+    /// handle outlives the `&self` borrow: it stays valid only until this
+    /// Surface is dropped (a window-state image swap retires it) and is
+    /// UI-thread-affine — callers must consume it within the same message
+    /// handler, without pumping, while the Surface is alive.
     pub(crate) fn mem_dc(&self) -> HDC {
         self.memdc
     }

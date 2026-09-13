@@ -26,7 +26,9 @@ use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, RegisterClipboardFormatW,
     SetClipboardData,
 };
-use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
+use windows::Win32::System::Memory::{
+    GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
+};
 use windows::Win32::System::Ole::{CF_BITMAP, CF_HDROP, CF_UNICODETEXT};
 use windows::Win32::UI::Shell::HDROP;
 use windows::core::w;
@@ -286,10 +288,16 @@ unsafe fn set_hglobal(format: u32, bytes: &[u8]) {
         };
         // SAFETY: hmem is ours, `bytes.len()` bytes were allocated.
         let ptr = GlobalLock(hmem);
-        if !ptr.is_null() {
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.cast(), bytes.len());
-            let _ = GlobalUnlock(hmem);
+        if ptr.is_null() {
+            // Publishing the never-written block would put uninitialized
+            // bytes on the clipboard — skip the format instead (as with
+            // the alloc failure above).
+            // SAFETY: the block is still ours and never reached the clipboard.
+            let _ = GlobalFree(Some(hmem));
+            return;
         }
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.cast(), bytes.len());
+        let _ = GlobalUnlock(hmem);
         match SetClipboardData(format, Some(HANDLE(hmem.0 as *mut _))) {
             Ok(_) => {}
             Err(_) => {
@@ -298,6 +306,42 @@ unsafe fn set_hglobal(format: u32, bytes: &[u8]) {
             }
         }
     }
+}
+
+/// Whether a locked CF_HDROP payload is structurally sound enough to hand
+/// to the shell's `DragQueryFile` parser: the DROPFILES header fits,
+/// `pFiles` lands inside the block, and the string list reaches an empty
+/// string (two consecutive NUL units) before the block ends — the bounds
+/// `DragQueryFile` cannot check itself (an HDROP is a bare pointer, not a
+/// sized allocation; a lone NUL only ends one string, the walk then reads
+/// on). Upstream trusts the clipboard blindly (viv.c:4033-4038 passes the
+/// lock straight through); riviv validates because a foreign process
+/// authored this memory. A malformed payload no-ops the paste exactly
+/// like every other unrecognized clipboard shape.
+pub(crate) fn hdrop_payload_is_sound(payload: &[u8]) -> bool {
+    if payload.len() < DROPFILES_LEN {
+        return false;
+    }
+    let p_files = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
+    if p_files > payload.len() {
+        return false;
+    }
+    let body = &payload[p_files..];
+    // fWide is a BOOL: nonzero = UTF-16 units, zero = ANSI bytes.
+    let wide = u32::from_le_bytes([payload[16], payload[17], payload[18], payload[19]]) != 0;
+    let unit = if wide { 2 } else { 1 };
+    // The list ends at an empty string: a NUL unit at a string start —
+    // position 0, or right after a string's own terminating NUL. Treating
+    // the virtual unit before the body as a terminator models position 0.
+    let mut prev_nul = true;
+    for c in body.chunks_exact(unit) {
+        let nul = c.iter().all(|&b| b == 0);
+        if nul && prev_nul {
+            return true;
+        }
+        prev_nul = nul;
+    }
+    false
 }
 
 /// WM_PASTE (upstream viv.c:4021-4047), reached through the EditPaste
@@ -319,10 +363,18 @@ pub(crate) fn on_paste(hwnd: HWND) {
             // duration (upstream GlobalLocks it at viv.c:4033).
             let ptr = GlobalLock(hmem);
             if !ptr.is_null() {
-                // The drop body runs inline (upstream SendMessage's to
-                // itself — same thread, same order), WITHOUT the
-                // DragFinish real drops get.
-                apply_drop_files(hwnd, HDROP(ptr));
+                // SAFETY: GlobalSize reports the block's full allocation;
+                // the lock makes exactly that many bytes readable at ptr,
+                // and the slice borrows only locked clipboard memory for
+                // the validation read below.
+                let size = GlobalSize(hmem);
+                let payload = std::ptr::slice_from_raw_parts(ptr.cast::<u8>(), size);
+                if hdrop_payload_is_sound(&*payload) {
+                    // The drop body runs inline (upstream SendMessage's to
+                    // itself — same thread, same order), WITHOUT the
+                    // DragFinish real drops get.
+                    apply_drop_files(hwnd, HDROP(ptr));
+                }
                 // SAFETY: paired with the lock above.
                 let _ = GlobalUnlock(hmem);
             }
@@ -371,6 +423,54 @@ mod tests {
         assert_eq!(&bytes[20..24], &a[..]);
         assert_eq!(&bytes[24..28], &b[..]);
         assert_eq!(&bytes[28..], &[0, 0]);
+    }
+
+    // ---- the foreign-payload soundness gate (paste hardening, #55) ----
+
+    #[test]
+    fn a_well_formed_wide_hdrop_is_sound() {
+        // Round-trip: what hdrop_bytes builds must always pass.
+        let bytes = hdrop_bytes(&[OsStr::new(r"C:\pics\a.png")]);
+        assert!(hdrop_payload_is_sound(&bytes));
+        // A count-0 list (header + bare terminator) is bounded too.
+        let empty_list = hdrop_bytes(&[]);
+        assert_eq!(empty_list.len(), DROPFILES_LEN + 2);
+        assert!(hdrop_payload_is_sound(&empty_list));
+    }
+
+    #[test]
+    fn a_truncated_or_misoffset_header_is_unsound() {
+        // Header cut short.
+        assert!(!hdrop_payload_is_sound(&[0u8; 19]));
+        // pFiles points past the block's end.
+        let mut bytes = hdrop_bytes(&[OsStr::new("a")]);
+        bytes[0..4].copy_from_slice(&100u32.to_le_bytes());
+        assert!(!hdrop_payload_is_sound(&bytes));
+        // pFiles lands exactly at the end — an empty body cannot hold a
+        // terminator, so the shell walk would run off the block.
+        let empty_list = hdrop_bytes(&[]);
+        assert!(!hdrop_payload_is_sound(&empty_list[..DROPFILES_LEN]));
+    }
+
+    #[test]
+    fn a_list_without_an_empty_string_is_unsound() {
+        // A wide path with its own NUL but no list terminator: a lone NUL
+        // only ends the string — the walk reads on, past the block.
+        let mut unterminated = Vec::new();
+        unterminated.extend_from_slice(&hdrop_bytes(&[OsStr::new("a")]));
+        unterminated.truncate(unterminated.len() - 2);
+        assert!(!hdrop_payload_is_sound(&unterminated));
+        // Same shape in ANSI (fWide = 0).
+        let mut ansi = Vec::new();
+        ansi.extend_from_slice(&(DROPFILES_LEN as u32).to_le_bytes());
+        ansi.extend_from_slice(&0i32.to_le_bytes());
+        ansi.extend_from_slice(&0i32.to_le_bytes());
+        ansi.extend_from_slice(&0u32.to_le_bytes()); // fNC
+        ansi.extend_from_slice(&0u32.to_le_bytes()); // fWide
+        ansi.extend_from_slice(b"a\0");
+        assert!(!hdrop_payload_is_sound(&ansi));
+        ansi.push(0); // the empty string arrives — now bounded.
+        assert!(hdrop_payload_is_sound(&ansi));
     }
 
     // ---- Preferred DropEffect payload (upstream viv.c:7421-7440) ----
