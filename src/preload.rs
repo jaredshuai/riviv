@@ -99,6 +99,48 @@ pub(crate) fn adopt_decision(state: PreloadState, has_first_frame: bool) -> Adop
     }
 }
 
+/// What the slot-drain tail does with a slot a navigation waits on
+/// (`activate_on_load`), from the batch's terminal net state — upstream's
+/// should_activate arms in the reply handler: the first frame
+/// (viv.c:2916-2924) promotes the load to the foreground, a completion
+/// with a parked image (viv.c:2824-2829) promotes AND fires the next
+/// preload itself, and a failure (viv.c:2808-2819) blanks with the failed
+/// verdict. A slot nobody waits on never touches the display.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DrainAdoption {
+    /// Leave the slot parked — nothing terminal for a waiting navigation.
+    None,
+    /// Swap the parked image in. `keep_session`: the stream still runs
+    /// (Loading) and continues as the foreground load (upstream flips
+    /// `_viv_load_is_preload` to 0 at the first frame, viv.c:2920); a
+    /// finished stream (Complete) has no reply left, so the next preload
+    /// fires from the completion arm itself (viv.c:2824-2826/2877-2879).
+    Promote { keep_session: bool },
+    /// The load failed while a navigation waited — the display blanks with
+    /// the failed verdict and the next preload chains (viv.c:2808-2819).
+    FailActivation,
+}
+
+/// The drain-tail decision for a waiting slot: whether its reply batch
+/// promotes the parked image, blanks on a failure, or does nothing.
+pub(crate) fn drain_adoption(
+    activate_on_load: bool,
+    state: PreloadState,
+    has_image: bool,
+) -> DrainAdoption {
+    if !activate_on_load {
+        return DrainAdoption::None;
+    }
+    match state {
+        PreloadState::Failed => DrainAdoption::FailActivation,
+        PreloadState::Loading if has_image => DrainAdoption::Promote { keep_session: true },
+        PreloadState::Complete if has_image => DrainAdoption::Promote {
+            keep_session: false,
+        },
+        PreloadState::Loading | PreloadState::Complete => DrainAdoption::None,
+    }
+}
+
 /// Whether the status bar's PRELOAD part shows (upstream gate viv.c:11210:
 /// a preload load is in flight, still decoding its first frame, and nobody
 /// is waiting to adopt it — `_viv_load_is_preload && _viv_preload_state ==
@@ -177,6 +219,73 @@ mod tests {
         assert_eq!(
             adopt_decision(PreloadState::Failed, true),
             AdoptDecision::AdoptFailed
+        );
+    }
+
+    // ---- drain-tail adoption for a navigation-waiting slot (upstream
+    // viv.c:2808-2829/2916-2924) ----
+
+    #[test]
+    fn a_first_frame_while_a_navigation_waits_promotes_and_keeps_the_stream() {
+        // viv.c:2916-2924: should_activate + first frame — the load becomes
+        // the foreground (remaining frames follow as the display's stream).
+        assert_eq!(
+            drain_adoption(true, PreloadState::Loading, true),
+            DrainAdoption::Promote { keep_session: true }
+        );
+    }
+
+    #[test]
+    fn a_completion_landing_in_the_same_drain_drops_the_finished_stream() {
+        // viv.c:2824-2829: COMPLETE + should_activate adopts the parked
+        // image and fires the next preload from the completion arm itself.
+        // Keeping the finished session would strand the Loading status and
+        // the preload chain (cubic P1): no reply is left to end it.
+        assert_eq!(
+            drain_adoption(true, PreloadState::Complete, true),
+            DrainAdoption::Promote {
+                keep_session: false
+            }
+        );
+    }
+
+    #[test]
+    fn a_failure_while_a_navigation_waits_blanks_regardless_of_parked_frames() {
+        // viv.c:2808-2819: FAILED + should_activate clears the display with
+        // the failed verdict — partial frames never adopt (Codex P1).
+        assert_eq!(
+            drain_adoption(true, PreloadState::Failed, false),
+            DrainAdoption::FailActivation
+        );
+        assert_eq!(
+            drain_adoption(true, PreloadState::Failed, true),
+            DrainAdoption::FailActivation
+        );
+    }
+
+    #[test]
+    fn a_waiting_slot_without_its_first_frame_yet_does_nothing() {
+        assert_eq!(
+            drain_adoption(true, PreloadState::Loading, false),
+            DrainAdoption::None
+        );
+    }
+
+    #[test]
+    fn a_slot_nobody_waits_on_never_touches_the_display() {
+        // Background terminal replies only record the slot's state; the
+        // display hears nothing (the same split as the reply stash).
+        assert_eq!(
+            drain_adoption(false, PreloadState::Complete, true),
+            DrainAdoption::None
+        );
+        assert_eq!(
+            drain_adoption(false, PreloadState::Failed, true),
+            DrainAdoption::None
+        );
+        assert_eq!(
+            drain_adoption(false, PreloadState::Loading, true),
+            DrainAdoption::None
         );
     }
 

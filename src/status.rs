@@ -167,7 +167,17 @@ pub(crate) fn update(hwnd: HWND, snapshot: &StatusSnapshot) {
                 HGDIOBJ::default()
             };
             let sizes = (
-                text_extent(hdc, preload_text),
+                // Non-empty text owns its part even when the measure fails
+                // (a 0 would make status_part_edges DROP the preload part
+                // while set_text below still writes it — the frame/dimension
+                // texts would shift one part left until the next refresh;
+                // upstream keys the boundary push on the text too,
+                // viv.c:11312's `if (*preload_buf)`).
+                if preload_text.is_empty() {
+                    0
+                } else {
+                    text_extent(hdc, preload_text).max(1)
+                },
                 text_extent(hdc, &frame_text),
                 text_extent(hdc, &dimension_text),
             );

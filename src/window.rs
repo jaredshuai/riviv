@@ -1461,9 +1461,14 @@ fn adopt_preload_flow(hwnd: HWND) {
         match preload::adopt_decision(slot_state, has_first_frame) {
             AdoptDecision::PromoteOnFirstFrame => {
                 // viv.c:15134-15164: the title/current fd follow the
-                // preload file NOW (the _viv_open_preload head), and the
-                // in-flight load is flagged — its first frame promotes it
-                // to the display (the drain's promotion path).
+                // preload file NOW (the _viv_open_preload head copies
+                // preload_fd into current_fd ONLY), and the in-flight load
+                // is flagged — its first frame promotes it to the display
+                // (the drain's promotion path). displayed_entry — upstream's
+                // frame_fd — stays on the still-shown old image until that
+                // adoption (viv.c:2962 copies load_fd into frame_fd at the
+                // first-frame reply): the displaced display must park into
+                // last under its OWN name (cubic+Codex P1).
                 let entry = state
                     .preload
                     .as_ref()
@@ -1474,7 +1479,6 @@ fn adopt_preload_flow(hwnd: HWND) {
                 }
                 state.nav_current = Some(entry.clone());
                 state.path = Some(entry.path.clone());
-                state.displayed_entry = Some(entry.clone());
                 state.pending_file_bytes = Some(entry.size);
                 title = Some(HSTRING::from_wide(&title_wide(state.path.as_deref())));
             }
@@ -3096,7 +3100,7 @@ fn on_load_replies(hwnd: HWND) {
         // The parked preload's replies apply against the slot's own state;
         // the display never hears about them (upstream's preload branches
         // stash into _viv_preload_frames only, viv.c:2926-2943).
-        let mut promote = false;
+        let mut adoption = preload::DrainAdoption::None;
         let playback = anim_playback(state);
         if let Some(slot) = state.preload.as_mut() {
             let slot_id = slot.session.id();
@@ -3133,22 +3137,53 @@ fn on_load_replies(hwnd: HWND) {
                     slot.state = PreloadState::Complete;
                 }
             }
-            // The first frame landed while a navigation waits on this
-            // preload — promote it below (upstream's
-            // should_activate first-frame arm, viv.c:2916-2924, runs the
-            // NORMAL first-frame branch: current display → last, first
-            // frame adopts, remaining frames follow as the foreground).
-            promote = slot.activate_on_load && slot.image.is_some();
+            // The batch's terminal net state decides what a waiting
+            // navigation gets: promote on a first frame, adopt-and-chain on
+            // a same-drain completion, blank on a failure (upstream's
+            // should_activate arms, viv.c:2808-2829/2916-2924) — the pure
+            // decision lives in preload::drain_adoption.
+            adoption =
+                preload::drain_adoption(slot.activate_on_load, slot.state, slot.image.is_some());
         }
-        if promote {
-            match adopt_parked_image(state, now, true) {
-                Ok(()) => {
-                    invalidate = true;
-                    adopted_new_image = true;
-                    title = Some(HSTRING::from_wide(&title_wide(state.path.as_deref())));
-                }
-                Err(e) => fatal_msg = Some(e),
+        match adoption {
+            preload::DrainAdoption::FailActivation => {
+                // The load failed while a navigation waited on it (upstream
+                // viv.c:2808-2819): the old display drops UNCACHED (only the
+                // already-failed adopt arm copies to last, viv.c:15187), the
+                // failed verdict shows, and the next preload chains.
+                // nav/path/title already name the failed file — the FAILED
+                // handler never touches current_fd (viv.c:2832-2840).
+                state.preload = None;
+                state.session = None;
+                state.image = None;
+                state.displayed_from = None;
+                state.status_load_failed = true;
+                reset_display_marks(state);
+                state.displayed_entry = None;
+                state.displayed_file_bytes = None;
+                state.pending_file_bytes = None;
+                invalidate = true;
+                kick_preload = true;
             }
+            preload::DrainAdoption::Promote { keep_session } => {
+                match adopt_parked_image(state, now, keep_session) {
+                    Ok(()) => {
+                        invalidate = true;
+                        adopted_new_image = true;
+                        title = Some(HSTRING::from_wide(&title_wide(state.path.as_deref())));
+                        // A stream that finished inside this drain has no
+                        // reply left to chain from — the completion arm
+                        // fires the next preload itself (viv.c:2824-2826/
+                        // 2877-2879); a kept stream chains at its own load
+                        // end instead.
+                        if !keep_session {
+                            kick_preload = true;
+                        }
+                    }
+                    Err(e) => fatal_msg = Some(e),
+                }
+            }
+            preload::DrainAdoption::None => {}
         }
         // Timer reconciliation from the drain's NET effect — deriving from
         // the final image state cannot disagree with the protocol (a batch

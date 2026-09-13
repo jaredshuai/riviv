@@ -12,9 +12,9 @@
 //!
 //! Scope vs upstream's pages: only implemented features get controls — the
 //! General page drops start-menu shortcuts and associations (#26), the View
-//! page drops title-bar-format / preload / cache (features not implemented;
-//! loop-once landed with #38), and keeps-aspect / fill / fullscreen-fill /
-//! frame-minus
+//! page drops title-bar-format (feature not implemented; loop-once landed
+//! with #38, preload/cache with #40), and keeps-aspect / fill /
+//! fullscreen-fill / frame-minus
 //! move here from upstream's MENU surface (viv.c:2032-2060 / 3994-3999),
 //! which riviv's menu does not register. The Controls page's key-binding
 //! editor lives in `keys.rs` + the hand-built area of `options_dlg.rs`
