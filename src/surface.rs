@@ -430,6 +430,13 @@ impl Surface {
         self.frame.height
     }
 
+    /// The memory DC the frame DIB is selected into — read-only use (the
+    /// clipboard image blit sources from it, #41). Never select into or
+    /// delete: the Surface owns both the DC and the selection.
+    pub(crate) fn mem_dc(&self) -> HDC {
+        self.memdc
+    }
+
     /// Extend the mip chain to `target` levels if needed, on the calling
     /// (UI) thread — upstream fills missing levels inside `_viv_get_mipmap`
     /// during WM_PAINT the same way (viv.c:14200-14258). Returns the

@@ -94,13 +94,14 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_ACTIVATE, WM_COMMAND, WM_CONTEXTMENU, WM_COPYDATA, WM_DESTROY, WM_DROPFILES, WM_ENDSESSION,
     WM_ERASEBKGND, WM_GETMINMAXINFO, WM_INITMENU, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
     WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_MOVE, WM_NCCREATE, WM_NCDESTROY, WM_NULL,
-    WM_PAINT, WM_QUERYENDSESSION, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SIZE,
-    WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_TIMER, WNDCLASSEXW, WS_CAPTION, WS_EX_ACCEPTFILES,
+    WM_PAINT, WM_PASTE, WM_QUERYENDSESSION, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP,
+    WM_SIZE, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_TIMER, WNDCLASSEXW, WS_CAPTION, WS_EX_ACCEPTFILES,
     WS_OVERLAPPEDWINDOW, WS_POPUP, WS_THICKFRAME, WS_VISIBLE, WindowFromPoint,
 };
 use windows::core::{HSTRING, PCSTR, PCWSTR, w};
 
 use crate::anim::{ANIMATION_TIMER_ID, RATE_ONE, rate_step};
+use crate::clipboard;
 use crate::config::Config;
 use crate::copydata;
 use crate::cursor::{self, CursorVisibility};
@@ -3871,6 +3872,14 @@ fn on_initmenu(hwnd: HWND) {
             nav_sort: playlist::SortMode::from_config(state.config.nav_sort),
             nav_sort_ascending: state.config.nav_sort_ascending != 0,
             shuffle: state.config.shuffle != 0,
+            // The clipboard quartet's gray (#41): a current file with no
+            // not-found / failed verdict standing (upstream's
+            // is_image_enabled, viv.c:7103).
+            image_enabled: clipboard::image_gate(
+                state.nav_current.is_some(),
+                state.status_file_not_found,
+                state.status_load_failed,
+            ),
         }
     });
     let Some(state) = snapshot else {
@@ -3896,7 +3905,7 @@ fn on_initmenu(hwnd: HWND) {
         };
         // SAFETY: bar is the window's own live menu.
         let _ = unsafe { CheckMenuItem(bar, u32::from(cmd.id()), flags) };
-        let enable: MENU_ITEM_FLAGS = if menu::enabled(cmd) {
+        let enable: MENU_ITEM_FLAGS = if menu::enabled(cmd, &state) {
             MF_ENABLED | MF_BYCOMMAND
         } else {
             // Grayed, not just disabled: the Options placeholder is a
@@ -4015,6 +4024,21 @@ fn on_command(hwnd: HWND, cmd: menu::Cmd) {
             // WM_DESTROY/WM_NCDESTROY with no borrow live.
             let _ = unsafe { DestroyWindow(hwnd) };
         }
+        // The Edit → clipboard family (#41; upstream viv.c:2335-2353, the
+        // same order).
+        menu::Cmd::EditCopy => clipboard::copy_current(hwnd, false),
+        menu::Cmd::EditCopyFilename => clipboard::copy_filename(hwnd),
+        menu::Cmd::EditCopyImage => clipboard::copy_image(hwnd),
+        // Upstream routes the command through WM_PASTE (viv.c:2347-2349)
+        // so anything else that posts the message lands on the same path.
+        menu::Cmd::EditPaste => {
+            // SAFETY: hwnd is live and owned by this thread; WM_PASTE runs
+            // inline (the clipboard session pumps nothing).
+            unsafe {
+                let _ = SendMessageW(hwnd, WM_PASTE, Some(WPARAM(0)), Some(LPARAM(0)));
+            }
+        }
+        menu::Cmd::EditCut => clipboard::copy_current(hwnd, true),
         menu::Cmd::ViewMenu => toggle_menu(hwnd),
         menu::Cmd::ViewFullscreen => toggle_fullscreen(hwnd),
         menu::Cmd::ViewOneToOne => toggle_one_to_one(hwnd),
@@ -4337,11 +4361,29 @@ fn on_keydown(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
     on_command(hwnd, cmd);
 }
 
-/// WM_DROPFILES (upstream viv.c:3076-3128).
+/// WM_DROPFILES (upstream viv.c:3076-3128): the drop body plus the
+/// DragFinish teardown a REAL shell drop owns. #41 splits the body out
+/// because the clipboard paste routes a system-owned HDROP through the
+/// same logic — freeing that would GlobalFree the clipboard's block.
 fn on_drop_files(hwnd: HWND, hdrop: HDROP) {
-    // SAFETY: `hdrop` is owned by this message; DragFinish is called exactly
-    // once on every path below, and nothing here pumps messages (the FS
-    // scans and metadata reads inside the playlist helpers cannot).
+    apply_drop_files(hwnd, hdrop);
+    // SAFETY: hdrop arrived with this message from the shell; DragFinish
+    // frees it exactly once (upstream never frees — a real-drop leak
+    // riviv fixes; this wrapper is the only place that may).
+    unsafe {
+        DragFinish(hdrop);
+    }
+}
+
+/// The drop-application body shared by WM_DROPFILES and the clipboard
+/// paste (#41; upstream viv.c:3076-3126): shift = append, plain =
+/// replace, the playlist build, the home, the foreground raise. NEVER
+/// frees `hdrop` — real drops free through [`on_drop_files`], and the
+/// paste's clipboard block belongs to the system.
+pub(crate) fn apply_drop_files(hwnd: HWND, hdrop: HDROP) {
+    // SAFETY: `hdrop` stays valid for the whole body (freed only by a
+    // caller, after this returns), and nothing here pumps messages (the
+    // FS scans and metadata reads inside the playlist helpers cannot).
     unsafe {
         // Upstream branches on shift BEFORE anything else: shift means
         // append (`add_current_if_empty`, viv.c:3090-3094 — the current
@@ -4395,7 +4437,6 @@ fn on_drop_files(hwnd: HWND, hdrop: HDROP) {
                 }
             }
         }
-        DragFinish(hdrop);
         // Upstream re-activates the viewer after a drop (viv.c:3126) so the
         // drag source window does not stay in front of the result.
         // SAFETY: hwnd is live and owned by this thread.
@@ -4680,6 +4721,12 @@ unsafe extern "system" fn wnd_proc(
         WM_DROPFILES => {
             // SAFETY: wparam is the HDROP owned by this message.
             on_drop_files(hwnd, HDROP(wparam.0 as *mut c_void));
+            LRESULT(0)
+        }
+        WM_PASTE => {
+            // The clipboard paste (#41; upstream viv.c:4021-4047) — the
+            // EditPaste command forwards here (viv.c:2347-2349).
+            clipboard::on_paste(hwnd);
             LRESULT(0)
         }
         // The single-instance handoff receive (#21; upstream viv.c:3688-3719)

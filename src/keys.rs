@@ -96,6 +96,15 @@ const DEFAULT_KEYS: &[(Cmd, &[KeyDef])] = &[
         &[key(true, false, true, b'E' as u16)],
     ),
     (Cmd::FileExit, &[key(true, false, false, b'Q' as u16)]),
+    // The #41 clipboard quartet (viv.c:987-990, right after the exit row
+    // and before the view presets — upstream table order).
+    (Cmd::EditCut, &[key(true, false, false, b'X' as u16)]),
+    (Cmd::EditCopy, &[key(true, false, false, b'C' as u16)]),
+    (
+        Cmd::EditCopyFilename,
+        &[key(true, false, true, b'C' as u16)],
+    ),
+    (Cmd::EditPaste, &[key(true, false, false, b'V' as u16)]),
     (Cmd::ViewOneToOne, &[key(true, true, false, b'0' as u16)]),
     (Cmd::ViewFullscreen, &[key(false, true, false, VK_RETURN)]),
     // View → Slideshow owns F11 (viv.c:996, upstream row order: after the
