@@ -91,6 +91,7 @@ mod custom_rate_dlg;
 mod everything;
 mod fit;
 mod ini;
+mod jumpto_dlg;
 mod keys;
 mod loader;
 mod loadthread;
