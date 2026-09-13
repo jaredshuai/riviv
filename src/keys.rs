@@ -184,6 +184,8 @@ const DEFAULT_KEYS: &[(Cmd, &[KeyDef])] = &[
     ),
     (Cmd::NavHome, &[key(false, false, false, VK_HOME)]),
     (Cmd::NavEnd, &[key(false, false, false, VK_END)]),
+    // #39: Jump To owns plain 'J' (viv.c:1046, right after the End row).
+    (Cmd::NavJumpTo, &[key(false, false, false, b'J' as u16)]),
     (Cmd::HelpAbout, &[key(true, false, false, VK_F1)]),
 ];
 
@@ -538,6 +540,17 @@ mod tests {
         assert!(vks(Cmd::AnimationJumpBackwardShort).is_empty());
         assert!(vks(Cmd::AnimationJumpForwardLong).is_empty());
         assert!(vks(Cmd::AnimationJumpBackwardLong).is_empty());
+        // The #39 sort/shuffle family: only Jump To registers a key
+        // ('J', viv.c:1046); upstream binds none for the sort rows or
+        // Shuffle (they are menu-mouse rows).
+        assert_eq!(
+            vks(Cmd::NavJumpTo),
+            vec![k(false, false, false, b'J' as u16)]
+        );
+        assert!(vks(Cmd::NavShuffle).is_empty());
+        assert!(vks(Cmd::NavSortName).is_empty());
+        assert!(vks(Cmd::NavSortAscending).is_empty());
+        assert!(vks(Cmd::NavSortDescending).is_empty());
         // Every command has a slot in the map.
         assert_eq!(m.per_cmd.len(), Cmd::COUNT);
     }
@@ -830,6 +843,20 @@ mod tests {
             (Cmd::NavPrev, "navigate_previous_keys"),
             (Cmd::NavHome, "navigate_home_keys"),
             (Cmd::NavEnd, "navigate_end_keys"),
+            // The #39 block: the five mode rows nest under the Sort
+            // submenu ("&Name"→name, "Full &Path"→fullpath, ...), the
+            // direction pair with them; Shuffle and Jump To sit directly
+            // under Navigate ("Shuffle", "&Jump To..." → jumpto — the
+            // dots drop with the punctuation).
+            (Cmd::NavSortName, "navigate_sort_name_keys"),
+            (Cmd::NavSortFullPath, "navigate_sort_full_path_keys"),
+            (Cmd::NavSortSize, "navigate_sort_size_keys"),
+            (Cmd::NavSortDateModified, "navigate_sort_date_modified_keys"),
+            (Cmd::NavSortDateCreated, "navigate_sort_date_created_keys"),
+            (Cmd::NavSortAscending, "navigate_sort_ascending_keys"),
+            (Cmd::NavSortDescending, "navigate_sort_descending_keys"),
+            (Cmd::NavShuffle, "navigate_shuffle_keys"),
+            (Cmd::NavJumpTo, "navigate_jump_to_keys"),
             (Cmd::HelpAbout, "help_about_keys"),
         ];
         for (cmd, name) in expect {

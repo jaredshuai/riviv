@@ -138,6 +138,23 @@ pub(crate) enum Cmd {
     NavHome,
     /// Navigate → End (`VIV_ID_NAV_END`).
     NavEnd,
+    /// Navigate → Sort → the five mode radios (#39; `VIV_ID_NAV_SORT_*`,
+    /// viv.c:946-950 — menu-table order Name/Full Path/Size/Date Modified/
+    /// Date Created, NOT the handler's case order).
+    NavSortName,
+    NavSortFullPath,
+    NavSortSize,
+    NavSortDateModified,
+    NavSortDateCreated,
+    /// Navigate → Sort → Ascending / Descending radios (#39; viv.c:952-953).
+    NavSortAscending,
+    NavSortDescending,
+    /// Navigate → Shuffle (#39; `VIV_ID_NAV_SHUFFLE`, viv.c:954 — a plain
+    /// check row, not a radio).
+    NavShuffle,
+    /// Navigate → Jump To... (#39; `VIV_ID_NAV_JUMPTO`, viv.c:956 — default
+    /// key 'J', viv.c:1046).
+    NavJumpTo,
     /// Help → About (`VIV_ID_HELP_ABOUT`).
     HelpAbout,
 }
@@ -152,6 +169,19 @@ impl Cmd {
     /// 1-based over the enum order).
     pub(crate) fn id(self) -> u16 {
         self as u16 + 1
+    }
+
+    /// The sort mode a Sort-submenu radio row selects (#39; `None` for the
+    /// direction pair, Shuffle and Jump To — every non-mode command).
+    pub(crate) fn sort_mode(self) -> Option<crate::playlist::SortMode> {
+        match self {
+            Self::NavSortName => Some(crate::playlist::SortMode::Name),
+            Self::NavSortFullPath => Some(crate::playlist::SortMode::FullPath),
+            Self::NavSortSize => Some(crate::playlist::SortMode::Size),
+            Self::NavSortDateModified => Some(crate::playlist::SortMode::DateModified),
+            Self::NavSortDateCreated => Some(crate::playlist::SortMode::DateCreated),
+            _ => None,
+        }
     }
 
     /// The rate (in ms) a Rate-submenu row selects; `None` for Custom
@@ -248,6 +278,15 @@ impl Cmd {
         Self::NavPrev,
         Self::NavHome,
         Self::NavEnd,
+        Self::NavSortName,
+        Self::NavSortFullPath,
+        Self::NavSortSize,
+        Self::NavSortDateModified,
+        Self::NavSortDateCreated,
+        Self::NavSortAscending,
+        Self::NavSortDescending,
+        Self::NavShuffle,
+        Self::NavJumpTo,
         Self::HelpAbout,
     ];
 }
@@ -270,6 +309,9 @@ pub(crate) enum Slot {
     /// viv.c:920 — between Slideshow and Navigate in the root order).
     Animation,
     Navigate,
+    /// The Navigate → Sort popup (#39; upstream `_VIV_MENU_NAVIGATE_SORT`,
+    /// viv.c:945).
+    NavigateSort,
     Help,
 }
 
@@ -672,6 +714,67 @@ pub(crate) const ENTRIES: &[Entry] = &[
         parent: Slot::Navigate,
         cmd: Cmd::NavEnd,
     },
+    // #39 (viv.c:944-956): separator, the Sort popup (five mode radios +
+    // separator + the direction pair), Shuffle, separator, Jump To.
+    Entry::Separator {
+        parent: Slot::Navigate,
+    },
+    Entry::Popup {
+        loc: loc::Id::MenuSort,
+        parent: Slot::Navigate,
+        slot: Slot::NavigateSort,
+    },
+    Entry::Item {
+        loc: loc::Id::MenuSortName,
+        parent: Slot::NavigateSort,
+        cmd: Cmd::NavSortName,
+    },
+    Entry::Item {
+        loc: loc::Id::MenuSortFullPath,
+        parent: Slot::NavigateSort,
+        cmd: Cmd::NavSortFullPath,
+    },
+    Entry::Item {
+        loc: loc::Id::MenuSortSize,
+        parent: Slot::NavigateSort,
+        cmd: Cmd::NavSortSize,
+    },
+    Entry::Item {
+        loc: loc::Id::MenuSortDateModified,
+        parent: Slot::NavigateSort,
+        cmd: Cmd::NavSortDateModified,
+    },
+    Entry::Item {
+        loc: loc::Id::MenuSortDateCreated,
+        parent: Slot::NavigateSort,
+        cmd: Cmd::NavSortDateCreated,
+    },
+    Entry::Separator {
+        parent: Slot::NavigateSort,
+    },
+    Entry::Item {
+        loc: loc::Id::MenuSortAscending,
+        parent: Slot::NavigateSort,
+        cmd: Cmd::NavSortAscending,
+    },
+    Entry::Item {
+        loc: loc::Id::MenuSortDescending,
+        parent: Slot::NavigateSort,
+        cmd: Cmd::NavSortDescending,
+    },
+    Entry::Item {
+        loc: loc::Id::MenuShuffle,
+        parent: Slot::Navigate,
+        cmd: Cmd::NavShuffle,
+    },
+    Entry::Separator {
+        parent: Slot::Navigate,
+    },
+    Entry::Item {
+        loc: loc::Id::MenuJumpTo,
+        parent: Slot::Navigate,
+        cmd: Cmd::NavJumpTo,
+    },
     // Help (viv.c:962-965): upstream precedes About with Help /
     // command-line options / website / donate rows riviv does not ship.
     Entry::Popup {
@@ -741,6 +844,15 @@ pub(crate) struct MenuState {
     /// The animation playing flag (#38; upstream viv.c:7184 — Play/Pause
     /// CHECKES while playing, the pause being the unchecked state).
     pub(crate) animation_playing: bool,
+    /// The navigation sort config (#39; upstream viv.c:7188-7192 — the
+    /// five mode radios check on the equal mode; an Unknown config value
+    /// checks none).
+    pub(crate) nav_sort: crate::playlist::SortMode,
+    /// The sort direction (#39; upstream viv.c:7194-7195 — Ascending /
+    /// Descending check on the flag).
+    pub(crate) nav_sort_ascending: bool,
+    /// The shuffle flag (#39; upstream viv.c:7186 — a plain check).
+    pub(crate) shuffle: bool,
 }
 
 /// Whether `cmd`'s menu item carries a check in `state` (upstream
@@ -752,19 +864,40 @@ pub(crate) fn checked(cmd: Cmd, state: &MenuState) -> bool {
         Cmd::ViewOneToOne => state.one_to_one,
         Cmd::ViewSlideshow | Cmd::SlideshowPause => state.slideshow,
         Cmd::AnimationPlayPause => state.animation_playing,
-        // The radio's checked row: the preset that equals the rate, or
-        // Custom when the rate is no preset (viv.c:7140-7189's switch
-        // default).
-        Cmd::SlideshowRateCustom => !crate::slideshow::is_preset(state.slideshow_rate_ms),
-        cmd => cmd.slideshow_rate_ms() == Some(state.slideshow_rate_ms),
+        // The sort radios (#39): the equal mode checks; an Unknown config
+        // value checks none of the five (viv.c:7188-7192). The direction
+        // pair checks on the flag (viv.c:7194-7195); Shuffle is a plain
+        // check on the flag (viv.c:7186).
+        cmd => {
+            if let Some(mode) = cmd.sort_mode() {
+                state.nav_sort == mode
+            } else {
+                match cmd {
+                    Cmd::NavSortAscending => state.nav_sort_ascending,
+                    Cmd::NavSortDescending => !state.nav_sort_ascending,
+                    Cmd::NavShuffle => state.shuffle,
+                    // The radio's checked row: the preset that equals the
+                    // rate, or Custom when the rate is no preset (viv.c:
+                    // 7140-7189's switch default).
+                    Cmd::SlideshowRateCustom => {
+                        !crate::slideshow::is_preset(state.slideshow_rate_ms)
+                    }
+                    other => other.slideshow_rate_ms() == Some(state.slideshow_rate_ms),
+                }
+            }
+        }
     }
 }
 
 /// Whether `cmd`'s check renders as a radio dot (upstream passes
 /// `MFT_RADIOCHECK` in the CheckMenuItem flags for the whole Rate submenu
-/// family, viv.c:7165-7189 — a display trait, not a state).
+/// family, viv.c:7165-7189, and the whole Sort submenu family, viv.c:7188-
+/// 7195 — a display trait, not a state).
 pub(crate) fn radio(cmd: Cmd) -> bool {
-    cmd.slideshow_rate_ms().is_some() || cmd == Cmd::SlideshowRateCustom
+    cmd.slideshow_rate_ms().is_some()
+        || cmd == Cmd::SlideshowRateCustom
+        || cmd.sort_mode().is_some()
+        || matches!(cmd, Cmd::NavSortAscending | Cmd::NavSortDescending)
 }
 
 /// Whether `cmd`'s menu item is selectable. Everything riviv registers is
@@ -867,6 +1000,18 @@ mod tests {
         assert_eq!(Cmd::AnimationRateIncrease.id(), 49);
         assert_eq!(Cmd::AnimationRateReset.id(), 50);
         assert_eq!(Cmd::NavNext.id(), 51);
+        // The #39 sort/shuffle/jumpto block runs 52-63 (menu-table order,
+        // viv.c:946-956); HelpAbout moves 55 → 64.
+        assert_eq!(Cmd::NavSortName.id(), 55);
+        assert_eq!(Cmd::NavSortFullPath.id(), 56);
+        assert_eq!(Cmd::NavSortSize.id(), 57);
+        assert_eq!(Cmd::NavSortDateModified.id(), 58);
+        assert_eq!(Cmd::NavSortDateCreated.id(), 59);
+        assert_eq!(Cmd::NavSortAscending.id(), 60);
+        assert_eq!(Cmd::NavSortDescending.id(), 61);
+        assert_eq!(Cmd::NavShuffle.id(), 62);
+        assert_eq!(Cmd::NavJumpTo.id(), 63);
+        assert_eq!(Cmd::HelpAbout.id(), 64);
     }
 
     #[test]
@@ -935,8 +1080,11 @@ mod tests {
     fn check_marks_mirror_the_upstream_conditions() {
         // viv.c:7125/7131/7132 — the Menu/Fullscreen/1:1 checks; viv.c:
         // 7133/7138 — both slideshow rows check with the running flag;
-        // viv.c:7184 — Play/Pause checks with the playing flag. Every
-        // non-rate item is unchecked with the toggles off.
+        // viv.c:7184 — Play/Pause checks with the playing flag; viv.c:
+        // 7186-7195 — the Sort radios check with the sort config (Name +
+        // Ascending here) and Shuffle with its flag. Every other item is
+        // unchecked with the toggles off (the sort block: FullPath mode,
+        // Descending direction, shuffle off).
         let on = MenuState {
             show_menu: true,
             fullscreen: true,
@@ -944,6 +1092,9 @@ mod tests {
             slideshow: true,
             slideshow_rate_ms: 5_000,
             animation_playing: true,
+            nav_sort: crate::playlist::SortMode::Name,
+            nav_sort_ascending: true,
+            shuffle: true,
         };
         let off = MenuState {
             show_menu: false,
@@ -952,6 +1103,9 @@ mod tests {
             slideshow: false,
             slideshow_rate_ms: 5_000,
             animation_playing: false,
+            nav_sort: crate::playlist::SortMode::FullPath,
+            nav_sort_ascending: false,
+            shuffle: false,
         };
         for cmd in Cmd::ALL {
             let expected_on = matches!(
@@ -963,27 +1117,110 @@ mod tests {
                     | Cmd::SlideshowPause
                     | Cmd::SlideshowRate5000
                     | Cmd::AnimationPlayPause
+                    | Cmd::NavSortName
+                    | Cmd::NavSortAscending
+                    | Cmd::NavShuffle
             );
             assert_eq!(checked(cmd, &on), expected_on, "{cmd:?} with everything on");
+            let expected_off = matches!(
+                cmd,
+                Cmd::SlideshowRate5000 | Cmd::NavSortFullPath | Cmd::NavSortDescending
+            );
             assert_eq!(
                 checked(cmd, &off),
-                cmd.slideshow_rate_ms() == Some(5_000),
-                "{cmd:?} with toggles off keeps only the rate radio"
+                expected_off,
+                "{cmd:?} with toggles off keeps the rate radio and the FullPath/Descending radios"
             );
         }
+    }
+
+    /// The Sort submenu behaves like the Rate submenu's radio invariant:
+    /// exactly one mode row and exactly one direction row check for ANY
+    /// config — except an Unknown (garbage ini) sort, where upstream's
+    /// equal-compare chain checks no mode at all while the direction pair
+    /// still follows the flag (viv.c:7188-7195).
+    #[test]
+    fn the_sort_radios_check_exactly_one_row_each() {
+        for mode in [
+            crate::playlist::SortMode::Name,
+            crate::playlist::SortMode::Size,
+            crate::playlist::SortMode::DateModified,
+            crate::playlist::SortMode::DateCreated,
+            crate::playlist::SortMode::FullPath,
+        ] {
+            for &ascending in &[true, false] {
+                let state = MenuState {
+                    nav_sort: mode,
+                    nav_sort_ascending: ascending,
+                    shuffle: false,
+                    ..plain_state()
+                };
+                let modes_on: Vec<Cmd> = (Cmd::ALL)
+                    .into_iter()
+                    .filter(|c| c.sort_mode().is_some() && checked(*c, &state))
+                    .collect();
+                assert_eq!(modes_on.as_slice(), [mode_cmd(mode)], "{mode:?}");
+                let dirs_on: Vec<Cmd> = (Cmd::ALL)
+                    .into_iter()
+                    .filter(|c| {
+                        matches!(c, Cmd::NavSortAscending | Cmd::NavSortDescending)
+                            && checked(*c, &state)
+                    })
+                    .collect();
+                assert_eq!(
+                    dirs_on.as_slice(),
+                    if ascending {
+                        &[Cmd::NavSortAscending][..]
+                    } else {
+                        &[Cmd::NavSortDescending][..]
+                    },
+                    "{mode:?}"
+                );
+            }
+        }
+        // Garbage sort value: no mode row checks, the direction pair
+        // follows the flag.
+        let state = MenuState {
+            nav_sort: crate::playlist::SortMode::Unknown,
+            nav_sort_ascending: false,
+            ..plain_state()
+        };
+        for cmd in Cmd::ALL {
+            assert_ne!(cmd.sort_mode(), Some(crate::playlist::SortMode::Unknown));
+            if cmd.sort_mode().is_some() {
+                assert!(
+                    !checked(cmd, &state),
+                    "{cmd:?} must stay off for garbage sort"
+                );
+            }
+        }
+        assert!(checked(Cmd::NavSortDescending, &state));
+        assert!(!checked(Cmd::NavSortAscending, &state));
+    }
+
+    fn mode_cmd(mode: crate::playlist::SortMode) -> Cmd {
+        (Cmd::ALL)
+            .into_iter()
+            .find(|c| c.sort_mode() == Some(mode))
+            .unwrap()
     }
 
     #[test]
     fn the_rate_radio_checks_the_matching_preset_or_custom() {
         // viv.c:7140-7189: exactly one row of the Rate submenu is checked
         // for any rate — the equal preset, or Custom when none matches.
+        // (#39 widened `radio` to the Sort family; this test counts RATE
+        // rows only.)
         for &rate in &crate::slideshow::RATE_PRESETS {
             let state = MenuState {
                 slideshow: true,
                 slideshow_rate_ms: rate,
                 ..plain_state()
             };
-            let rate_cmds: Vec<Cmd> = Cmd::ALL.into_iter().filter(|c| radio(*c)).collect();
+            let rate_cmds: Vec<Cmd> = (Cmd::ALL)
+                .into_iter()
+                .filter(|c| c.slideshow_rate_ms().is_some() || *c == Cmd::SlideshowRateCustom)
+                .collect();
             let on: Vec<Cmd> = rate_cmds
                 .into_iter()
                 .filter(|c| checked(*c, &state))
@@ -1012,6 +1249,9 @@ mod tests {
             slideshow: false,
             slideshow_rate_ms: 5_000,
             animation_playing: true,
+            nav_sort: crate::playlist::SortMode::DateModified,
+            nav_sort_ascending: false,
+            shuffle: false,
         }
     }
 

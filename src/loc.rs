@@ -280,12 +280,30 @@ pub(crate) enum Id {
     /// slideshow-scoped "advance waits for one full animation pass"
     /// setting).
     OptionsLoopAnimationsOnce,
+    /// ---- #39: Navigate sort / shuffle / Jump To ----
+    /// Navigate (Sort) popup caption "&Sort" (en_us.h:165).
+    MenuSort,
+    /// Sort (5 radio rows, en_us.h:166-170).
+    MenuSortName,
+    MenuSortFullPath,
+    MenuSortSize,
+    MenuSortDateModified,
+    MenuSortDateCreated,
+    /// Sort direction radio pair (en_us.h:171-172).
+    MenuSortAscending,
+    MenuSortDescending,
+    /// Navigate "Shuffle" (en_us.h:173).
+    MenuShuffle,
+    /// Navigate "&Jump To..." (en_us.h:174).
+    MenuJumpTo,
+    /// Jump To dialog caption "Jump To" (en_us.h:255).
+    JumpToCaption,
 }
 
 impl Id {
     /// Variant count; array-typing both tables against this keeps them
     /// length-locked to the enum by construction.
-    pub(crate) const COUNT: usize = Self::OptionsLoopAnimationsOnce as usize + 1;
+    pub(crate) const COUNT: usize = Self::JumpToCaption as usize + 1;
 }
 
 /// Table choice (upstream `LOCALIZATION_LANGUAGE_*`, localization.h:30-32).
@@ -434,6 +452,17 @@ const EN_US: [&str; Id::COUNT] = [
     "&Increase Rate",                              // MenuAnimationRateIncrease
     "R&eset Rate",                                 // MenuAnimationRateReset
     "&Play animations at least once in slideshow", // OptionsLoopAnimationsOnce (en_us.h:230)
+    "&Sort",                                       // MenuSort (en_us.h:165)
+    "&Name",                                       // MenuSortName (en_us.h:166)
+    "Full &Path",                                  // MenuSortFullPath (en_us.h:167)
+    "&Size",                                       // MenuSortSize (en_us.h:168)
+    "Date &Modified",                              // MenuSortDateModified (en_us.h:169)
+    "Date &Created",                               // MenuSortDateCreated (en_us.h:170)
+    "&Ascending",                                  // MenuSortAscending (en_us.h:171)
+    "&Descending",                                 // MenuSortDescending (en_us.h:172)
+    "Shuffle",                                     // MenuShuffle (en_us.h:173)
+    "&Jump To...",                                 // MenuJumpTo (en_us.h:174)
+    "Jump To",                                     // JumpToCaption (en_us.h:255)
 ];
 
 /// zh-CN table — upstream localization_zh_cn.h:31/197-199/261-263.
@@ -574,6 +603,17 @@ const ZH_CN: [&str; Id::COUNT] = [
     "提高速率(&I)",                   // MenuAnimationRateIncrease
     "重置速率(&E)",                   // MenuAnimationRateReset
     "在幻灯片中至少播放一次动画(&P)", // OptionsLoopAnimationsOnce (zh_cn.h:231)
+    "排序(&S)",                       // MenuSort (zh_cn.h:165)
+    "名称(&N)",                       // MenuSortName (zh_cn.h:166)
+    "完整路径(&P)",                   // MenuSortFullPath (zh_cn.h:167)
+    "大小(&S)",                       // MenuSortSize (zh_cn.h:168)
+    "修改日期(&M)",                   // MenuSortDateModified (zh_cn.h:169)
+    "创建日期(&C)",                   // MenuSortDateCreated (zh_cn.h:170)
+    "升序(&A)",                       // MenuSortAscending (zh_cn.h:171)
+    "降序(&D)",                       // MenuSortDescending (zh_cn.h:172)
+    "随机(&S)",                       // MenuShuffle (zh_cn.h:173)
+    "跳转到(&J)...",                  // MenuJumpTo (zh_cn.h:174)
+    "跳转到",                         // JumpToCaption (zh_cn.h:256)
 ];
 
 /// Map a `GetUserDefaultUILanguage` LANGID onto the table choice
