@@ -435,7 +435,7 @@ pub(crate) fn send_search(
         }
         // The random mode's first query goes through home (upstream
         // `_viv_home(0,0)` whose random branch sends it, viv.c:13397/6122).
-        home_open(hwnd_main, false);
+        home_open(hwnd_main, false, false);
         return true;
     }
     // A plain search exits random mode BEFORE looking for Everything

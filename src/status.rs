@@ -3,9 +3,12 @@
 //! text/width model in `text.rs` (upstream `_viv_status_show`,
 //! `_viv_get_status_high`, `_viv_status_update`, viv.c:10932-11440).
 //!
-//! Layout: `[main text (elastic)] [frame counter "n / m"] [dimensions
-//! "W x H (N KB)"]` — upstream's preload / pixel-info parts are skipped
-//! (riviv has neither feature); the counter and dimension parts keep
+//! Layout: `[main text (elastic)] [preload indicator] [frame counter
+//! "n / m"] [dimensions "W x H (N KB)"]` — the preload part exists only
+//! while its text is non-empty (upstream pushes its SB_SETPARTS boundary
+//! inside the non-empty check, viv.c:11312-11316), so the part count
+//! alternates between 3 and 4. The pixel-info parts are still skipped
+//! (riviv has neither feature — #47); the counter and dimension parts keep
 //! upstream's trailing-slot semantics.
 
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, RECT, WPARAM};
@@ -22,7 +25,7 @@ use windows::core::{PCWSTR, w};
 
 use crate::text::{
     min_status_part_wide, status_dimension_text, status_frame_text, status_main_text,
-    status_part_edges, to_wide,
+    status_part_edges, status_preload_text, to_wide,
 };
 
 /// Child-window id for the status bar (upstream `VIV_ID_STATUS`, viv.h:196).
@@ -41,6 +44,10 @@ pub(crate) struct StatusSnapshot {
     /// A slideshow is running — "Slideshow playing" below every verdict
     /// (#37; upstream viv.c:11374-11377).
     pub(crate) slideshow: bool,
+    /// A preload load is decoding its first frame — the "PRELOAD" part
+    /// shows and the elastic main part shrinks (upstream viv.c:11210-11214,
+    /// #40).
+    pub(crate) preload_pending: bool,
     /// 1-based frame position / loaded frame count; `None` when blank.
     pub(crate) frame: Option<(usize, usize)>,
     /// The frames-remaining form (`config_frame_minus`, viv.c:11187-11203).
@@ -115,6 +122,7 @@ pub(crate) fn update(hwnd: HWND, snapshot: &StatusSnapshot) {
         snapshot.load_failed,
         snapshot.slideshow,
     );
+    let preload_text = status_preload_text(snapshot.preload_pending);
     let frame_text = match snapshot.frame {
         Some((position, total)) => status_frame_text(position, total, snapshot.frame_remaining),
         None => String::new(),
@@ -159,6 +167,17 @@ pub(crate) fn update(hwnd: HWND, snapshot: &StatusSnapshot) {
                 HGDIOBJ::default()
             };
             let sizes = (
+                // Non-empty text owns its part even when the measure fails
+                // (a 0 would make status_part_edges DROP the preload part
+                // while set_text below still writes it — the frame/dimension
+                // texts would shift one part left until the next refresh;
+                // upstream keys the boundary push on the text too,
+                // viv.c:11312's `if (*preload_buf)`).
+                if preload_text.is_empty() {
+                    0
+                } else {
+                    text_extent(hdc, preload_text).max(1)
+                },
                 text_extent(hdc, &frame_text),
                 text_extent(hdc, &dimension_text),
             );
@@ -168,12 +187,13 @@ pub(crate) fn update(hwnd: HWND, snapshot: &StatusSnapshot) {
             sizes
         };
         let _ = ReleaseDC(Some(hwnd), hdc);
-        let (frame_w, dimension_w) = sizes;
+        let (preload_w, frame_w, dimension_w) = sizes;
 
         let margin = GetSystemMetrics(SM_CXEDGE) * 5;
         let grip = GetSystemMetrics(SM_CXVSCROLL) + GetSystemMetrics(SM_CXBORDER);
         let edges = status_part_edges(
             snapshot.client_wide,
+            preload_w,
             frame_w,
             dimension_w,
             margin,
@@ -186,9 +206,18 @@ pub(crate) fn update(hwnd: HWND, snapshot: &StatusSnapshot) {
             Some(WPARAM(edges.len())),
             Some(LPARAM(edges.as_ptr() as isize)),
         );
+        // Part indices follow the edges: the preload part sits at 1 and
+        // exists only while its text is non-empty (upstream's dynamic
+        // part push, viv.c:11312-11316); frame/dimension shift with it.
         set_text(hwnd, 0, main);
-        set_text(hwnd, 1, &frame_text);
-        set_text(hwnd, 2, &dimension_text);
+        let mut part = 1;
+        if !preload_text.is_empty() {
+            set_text(hwnd, part, preload_text);
+            part += 1;
+        }
+        set_text(hwnd, part, &frame_text);
+        part += 1;
+        set_text(hwnd, part, &dimension_text);
     }
 }
 

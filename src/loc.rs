@@ -298,12 +298,20 @@ pub(crate) enum Id {
     MenuJumpTo,
     /// Jump To dialog caption "Jump To" (en_us.h:255).
     JumpToCaption,
+    /// ---- #40: preload + last-image cache ----
+    /// Status-bar PRELOAD part while a preload decodes its first frame
+    /// (en_us.h:196 / zh_cn.h:196).
+    StatusBarPreload,
+    /// Options View page: preload checkbox (en_us.h:231 / zh_cn.h:232).
+    OptionsPreloadNext,
+    /// Options View page: last-cache checkbox (en_us.h:232 / zh_cn.h:233).
+    OptionsCacheLast,
 }
 
 impl Id {
     /// Variant count; array-typing both tables against this keeps them
     /// length-locked to the enum by construction.
-    pub(crate) const COUNT: usize = Self::JumpToCaption as usize + 1;
+    pub(crate) const COUNT: usize = Self::OptionsCacheLast as usize + 1;
 }
 
 /// Table choice (upstream `LOCALIZATION_LANGUAGE_*`, localization.h:30-32).
@@ -463,6 +471,9 @@ const EN_US: [&str; Id::COUNT] = [
     "Shuffle",                                     // MenuShuffle (en_us.h:173)
     "&Jump To...",                                 // MenuJumpTo (en_us.h:174)
     "Jump To",                                     // JumpToCaption (en_us.h:255)
+    "PRELOAD",                                     // StatusBarPreload (en_us.h:196)
+    "Preload &next image",                         // OptionsPreloadNext (en_us.h:231)
+    "Cache &last image",                           // OptionsCacheLast (en_us.h:232)
 ];
 
 /// zh-CN table — upstream localization_zh_cn.h:31/197-199/261-263.
@@ -614,6 +625,9 @@ const ZH_CN: [&str; Id::COUNT] = [
     "随机(&S)",                       // MenuShuffle (zh_cn.h:173)
     "跳转到(&J)...",                  // MenuJumpTo (zh_cn.h:174)
     "跳转到",                         // JumpToCaption (zh_cn.h:256)
+    "预加载",                         // StatusBarPreload (zh_cn.h:196)
+    "预加载下一张图像(&N)",           // OptionsPreloadNext (zh_cn.h:232)
+    "缓存最后一张图像(&L)",           // OptionsCacheLast (zh_cn.h:233)
 ];
 
 /// Map a `GetUserDefaultUILanguage` LANGID onto the table choice

@@ -501,6 +501,39 @@ impl<F> LoadedImage<F> {
         self.decode_complete = true;
     }
 
+    /// Restart the timeline at frame 0 anchored to `now` — the display
+    /// adoption of a PARKED image (preload partial adoption, last-cache
+    /// activation) needs it: upstream re-anchors at
+    /// `_viv_start_first_frame` (viv.c:14313-14319), while the parked
+    /// image's anchor dates from when its first frame was decoded, which
+    /// may be seconds in the past.
+    pub(crate) fn reanchor_at(&mut self, now: u64) {
+        self.position = 0;
+        self.scheduler = FrameScheduler::new(now);
+    }
+
+    /// Convert every frame through `convert` (DibFrame -> Surface on the
+    /// UI thread when a parked image takes the display — the same
+    /// worker-to-UI handoff the drain does per reply, batched here for the
+    /// adoption path). The first failure aborts, dropping the remaining
+    /// frames; position and completeness survive the mapping.
+    pub(crate) fn map_frames<G, E>(
+        self,
+        convert: impl Fn(F) -> Result<G, E>,
+    ) -> Result<LoadedImage<G>, E> {
+        Ok(LoadedImage {
+            frames: self
+                .frames
+                .into_iter()
+                .map(convert)
+                .collect::<Result<Vec<_>, E>>()?,
+            delays_ms: self.delays_ms,
+            position: self.position,
+            scheduler: self.scheduler,
+            decode_complete: self.decode_complete,
+        })
+    }
+
     /// Canvas width — all frames share it (enforced at decode).
     pub(crate) fn width(&self) -> i32
     where
@@ -735,7 +768,9 @@ pub(crate) fn apply_reply<F>(
             // terminated (viv.c:2892-2895: "if we check the terminate flag
             // and hold down right, we might never see an image"); a newer
             // session's first frame simply wins by construction — this
-            // handler only ever drains the newest session's queue.
+            // handler only ever drains the newest session's queue. The
+            // window layer takes the displaced display out BEFORE calling
+            // this (its last-cache park, upstream viv.c:2949).
             *image = Some(LoadedImage::first_frame(frame, delay_ms, now));
             *displayed_from = Some(session_id);
             ReplyOutcome {
@@ -1178,6 +1213,105 @@ mod tests {
                 .repaint
         );
         assert_eq!(*img.surface(), 1);
+    }
+
+    #[test]
+    fn reanchoring_a_parked_image_restarts_its_timeline() {
+        // A preload adopted mid-decode anchors at its first frame's decode
+        // time; reanchor_at moves the anchor to the ADOPTION moment — the
+        // first timer event must not credit the parked gap (upstream
+        // re-anchors in _viv_start_first_frame, viv.c:14313-14319).
+        let mut image = None;
+        let mut displayed_from = None;
+        apply_reply(
+            &mut image,
+            &mut displayed_from,
+            1,
+            0,
+            FREQ,
+            anim::Playback::new(),
+            frame(1),
+        );
+        apply_reply(
+            &mut image,
+            &mut displayed_from,
+            1,
+            0,
+            FREQ,
+            anim::Playback::new(),
+            additional(2),
+        );
+        let img = image.as_mut().unwrap();
+        // Parked long enough for frame 0's delay to expire, then adopted
+        // at t=10_000.
+        img.reanchor_at(10_000);
+        // 50 ms after the new anchor: frame 0's 100 ms delay not yet spent.
+        assert!(
+            !img.advance_on_timer(10_050, FREQ, false, anim::Playback::new())
+                .repaint
+        );
+        assert_eq!(*img.surface(), 1, "position reset to the first frame");
+        // At the edge the timeline advances from the NEW anchor.
+        assert!(
+            img.advance_on_timer(10_100, FREQ, false, anim::Playback::new())
+                .repaint
+        );
+        assert_eq!(*img.surface(), 2);
+    }
+
+    #[test]
+    fn mapping_frames_converts_every_frame_and_keeps_the_timeline() {
+        let mut image = None;
+        let mut displayed_from = None;
+        apply_reply(
+            &mut image,
+            &mut displayed_from,
+            1,
+            0,
+            FREQ,
+            anim::Playback::new(),
+            frame(1),
+        );
+        apply_reply(
+            &mut image,
+            &mut displayed_from,
+            1,
+            0,
+            FREQ,
+            anim::Playback::new(),
+            additional(2),
+        );
+        let mut img = image.unwrap();
+        img.mark_complete();
+        let mapped = img
+            .map_frames(|f| Ok::<String, String>(f.to_string()))
+            .unwrap();
+        assert_eq!(mapped.frame_count(), 2);
+        assert!(mapped.decode_complete());
+        // The frame payloads went through the conversion; the parked
+        // position survives (adoption re-anchors separately).
+        assert_eq!(mapped.frame_position_1based(), 1);
+    }
+
+    #[test]
+    fn a_frame_mapping_failure_aborts_with_the_error() {
+        let mut image = None;
+        let mut displayed_from = None;
+        apply_reply(
+            &mut image,
+            &mut displayed_from,
+            1,
+            0,
+            FREQ,
+            anim::Playback::new(),
+            frame(1),
+        );
+        let img = image.unwrap();
+        let err = img
+            .map_frames(|_| Err::<u32, _>("gdi exhausted".to_string()))
+            .err()
+            .expect("the mapping must fail");
+        assert_eq!(err, "gdi exhausted");
     }
 
     #[test]
