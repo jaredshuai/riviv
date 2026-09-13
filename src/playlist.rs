@@ -69,9 +69,11 @@ pub(crate) enum SortMode {
     /// `CONFIG_NAV_SORT_FULL_PATH_AND_FILENAME` = 4 — the whole path.
     FullPath,
     /// A hand-edited ini value outside 0-4. Upstream's compare switch has
-    /// no default (viv.c:5713-5807), so everything compares EQUAL:
-    /// navigation finds no candidate and no-ops, and none of the five sort
-    /// radios checks (the CheckMenuItem compares all fail, viv.c:7188-7192).
+    /// no default (viv.c:5713-5807), so everything compares EQUAL: `next`
+    /// degenerates to the wrap target (the first non-current entry — the
+    /// start scan has no compare gate, viv.c:5965-5982, only the same-path
+    /// guard blocks it, viv.c:6086-6092) and none of the five sort radios
+    /// checks (the CheckMenuItem compares all fail, viv.c:7188-7192).
     Unknown,
 }
 
@@ -387,7 +389,8 @@ pub(crate) fn nav_compare(a: &PlaylistEntry, b: &PlaylistEntry) -> Ordering {
 /// so under the descending flip the tie group reads name ASCENDING then
 /// id ASCENDING) — and the final direction flip for descending
 /// (viv.c:5809-5812). An unknown config value compares everything EQUAL
-/// (upstream's switch has no default) so navigation no-ops.
+/// (upstream's switch has no default) — see [`SortMode::Unknown`] for the
+/// degenerate navigation that follows.
 pub(crate) fn fd_compare(
     a: &PlaylistEntry,
     b: &PlaylistEntry,
@@ -1118,6 +1121,32 @@ mod tests {
         assert_eq!(
             fd_compare(&b, &a, SortMode::Unknown, false),
             Ordering::Equal
+        );
+    }
+
+    // The degenerate navigation under a garbage sort value (cubic #53
+    // round 1, disposition #3): best never qualifies but the wrap target
+    // has NO compare gate upstream (viv.c:5965-5982) — next opens the
+    // first non-current entry (ping-ponging between the first two) and
+    // home opens the first entry. NOT a no-op; riviv mirrors upstream.
+    #[test]
+    fn unknown_sort_navigation_degenerates_to_the_wrap_target() {
+        let a = entry("a.png", 100, 0);
+        let b = entry("b.png", 200, 1);
+        let entries = [a.clone(), b.clone()];
+        assert_eq!(
+            next(&entries, Some(&b), false, true, SortMode::Unknown, false).map(|e| e.path.clone()),
+            Some(a.path.clone())
+        );
+        // From the first entry the wrap target is the second — the
+        // ping-pong (only a same-path target no-ops, viv.c:6086-6092).
+        assert_eq!(
+            next(&entries, Some(&a), false, true, SortMode::Unknown, false).map(|e| e.path.clone()),
+            Some(b.path.clone())
+        );
+        assert_eq!(
+            home(&entries, false, SortMode::Unknown, false).map(|e| e.path.clone()),
+            Some(a.path.clone())
         );
     }
 
