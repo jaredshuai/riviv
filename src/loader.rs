@@ -461,9 +461,14 @@ impl<F> LoadedImage<F> {
     /// advances on schedule. The probe only applies while PLAYING and
     /// compares the rate-scaled delay (#38): upstream's stall branch —
     /// what this synthesizes — lives inside the play gate (viv.c:3195-
-    /// 3240) and consumes the scaled delay (viv.c:3209); a paused display
-    /// re-anchors for free anyway (every timer event moves the anchor,
-    /// paused or not).
+    /// 3240) and consumes the scaled delay (viv.c:3209). While PAUSED
+    /// the arrival always re-anchors: upstream's timer has been running
+    /// since the first frame, re-anchoring while discarding time every
+    /// event (viv.c:3195), but riviv's timer only starts at this second
+    /// frame — without the reset, a resume landing between the timer
+    /// start and its first event would credit the whole paused/decode
+    /// gap and skip frames (cubic round 1). `timer_tick` is still zero
+    /// here (no timer ever ran), so the reset loses nothing.
     fn second_frame(
         &mut self,
         frame: F,
@@ -476,8 +481,8 @@ impl<F> LoadedImage<F> {
             // Defensive, same as push_frame: a completed frame set is final.
             return;
         }
-        if playback.playing
-            && self.scheduler.at_frame_edge(
+        if !playback.playing
+            || self.scheduler.at_frame_edge(
                 now,
                 freq,
                 &self.delays_ms,
@@ -668,6 +673,16 @@ pub(crate) enum UiAction {
     Invalidate,
     /// Adopt the session's path (window title + Ctrl+O initial dir).
     SetWindowTitle,
+    /// Reset playback to playing — upstream's `_viv_clear` sets
+    /// `_viv_animation_play = 1` (viv.c:1291) and runs at exactly the
+    /// display-death moments that emit this: the first-frame adoption
+    /// (viv.c:2951) and the failed-load clear (viv.c:2804/2835). The
+    /// window layer's open request deliberately does NOT reset playback:
+    /// upstream's not-found verdict runs no `_viv_open`/`_viv_clear` at
+    /// all (viv.c:5094-5098) and a queued load keeps the old display up
+    /// until its reply, so a paused animation must stay paused while its
+    /// image is still the one on screen (cubic round 1).
+    ResetPlayback,
 }
 
 #[derive(Default, Debug)]
@@ -702,9 +717,9 @@ pub(crate) struct ReplyOutcome {
 /// same QPC frequency, needed to judge whether a late second frame
 /// arrived past the loaded edge (see `LoadedImage::second_frame`).
 /// `playback` carries the animation pause flag and rate position (#38):
-/// the re-anchor probe only applies while playing (upstream's stall
-/// branch lives inside the play gate, viv.c:3195-3240) and compares
-/// against the rate-scaled delay (viv.c:3209).
+/// the re-anchor probe compares against the rate-scaled delay (viv.c:
+/// 3209) and a paused arrival re-anchors unconditionally (cubic round 1
+/// — see `second_frame`).
 pub(crate) fn apply_reply<F>(
     image: &mut Option<LoadedImage<F>>,
     displayed_from: &mut Option<u64>,
@@ -724,7 +739,11 @@ pub(crate) fn apply_reply<F>(
             *image = Some(LoadedImage::first_frame(frame, delay_ms, now));
             *displayed_from = Some(session_id);
             ReplyOutcome {
-                actions: vec![UiAction::Invalidate, UiAction::SetWindowTitle],
+                actions: vec![
+                    UiAction::Invalidate,
+                    UiAction::SetWindowTitle,
+                    UiAction::ResetPlayback,
+                ],
                 ..Default::default()
             }
         }
@@ -762,7 +781,11 @@ pub(crate) fn apply_reply<F>(
                 *image = None;
                 *displayed_from = None;
                 ReplyOutcome {
-                    actions: vec![UiAction::Invalidate, UiAction::SetWindowTitle],
+                    actions: vec![
+                        UiAction::Invalidate,
+                        UiAction::SetWindowTitle,
+                        UiAction::ResetPlayback,
+                    ],
                     load_ended: true,
                     load_failed: true,
                     ..Default::default()
@@ -836,7 +859,11 @@ mod tests {
         );
         assert_eq!(
             out.actions,
-            vec![UiAction::Invalidate, UiAction::SetWindowTitle]
+            vec![
+                UiAction::Invalidate,
+                UiAction::SetWindowTitle,
+                UiAction::ResetPlayback
+            ]
         );
         assert_eq!(displayed_from, Some(1));
         let img = image.unwrap();
@@ -936,6 +963,59 @@ mod tests {
     }
 
     #[test]
+    fn a_paused_second_frame_reanchors_so_a_fast_resume_cannot_skip() {
+        // cubic round 1: pausing before the second frame arrives freezes
+        // the anchor at the first frame — and riviv's timer only starts AT
+        // the second frame, so nothing has been re-anchoring while paused
+        // the way upstream's always-running timer does (viv.c:3195). The
+        // arrival must therefore re-anchor unconditionally while paused:
+        // a resume landing between the timer start and its first event
+        // would otherwise credit the whole paused/decode gap (capped at
+        // one second) and skip frames immediately.
+        let mut image = None;
+        let mut displayed_from = None;
+        apply_reply(
+            &mut image,
+            &mut displayed_from,
+            1,
+            0,
+            FREQ,
+            anim::Playback::new(),
+            frame(1),
+        );
+        let paused = anim::Playback {
+            playing: false,
+            ..anim::Playback::new()
+        };
+        // Frame 2 arrives 5 s into the pause — far past the loaded edge
+        // AND paused, so the re-anchor must come from the paused arm.
+        apply_reply(
+            &mut image,
+            &mut displayed_from,
+            1,
+            5_000,
+            FREQ,
+            paused,
+            additional(2),
+        );
+        let mut img = image.unwrap();
+        // Resume 10 ms after the arrival: the first timer event measures
+        // from the arrival, so nothing advances yet...
+        assert!(
+            !img.advance_on_timer(5_010, FREQ, false, anim::Playback::new())
+                .repaint,
+            "10 ms since the arrival"
+        );
+        assert_eq!(*img.surface(), 1);
+        // ...and frame 2 shows on schedule 100 ms after the arrival.
+        assert!(
+            img.advance_on_timer(5_100, FREQ, false, anim::Playback::new())
+                .repaint
+        );
+        assert_eq!(*img.surface(), 2);
+    }
+
+    #[test]
     fn a_replacement_failing_pre_first_frame_finalizes_the_kept_animation() {
         // An animation mid-decode is superseded by a new open whose decode
         // fails before producing a frame: the old image is kept (issue #4
@@ -964,7 +1044,7 @@ mod tests {
             additional(2),
         );
         // Session 2 superseded session 1 and failed pre-first-frame.
-        apply_reply(
+        let out = apply_reply(
             &mut image,
             &mut displayed_from,
             2,
@@ -973,6 +1053,10 @@ mod tests {
             anim::Playback::new(),
             Reply::FailedUser("bad file".into()),
         );
+        // The kept display must NOT reset playback (cubic round 1): the
+        // paused old animation stays paused — upstream resets play only in
+        // `_viv_clear`, which never runs while the old image survives.
+        assert!(!out.actions.contains(&UiAction::ResetPlayback));
         let mut img = image.unwrap();
         assert!(img.is_animated(), "old animation kept");
         // The kept prefix plays and wraps — not stalled at the edge.
@@ -1245,7 +1329,11 @@ mod tests {
         );
         assert_eq!(
             out.actions,
-            vec![UiAction::Invalidate, UiAction::SetWindowTitle]
+            vec![
+                UiAction::Invalidate,
+                UiAction::SetWindowTitle,
+                UiAction::ResetPlayback
+            ]
         );
         assert!(image.is_none(), "partial image cleared");
         assert_eq!(displayed_from, None);
@@ -1283,7 +1371,11 @@ mod tests {
         );
         assert_eq!(
             out.actions,
-            vec![UiAction::Invalidate, UiAction::SetWindowTitle]
+            vec![
+                UiAction::Invalidate,
+                UiAction::SetWindowTitle,
+                UiAction::ResetPlayback
+            ]
         );
         assert!(image.is_none());
     }

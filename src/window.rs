@@ -1381,11 +1381,15 @@ fn request_open(hwnd: HWND, path: &OsStr, origin: OpenOrigin<'_>) {
             }
             state.status_file_not_found = true;
             state.status_load_failed = false;
-            // The per-image animation marks die with the open (upstream
-            // `_viv_open` → `_viv_clear`, viv.c:1278-1279) — and so does a
-            // paused state (viv.c:1291: every new image plays).
+            // The per-image animation marks die with the open (upstream's
+            // nav flavor reaches `_viv_clear`'s resets at the FAILED reply,
+            // viv.c:1278-1279). Playback is deliberately NOT reset here:
+            // this verdict keeps the old display, and upstream resets play
+            // only inside `_viv_clear` — where the old display dies (the
+            // command-line not-found runs no `_viv_open`/`_viv_clear` at
+            // all, viv.c:5094-5098), so a paused animation stays paused
+            // until a new image is actually adopted (cubic round 1).
             state.animation_looped = false;
-            state.animation_playing = true;
             state.slideshow_timeup = false;
             // Supersede any in-flight load so its late replies are inert.
             state.session = None;
@@ -1404,9 +1408,12 @@ fn request_open(hwnd: HWND, path: &OsStr, origin: OpenOrigin<'_>) {
         state.status_load_failed = false;
         // The per-image animation marks die with the open (upstream
         // `_viv_open` → `_viv_clear`'s frame_looped/timeup resets,
-        // viv.c:1278-1279) — and so does a paused state (viv.c:1291).
+        // viv.c:1278-1279). Playback resets only at the reply that swaps
+        // the display — upstream's `_viv_clear` runs at the first-frame/
+        // FAILED replies (viv.c:2951/2804), which the drain applies as
+        // UiAction::ResetPlayback — so a paused old animation stays paused
+        // while Loading shows (cubic round 1).
         state.animation_looped = false;
-        state.animation_playing = true;
         state.slideshow_timeup = false;
         // The navigation reference follows the request (viv.c:1574-1579) —
         // the entry for a navigation, a fresh id-0 entry for a direct pick
@@ -2364,6 +2371,14 @@ fn on_load_replies(hwnd: HWND) {
             for action in outcome.actions {
                 match action {
                     UiAction::Invalidate => invalidate = true,
+                    UiAction::ResetPlayback => {
+                        // Upstream's `_viv_clear` sets
+                        // `_viv_animation_play = 1` (viv.c:1291): every
+                        // display swap starts playing. The open request
+                        // deliberately leaves the old pause alone until
+                        // this moment (cubic round 1).
+                        state.animation_playing = true;
+                    }
                     UiAction::SetWindowTitle => {
                         // The display adopted this session's image (or
                         // cleared it): the zoom/pan view resets with it
