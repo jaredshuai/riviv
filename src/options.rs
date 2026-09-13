@@ -153,6 +153,12 @@ pub(crate) enum Field {
     /// slideshow-scoped "advance waits for one full animation pass"
     /// setting; the runtime gate itself landed with #37).
     LoopAnimationsOnce,
+    /// The preload-next checkbox (#40; upstream
+    /// IDC_PRELOAD_NEXT_IMAGE_STATIC, viv.c:8391-8392/8775).
+    PreloadNext,
+    /// The cache-last checkbox (#40; upstream
+    /// IDC_CACHE_LAST_IMAGE_STATIC, viv.c:8394-8395/8776).
+    CacheLast,
     WindowedBg,
     FullscreenBg,
     LeftClickAction,
@@ -309,13 +315,35 @@ pub(crate) const VIEW: &[Ctrl] = &[
         w: 186,
         h: 10,
     },
+    // Preload / cache-last pair (rc:84-86: (0,87)/(0,103) 192x10 — the
+    // same relative order after the loop-once row; #40).
+    Ctrl {
+        kind: Kind::Checkbox,
+        label: loc::Id::OptionsPreloadNext,
+        field: Field::PreloadNext,
+        label_w: 0,
+        x: 0,
+        y: 121,
+        w: 186,
+        h: 10,
+    },
+    Ctrl {
+        kind: Kind::Checkbox,
+        label: loc::Id::OptionsCacheLast,
+        field: Field::CacheLast,
+        label_w: 0,
+        x: 0,
+        y: 138,
+        w: 186,
+        h: 10,
+    },
     Ctrl {
         kind: Kind::Checkbox,
         label: loc::Id::OptionsFrameMinus,
         field: Field::FrameMinus,
         label_w: 0,
         x: 0,
-        y: 121,
+        y: 155,
         w: 186,
         h: 10,
     },
@@ -325,7 +353,7 @@ pub(crate) const VIEW: &[Ctrl] = &[
         field: Field::WindowedBg,
         label_w: 96,
         x: 0,
-        y: 139,
+        y: 173,
         w: 50,
         h: 14,
     },
@@ -335,7 +363,7 @@ pub(crate) const VIEW: &[Ctrl] = &[
         field: Field::FullscreenBg,
         label_w: 96,
         x: 0,
-        y: 157,
+        y: 191,
         w: 50,
         h: 14,
     },
@@ -409,6 +437,8 @@ pub(crate) struct OptionsModel {
     pub(crate) auto_zoom_type: Option<i32>,
     pub(crate) frame_minus: bool,
     pub(crate) loop_animations_once: bool,
+    pub(crate) preload_next: bool,
+    pub(crate) cache_last: bool,
     pub(crate) windowed_bg: [u8; 3],
     pub(crate) fullscreen_bg: [u8; 3],
     pub(crate) left_click_action: Option<i32>,
@@ -432,6 +462,8 @@ impl OptionsModel {
             Field::AutoZoom => self.auto_zoom,
             Field::FrameMinus => self.frame_minus,
             Field::LoopAnimationsOnce => self.loop_animations_once,
+            Field::PreloadNext => self.preload_next,
+            Field::CacheLast => self.cache_last,
             _ => return None,
         })
     }
@@ -446,6 +478,8 @@ impl OptionsModel {
             Field::AutoZoom => self.auto_zoom = value,
             Field::FrameMinus => self.frame_minus = value,
             Field::LoopAnimationsOnce => self.loop_animations_once = value,
+            Field::PreloadNext => self.preload_next = value,
+            Field::CacheLast => self.cache_last = value,
             _ => {}
         }
     }
@@ -508,6 +542,8 @@ impl OptionsModel {
             auto_zoom_type: Some(config.auto_zoom_type),
             frame_minus: to_bool(config.frame_minus),
             loop_animations_once: to_bool(config.loop_animations_once),
+            preload_next: to_bool(config.preload_next),
+            cache_last: to_bool(config.cache_last),
             windowed_bg: config.windowed_bg(),
             fullscreen_bg: config.fullscreen_bg(),
             left_click_action: Some(config.left_click_action),
@@ -555,6 +591,10 @@ impl OptionsModel {
         config.auto_zoom = i32::from(self.auto_zoom);
         config.frame_minus = i32::from(self.frame_minus);
         config.loop_animations_once = i32::from(self.loop_animations_once);
+        // #40 (upstream viv.c:8775-8776): both caches re-arm from the next
+        // navigation; no runtime invalidation is owed.
+        config.preload_next = i32::from(self.preload_next);
+        config.cache_last = i32::from(self.cache_last);
         config.windowed_background_color_r = i32::from(self.windowed_bg[0]);
         config.windowed_background_color_g = i32::from(self.windowed_bg[1]);
         config.windowed_background_color_b = i32::from(self.windowed_bg[2]);
@@ -634,7 +674,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!((bools, values, colors), (8, 6, 2));
+        assert_eq!((bools, values, colors), (10, 6, 2));
     }
 
     #[test]
@@ -680,7 +720,7 @@ mod tests {
                 );
             }
         }
-        assert_eq!(seen.len(), 16);
+        assert_eq!(seen.len(), 18);
     }
 
     #[test]
@@ -742,6 +782,8 @@ mod tests {
             auto_zoom_type: Some(2),
             frame_minus: true,
             loop_animations_once: false,
+            preload_next: false,
+            cache_last: true,
             windowed_bg: [10, 20, 30],
             fullscreen_bg: [1, 2, 3],
             left_click_action: Some(3),
@@ -760,6 +802,9 @@ mod tests {
         assert_eq!(config.auto_zoom, 1);
         assert_eq!(config.auto_zoom_type, 2);
         assert_eq!(config.frame_minus, 1);
+        assert_eq!(config.loop_animations_once, 0);
+        assert_eq!(config.preload_next, 0);
+        assert_eq!(config.cache_last, 1);
         assert_eq!(config.windowed_background_color_r, 10);
         assert_eq!(config.fullscreen_background_color_b, 3);
         assert_eq!(config.left_click_action, 3);

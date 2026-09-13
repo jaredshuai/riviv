@@ -106,15 +106,16 @@ use crate::copydata;
 use crate::cursor::{self, CursorVisibility};
 use crate::custom_rate_dlg;
 use crate::everything;
-use crate::loader::{LoadedImage, UiAction, apply_reply, map_reply_frame};
+use crate::loader::{LoadReply, LoadedImage, UiAction, apply_reply, map_reply_frame};
 use crate::loadthread::{LoadSession, LoadThread, REPLY_KICK_MESSAGE};
 use crate::loc;
 use crate::menu;
 use crate::paint::paint;
 use crate::playlist::{self, Playlist, PlaylistEntry};
+use crate::preload::{self, AdoptDecision, LastCache, PreloadSlot, PreloadState};
 use crate::slideshow;
 use crate::status;
-use crate::surface::Surface;
+use crate::surface::{DibFrame, Surface};
 use crate::text::{dialog_filter, title_wide, to_wide};
 use crate::zoom::{FitPolicy, View, Viewport};
 use windows::Win32::System::Power::{
@@ -278,6 +279,24 @@ pub(crate) struct WindowState {
     /// `_viv_is_prevent_sleep`, viv.c:789) — SetThreadExecutionState is
     /// only called on a CHANGE of the derived want (viv.c:7319-7347).
     pub(crate) prevent_sleep_active: bool,
+    /// The parked next-image preload (#40; upstream `_viv_preload_*`
+    /// globals, viv.c:756-764). `None` while idle; a foreground open or a
+    /// sort/shuffle cache clear drops it.
+    pub(crate) preload: Option<PreloadSlot>,
+    /// The previous display parked for instant navigation back (#40;
+    /// upstream `_viv_last_fd`/`_viv_last_frames`, one slot).
+    pub(crate) last_cache: Option<LastCache>,
+    /// The direction of the last MANUAL navigation — the preload follows
+    /// it (upstream `_viv_last_is_prev`, viv.c:762: recorded by
+    /// `_viv_next` for non-preload calls only, and `_viv_preload_next`
+    /// navigates with it, viv.c:14308).
+    pub(crate) last_nav_prev: bool,
+    /// The navigation entry of the image currently displayed (upstream
+    /// `_viv_frame_fd`, "may differ to the current fd because we change
+    /// the title before the frames are loaded", viv.c:770 — set at the
+    /// first-frame reply, viv.c:2962): what
+    /// `viv_copy_current_image_to_last_image` caches (viv.c:14441).
+    pub(crate) displayed_entry: Option<PlaylistEntry>,
 }
 
 /// Window state pointer stored in GWLP_USERDATA between WM_NCCREATE and
@@ -320,10 +339,20 @@ fn status_snapshot(state: &WindowState, hwnd: HWND) -> status::StatusSnapshot {
     // next refresh.
     let _ = unsafe { GetClientRect(hwnd, &mut client) };
     status::StatusSnapshot {
-        loading: state.session.is_some(),
+        // The main part's Loading also covers a preload flagged for
+        // promotion: the user navigated onto its file and the load is now
+        // destined for the display (upstream's should_activate clause in
+        // the Loading gate, viv.c:11356).
+        loading: state.session.is_some()
+            || state.preload.as_ref().is_some_and(|s| s.activate_on_load),
         file_not_found: state.status_file_not_found,
         load_failed: state.status_load_failed,
         slideshow: state.slideshow,
+        // The PRELOAD part while a preload decodes its first frame (upstream
+        // viv.c:11210-11214, #40).
+        preload_pending: state.preload.as_ref().is_some_and(|s| {
+            preload::indicator_visible(s.state, s.image.is_some(), s.activate_on_load)
+        }),
         frame: state
             .image
             .as_ref()
@@ -540,7 +569,7 @@ fn on_double_click(hwnd: HWND, lparam: LPARAM) {
         // 3/4 = zoom in / next image: the default arm re-runs the click
         // action (upstream viv.c:3313-3326).
         3 => zoom_at(hwnd, false, (pt.x, pt.y)),
-        4 => nav_next(hwnd, false, true),
+        4 => nav_next(hwnd, false, true, false),
         // 0/1/2/5/6 (scroll, slideshow, animation, 1:1 scroll, move
         // window): the double-click toggles FULLSCREEN — upstream's arm
         // switches on exactly these values and never re-runs the action,
@@ -576,7 +605,7 @@ fn on_right_button(hwnd: HWND, msg: u32, lparam: LPARAM) -> bool {
         }
         2 => {
             if press {
-                nav_next(hwnd, true, true);
+                nav_next(hwnd, true, true, false);
             }
             true
         }
@@ -972,17 +1001,17 @@ fn on_mousewheel(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
         // Action 1: wheel up = previous, down = next (viv.c:14063-14074).
         1 => {
             if delta > 0 {
-                nav_next(hwnd, true, true);
+                nav_next(hwnd, true, true, false);
             } else if delta < 0 {
-                nav_next(hwnd, false, true);
+                nav_next(hwnd, false, true, false);
             }
         }
         // Action 2: wheel up = next, down = previous (viv.c:14075-14086).
         2 => {
             if delta > 0 {
-                nav_next(hwnd, false, true);
+                nav_next(hwnd, false, true, false);
             } else if delta < 0 {
-                nav_next(hwnd, true, true);
+                nav_next(hwnd, true, true, false);
             }
         }
         // Action 0 (and any hand-edited unknown value, which upstream's
@@ -1221,7 +1250,7 @@ fn on_left_button_down(hwnd: HWND, lparam: LPARAM) {
             return;
         }
         4 => {
-            nav_next(hwnd, false, true);
+            nav_next(hwnd, false, true, false);
             return;
         }
         // 1 = play/pause slideshow (upstream's action-1 arm is
@@ -1345,11 +1374,400 @@ pub(crate) enum OpenOrigin<'a> {
     Nav(&'a PlaylistEntry),
 }
 
+/// The early-return arms ahead of request_open's decode queue (upstream
+/// `_viv_open`'s order: last cache, preload, already-loading).
+enum Arm {
+    LastHit,
+    PreloadHit,
+    AlreadyLoading,
+}
+
+/// Navigate onto the file the last cache holds (upstream `_viv_open`'s
+/// arm 2, viv.c:1469-1497, + `_viv_activate_last`, viv.c:14457-14525):
+/// the parked image swaps in wholesale and the live display parks in its
+/// place — no decode, no disk access, so it works even if the file has
+/// vanished since. The swap re-caches the displaced display, making A→B→A
+/// a ping-pong of parked images.
+fn activate_last_flow(hwnd: HWND) {
+    let now = qpc_now();
+    let title = {
+        // SAFETY: the borrow spans state stores and the (already decoded)
+        // image swap — nothing pumps; the Win32 tail runs after the drop.
+        let Some(state) = (unsafe { state_of(hwnd) }) else {
+            return;
+        };
+        let Some(cache) = state.last_cache.take() else {
+            return;
+        };
+        // Arm 2's stop-loading (terminate, viv.c:1481-1484) plus the
+        // preload-name clear (viv.c:1487): drop the foreground session and
+        // any parked preload (riviv's drop terminates the queued/decoding
+        // job — upstream's terminate flag does the same at the next
+        // per-frame check).
+        state.session = None;
+        state.preload = None;
+        // The current display parks in last (upstream's old_frames save,
+        // viv.c:14467-14485 — only when cacheable).
+        move_display_to_last(state);
+        // The parked image becomes the display, re-anchored like upstream's
+        // `_viv_start_first_frame` (viv.c:14313-14319).
+        let mut image = cache.image;
+        image.reanchor_at(now);
+        state.image = Some(image);
+        state.displayed_from = None;
+        reset_display_marks(state);
+        // current_fd = last_fd + title (viv.c:14499-14501).
+        state.nav_current = Some(cache.entry.clone());
+        state.path = Some(cache.entry.path.clone());
+        state.displayed_entry = Some(cache.entry.clone());
+        state.displayed_file_bytes = Some(cache.entry.size);
+        state.pending_file_bytes = None;
+        HSTRING::from_wide(&title_wide(state.path.as_deref()))
+    };
+    adopt_display_tail(hwnd, Some(title), true);
+    // Chain-preload the next neighbor (upstream viv.c:1493).
+    request_preload(hwnd);
+}
+
+/// Navigate onto the file a preload slot holds (upstream `_viv_open`'s
+/// arm 3 → `_viv_open_preload`, viv.c:1498-1501/15132-15206): the slot's
+/// decode state picks the arm — swap the parked frames in (whole or
+/// partial), flag the in-flight load for promotion, or show the failed
+/// verdict.
+fn adopt_preload_flow(hwnd: HWND) {
+    let now = qpc_now();
+    let mut title: Option<HSTRING> = None;
+    let mut fatal_msg: Option<String> = None;
+    let mut invalidate = false;
+    let mut chain_preload = false;
+    {
+        // SAFETY: the borrow spans state stores and pure frame mapping;
+        // nothing pumps. The Win32 tail and the chained preload run after
+        // the drop.
+        let Some(state) = (unsafe { state_of(hwnd) }) else {
+            return;
+        };
+        // Upstream resets the failure flags for every non-preload open
+        // before the arms (viv.c:1445-1458).
+        state.status_file_not_found = false;
+        state.status_load_failed = false;
+        // The decision reads the slot up front (the arms below mutate or
+        // take it, so the borrow must not span them).
+        let Some((slot_state, has_first_frame)) =
+            state.preload.as_ref().map(|s| (s.state, s.image.is_some()))
+        else {
+            return;
+        };
+        match preload::adopt_decision(slot_state, has_first_frame) {
+            AdoptDecision::PromoteOnFirstFrame => {
+                // viv.c:15134-15164: the title/current fd follow the
+                // preload file NOW (the _viv_open_preload head), and the
+                // in-flight load is flagged — its first frame promotes it
+                // to the display (the drain's promotion path).
+                let entry = state
+                    .preload
+                    .as_ref()
+                    .map(|s| s.entry.clone())
+                    .expect("slot presence checked above");
+                if let Some(slot) = state.preload.as_mut() {
+                    slot.activate_on_load = true;
+                }
+                state.nav_current = Some(entry.clone());
+                state.path = Some(entry.path.clone());
+                state.displayed_entry = Some(entry.clone());
+                state.pending_file_bytes = Some(entry.size);
+                title = Some(HSTRING::from_wide(&title_wide(state.path.as_deref())));
+            }
+            AdoptDecision::AdoptComplete => {
+                // viv.c:15176-15182: cache the display, swap the whole
+                // parked image in, chain-preload the next neighbor. The
+                // finished session drops (nothing replies anymore).
+                if let Err(e) = adopt_parked_image(state, now, false) {
+                    fatal_msg = Some(e);
+                } else {
+                    invalidate = true;
+                    chain_preload = true;
+                    title = Some(HSTRING::from_wide(&title_wide(state.path.as_deref())));
+                }
+            }
+            AdoptDecision::AdoptPartial => {
+                // viv.c:15166-15175: switch now — the parked first frame
+                // takes the display and the still-running stream finishes
+                // as the foreground load.
+                if let Err(e) = adopt_parked_image(state, now, true) {
+                    fatal_msg = Some(e);
+                } else {
+                    invalidate = true;
+                    title = Some(HSTRING::from_wide(&title_wide(state.path.as_deref())));
+                }
+            }
+            AdoptDecision::AdoptFailed => {
+                // viv.c:15184-15202: the display parks in last, then blanks
+                // with the failed verdict; the failed file's name stays in
+                // the title (the FAILED handler never touches
+                // current_fd/title, viv.c:2832-2840).
+                let Some(slot) = state.preload.take() else {
+                    return;
+                };
+                state.session = None;
+                move_display_to_last(state);
+                state.image = None;
+                state.displayed_from = None;
+                state.status_load_failed = true;
+                reset_display_marks(state);
+                state.nav_current = Some(slot.entry.clone());
+                state.path = Some(slot.entry.path.clone());
+                state.displayed_entry = None;
+                state.displayed_file_bytes = None;
+                state.pending_file_bytes = None;
+                invalidate = true;
+                chain_preload = true;
+                title = Some(HSTRING::from_wide(&title_wide(state.path.as_deref())));
+            }
+        }
+    }
+    adopt_display_tail(hwnd, title, invalidate);
+    if let Some(msg) = fatal_msg {
+        fatal(&msg);
+    }
+    if chain_preload {
+        request_preload(hwnd);
+    }
+}
+
+/// The shared body of the two adopt arms: the current display parks in
+/// last, the parked image takes the display (DC-carrying Surfaces built
+/// here on the UI thread — a wrap failure is GDI exhaustion, fatal like
+/// the drain's reply mapping, ADR 0001), re-anchored like upstream's
+/// `_viv_start_first_frame` (viv.c:14313-14319), and the preload file
+/// commits as the display's entry (upstream copies preload_fd into
+/// current_fd/frame_fd, viv.c:14415/15134). `keep_session` moves the
+/// still-running stream into the foreground slot (AdoptPartial, upstream
+/// flips `_viv_load_is_preload` to 0, viv.c:15172); dropping it retires a
+/// finished stream (AdoptComplete).
+fn adopt_parked_image(state: &mut WindowState, now: u64, keep_session: bool) -> Result<(), String> {
+    let Some(slot) = state.preload.take() else {
+        return Ok(());
+    };
+    let entry = slot.entry;
+    let session = slot.session;
+    let image = slot
+        .image
+        .expect("adopt with no parked image is unreachable: adopt_decision gates on it");
+    move_display_to_last(state);
+    let mut image = image.map_frames(Surface::from_frame)?;
+    image.reanchor_at(now);
+    state.image = Some(image);
+    state.displayed_from = Some(session.id());
+    reset_display_marks(state);
+    if keep_session {
+        state.session = Some(session);
+    }
+    state.nav_current = Some(entry.clone());
+    state.path = Some(entry.path.clone());
+    state.displayed_entry = Some(entry.clone());
+    state.displayed_file_bytes = Some(entry.size);
+    state.pending_file_bytes = None;
+    Ok(())
+}
+
+/// Park the current display into the last cache (upstream
+/// `viv_copy_current_image_to_last_image`, viv.c:14423-14455).
+fn move_display_to_last(state: &mut WindowState) {
+    let displaced = state.image.take();
+    move_displaced_to_last(state, displaced);
+}
+
+/// The shared park: the old cache frees, then the display's frames move
+/// wholesale — but only when the feature is on and the whole image has
+/// decoded (a partial frame set must keep streaming into the display, and
+/// upstream frees the old cache without refilling instead,
+/// viv.c:14429-14443). A blank display empties the cache (the vacuous
+/// 0==0 count compare copies the empty fd over it).
+fn move_displaced_to_last(state: &mut WindowState, displaced: Option<LoadedImage<Surface>>) {
+    state.last_cache = None;
+    if let Some(image) = displaced
+        && preload::cacheable(state.config.cache_last != 0, image.decode_complete())
+        && let Some(entry) = state.displayed_entry.take()
+    {
+        state.last_cache = Some(LastCache { entry, image });
+        return;
+    }
+    state.displayed_entry = None;
+}
+
+/// The frame-freeing half of upstream `_viv_clear` is the LoadedImage
+/// replacement itself; this is the rest — view and animation marks reset,
+/// playback restarted (viv.c:1278-1291).
+fn reset_display_marks(state: &mut WindowState) {
+    state.view.reset();
+    state.animation_looped = false;
+    state.slideshow_timeup = false;
+    state.animation_playing = true;
+}
+
+/// The Win32 tail shared by the adopt flows (and mirroring the drain's
+/// post-borrow section): title, status, the auto-size edge (upstream
+/// `_viv_start_first_frame`'s tail, viv.c:14363-14383), the cursor
+/// reconcile and the repaint.
+fn adopt_display_tail(hwnd: HWND, title: Option<HSTRING>, invalidate: bool) {
+    refresh_status(hwnd);
+    // SAFETY: a fresh short borrow for the config/mode read.
+    let auto = (unsafe { state_of(hwnd) }).and_then(|s| {
+        (!s.fullscreen && s.config.auto_zoom != 0).then_some(s.config.auto_zoom_type)
+    });
+    if let Some(kind) = auto.filter(|k| (0..=3).contains(k)) {
+        window_size_to_image(hwnd, kind);
+    }
+    update_cursor(hwnd);
+    if let Some(title) = title.as_ref() {
+        // SAFETY: hwnd is live; the HSTRING outlives the call. Fail-soft
+        // like every other title update (upstream viv.c:1249 ignores the
+        // SetWindowTextW return too).
+        let _ = unsafe { SetWindowTextW(hwnd, title) };
+    }
+    if invalidate {
+        // SAFETY: queues a WM_PAINT; never pumps messages.
+        let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+    }
+}
+
+/// Kick a background preload of the navigation neighbor (upstream
+/// `_viv_preload_next`, viv.c:14302-14310: `_viv_next(_viv_last_is_prev,
+/// reset=0, is_preload=1, wait=0)` under the config gate). Fired after a
+/// foreground load ends, after cache/preload adoptions, and by the
+/// shuffle toggle when idle.
+fn request_preload(hwnd: HWND) {
+    // SAFETY: reads and a copy out; the navigation re-borrows fresh.
+    let Some(state) = (unsafe { state_of(hwnd) }) else {
+        return;
+    };
+    if state.config.preload_next == 0 {
+        return;
+    }
+    if state.random_search.is_some() {
+        // Preloading is not supported in random mode (upstream `_viv_next`'s
+        // is_preload bail, viv.c:5825-5828) — no query, no preload.
+        return;
+    }
+    let prev = state.last_nav_prev;
+    nav_next(hwnd, prev, false, true);
+}
+
+/// Queue one entry as a preload job (upstream `_viv_open(fd, 1)`'s
+/// fresh-start arm, viv.c:1512-1568). Guards: the same file already
+/// parked or already the foreground load is skipped (the latter upstream
+/// handles by terminating the foreground and re-chaining the same fd —
+/// viv.c:1505-1520 — which the FIFO job queue makes pointless), and the
+/// last cache's file is never preloaded (viv.c:1462-1467).
+fn queue_preload(hwnd: HWND, entry: &PlaylistEntry) {
+    // SAFETY: the borrow spans the guard reads, the viewport query and
+    // the worker request — the channel send never blocks, nothing pumps.
+    let Some(state) = (unsafe { state_of(hwnd) }) else {
+        return;
+    };
+    if state
+        .preload
+        .as_ref()
+        .is_some_and(|s| s.entry.path == entry.path)
+    {
+        return; // already preloading this exact file
+    }
+    if state
+        .session
+        .as_ref()
+        .is_some_and(|s| s.path() == entry.path)
+    {
+        return; // already loading as the foreground
+    }
+    if state
+        .last_cache
+        .as_ref()
+        .is_some_and(|c| c.entry.path == entry.path)
+    {
+        return; // don't preload the last cache's file (viv.c:1462-1467)
+    }
+    state.preload = None;
+    // The request-time render viewport rides the job for the worker's mip
+    // pre-generation, exactly like a foreground open (upstream snapshots
+    // _viv_load_render_wide/high per load, viv.c:1557-1558).
+    let mut client = RECT::default();
+    // SAFETY: a pure window query on the live hwnd — no pumping.
+    let _ = unsafe { GetClientRect(hwnd, &mut client) };
+    let bar_h = match status::height(state.status) {
+        0 => initial_status_height(),
+        h => h,
+    };
+    let render_viewport = (
+        client.right - client.left,
+        (client.bottom - client.top - bar_h).max(0),
+    );
+    let background = state.config.windowed_bg();
+    let session = state
+        .load_thread
+        .request(hwnd, entry.path.clone(), render_viewport, background);
+    state.preload = Some(PreloadSlot {
+        session,
+        entry: entry.clone(),
+        image: None,
+        adopted_from: None,
+        state: PreloadState::Loading,
+        activate_on_load: false,
+    });
+    refresh_status(hwnd);
+}
+
 /// Queue `path` for background decoding (upstream `_viv_open`'s
 /// CreateThread arm, viv.c:1569). The current display stays up until this
 /// load's first frame replies in; storing a new session supersedes
 /// (flags) any in-flight one.
+///
+/// The arms ahead of the decode queue (upstream `_viv_open`'s early
+/// returns, viv.c:1462-1510): a last-cache hit activates the parked
+/// image, a preload hit adopts the parked frames, and a repeat request of
+/// the in-flight file is a no-op. They run BEFORE the existence check so
+/// a cached/preloaded image still shows from memory after its file
+/// vanished (upstream never touches the disk on these paths).
 pub(crate) fn request_open(hwnd: HWND, path: &OsStr, origin: OpenOrigin<'_>) {
+    // SAFETY: the borrow spans flag reads/stores and the cache hits'
+    // dispatch; nothing pumps. The adopt flows re-borrow fresh.
+    let arm = (unsafe { state_of(hwnd) }).and_then(|state| {
+        // Upstream resets the failure flags at the start of every
+        // non-preload open, before the arms (viv.c:1445-1458).
+        state.status_file_not_found = false;
+        state.status_load_failed = false;
+        if state
+            .last_cache
+            .as_ref()
+            .is_some_and(|c| c.entry.path == path)
+        {
+            return Some(Arm::LastHit);
+        }
+        if state.preload.as_ref().is_some_and(|s| s.entry.path == path) {
+            return Some(Arm::PreloadHit);
+        }
+        if state.session.as_ref().is_some_and(|s| s.path() == path) {
+            // Upstream viv.c:1505-1510: "already loading this one" — a
+            // repeat request must not supersede the in-flight decode.
+            return Some(Arm::AlreadyLoading);
+        }
+        None
+    });
+    match arm {
+        Some(Arm::LastHit) => {
+            activate_last_flow(hwnd);
+            return;
+        }
+        Some(Arm::PreloadHit) => {
+            adopt_preload_flow(hwnd);
+            return;
+        }
+        Some(Arm::AlreadyLoading) => {
+            refresh_status(hwnd);
+            return;
+        }
+        None => {}
+    }
     // Existence check BEFORE queueing a decode (upstream
     // `_viv_open_from_filename`'s GetFileAttributesEx arm, viv.c:1359 —
     // the status bar's "File not found." is a pre-open verdict, not a
@@ -1470,6 +1888,12 @@ pub(crate) fn request_open(hwnd: HWND, path: &OsStr, origin: OpenOrigin<'_>) {
         // The composite background snapshots at request time — a color
         // change mid-load must not flip frames already in flight.
         let background = state.config.windowed_bg();
+        // Clear any existing preload and start fresh (upstream
+        // `_viv_clear_preload` inside `_viv_open`'s fresh-start arm,
+        // viv.c:1512-1513) — placed after the not-found verdict, which
+        // upstream never passes through `_viv_open` (viv.c:5094-5098), so
+        // a missing file does not kill a parked preload.
+        state.preload = None;
         let session =
             state
                 .load_thread
@@ -1510,7 +1934,7 @@ fn open_from_filename(hwnd: HWND, path: &OsStr) -> bool {
             if let Some(state) = unsafe { state_of(hwnd) } {
                 playlist::add_path(&mut state.playlist, p);
             }
-            home_open(hwnd, false);
+            home_open(hwnd, false, false);
             true
         }
         Ok(_) => {
@@ -1528,7 +1952,7 @@ fn open_from_filename(hwnd: HWND, path: &OsStr) -> bool {
                 .map(|state| playlist::add_expanded(&mut state.playlist, p))
                 .unwrap_or(false);
             if found {
-                home_open(hwnd, false);
+                home_open(hwnd, false, false);
             }
             found
         }
@@ -1655,10 +2079,11 @@ fn perf_counter() -> u64 {
 /// is allowed); with no playlist, the folder scan of `scan_dir` — and a
 /// scan that finds NOTHING blanks the display (`_viv_blank`, viv.c:6245-
 /// 6253; unreachable while the playlist is non-empty, its first node
-/// always qualifies). In random mode (checked first, `end` ignored like
+/// always qualifies) — except for a preload, whose home arm stays silent
+/// (viv.c:6247-6252). In random mode (checked first, `end` ignored like
 /// upstream) the call just draws one more random image (viv.c:6122-6125).
-pub(crate) fn home_open(hwnd: HWND, end: bool) {
-    home_open_inner(hwnd, end);
+pub(crate) fn home_open(hwnd: HWND, end: bool, preload: bool) {
+    home_open_inner(hwnd, end, preload);
     // Upstream `_viv_home`'s tail resets a running slideshow timer
     // UNCONDITIONALLY — every home path (keys, drop-replace, folder open,
     // Everything replace, the random first-query) re-arms it (viv.c:
@@ -1667,10 +2092,15 @@ pub(crate) fn home_open(hwnd: HWND, end: bool) {
     reset_slideshow_timer(hwnd);
 }
 
-fn home_open_inner(hwnd: HWND, end: bool) {
+fn home_open_inner(hwnd: HWND, end: bool, preload: bool) {
     // Random mode first (viv.c:6122): borrow only long enough to decide.
     // SAFETY: the read-only borrow ends inside is_some_and.
     if (unsafe { state_of(hwnd) }).is_some_and(|s| s.random_search.is_some()) {
+        if preload {
+            // Unreachable via request_preload's own bail (viv.c:5825-5828
+            // runs before _viv_home can); kept total anyway.
+            return;
+        }
         everything::send_random(hwnd);
         return;
     }
@@ -1706,13 +2136,27 @@ fn home_open_inner(hwnd: HWND, end: bool) {
         }
     });
     if let Some(entry) = target {
-        request_open(hwnd, &entry.path, OpenOrigin::Nav(&entry));
+        if preload {
+            queue_preload(hwnd, &entry);
+        } else {
+            request_open(hwnd, &entry.path, OpenOrigin::Nav(&entry));
+        }
         return;
     }
     let entries = scan_entries(&scan_dir(hwnd));
     match playlist::home(&entries, end, mode, ascending) {
-        Some(entry) => request_open(hwnd, &entry.path, OpenOrigin::Nav(entry)),
-        None => blank_display(hwnd),
+        Some(entry) => {
+            if preload {
+                queue_preload(hwnd, entry);
+            } else {
+                request_open(hwnd, &entry.path, OpenOrigin::Nav(entry));
+            }
+        }
+        None => {
+            if !preload {
+                blank_display(hwnd);
+            }
+        }
     }
 }
 
@@ -1726,7 +2170,14 @@ fn home_open_inner(hwnd: HWND, end: bool) {
 /// folder-scan arm over the current file's parent, and no current at all
 /// becomes home(0) — for prev too (viv.c:6101-6104). next/prev NEVER
 /// blanks: no candidate is a no-op (viv.c:6093-6099).
-fn nav_next(hwnd: HWND, prev: bool, reset_slideshow: bool) {
+///
+/// `preload=true` is the background flavor (`_viv_next(..., 1, ...)`,
+/// reached only from `request_preload`): the direction comes from the
+/// last MANUAL navigation (viv.c:5833-5835 — `last_nav_prev` is recorded
+/// by non-preload calls only), random mode bails without querying
+/// (viv.c:5825-5828), targets queue as preload jobs, and the home arm
+/// never blanks (viv.c:6247-6252).
+fn nav_next(hwnd: HWND, prev: bool, reset_slideshow: bool, preload: bool) {
     enum Action {
         Random,
         Home,
@@ -1746,47 +2197,65 @@ fn nav_next(hwnd: HWND, prev: bool, reset_slideshow: bool) {
             return;
         };
         if state.random_search.is_some() {
+            if preload {
+                // Preloading is not supported in random mode — request_
+                // preload already bailed, this is the belt to its braces
+                // (viv.c:5825-5828).
+                return;
+            }
             Action::Random
-        } else if state.config.shuffle != 0 {
-            ensure_shuffle_ready(state);
-            if state.playlist.is_empty() {
-                // The initial shuffle built nothing (no current, or its
-                // directory holds no images): upstream lands home(0) with
-                // no current and the plain directory-scan arm with one
-                // (viv.c:5863-6104's control flow).
-                if state.nav_current.is_none() {
-                    Action::Home
+        } else {
+            if !preload {
+                state.last_nav_prev = prev;
+            }
+            if state.config.shuffle != 0 {
+                ensure_shuffle_ready(state);
+                if state.playlist.is_empty() {
+                    // The initial shuffle built nothing (no current, or
+                    // its directory holds no images): upstream lands
+                    // home(0) with no current and the plain
+                    // directory-scan arm with one (viv.c:5863-6104's
+                    // control flow).
+                    if state.nav_current.is_none() {
+                        Action::Home
+                    } else {
+                        Action::Scan
+                    }
                 } else {
-                    Action::Scan
+                    // The order neighbor. A pathless current matches no id, so
+                    // upstream's lookup returns -1 and the front/back row
+                    // serves (viv.c:5908-5918) — `shuffle_edge(!prev)` is the
+                    // same read.
+                    let target = match state.nav_current.as_ref() {
+                        Some(current) => state.playlist.shuffle_target(current, prev),
+                        None => state.playlist.shuffle_edge(!prev),
+                    };
+                    match target {
+                        Some(entry) => Action::Open(entry.clone()),
+                        // Unreachable with a non-empty playlist (ensure built
+                        // the order); the sorted scan keeps it total.
+                        None => Action::PlaylistSorted,
+                    }
                 }
             } else {
-                // The order neighbor. A pathless current matches no id, so
-                // upstream's lookup returns -1 and the front/back row
-                // serves (viv.c:5908-5918) — `shuffle_edge(!prev)` is the
-                // same read.
-                let target = match state.nav_current.as_ref() {
-                    Some(current) => state.playlist.shuffle_target(current, prev),
-                    None => state.playlist.shuffle_edge(!prev),
-                };
-                match target {
-                    Some(entry) => Action::Open(entry.clone()),
-                    // Unreachable with a non-empty playlist (ensure built
-                    // the order); the sorted scan keeps it total.
-                    None => Action::PlaylistSorted,
+                match state.nav_current.as_ref() {
+                    None => Action::Home,
+                    Some(_) if state.playlist.is_empty() => Action::Scan,
+                    Some(_) => Action::PlaylistSorted,
                 }
-            }
-        } else {
-            match state.nav_current.as_ref() {
-                None => Action::Home,
-                Some(_) if state.playlist.is_empty() => Action::Scan,
-                Some(_) => Action::PlaylistSorted,
             }
         }
     };
     match action {
         Action::Random => everything::send_random(hwnd),
-        Action::Home => home_open(hwnd, false),
-        Action::Open(entry) => request_open(hwnd, &entry.path, OpenOrigin::Nav(&entry)),
+        Action::Home => home_open(hwnd, false, preload),
+        Action::Open(entry) => {
+            if preload {
+                queue_preload(hwnd, &entry);
+            } else {
+                request_open(hwnd, &entry.path, OpenOrigin::Nav(&entry));
+            }
+        }
         Action::PlaylistSorted => {
             // SAFETY: the borrow ends at the end of the statement (the
             // entry is cloned out); nothing below pumps.
@@ -1802,7 +2271,11 @@ fn nav_next(hwnd: HWND, prev: bool, reset_slideshow: bool) {
                 .cloned()
             });
             if let Some(entry) = target {
-                request_open(hwnd, &entry.path, OpenOrigin::Nav(&entry));
+                if preload {
+                    queue_preload(hwnd, &entry);
+                } else {
+                    request_open(hwnd, &entry.path, OpenOrigin::Nav(&entry));
+                }
             }
         }
         Action::Scan => {
@@ -1826,7 +2299,11 @@ fn nav_next(hwnd: HWND, prev: bool, reset_slideshow: bool) {
             if let Some(entry) =
                 playlist::next(&entries, current.as_ref(), prev, false, sort, ascending)
             {
-                request_open(hwnd, &entry.path, OpenOrigin::Nav(entry));
+                if preload {
+                    queue_preload(hwnd, entry);
+                } else {
+                    request_open(hwnd, &entry.path, OpenOrigin::Nav(entry));
+                }
             }
         }
     }
@@ -2016,7 +2493,7 @@ fn on_slideshow_timer(hwnd: HWND) {
         }
     });
     if advance.is_some() {
-        nav_next(hwnd, false, false);
+        nav_next(hwnd, false, false, false);
     }
 }
 
@@ -2079,6 +2556,9 @@ fn blank_display(hwnd: HWND) {
         state.displayed_file_bytes = None;
         state.pending_file_bytes = None;
         state.session = None;
+        // The frame fd empties with the display (upstream `_viv_clear`
+        // clears _viv_frame_fd's name, viv.c:1273) — nothing left to cache.
+        state.displayed_entry = None;
         // The zoom/pan view dies with the display (upstream `_viv_blank` →
         // `_viv_clear`, viv.c:7910 + 1282-1288) — and so do the per-image
         // animation marks (frame_looped/timeup, viv.c:1278/1279). The
@@ -2345,7 +2825,7 @@ fn on_everything_reply(hwnd: HWND, cds: &COPYDATASTRUCT, add: bool) {
         reply
     });
     if !add && parsed.is_some() {
-        home_open(hwnd, false);
+        home_open(hwnd, false, false);
     }
 }
 
@@ -2484,99 +2964,190 @@ fn on_load_replies(hwnd: HWND) {
     // A NEW image adopted the display this drain — the auto-size hook's
     // trigger (upstream `_viv_start_first_frame`'s tail, viv.c:14363-14383).
     let mut adopted_new_image = false;
+    // The foreground load ended while still the active session — chain a
+    // background preload (upstream's allow_preload_next →
+    // _viv_preload_next, viv.c:2874-2879).
+    let mut kick_preload = false;
     {
         // Copy the session facts out first so the immutable borrow ends
         // before the reply loop mutates the display state.
         // SAFETY: the borrow spans queue draining, the pure reply state
-        // machine, and read-only geometry queries — nothing here pumps
+        // machines, and read-only geometry queries — nothing here pumps
         // messages, so no second state_of borrow can alias this one.
         let Some(state) = (unsafe { state_of(hwnd) }) else {
             return;
         };
-        let Some(session) = state.session.as_ref() else {
-            return;
-        };
-        let replies = session.drain();
-        let session_id = session.id();
-        let session_path = session.path().to_os_string();
-        for reply in replies {
-            // Frames cross the thread boundary as bare DIBs; the DC-carrying
-            // Surface is built here, on the UI thread that renders with it
-            // (memory DCs belong to their creating thread). A wrap failure
-            // is GDI exhaustion — system-level, fail loud (ADR 0001).
-            let reply = map_reply_frame(reply, Surface::from_frame);
-            // Whether THIS session already owned the display before the
-            // reply — the auto-size hook must fire on the adoption EDGE
-            // only (upstream's `_viv_start_first_frame` runs at the first
-            // frame; the completing reply's title refresh must not size
-            // the window again).
-            let displayed_before_reply = state.displayed_from == Some(session_id);
-            let playback = anim_playback(state);
-            let outcome = apply_reply(
-                &mut state.image,
-                &mut state.displayed_from,
-                session_id,
-                now,
-                state.timer_freq,
-                playback,
-                reply,
-            );
-            // The status bar's Loading/Failed flags follow the protocol
-            // facts (#5): the session ends at its terminal reply (taken so
-            // `session.is_some()` stops meaning "loading"), and a
-            // user-level failure sticks until the next open.
-            if outcome.load_ended && state.session.as_ref().is_some_and(|s| s.id() == session_id) {
-                state.session = None;
-            }
-            if outcome.load_failed {
-                state.status_load_failed = true;
-            }
-            if let Some(msg) = outcome.fatal {
-                fatal_msg = Some(msg);
-                break;
-            }
-            for action in outcome.actions {
-                match action {
-                    UiAction::Invalidate => invalidate = true,
-                    UiAction::ResetPlayback => {
-                        // Upstream's `_viv_clear` sets
-                        // `_viv_animation_play = 1` (viv.c:1291): every
-                        // display swap starts playing. The open request
-                        // deliberately leaves the old pause alone until
-                        // this moment (cubic round 1).
-                        state.animation_playing = true;
-                    }
-                    UiAction::SetWindowTitle => {
-                        // The display adopted this session's image (or
-                        // cleared it): the zoom/pan view resets with it
-                        // (upstream `_viv_clear` runs at exactly these
-                        // points, viv.c:2804/2835/7910) and the status
-                        // bar's "(N KB)" follows the same commit/clear.
-                        state.view.reset();
-                        if state.displayed_from == Some(session_id) && !displayed_before_reply {
-                            adopted_new_image = true;
-                            state.path = Some(session_path.clone());
-                            title = Some(HSTRING::from_wide(&title_wide(state.path.as_deref())));
-                            // Commit the staged size now that THIS session's
-                            // image is on screen (a failed replacement never
-                            // reaches here, so the old size survives).
-                            state.displayed_file_bytes = state.pending_file_bytes.take();
-                        } else {
-                            // The mid-stream FAILED clear: the display goes
-                            // blank but the title KEEPS the failed file's
-                            // name — upstream's FAILED handler runs
-                            // _viv_clear on the frame data only, leaving
-                            // _viv_current_fd and the title untouched
-                            // (viv.c:2832-2840); only blank clears both
-                            // (viv.c:7919-7923). The status bar's "(N KB)"
-                            // still clears with the display.
-                            state.displayed_file_bytes = None;
+        if let Some(session) = state.session.as_ref() {
+            let replies = session.drain();
+            let session_id = session.id();
+            let session_path = session.path().to_os_string();
+            for reply in replies {
+                // Frames cross the thread boundary as bare DIBs; the DC-carrying
+                // Surface is built here, on the UI thread that renders with it
+                // (memory DCs belong to their creating thread). A wrap failure
+                // is GDI exhaustion — system-level, fail loud (ADR 0001).
+                let reply = map_reply_frame(reply, Surface::from_frame);
+                // Whether THIS session already owned the display before the
+                // reply — the auto-size hook must fire on the adoption EDGE
+                // only (upstream's `_viv_start_first_frame` runs at the first
+                // frame; the completing reply's title refresh must not size
+                // the window again).
+                let displayed_before_reply = state.displayed_from == Some(session_id);
+                let playback = anim_playback(state);
+                // A first frame displaces the current display: upstream
+                // parks it in the last cache at EVERY first-frame reply
+                // (viv.c:2949) — take it out before apply_reply replaces
+                // it. A blank display displaces nothing (upstream's vacuous
+                // count compare empties the cache instead).
+                let is_first_frame = matches!(reply, LoadReply::FirstFrame { .. });
+                let displaced = if is_first_frame {
+                    state.image.take()
+                } else {
+                    None
+                };
+                let outcome = apply_reply(
+                    &mut state.image,
+                    &mut state.displayed_from,
+                    session_id,
+                    now,
+                    state.timer_freq,
+                    playback,
+                    reply,
+                );
+                // The displaced display parks BEFORE the adoption edge
+                // below re-points displayed_entry at the new session's
+                // entry (upstream: copy_current_to_last runs at
+                // viv.c:2949, _viv_clear at 2951).
+                if is_first_frame {
+                    move_displaced_to_last(state, displaced);
+                }
+                // The status bar's Loading/Failed flags follow the protocol
+                // facts (#5): the session ends at its terminal reply (taken so
+                // `session.is_some()` stops meaning "loading"), and a
+                // user-level failure sticks until the next open.
+                if outcome.load_ended
+                    && state.session.as_ref().is_some_and(|s| s.id() == session_id)
+                {
+                    state.session = None;
+                    kick_preload = true;
+                }
+                if outcome.load_failed {
+                    state.status_load_failed = true;
+                }
+                if let Some(msg) = outcome.fatal {
+                    fatal_msg = Some(msg);
+                    break;
+                }
+                for action in outcome.actions {
+                    match action {
+                        UiAction::Invalidate => invalidate = true,
+                        UiAction::ResetPlayback => {
+                            // Upstream's `_viv_clear` sets
+                            // `_viv_animation_play = 1` (viv.c:1291): every
+                            // display swap starts playing. The open request
+                            // deliberately leaves the old pause alone until
+                            // this moment (cubic round 1).
+                            state.animation_playing = true;
+                        }
+                        UiAction::SetWindowTitle => {
+                            // The display adopted this session's image (or
+                            // cleared it): the zoom/pan view resets with it
+                            // (upstream `_viv_clear` runs at exactly these
+                            // points, viv.c:2804/2835/7910) and the status
+                            // bar's "(N KB)" follows the same commit/clear.
+                            state.view.reset();
+                            if state.displayed_from == Some(session_id) && !displayed_before_reply {
+                                adopted_new_image = true;
+                                state.path = Some(session_path.clone());
+                                title =
+                                    Some(HSTRING::from_wide(&title_wide(state.path.as_deref())));
+                                // The navigation facts follow the adopted
+                                // image (upstream copies _viv_load_fd into
+                                // _viv_frame_fd at the first-frame reply,
+                                // viv.c:2962 — the last-cache source).
+                                state.displayed_entry = state.nav_current.clone();
+                                // Commit the staged size now that THIS session's
+                                // image is on screen (a failed replacement never
+                                // reaches here, so the old size survives).
+                                state.displayed_file_bytes = state.pending_file_bytes.take();
+                            } else {
+                                // The mid-stream FAILED clear: the display goes
+                                // blank but the title KEEPS the failed file's
+                                // name — upstream's FAILED handler runs
+                                // _viv_clear on the frame data only, leaving
+                                // _viv_current_fd and the title untouched
+                                // (viv.c:2832-2840); only blank clears both
+                                // (viv.c:7919-7923). The status bar's "(N KB)"
+                                // still clears with the display, and the frame
+                                // fd empties with it (viv.c:1273) — nothing to
+                                // cache.
+                                state.displayed_file_bytes = None;
+                                state.displayed_entry = None;
+                            }
                         }
                     }
                 }
+                if fatal_msg.is_some() {
+                    break;
+                }
             }
-            if fatal_msg.is_some() {
-                break;
+        }
+        // ---- preload slot drain (#40) ----
+        // The parked preload's replies apply against the slot's own state;
+        // the display never hears about them (upstream's preload branches
+        // stash into _viv_preload_frames only, viv.c:2926-2943).
+        let mut promote = false;
+        let playback = anim_playback(state);
+        if let Some(slot) = state.preload.as_mut() {
+            let slot_id = slot.session.id();
+            let replies = slot.session.drain();
+            for reply in replies {
+                // DIBs stay bare — the DC wrap happens only if/when the
+                // image takes the display (the same split upstream makes
+                // between _viv_preload_frames and _viv_frames).
+                let reply = map_reply_frame(reply, Ok::<DibFrame, String>);
+                let outcome = apply_reply(
+                    &mut slot.image,
+                    &mut slot.adopted_from,
+                    slot_id,
+                    now,
+                    state.timer_freq,
+                    playback,
+                    reply,
+                );
+                if let Some(_msg) = outcome.fatal {
+                    // A system-level decode failure in a PARKED preload
+                    // degrades to a failed slot (upstream's load thread
+                    // reports GDI exhaustion as a user-level load failure
+                    // and the preload arm just marks state 2,
+                    // viv.c:2808-2812); killing the viewer over a
+                    // background prefetch would be worse. The foreground
+                    // path keeps its fail-loud posture (README note).
+                    slot.state = PreloadState::Failed;
+                    slot.image = None;
+                    continue;
+                }
+                if outcome.load_failed {
+                    slot.state = PreloadState::Failed;
+                } else if outcome.load_ended {
+                    slot.state = PreloadState::Complete;
+                }
+            }
+            // The first frame landed while a navigation waits on this
+            // preload — promote it below (upstream's
+            // should_activate first-frame arm, viv.c:2916-2924, runs the
+            // NORMAL first-frame branch: current display → last, first
+            // frame adopts, remaining frames follow as the foreground).
+            promote = slot.activate_on_load && slot.image.is_some();
+        }
+        if promote {
+            match adopt_parked_image(state, now, true) {
+                Ok(()) => {
+                    invalidate = true;
+                    adopted_new_image = true;
+                    title = Some(HSTRING::from_wide(&title_wide(state.path.as_deref())));
+                }
+                Err(e) => fatal_msg = Some(e),
             }
         }
         // Timer reconciliation from the drain's NET effect — deriving from
@@ -2643,6 +3214,13 @@ fn on_load_replies(hwnd: HWND) {
         // like upstream viv.c:3284 — WM_PAINT fills the whole client itself.
         let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
     }
+    // Chain a background preload after the load ended (upstream fires
+    // _viv_preload_next inside the completion reply, viv.c:2874-2879 —
+    // after the next_fd pickup, which the FIFO job queue makes
+    // unnecessary).
+    if kick_preload {
+        request_preload(hwnd);
+    }
 }
 
 /// The playback knobs snapshot from the window state (#38) — the pause
@@ -2701,7 +3279,7 @@ fn on_animation_timer(hwnd: HWND) {
         // The gate held the slideshow's advance until this animation
         // looped once — fire it now, as a MANUAL advance (the timer
         // re-arms, viv.c:3245's `_viv_next(0,1,0,0)`).
-        nav_next(hwnd, false, true);
+        nav_next(hwnd, false, true, false);
     }
     if repaint {
         // The frame counter part ("n / m") tracks the displayed frame
@@ -3465,16 +4043,16 @@ fn on_command(hwnd: HWND, cmd: menu::Cmd) {
         menu::Cmd::AnimationRateDecrease => animation_rate_step(hwnd, true),
         menu::Cmd::AnimationRateIncrease => animation_rate_step(hwnd, false),
         menu::Cmd::AnimationRateReset => animation_rate_reset(hwnd),
-        menu::Cmd::NavNext => nav_next(hwnd, false, true),
-        menu::Cmd::NavPrev => nav_next(hwnd, true, true),
-        menu::Cmd::NavHome => home_open(hwnd, false),
-        menu::Cmd::NavEnd => home_open(hwnd, true),
+        menu::Cmd::NavNext => nav_next(hwnd, false, true, false),
+        menu::Cmd::NavPrev => nav_next(hwnd, true, true, false),
+        menu::Cmd::NavHome => home_open(hwnd, false, false),
+        menu::Cmd::NavEnd => home_open(hwnd, true, false),
         // The #39 sort family (upstream viv.c:1750-1816): the five mode
         // rows re-click the active mode into a direction flip and pick a
         // new mode with its default direction; the direction pair sets the
-        // flag outright. Upstream also clears the preload/last caches on
-        // every sort change (viv.c:1791-1794) — those caches are #40 and
-        // plug in here when it lands.
+        // flag outright. Every sort change clears the preload/last caches
+        // WITHOUT re-preloading (viv.c:1791-1794/1801-1814 — the next
+        // in-flight load's completion or the next navigation re-arms).
         cmd @ (menu::Cmd::NavSortName
         | menu::Cmd::NavSortFullPath
         | menu::Cmd::NavSortSize
@@ -3489,6 +4067,8 @@ fn on_command(hwnd: HWND, cmd: menu::Cmd) {
         // Toggle shuffle (upstream viv.c:1723-1748): turning it OFF frees
         // the shuffle order (the index array); on stays lazy — the next
         // navigation builds a fresh order (`_viv_do_initial_shuffle`).
+        // Both directions clear the caches and re-preload when idle
+        // (viv.c:1738-1747).
         menu::Cmd::NavShuffle => shuffle_toggle(hwnd),
         menu::Cmd::NavJumpTo => crate::jumpto_dlg::open(hwnd),
         menu::Cmd::HelpAbout => show_about(hwnd),
@@ -3498,9 +4078,13 @@ fn on_command(hwnd: HWND, cmd: menu::Cmd) {
 /// A sort-mode menu click (upstream viv.c:1756-1789): same mode flips the
 /// direction, a different mode lands on its default direction. The config
 /// write persists through the exit save (the `sort`/`sort_ascending` ini
-/// keys).
+/// keys). Every change clears the caches and terminates an in-flight
+/// PRELOAD (viv.c:1791-1793 — `_viv_clear_loading_preload` touches only a
+/// preload load, never a foreground one; the parked slot's drop is that
+/// terminate).
 fn sort_click(hwnd: HWND, mode: playlist::SortMode) {
-    // SAFETY: the borrow spans only the two config stores — nothing pumps.
+    // SAFETY: the borrow spans only the config stores and the cache drops
+    // — nothing pumps.
     if let Some(state) = unsafe { state_of(hwnd) } {
         let (mode, ascending) = playlist::apply_sort_click(
             mode,
@@ -3509,28 +4093,43 @@ fn sort_click(hwnd: HWND, mode: playlist::SortMode) {
         );
         state.config.nav_sort = mode as i32;
         state.config.nav_sort_ascending = i32::from(ascending);
+        state.preload = None;
+        state.last_cache = None;
     }
 }
 
 /// The Ascending/Descending rows (upstream viv.c:1798-1816): set the flag
-/// directly — no mode change, no toggle.
+/// directly — no mode change, no toggle. The cache clear matches the mode
+/// rows (viv.c:1801-1814).
 fn sort_set_direction(hwnd: HWND, ascending: bool) {
-    // SAFETY: the borrow spans only the config store — nothing pumps.
+    // SAFETY: the borrow spans only the config store and the cache drops
+    // — nothing pumps.
     if let Some(state) = unsafe { state_of(hwnd) } {
         state.config.nav_sort_ascending = i32::from(ascending);
+        state.preload = None;
+        state.last_cache = None;
     }
 }
 
 /// The Shuffle row (upstream viv.c:1723-1748): flip the config; OFF frees
-/// the shuffle order so a later ON re-shuffles fresh.
+/// the shuffle order so a later ON re-shuffles fresh. Both directions
+/// clear the caches (viv.c:1738-1741) and re-preload when no load is in
+/// flight (viv.c:1744-1747).
 fn shuffle_toggle(hwnd: HWND) {
-    // SAFETY: the borrow spans the flag flip and the order drop — nothing
-    // pumps.
+    let mut re_preload = false;
+    // SAFETY: the borrow spans the flag flip, the order drop and the
+    // cache drops — nothing pumps.
     if let Some(state) = unsafe { state_of(hwnd) } {
         state.config.shuffle = i32::from(state.config.shuffle == 0);
         if state.config.shuffle == 0 {
             state.playlist.drop_shuffle();
         }
+        state.preload = None;
+        state.last_cache = None;
+        re_preload = state.session.is_none();
+    }
+    if re_preload {
+        request_preload(hwnd);
     }
 }
 
@@ -3749,7 +4348,7 @@ fn on_drop_files(hwnd: HWND, hdrop: HDROP) {
             // Only the replace flavor homes (viv.c:3113-3116); a shift-append
             // leaves the current image up.
             if !is_shift {
-                home_open(hwnd, false);
+                home_open(hwnd, false, false);
             }
         } else if count == 1 {
             let len = DragQueryFileW(hdrop, 0, None) as usize;
@@ -4655,6 +5254,10 @@ pub(crate) fn run(args: Vec<OsString>) -> Result<(), String> {
         animation_playing: true,
         animation_rate_pos: crate::anim::RATE_ONE,
         prevent_sleep_active: false,
+        preload: None,
+        last_cache: None,
+        last_nav_prev: false,
+        displayed_entry: None,
     };
 
     // SAFETY: returns the module handle of this exe; no side effects.

@@ -103,6 +103,7 @@ mod options_dlg;
 mod paint;
 mod pixels;
 mod playlist;
+mod preload;
 mod slideshow;
 mod status;
 mod stitch;

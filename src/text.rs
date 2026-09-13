@@ -78,6 +78,17 @@ pub(crate) fn status_main_text(
     }
 }
 
+/// The preload part's text: the fixed loc string while a preload load is
+/// decoding its first frame, empty (the part disappears) otherwise
+/// (upstream viv.c:11210-11213, "PRELOAD" / 预加载).
+pub(crate) fn status_preload_text(pending: bool) -> &'static str {
+    if pending {
+        loc::get(Id::StatusBarPreload)
+    } else {
+        ""
+    }
+}
+
 /// Frame counter part: `current / total` (viv.c:11183-11209 — upstream
 /// shows `position + 1`; we take the 1-based position directly). Empty for
 /// static images; without a pre-known total the streaming decode counts
@@ -147,27 +158,39 @@ pub(crate) fn min_status_part_wide(dpi: u32) -> i32 {
     (72 * dpi / 96) as i32
 }
 
-/// Right-edge layout for SB_SETPARTS: `[main][frame][dimension]`
-/// (viv.c:11229-11344 minus the preload/pixel-info parts riviv does not
-/// have). `frame_w`/`dimension_w` are the measured text widths; each part
-/// gets a `SM_CXEDGE * 5` text margin and is floored at `min_wide`; the
-/// dimension part additionally reserves the size-grip strip
-/// (SM_CXVSCROLL + SM_CXBORDER, viv.c:11292). The main part takes what is
-/// left (floor 0); the dimension part runs to the right edge (-1). When
-/// the window is too cramped, the trailing dimension part keeps its width
-/// and the LEADING parts collapse first — upstream accumulates from the
-/// unclamped remainder (viv.c:11306-11341), which makes the frame boundary
+/// Right-edge layout for SB_SETPARTS: `[main][preload?][frame][dimension]`
+/// (viv.c:11296-11342 minus the pixel-info parts riviv does not have —
+/// #47). The preload part EXISTS only while its text is non-empty (upstream
+/// pushes its boundary inside `if (*preload_buf)`, so the part count
+/// alternates between 3 and 4); `frame_w`/`dimension_w` are the measured
+/// text widths; each part gets a `SM_CXEDGE * 5` text margin, the frame and
+/// dimension parts are floored at `min_wide` (the preload part is not —
+/// upstream measures it raw, viv.c:11266-11271), and the dimension part
+/// additionally reserves the size-grip strip (SM_CXVSCROLL + SM_CXBORDER,
+/// viv.c:11292). The main part takes what is left (floor 0); the dimension
+/// part runs to the right edge (-1). When the window is too cramped, the
+/// trailing dimension part keeps its width and the LEADING parts collapse
+/// first — upstream accumulates each boundary from the unclamped remainder
+/// (viv.c:11305-11341), which makes the frame boundary
 /// `client_w - dimension_w` (possibly negative = a collapsed part).
 pub(crate) fn status_part_edges(
     client_w: i32,
+    preload_text_w: i32,
     frame_text_w: i32,
     dimension_text_w: i32,
     margin: i32,
     grip: i32,
     min_wide: i32,
-) -> [i32; 3] {
+) -> Vec<i32> {
     // An empty part shows no text, so it takes no width (upstream only
-    // measures non-empty buffers, viv.c:11241-11290).
+    // measures non-empty buffers, viv.c:11241-11290) and — for the preload
+    // part — does not exist at all (the boundary push sits inside the
+    // non-empty check).
+    let preload_w = if preload_text_w > 0 {
+        preload_text_w + margin
+    } else {
+        0
+    };
     let frame_w = if frame_text_w > 0 {
         (frame_text_w + margin).max(min_wide)
     } else {
@@ -178,13 +201,19 @@ pub(crate) fn status_part_edges(
     } else {
         0
     };
-    let main_edge = (client_w - frame_w - dimension_w).max(0);
     // Upstream's unclamped accumulation: part_wide (after max(0) for part
     // 0) continues from the raw remainder, so the frame boundary is
     // client_w - dimension_w regardless of the floor above — a cramped
     // window starves the frame counter, never the dimension part
     // (Codex PR #13 round 3).
-    [main_edge, client_w - dimension_w, -1]
+    let raw = client_w - preload_w - frame_w - dimension_w;
+    let mut edges = vec![raw.max(0)];
+    if preload_w > 0 {
+        edges.push(raw + preload_w);
+    }
+    edges.push(raw + preload_w + frame_w);
+    edges.push(-1);
+    edges
 }
 
 #[cfg(test)]
@@ -349,7 +378,7 @@ mod tests {
         // margin 10 (SM_CXEDGE*5 at 2 px), grip 17 (SM_CXVSCROLL+BORDER),
         // min 72: frame = max(50, 72) = 72; dimension = max(130, 72)+17 = 147.
         assert_eq!(
-            status_part_edges(1000, 40, 120, 10, 17, 72),
+            status_part_edges(1000, 0, 40, 120, 10, 17, 72),
             [781, 853, -1],
             "main fills the remainder, dimension runs to the right edge"
         );
@@ -359,7 +388,35 @@ mod tests {
     fn part_edges_floor_small_parts_at_the_minimum() {
         // frame: text 5 + margin 10 = 15 -> floored to 72; dimension empty
         // takes nothing (upstream only measures non-empty buffers).
-        assert_eq!(status_part_edges(1000, 5, 0, 10, 17, 72), [928, 1000, -1]);
+        assert_eq!(
+            status_part_edges(1000, 0, 5, 0, 10, 17, 72),
+            [928, 1000, -1]
+        );
+    }
+
+    #[test]
+    fn a_nonempty_preload_inserts_its_part_between_main_and_frame() {
+        // Upstream pushes the preload boundary inside `if (*preload_buf)`
+        // (viv.c:11312-11316): the part count goes 3 -> 4, the preload text
+        // takes width+margin with NO minimum floor (viv.c:11266-11271), and
+        // the main part shrinks by it. preload 50 -> 60 wide; raw remainder
+        // = 1000 - 60 - 72 - 147 = 721; boundaries accumulate unclamped.
+        assert_eq!(
+            status_part_edges(1000, 50, 40, 120, 10, 17, 72),
+            [721, 781, 853, -1],
+            "main shrinks by the preload part, frame/dimension edges keep upstream's accumulation"
+        );
+    }
+
+    #[test]
+    fn a_tiny_preload_text_still_takes_its_raw_width() {
+        // No min_wide floor on the preload part (upstream measures it raw,
+        // unlike the frame counter): preload 5+10 = 15; the frame counter
+        // (5+10 = 15) floors at 72; dimension empty. raw = 1000-15-72.
+        assert_eq!(
+            status_part_edges(1000, 5, 5, 0, 10, 17, 72),
+            [913, 928, 1000, -1]
+        );
     }
 
     #[test]
@@ -369,7 +426,7 @@ mod tests {
         // the frame boundary continues from the UNCLAMPED remainder
         // (client - dimension, viv.c:11331-11336) and may go negative (a
         // collapsed part) — the dimension part keeps its width instead.
-        let edges = status_part_edges(100, 500, 500, 10, 17, 72);
+        let edges = status_part_edges(100, 0, 500, 500, 10, 17, 72);
         assert_eq!(edges[0], 0, "main part floored at 0 (viv.c:11308)");
         assert_eq!(
             edges[1],
@@ -384,16 +441,16 @@ mod tests {
         // client 150, frame needs 72, dimension needs 89: the dimension
         // part keeps its 89 px; the frame counter is squeezed to 61 and the
         // main part to 0 — the trailing dimension text stays readable.
-        assert_eq!(status_part_edges(150, 5, 60, 10, 17, 72), [0, 61, -1]);
+        assert_eq!(status_part_edges(150, 0, 5, 60, 10, 17, 72), [0, 61, -1]);
         // Comfortable case unchanged: main fills the remainder, frame gets
         // its full width, dimension runs to the right edge.
-        assert_eq!(status_part_edges(500, 5, 60, 10, 17, 72), [339, 411, -1]);
+        assert_eq!(status_part_edges(500, 0, 5, 60, 10, 17, 72), [339, 411, -1]);
     }
 
     #[test]
     fn an_empty_window_shows_only_the_dimension_part_at_the_edge() {
         // No image and no frame counter: everything collapses to the main
         // part plus the (empty, zero-width) slots.
-        assert_eq!(status_part_edges(640, 0, 0, 10, 17, 72), [640, 640, -1]);
+        assert_eq!(status_part_edges(640, 0, 0, 0, 10, 17, 72), [640, 640, -1]);
     }
 }
