@@ -47,6 +47,16 @@ const VK_ADD: u16 = 0x6b;
 const VK_SUBTRACT: u16 = 0x6d;
 const VK_OEM_PLUS: u16 = 0xbb;
 const VK_OEM_MINUS: u16 = 0xbd;
+// The Pan/Scan family (#44; WinUser.h VK_NUMPAD0..9 = 0x60..0x69).
+const VK_NUMPAD1: u16 = 0x61;
+const VK_NUMPAD2: u16 = 0x62;
+const VK_NUMPAD3: u16 = 0x63;
+const VK_NUMPAD4: u16 = 0x64;
+const VK_NUMPAD5: u16 = 0x65;
+const VK_NUMPAD6: u16 = 0x66;
+const VK_NUMPAD7: u16 = 0x67;
+const VK_NUMPAD8: u16 = 0x68;
+const VK_NUMPAD9: u16 = 0x69;
 
 /// The chord helper for table rows: modifiers plus a VK.
 const fn key(ctrl: bool, alt: bool, shift: bool, vk: u16) -> KeyDef {
@@ -110,6 +120,74 @@ const DEFAULT_KEYS: &[(Cmd, &[KeyDef])] = &[
     // View → Slideshow owns F11 (viv.c:996, upstream row order: after the
     // fullscreen row) — #37.
     (Cmd::ViewSlideshow, &[key(false, false, false, VK_F11)]),
+    // The Pan/Scan family (#44; upstream viv.c:1001-1016, between the
+    // window-size presets and the zoom rows — riviv has no preset rows
+    // yet, so directly after F11). The four diagonals and Move Center
+    // are Ctrl-modified; the six size steps and Reset are bare NUMPAD.
+    (
+        Cmd::ViewPanScanIncreaseSize,
+        &[key(false, false, false, VK_NUMPAD9)],
+    ),
+    (
+        Cmd::ViewPanScanDecreaseSize,
+        &[key(false, false, false, VK_NUMPAD1)],
+    ),
+    (
+        Cmd::ViewPanScanIncreaseWidth,
+        &[key(false, false, false, VK_NUMPAD6)],
+    ),
+    (
+        Cmd::ViewPanScanDecreaseWidth,
+        &[key(false, false, false, VK_NUMPAD4)],
+    ),
+    (
+        Cmd::ViewPanScanIncreaseHeight,
+        &[key(false, false, false, VK_NUMPAD8)],
+    ),
+    (
+        Cmd::ViewPanScanDecreaseHeight,
+        &[key(false, false, false, VK_NUMPAD2)],
+    ),
+    (
+        Cmd::ViewPanScanMoveUp,
+        &[key(true, false, false, VK_NUMPAD8)],
+    ),
+    (
+        Cmd::ViewPanScanMoveDown,
+        &[key(true, false, false, VK_NUMPAD2)],
+    ),
+    (
+        Cmd::ViewPanScanMoveLeft,
+        &[key(true, false, false, VK_NUMPAD4)],
+    ),
+    (
+        Cmd::ViewPanScanMoveRight,
+        &[key(true, false, false, VK_NUMPAD6)],
+    ),
+    (
+        Cmd::ViewPanScanMoveUpLeft,
+        &[key(true, false, false, VK_NUMPAD7)],
+    ),
+    (
+        Cmd::ViewPanScanMoveUpRight,
+        &[key(true, false, false, VK_NUMPAD9)],
+    ),
+    (
+        Cmd::ViewPanScanMoveDownLeft,
+        &[key(true, false, false, VK_NUMPAD1)],
+    ),
+    (
+        Cmd::ViewPanScanMoveDownRight,
+        &[key(true, false, false, VK_NUMPAD3)],
+    ),
+    (
+        Cmd::ViewPanScanMoveCenter,
+        &[key(true, false, false, VK_NUMPAD5)],
+    ),
+    (
+        Cmd::ViewPanScanReset,
+        &[key(false, false, false, VK_NUMPAD5)],
+    ),
     (
         Cmd::ViewZoomIn,
         &[

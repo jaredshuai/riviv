@@ -88,15 +88,17 @@ use windows::Win32::UI::WindowsAndMessaging::{
     PostMessageW, PostQuitMessage, RegisterClassExW, SC_MONITORPOWER, SHOW_WINDOW_CMD, SM_CXICON,
     SM_CXSMICON, SM_CYICON, SM_CYSMICON, SW_MAXIMIZE, SW_RESTORE, SW_SHOW, SW_SHOWNORMAL,
     SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOZORDER, SYSTEM_METRICS_INDEX,
-    SendMessageW, SetForegroundWindow, SetMenu, SetProcessDPIAware, SetTimer, SetWindowLongPtrW,
-    SetWindowPos, SetWindowTextW, ShowCursor, ShowWindow, TPM_CENTERALIGN, TPM_LEFTBUTTON,
-    TPM_VCENTERALIGN, TrackPopupMenu, TranslateMessage, USER_TIMER_MINIMUM, WINDOW_EX_STYLE,
-    WINDOW_STYLE, WM_ACTIVATE, WM_COMMAND, WM_CONTEXTMENU, WM_COPYDATA, WM_DESTROY, WM_DROPFILES,
-    WM_ENDSESSION, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_INITMENU, WM_KEYDOWN, WM_LBUTTONDBLCLK,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_MOVE, WM_NCCREATE, WM_NCDESTROY,
-    WM_NULL, WM_PAINT, WM_PASTE, WM_QUERYENDSESSION, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN,
-    WM_RBUTTONUP, WM_SIZE, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_TIMER, WNDCLASSEXW, WS_CAPTION,
-    WS_EX_ACCEPTFILES, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_THICKFRAME, WS_VISIBLE, WindowFromPoint,
+    SendMessageW, SetCursorPos, SetForegroundWindow, SetMenu, SetProcessDPIAware, SetTimer,
+    SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowCursor, ShowWindow, TPM_CENTERALIGN,
+    TPM_LEFTBUTTON, TPM_VCENTERALIGN, TrackPopupMenu, TranslateMessage, USER_TIMER_MINIMUM,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WM_ACTIVATE, WM_COMMAND, WM_CONTEXTMENU, WM_COPYDATA,
+    WM_DESTROY, WM_DROPFILES, WM_ENDSESSION, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_INITMENU,
+    WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_MOVE, WM_NCCREATE, WM_NCDESTROY, WM_NCXBUTTONDBLCLK,
+    WM_NCXBUTTONDOWN, WM_NULL, WM_PAINT, WM_PASTE, WM_QUERYENDSESSION, WM_RBUTTONDBLCLK,
+    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SIZE, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_TIMER,
+    WM_XBUTTONDBLCLK, WM_XBUTTONDOWN, WNDCLASSEXW, WS_CAPTION, WS_EX_ACCEPTFILES,
+    WS_OVERLAPPEDWINDOW, WS_POPUP, WS_THICKFRAME, WS_VISIBLE, WindowFromPoint,
 };
 use windows::core::{HSTRING, PCSTR, PCWSTR, w};
 
@@ -199,6 +201,12 @@ pub(crate) struct WindowState {
     /// (upstream `_viv_doing == _VIV_DOING_SCROLL` + `_viv_doing_x/y`,
     /// viv.c:14682-14693). `None` = not dragging.
     pub(crate) drag: Option<(i32, i32)>,
+    /// In-progress middle-drag scroll (#44; upstream `_viv_doing ==
+    /// _VIV_DOING_MSCROLL` + `_viv_mdoing_x/y`, viv.c:3329-3345): the
+    /// SCREEN anchor the cursor is re-pinned to — the scroll delta each
+    /// move is anchor minus the live cursor position. `None` = not
+    /// middle-dragging.
+    pub(crate) mscroll: Option<POINT>,
     /// Fullscreen state (#8; upstream `_viv_is_fullscreen`,
     /// `_viv_fullscreen_is_maxed`, `_viv_fullscreen_rect`,
     /// `_viv_fullscreen_zoom_offset`, viv.c:704-707). The rect is the
@@ -1053,6 +1061,48 @@ fn zoom_at(hwnd: HWND, out: bool, cursor: (i32, i32)) {
     }
 }
 
+/// One Pan/Scan size/width/height step (#44; upstream
+/// `VIV_ID_VIEW_PANSCAN_{INCREASE,DECREASE}_{SIZE,WIDTH,HEIGHT}` →
+/// `_viv_dst_zoom_set`, viv.c:2246-2268): the clamped index pair, repaint
+/// only when an index actually moved.
+fn panscan_step(hwnd: HWND, dx: i32, dy: i32) {
+    // SAFETY: the borrow spans only the pure step.
+    let changed = (unsafe { state_of(hwnd) }).is_some_and(|state| state.view.panscan.step(dx, dy));
+    if changed {
+        repaint(hwnd);
+    }
+}
+
+/// One Pan/Scan Move arrow (#44; upstream the eight MOVE commands →
+/// `_viv_dst_pos_set(x ± 5, y ± 5)`, viv.c:2270-2299): clamped, repaint
+/// only on a real position change.
+fn panscan_pan(hwnd: HWND, dx: i32, dy: i32) {
+    // SAFETY: the borrow spans only the pure pan.
+    let changed = (unsafe { state_of(hwnd) }).is_some_and(|state| state.view.panscan.pan(dx, dy));
+    if changed {
+        repaint(hwnd);
+    }
+}
+
+/// Move Center / Pan-Scan Reset (#44; upstream viv.c:2302-2313): both write
+/// the position directly and invalidate UNCONDITIONALLY (no change check),
+/// Reset additionally restores the identity factor indices.
+fn panscan_center(hwnd: HWND) {
+    // SAFETY: the borrow spans only the pure state write.
+    if let Some(state) = unsafe { state_of(hwnd) } {
+        state.view.panscan.center();
+    }
+    repaint(hwnd);
+}
+
+fn panscan_reset(hwnd: HWND) {
+    // SAFETY: the borrow spans only the pure state write.
+    if let Some(state) = unsafe { state_of(hwnd) } {
+        state.view.panscan.reset();
+    }
+    repaint(hwnd);
+}
+
 /// A `+`/`-` keypress zoom step — anchored at the viewport center (upstream
 /// `_viv_zoom_in` with have_xy=0 feeds the client-area center through the
 /// same wheel action, viv.c:11803-11821).
@@ -1274,8 +1324,16 @@ fn on_left_button_down(hwnd: HWND, lparam: LPARAM) {
         0 => {}
         _ => return,
     }
-    // SAFETY: the borrow spans only the drag-point store.
+    // Upstream's single `_viv_doing` slot: a left-press mid-middle-drag
+    // REPLACES the mscroll silently — no cursor restore, no cleanup
+    // (WM_LBUTTONDOWN's scroll arm never checks `_viv_doing`, viv.c:14682-
+    // 14693, while WM_MBUTTONDOWN's NOTHING-guard does, viv.c:3330). The
+    // unbalanced raw ShowCursor leaves the cursor hidden until some later
+    // complete mscroll pair re-balances it — upstream's own quirk, kept
+    // bug-for-bug.
+    // SAFETY: the borrow spans only the two field stores.
     if let Some(state) = unsafe { state_of(hwnd) } {
+        state.mscroll = None;
         state.drag = Some((pt.x, pt.y));
     }
     // SAFETY: hwnd is live and owned by this thread. Capture is released in
@@ -1350,6 +1408,38 @@ fn on_mouse_move(hwnd: HWND, lparam: LPARAM) {
     if panned {
         repaint(hwnd);
     }
+    // The middle-drag scroll (#44; upstream `_VIV_DOING_MSCROLL` arm,
+    // viv.c:3610-3625): the delta is the SCREEN anchor minus the live
+    // cursor, the cursor re-pins to the anchor after every move (the
+    // unbounded-virtual-mouse pattern), and the view scrolls by that
+    // delta — upstream computes it and re-pins but never wired the
+    // scroll call; riviv completes the evident intent (MPC-HC panscan
+    // drag: mouse right reveals the image's right side), a documented
+    // README deviation.
+    // SAFETY: the borrow spans the anchor read, the pure scroll, and the
+    // cursor re-pin — SetCursorPos pumps nothing (it delivers no
+    // WM_MOUSEMOVE), so no reentrant state_of borrow can interleave.
+    let mscrolled = (unsafe { state_of(hwnd) }).is_some_and(|state| {
+        let Some(anchor) = state.mscroll else {
+            return false;
+        };
+        let mut live = POINT::default();
+        // SAFETY: read-only cursor query, pumps nothing.
+        let _ = unsafe { GetCursorPos(&mut live) };
+        let (mx, my) = (anchor.x - live.x, anchor.y - live.y);
+        if mx == 0 && my == 0 {
+            return false;
+        }
+        let (vp, src) = viewport_and_src(hwnd, state);
+        let fit = fit_policy(state);
+        state.view.scroll_by(mx, my, src.0, src.1, vp, fit);
+        // SAFETY: raw position write; no messages result.
+        let _ = unsafe { SetCursorPos(anchor.x, anchor.y) };
+        true
+    });
+    if mscrolled {
+        repaint(hwnd);
+    }
 }
 
 /// WM_LBUTTONUP — end the drag (upstream `_viv_doing_cancel`,
@@ -1360,6 +1450,85 @@ fn on_left_button_up(hwnd: HWND) {
     if was_dragging {
         // SAFETY: we took the capture in WM_LBUTTONDOWN on this thread.
         let _ = unsafe { ReleaseCapture() };
+    }
+}
+
+/// WM_MBUTTONDOWN (#44; upstream viv.c:3329-3345): start the middle-drag
+/// scroll — capture, anchor the cursor's SCREEN position, then hide the
+/// cursor with a RAW `ShowCursor(FALSE)` the `CursorVisibility` flag never
+/// sees (upstream's `_viv_is_cursor_shown` stays 1, so `_viv_show_cursor`
+/// no-ops for the whole drag; viv.c:14559-14571 — the hide lasts until the
+/// cancel path's raw ShowCursor(TRUE)). Guarded: only when neither drag
+/// mode is in progress (upstream's `_viv_doing == _VIV_DOING_NOTHING`).
+fn on_middle_button_down(hwnd: HWND) {
+    let mut pt = POINT::default();
+    // SAFETY: GetCursorPos is a read-only query that pumps nothing.
+    let _ = unsafe { GetCursorPos(&mut pt) };
+    // SAFETY: the borrow spans the guard and the anchor store.
+    let start = (unsafe { state_of(hwnd) }).is_some_and(|state| {
+        if state.drag.is_some() || state.mscroll.is_some() {
+            return false;
+        }
+        state.mscroll = Some(pt);
+        true
+    });
+    if !start {
+        return;
+    }
+    // SAFETY: hwnd is live and owned by this thread; the capture is
+    // released on every mscroll cancel path (MBUTTONUP / ESC).
+    let _ = unsafe { SetCapture(hwnd) };
+    // SAFETY: raw display-count hide, upstream viv.c:3344.
+    unsafe {
+        let _ = ShowCursor(false);
+    }
+}
+
+/// WM_MBUTTONUP — end the middle-drag scroll (upstream WM_MBUTTONUP →
+/// `_viv_doing_cancel`, viv.c:3667-3670 + 7850-7871): release the capture
+/// and re-show the cursor, both only if a middle-drag was live.
+fn on_middle_button_up(hwnd: HWND) {
+    // SAFETY: the borrow spans only the Option take.
+    let was_mscrolling =
+        (unsafe { state_of(hwnd) }).is_some_and(|state| state.mscroll.take().is_some());
+    if was_mscrolling {
+        // SAFETY: the capture and the raw cursor hide were both taken on
+        // this thread in WM_MBUTTONDOWN.
+        unsafe {
+            let _ = ReleaseCapture();
+            let _ = ShowCursor(true);
+        }
+    }
+}
+
+/// WM_XBUTTONDOWN / WM_XBUTTONDBLCLK (and the NC variants) — the mouse
+/// back/forward buttons (#44; upstream filters these pre-dispatch in
+/// `_viv_is_msg`, viv.c:6302-6343): `xbutton_action` 1 zooms (back = out,
+/// forward = in, anchored at the message point), 2 navigates (back =
+/// previous, forward = next); every other value is inert (upstream's
+/// switch has only the two arms). The NC variants carry SCREEN
+/// coordinates through the same client-coordinate path — upstream feeds
+/// `GET_X_LPARAM` straight into `_viv_zoom_in` (ClientToScreen on screen
+/// coords, viv.c:6322-6329) — kept bug-for-bug.
+fn on_xbutton(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
+    const XBUTTON1: u16 = 0x0001;
+    const XBUTTON2: u16 = 0x0002;
+    let button = ((wparam.0 >> 16) & 0xffff) as u16;
+    // SAFETY: the borrow spans only the config read.
+    let action = (unsafe { state_of(hwnd) }).map_or(0, |s| s.config.xbutton_action);
+    let pt = lparam_point(lparam);
+    match action {
+        1 => match button {
+            XBUTTON1 => zoom_at(hwnd, true, (pt.x, pt.y)),
+            XBUTTON2 => zoom_at(hwnd, false, (pt.x, pt.y)),
+            _ => {}
+        },
+        2 => match button {
+            XBUTTON1 => nav_next(hwnd, true, true, false),
+            XBUTTON2 => nav_next(hwnd, false, true, false),
+            _ => {}
+        },
+        _ => {}
     }
 }
 
@@ -4124,6 +4293,25 @@ fn on_command(hwnd: HWND, cmd: menu::Cmd) {
         // position — viv.c:1678-1687/2059-2064); riviv's Ctrl+0 reset is
         // that action.
         menu::Cmd::ViewBestFit | menu::Cmd::ViewZoomReset => zoom_reset(hwnd),
+        // The Pan/Scan family (#44; upstream viv.c:2246-2313): the six
+        // size steps move the per-axis factor indices, the eight arrows
+        // and Center the pan position, Reset both to identity.
+        menu::Cmd::ViewPanScanIncreaseSize => panscan_step(hwnd, 1, 1),
+        menu::Cmd::ViewPanScanDecreaseSize => panscan_step(hwnd, -1, -1),
+        menu::Cmd::ViewPanScanIncreaseWidth => panscan_step(hwnd, 1, 0),
+        menu::Cmd::ViewPanScanDecreaseWidth => panscan_step(hwnd, -1, 0),
+        menu::Cmd::ViewPanScanIncreaseHeight => panscan_step(hwnd, 0, 1),
+        menu::Cmd::ViewPanScanDecreaseHeight => panscan_step(hwnd, 0, -1),
+        menu::Cmd::ViewPanScanMoveUp => panscan_pan(hwnd, 0, -5),
+        menu::Cmd::ViewPanScanMoveDown => panscan_pan(hwnd, 0, 5),
+        menu::Cmd::ViewPanScanMoveLeft => panscan_pan(hwnd, -5, 0),
+        menu::Cmd::ViewPanScanMoveRight => panscan_pan(hwnd, 5, 0),
+        menu::Cmd::ViewPanScanMoveUpLeft => panscan_pan(hwnd, -5, -5),
+        menu::Cmd::ViewPanScanMoveUpRight => panscan_pan(hwnd, 5, -5),
+        menu::Cmd::ViewPanScanMoveDownLeft => panscan_pan(hwnd, -5, 5),
+        menu::Cmd::ViewPanScanMoveDownRight => panscan_pan(hwnd, 5, 5),
+        menu::Cmd::ViewPanScanMoveCenter => panscan_center(hwnd),
+        menu::Cmd::ViewPanScanReset => panscan_reset(hwnd),
         menu::Cmd::ViewZoomIn => zoom_step_centered(hwnd, false),
         menu::Cmd::ViewZoomOut => zoom_step_centered(hwnd, true),
         // The Options dialog (#24) — modal over the viewer; commits into
@@ -4399,13 +4587,23 @@ fn on_keydown(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
     // "stop presenting" gesture, viv.c:6376-6382). This arm is NOT a
     // binding: it stands even when the ini binds ESC somewhere.
     if vk == VK_ESCAPE.0 && !ctrl && !shift && !alt {
-        // SAFETY: the borrow spans only the Option take.
-        let was_dragging =
-            (unsafe { state_of(hwnd) }).is_some_and(|state| state.drag.take().is_some());
-        if was_dragging {
-            // SAFETY: the capture was taken on this thread in
-            // WM_LBUTTONDOWN.
+        // SAFETY: the borrow spans the two Option takes.
+        let canceled = (unsafe { state_of(hwnd) })
+            .map(|state| (state.drag.take().is_some(), state.mscroll.take().is_some()));
+        if let Some((was_dragging, was_mscrolling)) = canceled
+            && (was_dragging || was_mscrolling)
+        {
+            // SAFETY: the capture was taken on this thread by a
+            // button-down arm; the raw cursor re-show balances the
+            // middle-drag's raw hide (upstream `_viv_doing_cancel`,
+            // viv.c:7850-7871).
             let _ = unsafe { ReleaseCapture() };
+            if was_mscrolling {
+                // SAFETY: as above.
+                unsafe {
+                    let _ = ShowCursor(true);
+                }
+            }
             return;
         }
         // SAFETY: the read-only borrow ends inside is_some_and.
@@ -4778,6 +4976,27 @@ unsafe extern "system" fn wnd_proc(
         WM_LBUTTONUP => {
             on_left_button_up(hwnd);
             LRESULT(0)
+        }
+        // The middle-button scroll pair (#44; upstream viv.c:3329-3345 /
+        // 3667-3670).
+        WM_MBUTTONDOWN => {
+            on_middle_button_down(hwnd);
+            LRESULT(0)
+        }
+        WM_MBUTTONUP => {
+            on_middle_button_up(hwnd);
+            LRESULT(0)
+        }
+        // The mouse back/forward buttons (#44; upstream intercepts DOWN,
+        // DBLCLK and the NC variants identically in its pre-dispatch
+        // filter, viv.c:6302-6343 — each fires the action once, and the
+        // messages still fall through to normal dispatch there, so no
+        // swallow here either).
+        WM_XBUTTONDOWN | WM_XBUTTONDBLCLK | WM_NCXBUTTONDOWN | WM_NCXBUTTONDBLCLK => {
+            on_xbutton(hwnd, wparam, lparam);
+            // SAFETY: the parameters are exactly this callback's own; the
+            // default procedure owns everything unmatched.
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
         // Upstream viv.c:3547-3555 — the deactivate arm compares the FULL
         // wParam against WA_INACTIVE (0); the guard flag swallows the
@@ -5392,6 +5611,7 @@ pub(crate) fn run() -> Result<(), String> {
         nav_current: None,
         view: View::new(),
         drag: None,
+        mscroll: None,
         fullscreen: false,
         fullscreen_was_maxed: false,
         fullscreen_restore_rect: RECT::default(),

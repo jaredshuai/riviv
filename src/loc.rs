@@ -77,6 +77,41 @@ pub(crate) enum Id {
     MenuOneToOne,
     /// View → "Best Fit" (viv.c:865).
     MenuBestFit,
+    /// View → Pan/Scan popup caption (#44; viv.c:870).
+    MenuPanScan,
+    /// Pan/Scan → "Increase Size" (#44; viv.c:871).
+    MenuPanScanIncreaseSize,
+    /// Pan/Scan → "Decrease Size" (#44; viv.c:872).
+    MenuPanScanDecreaseSize,
+    /// Pan/Scan → "Increase Width" (#44; viv.c:873).
+    MenuPanScanIncreaseWidth,
+    /// Pan/Scan → "Decrease Width" (#44; viv.c:874).
+    MenuPanScanDecreaseWidth,
+    /// Pan/Scan → "Increase Height" (#44; viv.c:875).
+    MenuPanScanIncreaseHeight,
+    /// Pan/Scan → "Decrease Height" (#44; viv.c:876).
+    MenuPanScanDecreaseHeight,
+    /// Pan/Scan → "Move Up" (#44; viv.c:890).
+    MenuPanScanMoveUp,
+    /// Pan/Scan → "Move Down" (#44; viv.c:891).
+    MenuPanScanMoveDown,
+    /// Pan/Scan → "Move Left" (#44; viv.c:892).
+    MenuPanScanMoveLeft,
+    /// Pan/Scan → "Move Right" (#44; viv.c:893).
+    MenuPanScanMoveRight,
+    /// Pan/Scan → "Move Up Left" (#44; viv.c:881 — MF_OWNERDRAW
+    /// upstream, keyboard-only like the #38 jump family).
+    MenuPanScanMoveUpLeft,
+    /// Pan/Scan → "Move Up Right" (#44; viv.c:882 — MF_OWNERDRAW).
+    MenuPanScanMoveUpRight,
+    /// Pan/Scan → "Move Down Left" (#44; viv.c:883 — MF_OWNERDRAW).
+    MenuPanScanMoveDownLeft,
+    /// Pan/Scan → "Move Down Right" (#44; viv.c:884 — MF_OWNERDRAW).
+    MenuPanScanMoveDownRight,
+    /// Pan/Scan → "Move Center" (#44; viv.c:894).
+    MenuPanScanMoveCenter,
+    /// Pan/Scan → "Reset" (#44; viv.c:896).
+    MenuPanScanReset,
     /// View → Zoom popup caption (viv.c:907).
     MenuZoom,
     /// Zoom → "Zoom In" (viv.c:908).
@@ -169,6 +204,10 @@ pub(crate) enum Id {
     OptionsRightClickAction,
     /// Controls page: mouse wheel action label (en_us.h:237).
     OptionsMouseWheelAction,
+    /// Controls page: X button (mouse back/forward) action label — a
+    /// riviv addition (#44): upstream exposes `xbutton_action` in the ini
+    /// only, with no Options row.
+    OptionsXButtonAction,
     /// Controls page: the commands list caption (en_us.h:238).
     OptionsCommands,
     /// Controls page: the key-list group caption (en_us.h:239).
@@ -352,34 +391,51 @@ const EN_US: [&str; Id::COUNT] = [
     "All Image Files", // OpenAllImageFiles (en_us.h:261)
     "All Files",  // OpenAllFiles (en_us.h:262)
     // Menu block (en_us.h:34/35/36/38/52/67/70/77/88/89/97-100/115/160-164/177/182).
-    "&File",           // MenuFile
-    "&Open File...",   // MenuOpenFile
-    "Open &Folder...", // MenuOpenFolder
-    "&Add File...",    // MenuAddFile
-    "E&xit",           // MenuExit
-    "&Edit",           // MenuEdit (#41)
-    "Cu&t",            // MenuCut
-    "&Copy",           // MenuCopy
-    "Copy Filename",   // MenuCopyFilename — no mnemonic upstream
-    "Cop&y Image",     // MenuCopyImage
-    "&Paste",          // MenuPaste
-    "&View",           // MenuView
-    "&Menu",           // MenuMenu
-    "F&ullscreen",     // MenuFullscreen
-    "1:1",             // MenuOneToOne
-    "&Best Fit",       // MenuBestFit
-    "&Zoom",           // MenuZoom
-    "Zoom &In",        // MenuZoomIn
-    "Zoom &Out",       // MenuZoomOut
-    "&Reset",          // MenuZoomReset
-    "&Options...",     // MenuOptions
-    "&Navigate",       // MenuNavigate
-    "&Next",           // MenuNext
-    "P&revious",       // MenuPrevious
-    "&Home",           // MenuHome
-    "&End",            // MenuEnd
-    "&Help",           // MenuHelp
-    "&About",          // MenuAbout
+    "&File",             // MenuFile
+    "&Open File...",     // MenuOpenFile
+    "Open &Folder...",   // MenuOpenFolder
+    "&Add File...",      // MenuAddFile
+    "E&xit",             // MenuExit
+    "&Edit",             // MenuEdit (#41)
+    "Cu&t",              // MenuCut
+    "&Copy",             // MenuCopy
+    "Copy Filename",     // MenuCopyFilename — no mnemonic upstream
+    "Cop&y Image",       // MenuCopyImage
+    "&Paste",            // MenuPaste
+    "&View",             // MenuView
+    "&Menu",             // MenuMenu
+    "F&ullscreen",       // MenuFullscreen
+    "1:1",               // MenuOneToOne
+    "&Best Fit",         // MenuBestFit
+    "Pa&n && Scan",      // MenuPanScan (#44; en_us.h:90)
+    "&Increase Size",    // MenuPanScanIncreaseSize (en_us.h:91)
+    "&Decrease Size",    // MenuPanScanDecreaseSize (en_us.h:92)
+    "I&ncrease Width",   // MenuPanScanIncreaseWidth (en_us.h:93)
+    "D&ecrease Width",   // MenuPanScanDecreaseWidth (en_us.h:94)
+    "In&crease Height",  // MenuPanScanIncreaseHeight (en_us.h:95)
+    "De&cre&ase Height", // MenuPanScanDecreaseHeight (en_us.h:96)
+    "Move &Up",          // MenuPanScanMoveUp (en_us.h:101)
+    "Move &Down",        // MenuPanScanMoveDown (en_us.h:102)
+    "Move &Left",        // MenuPanScanMoveLeft (en_us.h:103)
+    "Move &Right",       // MenuPanScanMoveRight (en_us.h:104)
+    "Move Up Left",      // MenuPanScanMoveUpLeft (en_us.h:105)
+    "Move Up Right",     // MenuPanScanMoveUpRight (en_us.h:106)
+    "Move Down Left",    // MenuPanScanMoveDownLeft (en_us.h:107)
+    "Move Down Right",   // MenuPanScanMoveDownRight (en_us.h:108)
+    "Move Cen&ter",      // MenuPanScanMoveCenter (en_us.h:109)
+    "Re&set",            // MenuPanScanReset (en_us.h:110)
+    "&Zoom",             // MenuZoom
+    "Zoom &In",          // MenuZoomIn
+    "Zoom &Out",         // MenuZoomOut
+    "&Reset",            // MenuZoomReset
+    "&Options...",       // MenuOptions
+    "&Navigate",         // MenuNavigate
+    "&Next",             // MenuNext
+    "P&revious",         // MenuPrevious
+    "&Home",             // MenuHome
+    "&End",              // MenuEnd
+    "&Help",             // MenuHelp
+    "&About",            // MenuAbout
     // Options block (#24; en_us.h:209-237/263-275 + the two menu strings
     // 86-87 + two riviv-authored labels).
     "Options - riviv",                     // OptionsCaption (brand swap)
@@ -412,6 +468,7 @@ const EN_US: [&str; Id::COUNT] = [
     "&Left click action:", // OptionsLeftClickAction
     "&Right click action:", // OptionsRightClickAction
     "&Mouse wheel action:", // OptionsMouseWheelAction
+    "X &button action:", // OptionsXButtonAction — riviv addition (#44)
     "&Commands:",  // OptionsCommands
     "Settings for selected command", // OptionsSettingsForSelected
     "&Add...",     // OptionsAddKey
@@ -565,6 +622,23 @@ const ZH_CN: [&str; Id::COUNT] = [
     "全屏(&F)",          // MenuFullscreen
     "1:1",               // MenuOneToOne
     "最佳适应(&B)",      // MenuBestFit
+    "平移和扫描(&N)",    // MenuPanScan (#44; zh_cn.h:90)
+    "增大尺寸(&I)",      // MenuPanScanIncreaseSize (zh_cn.h:91)
+    "减小尺寸(&D)",      // MenuPanScanDecreaseSize (zh_cn.h:92)
+    "增加宽度(&W)",      // MenuPanScanIncreaseWidth (zh_cn.h:93)
+    "减小宽度(&W)",      // MenuPanScanDecreaseWidth (zh_cn.h:94)
+    "增加高度(&H)",      // MenuPanScanIncreaseHeight (zh_cn.h:95)
+    "减小高度(&E)",      // MenuPanScanDecreaseHeight (zh_cn.h:96)
+    "向上移动(&U)",      // MenuPanScanMoveUp (zh_cn.h:101)
+    "向下移动(&D)",      // MenuPanScanMoveDown (zh_cn.h:102)
+    "向左移动(&L)",      // MenuPanScanMoveLeft (zh_cn.h:103)
+    "向右移动(&R)",      // MenuPanScanMoveRight (zh_cn.h:104)
+    "向左上移动",        // MenuPanScanMoveUpLeft (zh_cn.h:105)
+    "向右上移动",        // MenuPanScanMoveUpRight (zh_cn.h:106)
+    "向左下移动",        // MenuPanScanMoveDownLeft (zh_cn.h:107)
+    "向右下移动",        // MenuPanScanMoveDownRight (zh_cn.h:108)
+    "居中(&C)",          // MenuPanScanMoveCenter (zh_cn.h:109)
+    "重置(&S)",          // MenuPanScanReset (zh_cn.h:110)
     "缩放(&Z)",          // MenuZoom
     "放大(&I)",          // MenuZoomIn
     "缩小(&O)",          // MenuZoomOut
@@ -608,6 +682,7 @@ const ZH_CN: [&str; Id::COUNT] = [
     "左键操作(&L):",                      // OptionsLeftClickAction
     "右键操作(&R):",                      // OptionsRightClickAction
     "鼠标滚轮操作(&M):",                  // OptionsMouseWheelAction
+    "X 键操作(&B):",                      // OptionsXButtonAction — riviv 增补 (#44)
     "命令(&C):",                          // OptionsCommands
     "所选命令的设置",                     // OptionsSettingsForSelected
     "添加(&A)...",                        // OptionsAddKey

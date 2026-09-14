@@ -103,6 +103,7 @@ mod mip;
 mod options;
 mod options_dlg;
 mod paint;
+mod panscan;
 mod pixels;
 mod playlist;
 mod preload;

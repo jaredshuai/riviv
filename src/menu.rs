@@ -60,6 +60,55 @@ pub(crate) enum Cmd {
     ViewOneToOne,
     /// View → Best Fit (`VIV_ID_VIEW_BESTFIT`).
     ViewBestFit,
+    /// View → Pan/Scan → Increase Size (#44; `VIV_ID_VIEW_PANSCAN_
+    /// INCREASE_SIZE`, viv.h:110 — NUMPAD9).
+    ViewPanScanIncreaseSize,
+    /// View → Pan/Scan → Decrease Size (#44; `VIV_ID_VIEW_PANSCAN_
+    /// DECREASE_SIZE`, viv.h:111 — NUMPAD1).
+    ViewPanScanDecreaseSize,
+    /// View → Pan/Scan → Increase Width (#44; `VIV_ID_VIEW_PANSCAN_
+    /// INCREASE_WIDTH`, viv.h:112 — NUMPAD6).
+    ViewPanScanIncreaseWidth,
+    /// View → Pan/Scan → Decrease Width (#44; `VIV_ID_VIEW_PANSCAN_
+    /// DECREASE_WIDTH`, viv.h:113 — NUMPAD4).
+    ViewPanScanDecreaseWidth,
+    /// View → Pan/Scan → Increase Height (#44; `VIV_ID_VIEW_PANSCAN_
+    /// INCREASE_HEIGHT`, viv.h:114 — NUMPAD8).
+    ViewPanScanIncreaseHeight,
+    /// View → Pan/Scan → Decrease Height (#44; `VIV_ID_VIEW_PANSCAN_
+    /// DECREASE_HEIGHT`, viv.h:115 — NUMPAD2).
+    ViewPanScanDecreaseHeight,
+    /// View → Pan/Scan → Move Up (#44; `VIV_ID_VIEW_PANSCAN_MOVE_UP`,
+    /// viv.h:116 — Ctrl+NUMPAD8).
+    ViewPanScanMoveUp,
+    /// View → Pan/Scan → Move Down (#44; `VIV_ID_VIEW_PANSCAN_MOVE_DOWN`,
+    /// viv.h:117 — Ctrl+NUMPAD2).
+    ViewPanScanMoveDown,
+    /// View → Pan/Scan → Move Left (#44; `VIV_ID_VIEW_PANSCAN_MOVE_LEFT`,
+    /// viv.h:118 — Ctrl+NUMPAD4).
+    ViewPanScanMoveLeft,
+    /// View → Pan/Scan → Move Right (#44; `VIV_ID_VIEW_PANSCAN_MOVE_RIGHT`,
+    /// viv.h:119 — Ctrl+NUMPAD6).
+    ViewPanScanMoveRight,
+    /// View → Pan/Scan → Move Up Left (#44; `VIV_ID_VIEW_PANSCAN_MOVE_UP_
+    /// LEFT`, viv.h:120 — MF_OWNERDRAW upstream, keyboard-only
+    /// Ctrl+NUMPAD7 like the #38 jump family).
+    ViewPanScanMoveUpLeft,
+    /// View → Pan/Scan → Move Up Right (#44; `VIV_ID_VIEW_PANSCAN_MOVE_UP_
+    /// RIGHT`, viv.h:121 — MF_OWNERDRAW, Ctrl+NUMPAD9).
+    ViewPanScanMoveUpRight,
+    /// View → Pan/Scan → Move Down Left (#44; `VIV_ID_VIEW_PANSCAN_MOVE_
+    /// DOWN_LEFT`, viv.h:122 — MF_OWNERDRAW, Ctrl+NUMPAD1).
+    ViewPanScanMoveDownLeft,
+    /// View → Pan/Scan → Move Down Right (#44; `VIV_ID_VIEW_PANSCAN_MOVE_
+    /// DOWN_RIGHT`, viv.h:123 — MF_OWNERDRAW, Ctrl+NUMPAD3).
+    ViewPanScanMoveDownRight,
+    /// View → Pan/Scan → Move Center (#44; `VIV_ID_VIEW_PANSCAN_MOVE_
+    /// CENTER`, viv.h:124 — Ctrl+NUMPAD5).
+    ViewPanScanMoveCenter,
+    /// View → Pan/Scan → Reset (#44; `VIV_ID_VIEW_PANSCAN_RESET`,
+    /// viv.h:125 — NUMPAD5).
+    ViewPanScanReset,
     /// Zoom → Zoom In (`VIV_ID_VIEW_ZOOM_IN`).
     ViewZoomIn,
     /// Zoom → Zoom Out (`VIV_ID_VIEW_ZOOM_OUT`).
@@ -255,6 +304,22 @@ impl Cmd {
         Self::ViewSlideshow,
         Self::ViewOneToOne,
         Self::ViewBestFit,
+        Self::ViewPanScanIncreaseSize,
+        Self::ViewPanScanDecreaseSize,
+        Self::ViewPanScanIncreaseWidth,
+        Self::ViewPanScanDecreaseWidth,
+        Self::ViewPanScanIncreaseHeight,
+        Self::ViewPanScanDecreaseHeight,
+        Self::ViewPanScanMoveUp,
+        Self::ViewPanScanMoveDown,
+        Self::ViewPanScanMoveLeft,
+        Self::ViewPanScanMoveRight,
+        Self::ViewPanScanMoveUpLeft,
+        Self::ViewPanScanMoveUpRight,
+        Self::ViewPanScanMoveDownLeft,
+        Self::ViewPanScanMoveDownRight,
+        Self::ViewPanScanMoveCenter,
+        Self::ViewPanScanReset,
         Self::ViewZoomIn,
         Self::ViewZoomOut,
         Self::ViewZoomReset,
@@ -322,6 +387,9 @@ pub(crate) enum Slot {
     /// — between File and View in the root order).
     Edit,
     View,
+    /// The View → Pan/Scan popup (#44; upstream `_VIV_MENU_VIEW_PANSCAN`,
+    /// viv.c:870 — between Best Fit and Zoom).
+    ViewPanScan,
     ViewZoom,
     /// The Slideshow top-level menu (#37; upstream `_VIV_MENU_SLIDESHOW`,
     /// viv.c:892 — between View and Animation in the root order).
@@ -508,6 +576,102 @@ pub(crate) const ENTRIES: &[Entry] = &[
         loc: loc::Id::MenuBestFit,
         parent: Slot::View,
         cmd: Cmd::ViewBestFit,
+    },
+    // View → Pan/Scan (#44; upstream viv.c:870-896): the popup after Best
+    // Fit, six size steps, a separator, the move family (the four
+    // diagonals MF_OWNERDRAW = menu-hidden, viv.c:881-884), a separator,
+    // then Reset. Upstream's table interleaves the Zoom popup between the
+    // size and move halves, but the built menus are the same either way.
+    Entry::Popup {
+        loc: loc::Id::MenuPanScan,
+        parent: Slot::View,
+        slot: Slot::ViewPanScan,
+    },
+    Entry::Item {
+        loc: loc::Id::MenuPanScanIncreaseSize,
+        parent: Slot::ViewPanScan,
+        cmd: Cmd::ViewPanScanIncreaseSize,
+    },
+    Entry::Item {
+        loc: loc::Id::MenuPanScanDecreaseSize,
+        parent: Slot::ViewPanScan,
+        cmd: Cmd::ViewPanScanDecreaseSize,
+    },
+    Entry::Item {
+        loc: loc::Id::MenuPanScanIncreaseWidth,
+        parent: Slot::ViewPanScan,
+        cmd: Cmd::ViewPanScanIncreaseWidth,
+    },
+    Entry::Item {
+        loc: loc::Id::MenuPanScanDecreaseWidth,
+        parent: Slot::ViewPanScan,
+        cmd: Cmd::ViewPanScanDecreaseWidth,
+    },
+    Entry::Item {
+        loc: loc::Id::MenuPanScanIncreaseHeight,
+        parent: Slot::ViewPanScan,
+        cmd: Cmd::ViewPanScanIncreaseHeight,
+    },
+    Entry::Item {
+        loc: loc::Id::MenuPanScanDecreaseHeight,
+        parent: Slot::ViewPanScan,
+        cmd: Cmd::ViewPanScanDecreaseHeight,
+    },
+    Entry::Separator {
+        parent: Slot::ViewPanScan,
+    },
+    Entry::Item {
+        loc: loc::Id::MenuPanScanMoveUp,
+        parent: Slot::ViewPanScan,
+        cmd: Cmd::ViewPanScanMoveUp,
+    },
+    Entry::Item {
+        loc: loc::Id::MenuPanScanMoveDown,
+        parent: Slot::ViewPanScan,
+        cmd: Cmd::ViewPanScanMoveDown,
+    },
+    Entry::Item {
+        loc: loc::Id::MenuPanScanMoveLeft,
+        parent: Slot::ViewPanScan,
+        cmd: Cmd::ViewPanScanMoveLeft,
+    },
+    Entry::Item {
+        loc: loc::Id::MenuPanScanMoveRight,
+        parent: Slot::ViewPanScan,
+        cmd: Cmd::ViewPanScanMoveRight,
+    },
+    Entry::HiddenItem {
+        loc: loc::Id::MenuPanScanMoveUpLeft,
+        parent: Slot::ViewPanScan,
+        cmd: Cmd::ViewPanScanMoveUpLeft,
+    },
+    Entry::HiddenItem {
+        loc: loc::Id::MenuPanScanMoveUpRight,
+        parent: Slot::ViewPanScan,
+        cmd: Cmd::ViewPanScanMoveUpRight,
+    },
+    Entry::HiddenItem {
+        loc: loc::Id::MenuPanScanMoveDownLeft,
+        parent: Slot::ViewPanScan,
+        cmd: Cmd::ViewPanScanMoveDownLeft,
+    },
+    Entry::HiddenItem {
+        loc: loc::Id::MenuPanScanMoveDownRight,
+        parent: Slot::ViewPanScan,
+        cmd: Cmd::ViewPanScanMoveDownRight,
+    },
+    Entry::Item {
+        loc: loc::Id::MenuPanScanMoveCenter,
+        parent: Slot::ViewPanScan,
+        cmd: Cmd::ViewPanScanMoveCenter,
+    },
+    Entry::Separator {
+        parent: Slot::ViewPanScan,
+    },
+    Entry::Item {
+        loc: loc::Id::MenuPanScanReset,
+        parent: Slot::ViewPanScan,
+        cmd: Cmd::ViewPanScanReset,
     },
     Entry::Popup {
         loc: loc::Id::MenuZoom,
@@ -1064,46 +1228,64 @@ mod tests {
         assert_eq!(Cmd::EditCopyImage.id(), 10);
         assert_eq!(Cmd::EditPaste.id(), 11);
         assert_eq!(Cmd::ViewSlideshow.id(), 14);
-        assert_eq!(Cmd::SlideshowPause.id(), 21);
-        assert_eq!(Cmd::SlideshowRateDecrease.id(), 22);
-        assert_eq!(Cmd::SlideshowRateIncrease.id(), 23);
-        assert_eq!(Cmd::SlideshowRate250.id(), 24);
-        assert_eq!(Cmd::SlideshowRate500.id(), 25);
-        assert_eq!(Cmd::SlideshowRateCustom.id(), 41);
+        // The #44 Pan/Scan block runs 17-32 (viv.h:110-125 order, right
+        // after ViewBestFit=16), pushing every later id by 16.
+        assert_eq!(Cmd::ViewPanScanIncreaseSize.id(), 17);
+        assert_eq!(Cmd::ViewPanScanDecreaseSize.id(), 18);
+        assert_eq!(Cmd::ViewPanScanIncreaseWidth.id(), 19);
+        assert_eq!(Cmd::ViewPanScanDecreaseWidth.id(), 20);
+        assert_eq!(Cmd::ViewPanScanIncreaseHeight.id(), 21);
+        assert_eq!(Cmd::ViewPanScanDecreaseHeight.id(), 22);
+        assert_eq!(Cmd::ViewPanScanMoveUp.id(), 23);
+        assert_eq!(Cmd::ViewPanScanMoveDown.id(), 24);
+        assert_eq!(Cmd::ViewPanScanMoveLeft.id(), 25);
+        assert_eq!(Cmd::ViewPanScanMoveRight.id(), 26);
+        assert_eq!(Cmd::ViewPanScanMoveUpLeft.id(), 27);
+        assert_eq!(Cmd::ViewPanScanMoveUpRight.id(), 28);
+        assert_eq!(Cmd::ViewPanScanMoveDownLeft.id(), 29);
+        assert_eq!(Cmd::ViewPanScanMoveDownRight.id(), 30);
+        assert_eq!(Cmd::ViewPanScanMoveCenter.id(), 31);
+        assert_eq!(Cmd::ViewPanScanReset.id(), 32);
+        assert_eq!(Cmd::SlideshowPause.id(), 37);
+        assert_eq!(Cmd::SlideshowRateDecrease.id(), 38);
+        assert_eq!(Cmd::SlideshowRateIncrease.id(), 39);
+        assert_eq!(Cmd::SlideshowRate250.id(), 40);
+        assert_eq!(Cmd::SlideshowRate500.id(), 41);
+        assert_eq!(Cmd::SlideshowRateCustom.id(), 57);
         // The #38 Animation block runs 37-50 upstream-side (#37's NavNext
         // was 37; the 14 Animation commands pushed it to 51) — with the
-        // #41 shift it lands 42-55.
-        assert_eq!(Cmd::AnimationPlayPause.id(), 42);
-        assert_eq!(Cmd::AnimationJumpForwardMedium.id(), 43);
-        assert_eq!(Cmd::AnimationJumpBackwardMedium.id(), 44);
-        assert_eq!(Cmd::AnimationJumpForwardShort.id(), 45);
-        assert_eq!(Cmd::AnimationJumpBackwardShort.id(), 46);
-        assert_eq!(Cmd::AnimationJumpForwardLong.id(), 47);
-        assert_eq!(Cmd::AnimationJumpBackwardLong.id(), 48);
-        assert_eq!(Cmd::AnimationFrameStep.id(), 49);
-        assert_eq!(Cmd::AnimationFramePrev.id(), 50);
-        assert_eq!(Cmd::AnimationFirstFrame.id(), 51);
-        assert_eq!(Cmd::AnimationLastFrame.id(), 52);
-        assert_eq!(Cmd::AnimationRateDecrease.id(), 53);
-        assert_eq!(Cmd::AnimationRateIncrease.id(), 54);
-        assert_eq!(Cmd::AnimationRateReset.id(), 55);
-        assert_eq!(Cmd::NavNext.id(), 56);
+        // #41 and #44 shifts it lands 58-71.
+        assert_eq!(Cmd::AnimationPlayPause.id(), 58);
+        assert_eq!(Cmd::AnimationJumpForwardMedium.id(), 59);
+        assert_eq!(Cmd::AnimationJumpBackwardMedium.id(), 60);
+        assert_eq!(Cmd::AnimationJumpForwardShort.id(), 61);
+        assert_eq!(Cmd::AnimationJumpBackwardShort.id(), 62);
+        assert_eq!(Cmd::AnimationJumpForwardLong.id(), 63);
+        assert_eq!(Cmd::AnimationJumpBackwardLong.id(), 64);
+        assert_eq!(Cmd::AnimationFrameStep.id(), 65);
+        assert_eq!(Cmd::AnimationFramePrev.id(), 66);
+        assert_eq!(Cmd::AnimationFirstFrame.id(), 67);
+        assert_eq!(Cmd::AnimationLastFrame.id(), 68);
+        assert_eq!(Cmd::AnimationRateDecrease.id(), 69);
+        assert_eq!(Cmd::AnimationRateIncrease.id(), 70);
+        assert_eq!(Cmd::AnimationRateReset.id(), 71);
+        assert_eq!(Cmd::NavNext.id(), 72);
         // The #39 sort/shuffle/jumpto block (menu-table order,
-        // viv.c:946-956); HelpAbout lands 69.
-        assert_eq!(Cmd::NavSortName.id(), 60);
-        assert_eq!(Cmd::NavSortFullPath.id(), 61);
-        assert_eq!(Cmd::NavSortSize.id(), 62);
-        assert_eq!(Cmd::NavSortDateModified.id(), 63);
-        assert_eq!(Cmd::NavSortDateCreated.id(), 64);
-        assert_eq!(Cmd::NavSortAscending.id(), 65);
-        assert_eq!(Cmd::NavSortDescending.id(), 66);
-        assert_eq!(Cmd::NavShuffle.id(), 67);
-        assert_eq!(Cmd::NavJumpTo.id(), 68);
+        // viv.c:946-956); HelpCommandLineOptions lands 85, HelpAbout 86.
+        assert_eq!(Cmd::NavSortName.id(), 76);
+        assert_eq!(Cmd::NavSortFullPath.id(), 77);
+        assert_eq!(Cmd::NavSortSize.id(), 78);
+        assert_eq!(Cmd::NavSortDateModified.id(), 79);
+        assert_eq!(Cmd::NavSortDateCreated.id(), 80);
+        assert_eq!(Cmd::NavSortAscending.id(), 81);
+        assert_eq!(Cmd::NavSortDescending.id(), 82);
+        assert_eq!(Cmd::NavShuffle.id(), 83);
+        assert_eq!(Cmd::NavJumpTo.id(), 84);
         // The #48 Help→Command Line Options row takes upstream's slot
-        // between the (unshipped) help rows and About: 69, pushing
-        // HelpAbout to 70.
-        assert_eq!(Cmd::HelpCommandLineOptions.id(), 69);
-        assert_eq!(Cmd::HelpAbout.id(), 70);
+        // between the (unshipped) help rows and About: 85, pushing
+        // HelpAbout to 86.
+        assert_eq!(Cmd::HelpCommandLineOptions.id(), 85);
+        assert_eq!(Cmd::HelpAbout.id(), 86);
     }
 
     #[test]
@@ -1421,10 +1603,12 @@ mod tests {
     fn the_owner_draw_rows_hide_from_the_menu_bar_only() {
         // Upstream's MF_OWNERDRAW rows: present in the command table
         // (Controls list + WM_COMMAND + ini names), absent from the menu
-        // bar build (viv.c:12328). The animation quartet (viv.c:925-928)
-        // plus the #41 clipboard pair — Copy Filename (viv.c:828) and
-        // Paste (viv.c:830), keyboard Ctrl+Shift+C / Ctrl+V upstream. The
-        // table marks them HiddenItem; the visible Jump pair stays Item.
+        // bar build (viv.c:12328). The animation quartet (viv.c:925-928),
+        // the #41 clipboard pair — Copy Filename (viv.c:828) and Paste
+        // (viv.c:830), keyboard Ctrl+Shift+C / Ctrl+V upstream — and #44's
+        // four diagonal Pan/Scan moves (viv.c:881-884, Ctrl+NUMPAD
+        // corners). The table marks them HiddenItem; the visible rows
+        // stay Item.
         let hidden: Vec<Cmd> = ENTRIES
             .iter()
             .filter_map(|e| match e {
@@ -1437,6 +1621,10 @@ mod tests {
             vec![
                 Cmd::EditCopyFilename,
                 Cmd::EditPaste,
+                Cmd::ViewPanScanMoveUpLeft,
+                Cmd::ViewPanScanMoveUpRight,
+                Cmd::ViewPanScanMoveDownLeft,
+                Cmd::ViewPanScanMoveDownRight,
                 Cmd::AnimationJumpForwardShort,
                 Cmd::AnimationJumpBackwardShort,
                 Cmd::AnimationJumpForwardLong,
