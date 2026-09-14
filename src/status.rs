@@ -11,15 +11,18 @@
 //! (riviv has neither feature — #47); the counter and dimension parts keep
 //! upstream's trailing-slot semantics.
 
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, RECT, WPARAM};
+use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     GetDC, GetDeviceCaps, GetTextExtentPoint32W, HDC, HGDIOBJ, LOGPIXELSY, ReleaseDC, SelectObject,
 };
-use windows::Win32::UI::Controls::{SB_SETPARTS, SB_SETTEXTW, SBARS_SIZEGRIP};
+use windows::Win32::UI::Controls::{
+    SB_GETPARTS, SB_GETRECT, SB_SETPARTS, SB_SETTEXTW, SBARS_SIZEGRIP,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, GetSystemMetrics, GetWindowRect, HMENU, SM_CXBORDER, SM_CXEDGE, SM_CXVSCROLL,
-    SendMessageW, WINDOW_STYLE, WM_GETFONT, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
-    WS_EX_COMPOSITED, WS_VISIBLE,
+    CallWindowProcW, CreateWindowExW, GWL_WNDPROC, GetSystemMetrics, GetWindowRect, HMENU,
+    SM_CXBORDER, SM_CXEDGE, SM_CXVSCROLL, SendMessageW, SetWindowLongPtrW, WINDOW_STYLE,
+    WM_GETFONT, WM_LBUTTONDOWN, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_COMPOSITED,
+    WS_VISIBLE,
 };
 use windows::core::{PCWSTR, w};
 
@@ -67,10 +70,13 @@ pub(crate) struct StatusSnapshot {
 /// common control itself paints it only while the parent is resizable and
 /// not maximized). The caller must have registered the common-control
 /// classes first (upstream init's `InitCommonControlsEx`, viv.c:5236-5242).
+/// The bar is then subclassed for the part-0 drag-to-move (#45; upstream
+/// `_viv_status_proc`, viv.c:11543-11569 — gated on
+/// `config_toolbar_move_window` like the strip and menu-bar drags).
 pub(crate) fn create(parent: HWND, hinstance: HINSTANCE) -> Result<HWND, String> {
     // SAFETY: parent/hinstance are live; the class is comctl32's status
     // bar, registered by the caller's InitCommonControlsEx.
-    unsafe {
+    let hwnd = unsafe {
         CreateWindowExW(
             WS_EX_COMPOSITED,
             w!("msctls_statusbar32"),
@@ -88,7 +94,108 @@ pub(crate) fn create(parent: HWND, hinstance: HINSTANCE) -> Result<HWND, String>
             None,
         )
     }
-    .map_err(|e| format!("status bar CreateWindowExW failed: {e}"))
+    .map_err(|e| format!("status bar CreateWindowExW failed: {e}"))?;
+    subclass_for_drag(hwnd);
+    Ok(hwnd)
+}
+
+/// The bar's original wndproc, stashed by the subclass swap. A process
+/// owns at most one bar at a time (fullscreen destroys and recreates);
+/// each create re-swaps and overwrites — the previous window is gone by
+/// then, its proc value moot.
+static OLD_STATUS_PROC: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+
+fn subclass_for_drag(hwnd: HWND) {
+    // SAFETY: hwnd is our fresh child on this thread; the swap hands back
+    // the control's own proc, stored for the CallWindowProc forward. The
+    // fn-pointer round-trip goes through *const () per the lint's advice.
+    let old = unsafe {
+        SetWindowLongPtrW(
+            hwnd,
+            GWL_WNDPROC,
+            status_drag_proc as *const () as usize as isize,
+        )
+    };
+    OLD_STATUS_PROC.store(old, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The subclass (upstream `_viv_status_proc`, viv.c:11543-11569): a
+/// left-button press on part 0 (the elastic main text) enters the window
+/// move loop while `toolbar_move_window` is set; everything else — the
+/// size grip included, which lives in the control's own NC handling —
+/// reaches the original proc unchanged.
+unsafe extern "system" fn status_drag_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if msg == WM_LBUTTONDOWN
+        && crate::window::toolbar_move_window_enabled(hwnd)
+        && statusbar_index_from_x(hwnd, (lparam.0 & 0xffff) as i16 as i32) == Some(0)
+    {
+        // SAFETY: the move loop pumps; no borrows are live out here (the
+        // gate read its config inside its own short borrow).
+        crate::window::start_move_window(hwnd);
+        return LRESULT(0);
+    }
+    let old = OLD_STATUS_PROC.load(std::sync::atomic::Ordering::Relaxed);
+    if old == 0 {
+        // The swap never happened (theoretical); degrade to the default
+        // procedure.
+        // SAFETY: the parameters are exactly this callback's own.
+        return unsafe {
+            windows::Win32::UI::WindowsAndMessaging::DefWindowProcW(hwnd, msg, wparam, lparam)
+        };
+    }
+    // SAFETY: `old` is the status control's own proc captured by the
+    // SetWindowLongPtrW swap; CallWindowProc takes it as the fn-pointer
+    // flavor of WNDPROC (Option<fn>), so the isize transmutes to the raw
+    // fn and rides in Some.
+    unsafe {
+        CallWindowProcW(
+            Some(std::mem::transmute::<
+                isize,
+                unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT,
+            >(old)),
+            hwnd,
+            msg,
+            wparam,
+            lparam,
+        )
+    }
+}
+
+/// `os_statusbar_index_from_x` (os.c:1341-1382): the part whose SB_GETRECT
+/// contains `x`; 0 when the click is inside the bar but on no measured
+/// part ("simple?"), None outside the bar. Same-process sends only.
+fn statusbar_index_from_x(hwnd: HWND, x: i32) -> Option<i32> {
+    let mut rect = RECT::default();
+    // SAFETY: read-only query on our own child; a failure reads zeroed
+    // and the x bounds check fails first.
+    let _ = unsafe { windows::Win32::UI::WindowsAndMessaging::GetClientRect(hwnd, &mut rect) };
+    if x < 0 || x >= rect.right - rect.left {
+        return None;
+    }
+    // SAFETY: hwnd is ours; SB_GETPARTS with a null array only returns
+    // the count.
+    let count = unsafe { SendMessageW(hwnd, SB_GETPARTS, Some(WPARAM(0)), None) }.0 as i32;
+    for i in 0..count {
+        // SAFETY: hwnd is ours; the RECT outlives the call.
+        let ok = unsafe {
+            SendMessageW(
+                hwnd,
+                SB_GETRECT,
+                Some(WPARAM(i as usize)),
+                Some(LPARAM(&mut rect as *mut RECT as isize)),
+            )
+        }
+        .0 != 0;
+        if ok && x >= rect.left && x < rect.right {
+            return Some(i);
+        }
+    }
+    Some(0)
 }
 
 /// The bar's current height in pixels, 0 without a bar (upstream

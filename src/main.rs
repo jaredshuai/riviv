@@ -112,6 +112,7 @@ mod status;
 mod stitch;
 mod surface;
 mod text;
+mod toolbar;
 mod window;
 mod zoom;
 
