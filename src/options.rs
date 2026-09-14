@@ -92,6 +92,22 @@ pub(crate) const WHEEL_ACTIONS: &[ComboEntry] = &[
     },
 ];
 
+/// The X-button (mouse back/forward) actions riviv implements (#44;
+/// upstream values, viv.c:6312-6343: 1 zoom — back = out at the click,
+/// forward = in; 2 previous/next). A riviv-added row: upstream exposes
+/// `xbutton_action` (config.c:64, default 2) in the ini only. The item
+/// labels reuse the wheel table's strings.
+pub(crate) const XBUTTON_ACTIONS: &[ComboEntry] = &[
+    ComboEntry {
+        label: loc::Id::ActionZoom,
+        value: 1,
+    },
+    ComboEntry {
+        label: loc::Id::ActionPrevNext,
+        value: 2,
+    },
+];
+
 /// The auto-size combo (upstream `VIV_ID_VIEW_WINDOW_SIZE_50 + type`,
 /// viv.c:2076+ — the index IS the config value here).
 pub(crate) const AUTO_ZOOM_TYPES: &[ComboEntry] = &[
@@ -164,6 +180,7 @@ pub(crate) enum Field {
     LeftClickAction,
     RightClickAction,
     MouseWheelAction,
+    XButtonAction,
 }
 
 /// One dialog control, positioned in dialog units like upstream's rc
@@ -403,6 +420,19 @@ pub(crate) const CONTROLS: &[Ctrl] = &[
         w: 119,
         h: 100,
     },
+    // The X-button row is a riviv addition (#44) — upstream has no Options
+    // UI for `xbutton_action`; the geometry continues the rc's 17-du row
+    // pitch (IDD_CONTROLS:97-101).
+    Ctrl {
+        kind: Kind::Combo(XBUTTON_ACTIONS),
+        label: loc::Id::OptionsXButtonAction,
+        field: Field::XButtonAction,
+        label_w: 74,
+        x: 0,
+        y: 51,
+        w: 119,
+        h: 100,
+    },
 ];
 
 pub(crate) const PAGES: [Page; 3] = [
@@ -444,6 +474,7 @@ pub(crate) struct OptionsModel {
     pub(crate) left_click_action: Option<i32>,
     pub(crate) right_click_action: Option<i32>,
     pub(crate) mouse_wheel_action: Option<i32>,
+    pub(crate) xbutton_action: Option<i32>,
 }
 
 impl OptionsModel {
@@ -493,6 +524,7 @@ impl OptionsModel {
             Field::LeftClickAction => self.left_click_action,
             Field::RightClickAction => self.right_click_action,
             Field::MouseWheelAction => self.mouse_wheel_action,
+            Field::XButtonAction => self.xbutton_action,
             _ => None,
         }
     }
@@ -505,6 +537,7 @@ impl OptionsModel {
             Field::LeftClickAction => self.left_click_action = Some(value),
             Field::RightClickAction => self.right_click_action = Some(value),
             Field::MouseWheelAction => self.mouse_wheel_action = Some(value),
+            Field::XButtonAction => self.xbutton_action = Some(value),
             _ => {}
         }
     }
@@ -549,6 +582,7 @@ impl OptionsModel {
             left_click_action: Some(config.left_click_action),
             right_click_action: Some(config.right_click_action),
             mouse_wheel_action: Some(config.mouse_wheel_action),
+            xbutton_action: Some(config.xbutton_action),
         }
     }
 
@@ -582,6 +616,9 @@ impl OptionsModel {
         }
         if let Some(v) = self.mouse_wheel_action {
             config.mouse_wheel_action = v;
+        }
+        if let Some(v) = self.xbutton_action {
+            config.xbutton_action = v;
         }
         config.appdata = i32::from(self.appdata);
         config.multiple_instances = i32::from(self.multiple_instances);
@@ -674,7 +711,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!((bools, values, colors), (10, 6, 2));
+        assert_eq!((bools, values, colors), (10, 7, 2));
     }
 
     #[test]
@@ -682,11 +719,13 @@ mod tests {
         // The values are upstream's action numbering; the ORDER is the
         // combo order (upstream's AddString order, viv.c:8225-8252). The
         // left-click slideshow row landed with #37; the animation row
-        // with #38.
+        // with #38; the X-button pair with #44 (values 1/2 — upstream's
+        // `xbutton_action`, default 2, has no value 0).
         let values = |t: &[ComboEntry]| t.iter().map(|e| e.value).collect::<Vec<_>>();
         assert_eq!(values(LEFT_CLICK_ACTIONS), vec![0, 1, 2, 3, 4]);
         assert_eq!(values(RIGHT_CLICK_ACTIONS), vec![0, 1, 2]);
         assert_eq!(values(WHEEL_ACTIONS), vec![0, 1, 2]);
+        assert_eq!(values(XBUTTON_ACTIONS), vec![1, 2]);
         assert_eq!(values(AUTO_ZOOM_TYPES), vec![0, 1, 2, 3]);
         assert_eq!(values(BLIT_MODES), vec![0, 1]);
     }
@@ -720,7 +759,7 @@ mod tests {
                 );
             }
         }
-        assert_eq!(seen.len(), 18);
+        assert_eq!(seen.len(), 19);
     }
 
     #[test]
@@ -789,6 +828,7 @@ mod tests {
             left_click_action: Some(3),
             right_click_action: Some(2),
             mouse_wheel_action: Some(1),
+            xbutton_action: Some(2),
         };
         let effects = model.commit(&mut config);
         assert!(effects.repaint, "filter/fit/color changes repaint");

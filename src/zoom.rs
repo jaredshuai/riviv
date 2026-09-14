@@ -28,8 +28,20 @@
 //!   function over a size sweep — #8; both fill flags now flow in from
 //!   the config (#24), so upstream's default (`fullscreen_fill_window=1`)
 //!   drops to the largest level that still covers the monitor on entry.
+//!
+//! #44 adds the Pan/Scan layer ([`crate::panscan::Panscan`]): the render
+//! size the PAINT path draws is the preset-curve size scaled per axis by
+//! the panscan factors, and the image centers on the panscan position
+//! term instead of the plain viewport center (viv.c:4139-4154). The clamp
+//! and this model's own geometry stay in PRE-panscan coordinates exactly
+//! like upstream (`_viv_view_set` clamps on the unmultiplied size,
+//! viv.c:6449-6462); the pan position term feeds only the center-ANCHOR
+//! (viv.c:6530-6547) and the resize restore (viv.c:1646-1648) besides
+//! paint. The panscan state survives `reset` — upstream's `_viv_clear`
+//! never touches it (viv.c:1270-1291).
 
 use crate::fit::fit_shrink;
+use crate::panscan::{self, Panscan};
 /// The 16-step zoom curve (viv.c:685). Index 0 is fit; the value lerps the
 /// render size from the fit size toward the 16x maximum per axis.
 pub(crate) const ZOOM_PRESETS: [f32; 16] = [
@@ -95,6 +107,11 @@ pub(crate) struct View {
     /// Pan offset, one component per axis (`_viv_view_x/y`).
     pub(crate) view_x: i32,
     pub(crate) view_y: i32,
+    /// The Pan/Scan layer (#44; upstream `_viv_dst_pos_*` +
+    /// `_viv_dst_zoom_*_pos`, viv.c:719-725). Unlike every other field it
+    /// SURVIVES `reset` — upstream's `_viv_clear` leaves the panscan
+    /// globals alone, so they persist across image changes and blanks.
+    pub(crate) panscan: Panscan,
     /// The source pixel under the viewport center (`_viv_view_ix/iy`) —
     /// the anchor that survives a window resize.
     center_src_x: f64,
@@ -115,6 +132,7 @@ impl View {
             saved_pos: 0,
             view_x: 0,
             view_y: 0,
+            panscan: Panscan::default(),
             center_src_x: 0.0,
             center_src_y: 0.0,
         }
@@ -122,9 +140,15 @@ impl View {
 
     /// Back to the fresh-image state — runs on every display swap and blank
     /// (upstream `_viv_clear`, viv.c:1282-1288: zoom_pos/view/ix/iy/1to1 all
-    /// reset when a new image takes the display).
+    /// reset when a new image takes the display). The panscan layer is
+    /// explicitly EXEMPT: upstream never resets `_viv_dst_pos_*` /
+    /// `_viv_dst_zoom_*_pos` anywhere but the Pan/Scan commands (the
+    /// exhaustive write set is viv.c:2246-2313), so a panscanned view
+    /// carries into the next image.
     pub(crate) fn reset(&mut self) {
+        let panscan = self.panscan;
         *self = View::new();
+        self.panscan = panscan;
     }
 
     /// The rendered size at the current level, in viewport pixels (upstream
@@ -215,10 +239,13 @@ impl View {
         self.view_x = clamp_axis(rx, rw, vp.wide, vx);
         self.view_y = clamp_axis(ry, rh, vp.high, vy);
         // The resize anchor: which SOURCE pixel sits at the viewport center
-        // now (viv.c:6497-6520; `_viv_dst_pos` is 500 = center, so its term
-        // collapses into wide/2 here).
-        let rx = vp.wide / 2 - rw / 2 - self.view_x;
-        let ry = vp.high / 2 - rh / 2 - self.view_y;
+        // now (viv.c:6497-6547). The clamp above bounds the image around
+        // the PLAIN center (viv.c:6449-6462), but the anchor reads the
+        // panscan-adjusted position — upstream computes rx a SECOND time
+        // with the `_viv_dst_pos` term for exactly these two writes
+        // (viv.c:6530-6547).
+        let rx = panscan::center_term(vp.wide, self.panscan.pos_x) - rw / 2 - self.view_x;
+        let ry = panscan::center_term(vp.high, self.panscan.pos_y) - rh / 2 - self.view_y;
         if rw != 0 {
             self.center_src_x =
                 (i64::from(vp.wide / 2 - rx) * i64::from(src_w)) as f64 / f64::from(rw);
@@ -256,11 +283,19 @@ impl View {
         fit: FitPolicy,
     ) -> bool {
         let (rw, rh) = self.render_size(src_w, src_h, vp, fit);
-        // Upstream: (int)((ix * rw) / src + 0.5) + dst_pos-term - wide/2 - rw/2
-        // — with dst_pos 500 the middle terms cancel to plain -rw/2, and the
-        // truncation lands BEFORE the subtraction (viv.c:1648-1649).
-        let vx = ((self.center_src_x * f64::from(rw) / f64::from(src_w)) + 0.5) as i32 - rw / 2;
-        let vy = ((self.center_src_y * f64::from(rh) / f64::from(src_h)) + 0.5) as i32 - rh / 2;
+        // Upstream `_viv_on_size` (viv.c:1643-1651): the anchor projects
+        // back onto the render size, then the restore ADDS the panscan
+        // center term and subtracts the plain viewport half — the two
+        // cancel at the default position, so this is inert pre-#44. The
+        // truncation lands BEFORE the additions (viv.c:1648-1649).
+        let vx = ((self.center_src_x * f64::from(rw) / f64::from(src_w)) + 0.5) as i32
+            + panscan::center_term(vp.wide, self.panscan.pos_x)
+            - vp.wide / 2
+            - rw / 2;
+        let vy = ((self.center_src_y * f64::from(rh) / f64::from(src_h)) + 0.5) as i32
+            + panscan::center_term(vp.high, self.panscan.pos_y)
+            - vp.high / 2
+            - rh / 2;
         let before = (self.view_x, self.view_y);
         self.set_view(vx, vy, src_w, src_h, vp, fit);
         (self.view_x, self.view_y) != before
@@ -895,9 +930,80 @@ mod tests {
             view_y: 55,
             center_src_x: 12.5,
             center_src_y: 90.25,
+            ..View::new()
         };
         v.reset();
         assert_eq!(v, View::new());
+    }
+
+    #[test]
+    fn reset_preserves_the_panscan_layer() {
+        // Upstream's `_viv_clear` (viv.c:1270-1291) resets the preset zoom
+        // and drag pan but never the panscan globals — a panscanned view
+        // carries into the next image.
+        use crate::panscan::DST_ZOOM_ONE;
+        let mut v = View::new();
+        v.panscan.pan(-200, 100);
+        v.panscan.step(9, -9);
+        v.view_x = -40;
+        v.pos = 9;
+        v.reset();
+        assert_eq!(v.pos, 0);
+        assert_eq!((v.view_x, v.view_y), (0, 0));
+        assert_eq!(v.panscan.pos_x, 300);
+        assert_eq!(v.panscan.pos_y, 600);
+        assert_eq!(v.panscan.zoom_x, DST_ZOOM_ONE + 9);
+        assert_eq!(v.panscan.zoom_y, DST_ZOOM_ONE - 9);
+    }
+
+    #[test]
+    fn anchor_follows_the_panscan_center_term() {
+        // set_view's anchor writes (viv.c:6530-6547): the source pixel at
+        // the viewport CENTER reads the panscan-shifted image position.
+        // A fitted 400x300 render in a 400x300 viewport, panscan pos_x 0
+        // (image pushed half a viewport left): the center column of the
+        // viewport now shows source pixel (wide/2 + wide/2)/rw * src —
+        // i.e. the image's horizontal middle.
+        let mut v = View::new();
+        v.panscan.pos_x = 0;
+        v.set_view(0, 0, 400, 300, VP, FIT);
+        // rx = center_term(400, 0) - rw/2 - view_x = -200 - 200 - 0 = -400;
+        // center_src_x = (400/2 - (-400)) * 400 / 400 = 600.
+        assert_eq!(v.center_src_x, 600.0);
+        // ...and the drag-pan clamp stayed plain-centered: a fitted image
+        // cannot be dragged, panscan or not.
+        assert_eq!(v.view_x, 0);
+    }
+
+    #[test]
+    fn resize_restore_adds_the_panscan_center_term() {
+        // `_viv_on_size` (viv.c:1646-1648): view_x = anchor projection +
+        // center_term(wide) - wide/2 - rw/2. The anchor was STORED while
+        // panscan was still centered (the drag precedes the panscan move):
+        // after scroll_by(-40, 0) — the image followed the cursor left, so
+        // view_x = +40 — the anchor ix = (200 - rx_a)*100/1600 with
+        // rx_a = 200 - 800 - 40 = -640, i.e. 52.5. Shrinking to a
+        // 200-wide viewport then restores to
+        //   (int)(52.5 * 1600 / 100 + 0.5) + center_term(200,0) - 100 - 800
+        // = 840 - 100 - 100 - 800 = -160, which the clamp accepts
+        // (rx = 100 - 800 + 160 = -540, image covers the viewport).
+        let mut v = View {
+            pos: 15,
+            ..View::new()
+        };
+        let (rw, rh) = v.render_size(100, 60, VP, FIT);
+        assert_eq!((rw, rh), (1600, 960));
+        v.scroll_by(-40, 0, 100, 60, VP, FIT);
+        assert_eq!(v.view_x, 40);
+        v.panscan.pos_x = 0;
+        let smaller = Viewport {
+            wide: 200,
+            high: 100,
+        };
+        v.on_resize(100, 60, smaller, FIT);
+        assert_eq!(v.view_x, -160);
+        // The pre-#44 formula (no panscan term) would land at 840 - 100 -
+        // 800 = -60 — the pin above is the panscan-dependent value.
     }
 
     #[test]

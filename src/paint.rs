@@ -108,13 +108,23 @@ pub(crate) fn paint(hwnd: HWND) {
             let halftone_shrink = state.config.shrink_blit_mode == 1;
             let halftone_mag = state.config.mag_filter == 1;
             // The zoom/pan view decides the destination rect (upstream
-            // `_viv_get_render_size` + `rx = wide/2 - rw/2 - _viv_view_x`,
-            // viv.c:4136-4149); GDI clips whatever pans off-window.
+            // `_viv_get_render_size` + the panscan layer, viv.c:4136-4154):
+            // the preset-curve size scaled per axis by the panscan factors,
+            // centered on the panscan position term (plain viewport center
+            // at the default 500) minus the drag offset; GDI clips whatever
+            // pans off-window.
             let (rw, rh) = state
                 .view
                 .render_size(sw, sh, Viewport { wide: cw, high: ch }, fit);
-            let dx = client.left + cw / 2 - rw / 2 - state.view.view_x;
-            let dy = client.top + ch / 2 - rh / 2 - state.view.view_y;
+            let panscan = state.view.panscan;
+            let rw = crate::panscan::scale(rw, panscan.zoom_x);
+            let rh = crate::panscan::scale(rh, panscan.zoom_y);
+            let dx = client.left + crate::panscan::center_term(cw, panscan.pos_x)
+                - rw / 2
+                - state.view.view_x;
+            let dy = client.top + crate::panscan::center_term(ch, panscan.pos_y)
+                - rh / 2
+                - state.view.view_y;
             img = (dx, dy, rw, rh);
             if rw > 0 && rh > 0 {
                 // Mip selection by render size (upstream viv.c:4167): extend
