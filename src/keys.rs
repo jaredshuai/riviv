@@ -866,6 +866,12 @@ mod tests {
             (Cmd::NavSortDescending, "navigate_sort_descending_keys"),
             (Cmd::NavShuffle, "navigate_shuffle_keys"),
             (Cmd::NavJumpTo, "navigate_jump_to_keys"),
+            // The #48 Help row ("&Command Line Options" → the mnemonic and
+            // spaces drop).
+            (
+                Cmd::HelpCommandLineOptions,
+                "help_command_line_options_keys",
+            ),
             (Cmd::HelpAbout, "help_about_keys"),
         ];
         for (cmd, name) in expect {

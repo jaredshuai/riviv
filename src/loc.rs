@@ -320,12 +320,19 @@ pub(crate) enum Id {
     OptionsPreloadNext,
     /// Options View page: last-cache checkbox (en_us.h:232 / zh_cn.h:233).
     OptionsCacheLast,
+    /// ---- #48: second-pass CLI ----
+    /// Help → "Command Line Options" (en_us.h:179 / zh_cn.h:179).
+    MenuCommandLineOptions,
+    /// The usage box body (`_viv_command_line_options`, viv.c:11862-11894 —
+    /// upstream hardcodes the English text; riviv localizes it per the
+    /// issue, with the exe name brand-swapped like AppName).
+    UsageText,
 }
 
 impl Id {
     /// Variant count; array-typing both tables against this keeps them
     /// length-locked to the enum by construction.
-    pub(crate) const COUNT: usize = Self::OptionsCacheLast as usize + 1;
+    pub(crate) const COUNT: usize = Self::UsageText as usize + 1;
 }
 
 /// Table choice (upstream `LOCALIZATION_LANGUAGE_*`, localization.h:30-32).
@@ -494,6 +501,42 @@ const EN_US: [&str; Id::COUNT] = [
     "PRELOAD",                                     // StatusBarPreload (en_us.h:196)
     "Preload &next image",                         // OptionsPreloadNext (en_us.h:231)
     "Cache &last image",                           // OptionsCacheLast (en_us.h:232)
+    "&Command Line Options",                       // MenuCommandLineOptions (en_us.h:179)
+    // UsageText — upstream viv.c:11862-11894 verbatim except the exe name
+    // brand swap; the /everything and /random rows stay hidden (upstream
+    // comments them out).
+    "Usage:\nriviv.exe [/switches] [filename(s)]\n\
+     \n\
+     Switches:\n\
+     /slideshow\tStart a slideshow.\n\
+     /fullscreen\tStart fullscreen.\n\
+     /maximized\tStart maximized.\n\
+     /window\t\tStart windowed.\n\
+     /ontop\t\tShow on top of other windows.\n\
+     /minimal\t\tBorderless window.\n\
+     /compact\t\tBordered window.\n\
+     /x <x> /y <y> /width <width> /height <height>\n\
+     \t\tSet the Window position and size.\n\
+     /rate <rate>\tSet the slideshow rate in milliseconds.\n\
+     /name\t\tSort by name.\n\
+     /path\t\tSort by full path.\n\
+     /size\t\tSort by size.\n\
+     /dm\t\tSort by date modified.\n\
+     /dc\t\tSort by date created.\n\
+     /ascending\tSort in ascending order.\n\
+     /descending\tSort in descending order.\n\
+     /shuffle\t\tShuffle playlist.\n\
+     /<bmp|gif|ico|jpeg|jpg|png|tif|tiff|webp>\n\
+     \t\tInstall association.\n\
+     /no<bmp|gif|ico|jpeg|jpg|png|tif|tiff|webp>\n\
+     \t\tUninstall association.\n\
+     /appdata\t\tSave settings in appdata.\n\
+     /noappdata\tSave settings in exe path.\n\
+     /startmenu\tAdd Start menu shortcuts.\n\
+     /nostartmenu\tRemove Start menu shortcuts.\n\
+     /install <path>\tInstall to the specified path.\n\
+     /install-options <...> Run with the specified options after installation.\n\
+     /uninstall <path>\tUninstall from the specified path.",
 ];
 
 /// zh-CN table — upstream localization_zh_cn.h:31/197-199/261-263.
@@ -654,6 +697,41 @@ const ZH_CN: [&str; Id::COUNT] = [
     "预加载",                         // StatusBarPreload (zh_cn.h:196)
     "预加载下一张图像(&N)",           // OptionsPreloadNext (zh_cn.h:232)
     "缓存最后一张图像(&L)",           // OptionsCacheLast (zh_cn.h:233)
+    "命令行选项(&C)",                 // MenuCommandLineOptions (zh_cn.h:179)
+    // UsageText — riviv's translation of viv.c:11862-11894 (upstream
+    // hardcodes English; the issue mandates the bilingual body).
+    "用法:\nriviv.exe [/开关] [文件名]\n\
+     \n\
+     开关:\n\
+     /slideshow\t开始幻灯片播放。\n\
+     /fullscreen\t全屏启动。\n\
+     /maximized\t最大化启动。\n\
+     /window\t\t窗口化启动。\n\
+     /ontop\t\t窗口置顶。\n\
+     /minimal\t\t无边框窗口。\n\
+     /compact\t\t有边框窗口。\n\
+     /x <x> /y <y> /width <宽> /height <高>\n\
+     \t\t设置窗口位置和大小。\n\
+     /rate <速率>\t设置幻灯片速率(毫秒)。\n\
+     /name\t\t按名称排序。\n\
+     /path\t\t按完整路径排序。\n\
+     /size\t\t按大小排序。\n\
+     /dm\t\t按修改日期排序。\n\
+     /dc\t\t按创建日期排序。\n\
+     /ascending\t升序排序。\n\
+     /descending\t降序排序。\n\
+     /shuffle\t\t随机播放列表。\n\
+     /<bmp|gif|ico|jpeg|jpg|png|tif|tiff|webp>\n\
+     \t\t安装文件关联。\n\
+     /no<bmp|gif|ico|jpeg|jpg|png|tif|tiff|webp>\n\
+     \t\t卸载文件关联。\n\
+     /appdata\t\t将设置保存到 appdata。\n\
+     /noappdata\t将设置保存到 exe 所在目录。\n\
+     /startmenu\t添加开始菜单快捷方式。\n\
+     /nostartmenu\t移除开始菜单快捷方式。\n\
+     /install <路径>\t安装到指定路径。\n\
+     /install-options <...> 安装后以指定选项运行。\n\
+     /uninstall <路径>\t从指定路径卸载。",
 ];
 
 /// Map a `GetUserDefaultUILanguage` LANGID onto the table choice

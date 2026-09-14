@@ -37,8 +37,8 @@ use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::Path;
 
 use windows::Win32::Foundation::{
-    ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, GetLastError, HLOCAL, HMODULE, HWND, LPARAM,
-    LRESULT, LocalFree, POINT, RECT, SetLastError, WIN32_ERROR, WPARAM,
+    ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, GetLastError, HMODULE, HWND, LPARAM, LRESULT, POINT,
+    RECT, SetLastError, WIN32_ERROR, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
     COLOR_BTNFACE, GetMonitorInfoW, HBRUSH, InvalidateRect, MONITOR_DEFAULTTOPRIMARY, MONITORINFO,
@@ -72,9 +72,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_MENU, VK_SHIFT,
 };
 use windows::Win32::UI::Shell::{
-    CommandLineToArgvW, DragFinish, DragQueryFileW, FILEOPENDIALOGOPTIONS, FOS_NOCHANGEDIR,
-    FOS_PICKFOLDERS, FileOpenDialog, HDROP, IFileOpenDialog, IShellItem,
-    SHCreateItemFromParsingName, SIGDN_FILESYSPATH,
+    DragFinish, DragQueryFileW, FILEOPENDIALOGOPTIONS, FOS_NOCHANGEDIR, FOS_PICKFOLDERS,
+    FileOpenDialog, HDROP, IFileOpenDialog, IShellItem, SHCreateItemFromParsingName,
+    SIGDN_FILESYSPATH,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRect, AppendMenuW, CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW,
@@ -82,25 +82,26 @@ use windows::Win32::UI::WindowsAndMessaging::{
     DestroyWindow, DispatchMessageW, EnableMenuItem, FindWindowA, GWL_STYLE, GWLP_USERDATA,
     GetClientRect, GetCursorPos, GetForegroundWindow, GetMenu, GetMessageW, GetSystemMetrics,
     GetWindowLongPtrW, GetWindowRect, HICON, HMENU, HWND_TOP, IDC_ARROW, IMAGE_ICON, IsIconic,
-    IsZoomed, KillTimer, LR_DEFAULTCOLOR, LoadCursorW, LoadImageW, MB_ICONERROR, MB_OK,
-    MENU_ITEM_FLAGS, MF_BYCOMMAND, MF_CHECKED, MF_ENABLED, MF_GRAYED, MF_POPUP, MF_SEPARATOR,
-    MF_STRING, MF_UNCHECKED, MFT_RADIOCHECK, MINMAXINFO, MSG, MessageBoxW, PostMessageW,
-    PostQuitMessage, RegisterClassExW, SC_MONITORPOWER, SHOW_WINDOW_CMD, SM_CXICON, SM_CXSMICON,
-    SM_CYICON, SM_CYSMICON, SW_MAXIMIZE, SW_RESTORE, SW_SHOW, SW_SHOWNORMAL, SWP_FRAMECHANGED,
-    SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOZORDER, SYSTEM_METRICS_INDEX, SendMessageW,
-    SetForegroundWindow, SetMenu, SetProcessDPIAware, SetTimer, SetWindowLongPtrW, SetWindowPos,
-    SetWindowTextW, ShowCursor, ShowWindow, TPM_CENTERALIGN, TPM_LEFTBUTTON, TPM_VCENTERALIGN,
-    TrackPopupMenu, TranslateMessage, USER_TIMER_MINIMUM, WINDOW_EX_STYLE, WINDOW_STYLE,
-    WM_ACTIVATE, WM_COMMAND, WM_CONTEXTMENU, WM_COPYDATA, WM_DESTROY, WM_DROPFILES, WM_ENDSESSION,
-    WM_ERASEBKGND, WM_GETMINMAXINFO, WM_INITMENU, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_MOVE, WM_NCCREATE, WM_NCDESTROY, WM_NULL,
-    WM_PAINT, WM_PASTE, WM_QUERYENDSESSION, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP,
-    WM_SIZE, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_TIMER, WNDCLASSEXW, WS_CAPTION, WS_EX_ACCEPTFILES,
-    WS_OVERLAPPEDWINDOW, WS_POPUP, WS_THICKFRAME, WS_VISIBLE, WindowFromPoint,
+    IsZoomed, KillTimer, LR_DEFAULTCOLOR, LoadCursorW, LoadImageW, MB_ICONERROR, MB_ICONQUESTION,
+    MB_OK, MENU_ITEM_FLAGS, MF_BYCOMMAND, MF_CHECKED, MF_ENABLED, MF_GRAYED, MF_POPUP,
+    MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MFT_RADIOCHECK, MINMAXINFO, MSG, MessageBoxW,
+    PostMessageW, PostQuitMessage, RegisterClassExW, SC_MONITORPOWER, SHOW_WINDOW_CMD, SM_CXICON,
+    SM_CXSMICON, SM_CYICON, SM_CYSMICON, SW_MAXIMIZE, SW_RESTORE, SW_SHOW, SW_SHOWNORMAL,
+    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOZORDER, SYSTEM_METRICS_INDEX,
+    SendMessageW, SetForegroundWindow, SetMenu, SetProcessDPIAware, SetTimer, SetWindowLongPtrW,
+    SetWindowPos, SetWindowTextW, ShowCursor, ShowWindow, TPM_CENTERALIGN, TPM_LEFTBUTTON,
+    TPM_VCENTERALIGN, TrackPopupMenu, TranslateMessage, USER_TIMER_MINIMUM, WINDOW_EX_STYLE,
+    WINDOW_STYLE, WM_ACTIVATE, WM_COMMAND, WM_CONTEXTMENU, WM_COPYDATA, WM_DESTROY, WM_DROPFILES,
+    WM_ENDSESSION, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_INITMENU, WM_KEYDOWN, WM_LBUTTONDBLCLK,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_MOVE, WM_NCCREATE, WM_NCDESTROY,
+    WM_NULL, WM_PAINT, WM_PASTE, WM_QUERYENDSESSION, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN,
+    WM_RBUTTONUP, WM_SIZE, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_TIMER, WNDCLASSEXW, WS_CAPTION,
+    WS_EX_ACCEPTFILES, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_THICKFRAME, WS_VISIBLE, WindowFromPoint,
 };
 use windows::core::{HSTRING, PCSTR, PCWSTR, w};
 
 use crate::anim::{ANIMATION_TIMER_ID, RATE_ONE, rate_step};
+use crate::cli;
 use crate::clipboard;
 use crate::config::Config;
 use crate::copydata;
@@ -2644,68 +2645,96 @@ fn playlist_add_current_if_empty(state: &mut WindowState) {
     }
 }
 
-/// Run one command line's FILE arguments through the open path (upstream
-/// `_viv_process_command_line`, viv.c:4744-5148, minus the switch commands
-/// riviv does not take — switches were dropped at parse, main.rs): ONE
-/// argument keeps single-file semantics (a folder recurses into a
-/// playlist, a wildcard expands, a file opens directly); a SECOND argument
-/// pulls the first into the playlist too — everything added in argument
-/// order — and the first-inserted entry is what opens. When nothing
-/// resolves, the "File not found." verdict shows over the kept display
-/// (upstream viv.c:5090-5098). Shared by the startup open (viv.c:5445) and
-/// the single-instance handoff receive (#21, viv.c:3715).
+/// Apply one parsed command line (upstream `_viv_process_command_line`,
+/// viv.c:4744-5148 — the file-word ladder, the switch arms' side effects,
+/// and the show-state tail). Shared by the startup line (viv.c:5445) and
+/// the single-instance handoff receive (#21, viv.c:3715). Order per
+/// upstream: config writes land mid-walk (before the file open, so the
+/// `/name`-family governs the very navigation that follows), the
+/// Everything sends fire mid-walk too, the file actions and the
+/// end blocks (add-mode bootstrap / the open) replay the ladder, and the
+/// show tail (slideshow, fullscreen, rect, maximized) comes last.
 ///
-/// `is_add` is upstream's add-mode (viv.c:4778-4793): the file words are
-/// APPENDED to the playlist instead of replacing, and the display never
-/// changes — the receive-side rapid-handoff window, so a multi-select
-/// launch's burst of forwarded command lines builds one playlist instead
-/// of replacing each other.
-fn process_command_line(hwnd: HWND, args: &[OsString], is_add: bool) {
-    // The parse-time clear (viv.c:4998-5006): a REPLACING command line with
-    // at least one file word starts a fresh playlist; a switch-only line
-    // (empty `args` here, or in add-mode) never clears. Random mode exits
-    // on the first file word of ANY command line — add-mode included, the
-    // clear sits OUTSIDE upstream's `!is_add` gate (viv.c:4998-5003).
-    if !args.is_empty() {
-        // SAFETY: the borrow spans the clear and one field store.
-        if let Some(state) = unsafe { state_of(hwnd) } {
-            if !is_add {
-                state.playlist.clear();
-            }
-            state.random_search = None;
+/// One deliberate timing divergence, documented in README Differences:
+/// upstream pops the usage box for EACH unknown word mid-walk; riviv
+/// collects them and pops after the whole line is applied — a modal box
+/// pumping messages over a half-applied command line is reentrancy
+/// upstream only survives by accident.
+fn process_parsed_cl(hwnd: HWND, parsed: &cli::Parsed) {
+    // The switch arms' config writes (upstream's globals, viv.c:4838-4953).
+    // NOTE: unlike the menu's sort/shuffle handlers (viv.c:1750-1816), the
+    // CLI path writes the config DIRECTLY — no preload/last cache clear.
+    // SAFETY: the borrow spans plain field stores.
+    if let Some(state) = unsafe { state_of(hwnd) } {
+        if let Some(mode) = parsed.nav_sort {
+            state.config.nav_sort = mode as i32;
+        }
+        if let Some(ascending) = parsed.sort_ascending {
+            state.config.nav_sort_ascending = ascending;
+        }
+        if parsed.shuffle {
+            state.config.shuffle = 1;
+        }
+        if let Some(rate) = parsed.slideshow_rate {
+            state.config.slideshow_rate = rate;
         }
     }
-    // Two-plus words add every word (upstream's loop adds the stashed
-    // `single` once it sees the second word, then each next — net: all of
-    // them, viv.c:5008-5023); a lone word is NOT added here — below it
-    // either opens directly (replace) or is appended (add).
-    if args.len() >= 2 {
-        // SAFETY: the borrow spans the adds' metadata reads (read_dir /
-        // FindFirstFile never pump messages).
-        if let Some(state) = unsafe { state_of(hwnd) } {
-            for arg in args {
-                playlist::add_filename(&mut state.playlist, Path::new(arg));
+    // `/everything <term>` and `/random <term>` (viv.c:4857-4872 — the
+    // send fires mid-walk with the dialog parent 0). These take their own
+    // state borrows inside; none is held here.
+    for term in &parsed.everything {
+        everything::send_search(hwnd, HWND::default(), false, false, term);
+    }
+    for term in &parsed.random {
+        everything::send_search(hwnd, HWND::default(), false, true, term);
+    }
+    // The file-word ladder replay: relative words resolve against the CWD
+    // the same way main.rs's old absolutize did (upstream's
+    // string_path_combine — the handoff adopts the sender's cwd before
+    // this runs).
+    for action in &parsed.actions {
+        match action {
+            cli::ClAction::ExitRandom => {
+                // SAFETY: the borrow spans one field store.
+                if let Some(state) = unsafe { state_of(hwnd) } {
+                    state.random_search = None;
+                }
+            }
+            cli::ClAction::ClearPlaylist => {
+                // SAFETY: the borrow spans the clear.
+                if let Some(state) = unsafe { state_of(hwnd) } {
+                    state.playlist.clear();
+                }
+            }
+            cli::ClAction::AddFile(word) => {
+                let path = absolutize(word);
+                // SAFETY: the borrow spans the add's metadata read.
+                if let Some(state) = unsafe { state_of(hwnd) } {
+                    playlist::add_filename(&mut state.playlist, Path::new(&path));
+                }
             }
         }
     }
-    if is_add {
-        // SAFETY: the borrow spans the adds' metadata reads.
+    // The add-mode end block (viv.c:5027-5041): the current file seeds an
+    // EMPTY playlist before a lone word appends.
+    if parsed.is_add {
+        // SAFETY: the borrow spans the bootstrap's metadata read and the
+        // possible add.
         if let Some(state) = unsafe { state_of(hwnd) } {
-            // The bootstrap (viv.c:5028-5036): the current file seeds an
-            // EMPTY playlist before the argument lands — after the
-            // two-plus-word adds above, a non-empty list skips it, exactly
-            // upstream's order.
             playlist_add_current_if_empty(state);
-            // A lone word IS appended in add-mode (viv.c:5038-5041).
-            if args.len() == 1 {
-                playlist::add_filename(&mut state.playlist, Path::new(&args[0]));
+            if parsed.file_count == 1
+                && let Some(word) = &parsed.single
+            {
+                let path = absolutize(word);
+                playlist::add_filename(&mut state.playlist, Path::new(&path));
             }
         }
     }
     // Show the first image — never in add-mode (viv.c:5046-5098).
-    if !is_add && !args.is_empty() {
-        let resolved = if args.len() == 1 {
-            open_from_filename(hwnd, &args[0])
+    if !parsed.is_add && parsed.file_count >= 1 {
+        let resolved = if parsed.file_count == 1 {
+            let path = absolutize(parsed.single.as_ref().unwrap());
+            open_from_filename(hwnd, path.as_os_str())
         } else {
             // SAFETY: the borrow ends at the end of this statement (the
             // entry is cloned out).
@@ -2716,6 +2745,57 @@ fn process_command_line(hwnd: HWND, args: &[OsString], is_add: bool) {
             mark_startup_not_found(hwnd);
         }
     }
+    // The usage boxes — one per unknown switch word (viv.c:4986-4990);
+    // popped post-parse (see the doc comment above).
+    for _ in &parsed.unknown {
+        show_usage(hwnd);
+    }
+    // The show tail (viv.c:5102-5141).
+    if parsed.start_slideshow {
+        slideshow_start(hwnd);
+    }
+    // SAFETY: the read-only borrow ends inside the map.
+    let fullscreen = (unsafe { state_of(hwnd) }).is_some_and(|state| state.fullscreen);
+    if parsed.start_fullscreen {
+        if !fullscreen {
+            toggle_fullscreen(hwnd);
+            if parsed.start_maximized {
+                // `/fullscreen /maximized` — the fullscreen-maximized
+                // hybrid restores the maximized state on exit (viv.c:5112).
+                // SAFETY: the borrow spans one field store.
+                if let Some(state) = unsafe { state_of(hwnd) } {
+                    state.fullscreen_was_maxed = true;
+                }
+            }
+        }
+    } else {
+        if parsed.start_window {
+            if fullscreen {
+                toggle_fullscreen(hwnd);
+            }
+        } else if parsed.rect.any() {
+            // Unset axes keep the current rect (viv.c:4774 seeds all four
+            // from GetWindowRect).
+            let mut cur = RECT::default();
+            // SAFETY: hwnd is live; cur receives the window rect.
+            let _ = unsafe { GetWindowRect(hwnd, &mut cur) };
+            let x = parsed.rect.x.unwrap_or(cur.left);
+            let y = parsed.rect.y.unwrap_or(cur.top);
+            let wide = parsed.rect.wide.unwrap_or(cur.right - cur.left);
+            let high = parsed.rect.high.unwrap_or(cur.bottom - cur.top);
+            // SAFETY: hwnd is live; upstream's flags exactly (viv.c:5129).
+            let _ = unsafe {
+                SetWindowPos(hwnd, None, x, y, wide, high, SWP_NOZORDER | SWP_NOACTIVATE)
+            };
+        }
+        if parsed.start_maximized {
+            // SAFETY: hwnd is live; a cheap zoomed check.
+            if !unsafe { IsZoomed(hwnd) }.as_bool() {
+                // SAFETY: hwnd is live.
+                let _ = unsafe { ShowWindow(hwnd, SW_MAXIMIZE) };
+            }
+        }
+    }
     // Stamp the add-window anchor (viv.c:5146-5148): the END of every
     // command-line processing, add-mode included — a handoff arriving
     // within add_command_line_timeout of THIS one appends instead of
@@ -2724,6 +2804,33 @@ fn process_command_line(hwnd: HWND, args: &[OsString], is_add: bool) {
     if let Some(state) = unsafe { state_of(hwnd) } {
         // SAFETY: a cheap kernel tick query.
         state.last_cl_tick = Some(unsafe { GetTickCount() });
+    }
+}
+
+/// One file word as an absolute path (main.rs's old `file_args` step:
+/// upstream cwd-combines relative paths, string_path_combine).
+fn absolutize(word: &[u16]) -> std::ffi::OsString {
+    let s = std::ffi::OsString::from_wide(word);
+    match std::path::absolute(&s) {
+        Ok(p) => p.into_os_string(),
+        Err(_) => s,
+    }
+}
+
+/// The command-line usage box (`_viv_command_line_options`, viv.c:11856+):
+/// MB_OK|MB_ICONQUESTION over the caller — the question icon is what
+/// avoids the message beep — with the app name as caption. Reached for
+/// each unknown switch word AND from Help → Command Line Options
+/// (viv.c:1687-1688).
+fn show_usage(hwnd: HWND) {
+    // SAFETY: a modal box over the live window; no state borrow is live.
+    unsafe {
+        MessageBoxW(
+            Some(hwnd),
+            &HSTRING::from(loc::get(loc::Id::UsageText)),
+            &HSTRING::from(loc::get(loc::Id::AppName)),
+            MB_OK | MB_ICONQUESTION,
+        );
     }
 }
 
@@ -2761,24 +2868,27 @@ fn on_copydata(hwnd: HWND, cds: &COPYDATASTRUCT) -> bool {
     cwd.push(0);
     // SAFETY: cwd is NUL-terminated and outlives the call.
     let _ = unsafe { SetCurrentDirectoryW(PCWSTR::from_raw(cwd.as_ptr())) };
-    // The same switch/file filter main.rs ran at startup, over the ORIGINAL
-    // command line: CommandLineToArgvW is the splitter std itself uses for
-    // `args_os`, and the exe word is skipped like upstream's first
-    // string_get_word (viv.c:4789-4790).
-    let args = handoff_file_args(&handoff.command_line);
-    // The add-vs-replace decision (upstream viv.c:4778-4793) — the pure
-    // `handoff_add_mode` below, fed the receiver's facts.
-    // SAFETY: the read-only borrow ends inside is_some_and.
-    let is_add = (unsafe { state_of(hwnd) }).is_some_and(|state| {
-        // SAFETY: a cheap kernel tick query.
-        handoff_add_mode(
-            unsafe { GetTickCount() },
-            state.last_cl_tick,
-            state.config.add_command_line_timeout,
-            state.nav_current.is_some(),
-        )
-    });
-    process_command_line(hwnd, &args, is_add);
+    // The second pass over the ORIGINAL command line (#48): the raw
+    // tokenizer — quotes, switches, parameter words — exactly like the
+    // startup line (upstream runs the same `_viv_process_command_line`,
+    // viv.c:3715).
+    // The add-vs-replace decision + the `/add` arm's current-file input
+    // (upstream viv.c:4778-4793/4963-4969) — fed to the pure parse.
+    // SAFETY: the read-only borrow ends inside the let.
+    let (initial_is_add, has_current) = (unsafe { state_of(hwnd) })
+        .map(|state| {
+            // SAFETY: a cheap kernel tick query.
+            let add = handoff_add_mode(
+                unsafe { GetTickCount() },
+                state.last_cl_tick,
+                state.config.add_command_line_timeout,
+                state.nav_current.is_some(),
+            );
+            (add, state.nav_current.is_some())
+        })
+        .unwrap_or((false, false));
+    let parsed = cli::parse(&handoff.command_line, initial_is_add, has_current);
+    process_parsed_cl(hwnd, &parsed);
     // Show per the second launch's requested state (viv.c:3717): a "run
     // maximized" shortcut forwards SW_MAXIMIZE; a plain launch's
     // SW_SHOWNORMAL restores a minimized window and brings it forward.
@@ -2895,42 +3005,6 @@ fn on_random_reply(hwnd: HWND, cds: &COPYDATASTRUCT) {
         }
         _ => {}
     }
-}
-
-/// Split a forwarded command line into main.rs's file arguments: drop the
-/// exe word, then run the shared switch/file/absolutize filter. An
-/// unparseable line yields nothing — the handoff degenerates to a pure
-/// bring-to-front, matching upstream's nothing-found word loop.
-fn handoff_file_args(cl: &[u16]) -> Vec<OsString> {
-    let mut cmd = cl.to_vec();
-    cmd.push(0);
-    let mut argc = 0i32;
-    // SAFETY: cmd is NUL-terminated and outlives the call; on failure the
-    // return is null and nothing was allocated. On success argv points at
-    // an argc-sized array of NUL-terminated strings in LocalFree-owned
-    // memory, read out below and freed exactly once on every path.
-    let argv = unsafe { CommandLineToArgvW(PCWSTR::from_raw(cmd.as_ptr()), &mut argc) };
-    if argv.is_null() {
-        return Vec::new();
-    }
-    let mut words = Vec::new();
-    for i in 0..argc.max(0) as usize {
-        // SAFETY: argv[0..argc) are readable NUL-terminated strings per the
-        // CommandLineToArgvW contract; the walk reads up to each NUL.
-        let word = unsafe {
-            let arg = *argv.add(i);
-            let mut n = 0usize;
-            while *arg.0.add(n) != 0 {
-                n += 1;
-            }
-            OsString::from_wide(std::slice::from_raw_parts(arg.0, n))
-        };
-        words.push(word);
-    }
-    // SAFETY: argv came from CommandLineToArgvW and nothing retains it —
-    // the strings were all copied out above.
-    let _ = unsafe { LocalFree(Some(HLOCAL(argv.cast()))) };
-    crate::file_args(words.into_iter().skip(1))
 }
 
 /// Whether a forwarded command line APPENDS to the playlist instead of
@@ -4130,6 +4204,7 @@ fn on_command(hwnd: HWND, cmd: menu::Cmd) {
         // (viv.c:1738-1747).
         menu::Cmd::NavShuffle => shuffle_toggle(hwnd),
         menu::Cmd::NavJumpTo => crate::jumpto_dlg::open(hwnd),
+        menu::Cmd::HelpCommandLineOptions => show_usage(hwnd),
         menu::Cmd::HelpAbout => show_about(hwnd),
     }
 }
@@ -5106,7 +5181,7 @@ fn load_icon_resource(
     }
 }
 
-pub(crate) fn run(args: Vec<OsString>) -> Result<(), String> {
+pub(crate) fn run() -> Result<(), String> {
     // SAFETY: process-wide and must run before ANY DPI-sensitive query —
     // a GetMonitorInfo/GetCursorPos-scale call while still unaware LOCKS
     // the process into DPI virtualization and later SetProcessDPIAware
@@ -5508,9 +5583,12 @@ pub(crate) fn run(args: Vec<OsString>) -> Result<(), String> {
 
     // The startup command line (upstream viv.c:5445 — the very same
     // _viv_process_command_line the handoff receive re-runs, #21): the
-    // first run through never takes add-mode (the tick starts unset), so
-    // this is a plain replace/open.
-    process_command_line(hwnd, &args, false);
+    // first run through never takes add-mode (the tick starts unset) and
+    // has no current file, so both parse inputs are false. The RAW line —
+    // #48's second pass needs the quoting `args_os` cannot see.
+    let cl = crate::assoc::command_line_wide();
+    let parsed = cli::parse(&cl, false, false);
+    process_parsed_cl(hwnd, &parsed);
 
     // If we did not show the window above, make sure it is shown now
     // (upstream viv.c:5444-5451).

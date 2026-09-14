@@ -864,8 +864,9 @@ fn close_existing_process() {
 }
 
 /// The raw GetCommandLineW as a owned wide buffer (the #21 handoff's
-/// NUL-walk, window.rs:3478-3487).
-fn command_line_wide() -> Vec<u16> {
+/// NUL-walk, window.rs:3478-3487). Shared with the second-pass CLI parse
+/// (#48) — the quoting visibility `args_os` cannot provide.
+pub(crate) fn command_line_wide() -> Vec<u16> {
     // SAFETY: GetCommandLineW returns this process's NUL-terminated line,
     // valid for the process lifetime; the walk reads up to that NUL.
     unsafe {
