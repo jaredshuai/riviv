@@ -167,6 +167,9 @@ pub(crate) enum Cmd {
     /// Navigate → Jump To... (#39; `VIV_ID_NAV_JUMPTO`, viv.c:956 — default
     /// key 'J', viv.c:1046).
     NavJumpTo,
+    /// Help → Command Line Options (`VIV_ID_HELP_COMMAND_LINE_OPTIONS`,
+    /// viv.c:960 — no default key) — the usage box (#48).
+    HelpCommandLineOptions,
     /// Help → About (`VIV_ID_HELP_ABOUT`).
     HelpAbout,
 }
@@ -304,6 +307,7 @@ impl Cmd {
         Self::NavSortDescending,
         Self::NavShuffle,
         Self::NavJumpTo,
+        Self::HelpCommandLineOptions,
         Self::HelpAbout,
     ];
 }
@@ -830,12 +834,18 @@ pub(crate) const ENTRIES: &[Entry] = &[
         parent: Slot::Navigate,
         cmd: Cmd::NavJumpTo,
     },
-    // Help (viv.c:962-965): upstream precedes About with Help /
-    // command-line options / website / donate rows riviv does not ship.
+    // Help (viv.c:958-965): upstream precedes About with Help / website /
+    // donate rows riviv does not ship; the command-line options row is the
+    // one #48 takes, in its upstream slot between them and About.
     Entry::Popup {
         loc: loc::Id::MenuHelp,
         parent: Slot::Root,
         slot: Slot::Help,
+    },
+    Entry::Item {
+        loc: loc::Id::MenuCommandLineOptions,
+        parent: Slot::Help,
+        cmd: Cmd::HelpCommandLineOptions,
     },
     Entry::Item {
         loc: loc::Id::MenuAbout,
@@ -1089,7 +1099,11 @@ mod tests {
         assert_eq!(Cmd::NavSortDescending.id(), 66);
         assert_eq!(Cmd::NavShuffle.id(), 67);
         assert_eq!(Cmd::NavJumpTo.id(), 68);
-        assert_eq!(Cmd::HelpAbout.id(), 69);
+        // The #48 Help→Command Line Options row takes upstream's slot
+        // between the (unshipped) help rows and About: 69, pushing
+        // HelpAbout to 70.
+        assert_eq!(Cmd::HelpCommandLineOptions.id(), 69);
+        assert_eq!(Cmd::HelpAbout.id(), 70);
     }
 
     #[test]

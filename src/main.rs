@@ -84,6 +84,7 @@
 
 mod anim;
 mod assoc;
+mod cli;
 mod clipboard;
 mod config;
 mod copydata;
@@ -113,49 +114,13 @@ mod text;
 mod window;
 mod zoom;
 
-use std::ffi::{OsStr, OsString};
-use std::os::windows::ffi::OsStrExt;
-use std::path::absolute;
-
 use crate::window::run;
 
-/// Whether a command-line word is a switch, not a file (upstream
-/// viv.c:4825: an UNQUOTED '/'- or '-'-prefixed word — where
-/// `string_is_dot` (string.c:856-871) means "contains a '.' anywhere", so
-/// `-foo.png` is a FILE. `args_os` cannot see the original quoting, so
-/// quoted switches are skipped too; noted in README Differences).
-fn is_switch(arg: &OsStr) -> bool {
-    let wide = arg.encode_wide().collect::<Vec<u16>>();
-    match wide.first() {
-        Some(&c) if c == u16::from(b'/') || c == u16::from(b'-') => {
-            !wide.contains(&u16::from(b'.'))
-        }
-        _ => false,
-    }
-}
-
-/// The command line's file words — shared by the startup parse here and the
-/// single-instance handoff receive (#21): switches dropped, empties dropped
-/// (upstream skips blank words, viv.c:4993), the rest made absolute —
-/// upstream cwd-combines relative paths the same way (string_path_combine);
-/// the handoff path re-runs this AFTER adopting the sender's cwd, so its
-/// relative arguments resolve in ITS working directory (viv.c:3711-3715).
-pub(crate) fn file_args(words: impl IntoIterator<Item = OsString>) -> Vec<OsString> {
-    words
-        .into_iter()
-        .filter(|a| !a.is_empty() && !is_switch(a))
-        .map(|a| match absolute(&a) {
-            Ok(p) => p.into_os_string(),
-            Err(_) => a,
-        })
-        .collect()
-}
-
 fn main() {
-    // Parsed once for the startup open; the single-instance handoff receive
-    // re-parses its forwarded string through the same `file_args` (#21).
-    let args = file_args(std::env::args_os().skip(1));
-    if let Err(err) = run(args) {
+    // The whole command line — install pass, then the second pass's
+    // config switches and file words — is read raw inside `run` (#48:
+    // the second pass needs the quoting `args_os` cannot see).
+    if let Err(err) = run() {
         window::fatal(&format!("riviv: {err}"));
     }
 }
