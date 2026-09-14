@@ -2648,12 +2648,12 @@ fn playlist_add_current_if_empty(state: &mut WindowState) {
 /// Apply one parsed command line (upstream `_viv_process_command_line`,
 /// viv.c:4744-5148 — the file-word ladder, the switch arms' side effects,
 /// and the show-state tail). Shared by the startup line (viv.c:5445) and
-/// the single-instance handoff receive (#21, viv.c:3715). Order per
-/// upstream: config writes land mid-walk (before the file open, so the
-/// `/name`-family governs the very navigation that follows), the
-/// Everything sends fire mid-walk too, the file actions and the
-/// end blocks (add-mode bootstrap / the open) replay the ladder, and the
-/// show tail (slideshow, fullscreen, rect, maximized) comes last.
+/// the single-instance handoff receive (#21, viv.c:3715). The action
+/// stream replays IN WALK ORDER — a `/random` between file words fires
+/// its navigation before later words process, and a `/name` after it only
+/// then applies (upstream's one-loop ordering, cubic P1); the end blocks
+/// (add-mode bootstrap / the open), the usage boxes and the show tail
+/// (slideshow, fullscreen, rect, maximized) come last.
 ///
 /// One deliberate timing divergence, documented in README Differences:
 /// upstream pops the usage box for EACH unknown word mid-walk; riviv
@@ -2661,39 +2661,38 @@ fn playlist_add_current_if_empty(state: &mut WindowState) {
 /// pumping messages over a half-applied command line is reentrancy
 /// upstream only survives by accident.
 fn process_parsed_cl(hwnd: HWND, parsed: &cli::Parsed) {
-    // The switch arms' config writes (upstream's globals, viv.c:4838-4953).
-    // NOTE: unlike the menu's sort/shuffle handlers (viv.c:1750-1816), the
-    // CLI path writes the config DIRECTLY — no preload/last cache clear.
-    // SAFETY: the borrow spans plain field stores.
-    if let Some(state) = unsafe { state_of(hwnd) } {
-        if let Some(mode) = parsed.nav_sort {
-            state.config.nav_sort = mode as i32;
-        }
-        if let Some(ascending) = parsed.sort_ascending {
-            state.config.nav_sort_ascending = ascending;
-        }
-        if parsed.shuffle {
-            state.config.shuffle = 1;
-        }
-        if let Some(rate) = parsed.slideshow_rate {
-            state.config.slideshow_rate = rate;
-        }
-    }
-    // `/everything <term>` and `/random <term>` (viv.c:4857-4872 — the
-    // send fires mid-walk with the dialog parent 0). These take their own
-    // state borrows inside; none is held here.
-    for term in &parsed.everything {
-        everything::send_search(hwnd, HWND::default(), false, false, term);
-    }
-    for term in &parsed.random {
-        everything::send_search(hwnd, HWND::default(), false, true, term);
-    }
-    // The file-word ladder replay: relative words resolve against the CWD
-    // the same way main.rs's old absolutize did (upstream's
-    // string_path_combine — the handoff adopts the sender's cwd before
-    // this runs).
     for action in &parsed.actions {
         match action {
+            cli::ClAction::ConfigWrite(write) => {
+                // A switch arm's config write (upstream's globals,
+                // viv.c:4838-4953). NOTE: unlike the menu's sort/shuffle
+                // handlers (viv.c:1750-1816), the CLI path writes the
+                // config DIRECTLY — no preload/last cache clear.
+                // SAFETY: the borrow spans plain field stores.
+                if let Some(state) = unsafe { state_of(hwnd) } {
+                    if let Some(mode) = write.nav_sort {
+                        state.config.nav_sort = mode as i32;
+                    }
+                    if let Some(ascending) = write.sort_ascending {
+                        state.config.nav_sort_ascending = ascending;
+                    }
+                    if write.shuffle {
+                        state.config.shuffle = 1;
+                    }
+                    if let Some(rate) = write.slideshow_rate {
+                        state.config.slideshow_rate = rate;
+                    }
+                }
+            }
+            // `/everything <term>` and `/random <term>` (viv.c:4857-4872 —
+            // the send fires mid-walk with the dialog parent 0). send_search
+            // takes its own state borrows inside; none is held here.
+            cli::ClAction::Everything(term) => {
+                everything::send_search(hwnd, HWND::default(), false, false, term);
+            }
+            cli::ClAction::Random(term) => {
+                everything::send_search(hwnd, HWND::default(), false, true, term);
+            }
             cli::ClAction::ExitRandom => {
                 // SAFETY: the borrow spans one field store.
                 if let Some(state) = unsafe { state_of(hwnd) } {
@@ -2707,6 +2706,9 @@ fn process_parsed_cl(hwnd: HWND, parsed: &cli::Parsed) {
                 }
             }
             cli::ClAction::AddFile(word) => {
+                // Relative words resolve against the CWD (upstream's
+                // string_path_combine — the handoff adopts the sender's
+                // cwd before this runs).
                 let path = absolutize(word);
                 // SAFETY: the borrow spans the add's metadata read.
                 if let Some(state) = unsafe { state_of(hwnd) } {

@@ -22,6 +22,8 @@
 //! - `string_to_int` (string.c:260-285) skips non-digits WITHOUT stopping
 //!   ("1x2" parses as 12) and an absent parameter word parses as 0.
 
+use crate::playlist::SortMode;
+
 /// One tokenizer word (string.c:804-835): the unquoted text. Whether the
 /// raw word STARTED with a quote (viv.c:4801-4806's `was_quote`) is the
 /// caller's to read off the slice BEFORE consuming the word.
@@ -114,8 +116,26 @@ impl RectOverride {
     }
 }
 
-/// The ordered file-word side effects of the walk (upstream's loop state
-/// is order-sensitive: `is_add` can flip via `/add` between words).
+/// One config-write switch arm's fields — replayed at its walk position,
+/// last write wins per field (upstream assigns the globals mid-walk,
+/// viv.c:4838-4953).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ConfigWrite {
+    /// `/name`-family: the mode arm also fixes the direction (name/path →
+    /// ascending, dm/dc/size → descending, viv.c:4917-4953).
+    pub nav_sort: Option<crate::playlist::SortMode>,
+    /// `/ascending` or `/descending` alone.
+    pub sort_ascending: Option<i32>,
+    pub shuffle: bool,
+    /// `/rate <index>` (the PRESET index — the usage text saying
+    /// milliseconds is upstream's own doc/impl mismatch).
+    pub slideshow_rate: Option<i32>,
+}
+
+/// The ordered side-effect stream of the walk (upstream's loop is
+/// order-sensitive: `is_add` can flip via `/add` between words, and a
+/// `/random` between file words fires its navigation BEFORE later words
+/// — the shell replays one-by-one at the original positions).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ClAction {
     /// The first file word of the line: random mode exits (viv.c:4998-5006).
@@ -126,11 +146,18 @@ pub(crate) enum ClAction {
     /// One file word appended to the playlist (viv.c:5008-5023: the stashed
     /// `single` first, then each next word — the shell replays in order).
     AddFile(Vec<u16>),
+    /// `/everything <term>` fired its search mid-walk (viv.c:4857-4865).
+    Everything(Vec<u16>),
+    /// `/random <term>` armed and fired its first query mid-walk
+    /// (viv.c:4866-4872 — the randomize arm navigates immediately).
+    Random(Vec<u16>),
+    /// A config-writing switch arm landed (last write wins per field).
+    ConfigWrite(ConfigWrite),
 }
 
-/// The parsed second-pass outcome. The shell applies: config writes →
-/// Everything sends (in order) → the action replay → the end blocks
-/// (add-mode bootstrap / the open) → usage boxes → the show flags.
+/// The parsed second-pass outcome. The shell replays `actions` in order,
+/// then the end blocks (add-mode bootstrap / the open), the usage boxes,
+/// and the show tail (`/slideshow`, fullscreen, rect, maximized).
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Parsed {
     pub actions: Vec<ClAction>,
@@ -144,17 +171,6 @@ pub(crate) struct Parsed {
     pub start_window: bool,
     pub start_maximized: bool,
     pub rect: RectOverride,
-    pub slideshow_rate: Option<i32>,
-    /// `/name`-family: the mode arm also fixes the direction (name/path →
-    /// ascending, dm/dc/size → descending, viv.c:4917-4953).
-    pub nav_sort: Option<crate::playlist::SortMode>,
-    /// `/ascending` or `/descending` alone (last write wins).
-    pub sort_ascending: Option<i32>,
-    pub shuffle: bool,
-    /// `/everything <term>` terms in command-line order.
-    pub everything: Vec<Vec<u16>>,
-    /// `/random <term>` terms in command-line order.
-    pub random: Vec<Vec<u16>>,
     /// Unknown switch words — each pops the usage box (viv.c:4986-4990).
     pub unknown: Vec<Vec<u16>>,
 }
@@ -211,11 +227,14 @@ pub(crate) fn parse(cl: &[u16], is_add: bool, has_current: bool) -> Parsed {
                 // backlog); recognized so it stays usage-free, inert until
                 // the feature lands.
             } else if eq_switch(arm, "shuffle") {
-                out.shuffle = true;
+                out.actions.push(ClAction::ConfigWrite(ConfigWrite {
+                    shuffle: true,
+                    ..ConfigWrite::default()
+                }));
             } else if eq_switch(arm, "everything") {
-                out.everything.push(param(&mut i));
+                out.actions.push(ClAction::Everything(param(&mut i)));
             } else if eq_switch(arm, "random") {
-                out.random.push(param(&mut i));
+                out.actions.push(ClAction::Random(param(&mut i)));
             } else if eq_switch(arm, "minimal") || eq_switch(arm, "compact") {
                 // The view-preset pair (#46 backlog) — recognized, inert.
             } else if eq_switch(arm, "x") {
@@ -227,26 +246,30 @@ pub(crate) fn parse(cl: &[u16], is_add: bool, has_current: bool) -> Parsed {
             } else if eq_switch(arm, "height") {
                 out.rect.high = Some(to_int(&param(&mut i)));
             } else if eq_switch(arm, "rate") {
-                out.slideshow_rate = Some(to_int(&param(&mut i)));
+                out.actions.push(ClAction::ConfigWrite(ConfigWrite {
+                    slideshow_rate: Some(to_int(&param(&mut i))),
+                    ..ConfigWrite::default()
+                }));
             } else if eq_switch(arm, "name") {
-                out.nav_sort = Some(crate::playlist::SortMode::Name);
-                out.sort_ascending = Some(1);
+                out.actions.push(sort_write(SortMode::Name, 1));
             } else if eq_switch(arm, "dm") {
-                out.nav_sort = Some(crate::playlist::SortMode::DateModified);
-                out.sort_ascending = Some(0);
+                out.actions.push(sort_write(SortMode::DateModified, 0));
             } else if eq_switch(arm, "dc") {
-                out.nav_sort = Some(crate::playlist::SortMode::DateCreated);
-                out.sort_ascending = Some(0);
+                out.actions.push(sort_write(SortMode::DateCreated, 0));
             } else if eq_switch(arm, "path") {
-                out.nav_sort = Some(crate::playlist::SortMode::FullPath);
-                out.sort_ascending = Some(1);
+                out.actions.push(sort_write(SortMode::FullPath, 1));
             } else if eq_switch(arm, "size") {
-                out.nav_sort = Some(crate::playlist::SortMode::Size);
-                out.sort_ascending = Some(0);
+                out.actions.push(sort_write(SortMode::Size, 0));
             } else if eq_switch(arm, "ascending") {
-                out.sort_ascending = Some(1);
+                out.actions.push(ClAction::ConfigWrite(ConfigWrite {
+                    sort_ascending: Some(1),
+                    ..ConfigWrite::default()
+                }));
             } else if eq_switch(arm, "descending") {
-                out.sort_ascending = Some(0);
+                out.actions.push(ClAction::ConfigWrite(ConfigWrite {
+                    sort_ascending: Some(0),
+                    ..ConfigWrite::default()
+                }));
             } else if eq_switch(arm, "isrunas") {
                 // The install pass's re-execution marker — inert here
                 // (viv.c:4958-4961).
@@ -283,6 +306,16 @@ pub(crate) fn parse(cl: &[u16], is_add: bool, has_current: bool) -> Parsed {
     out
 }
 
+/// A `/name`-family arm's two-field write (the mode fixes the direction,
+/// viv.c:4917-4953).
+fn sort_write(mode: SortMode, ascending: i32) -> ClAction {
+    ClAction::ConfigWrite(ConfigWrite {
+        nav_sort: Some(mode),
+        sort_ascending: Some(ascending),
+        ..ConfigWrite::default()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -294,6 +327,27 @@ mod tests {
 
     fn s(v: &[u16]) -> String {
         String::from_utf16_lossy(v)
+    }
+
+    /// Fold the stream's ConfigWrite actions into the final config state
+    /// (the replay applies them in order — last write wins per field).
+    fn config_of(p: &Parsed) -> ConfigWrite {
+        let mut out = ConfigWrite::default();
+        for a in &p.actions {
+            if let ClAction::ConfigWrite(w) = a {
+                if let Some(mode) = w.nav_sort {
+                    out.nav_sort = Some(mode);
+                }
+                if let Some(asc) = w.sort_ascending {
+                    out.sort_ascending = Some(asc);
+                }
+                out.shuffle |= w.shuffle;
+                if let Some(rate) = w.slideshow_rate {
+                    out.slideshow_rate = Some(rate);
+                }
+            }
+        }
+        out
     }
 
     // ---- the tokenizer (string.c:804-835) ----
@@ -351,7 +405,7 @@ mod tests {
         assert_eq!(p.rect.y, Some(200));
         assert_eq!(p.rect.wide, Some(300));
         assert_eq!(p.rect.high, Some(400));
-        assert_eq!(p.slideshow_rate, Some(4));
+        assert_eq!(config_of(&p).slideshow_rate, Some(4));
         // The parameters never leak into the file words.
         assert_eq!(p.file_count, 1);
         assert_eq!(s(p.single.as_ref().unwrap()), "img.png");
@@ -366,18 +420,40 @@ mod tests {
     }
 
     #[test]
-    fn everything_and_random_consume_terms() {
+    fn everything_and_random_consume_terms_in_walk_order() {
         let p = parse(
             &w("exe /everything cat /random dog.png a.png"),
             false,
             false,
         );
-        assert_eq!(p.everything.len(), 1);
-        assert_eq!(s(&p.everything[0]), "cat");
-        assert_eq!(p.random.len(), 1);
-        assert_eq!(s(&p.random[0]), "dog.png");
+        assert_eq!(
+            p.actions,
+            vec![
+                ClAction::Everything(w("cat")),
+                ClAction::Random(w("dog.png")),
+                ClAction::ExitRandom,
+                ClAction::ClearPlaylist,
+            ]
+        );
         assert_eq!(p.file_count, 1); // dog.png was consumed as the term
         assert_eq!(s(p.single.as_ref().unwrap()), "a.png");
+    }
+
+    #[test]
+    fn a_search_between_file_words_keeps_its_walk_position() {
+        // The cubic P1 pin: `/random` between file words fires its
+        // navigation BEFORE later words process (viv.c walks one loop).
+        let p = parse(&w("exe a.png /random t b.png"), false, false);
+        assert_eq!(
+            p.actions,
+            vec![
+                ClAction::ExitRandom,
+                ClAction::ClearPlaylist,
+                ClAction::Random(w("t")),
+                ClAction::AddFile(w("a.png")),
+                ClAction::AddFile(w("b.png")),
+            ]
+        );
     }
 
     // ---- the sort family (viv.c:4917-4953) ----
@@ -385,34 +461,42 @@ mod tests {
     #[test]
     fn sort_arms_fix_both_mode_and_direction() {
         let p = parse(&w("exe /name"), false, false);
-        assert_eq!(p.nav_sort, Some(SortMode::Name));
-        assert_eq!(p.sort_ascending, Some(1));
+        let c = config_of(&p);
+        assert_eq!(c.nav_sort, Some(SortMode::Name));
+        assert_eq!(c.sort_ascending, Some(1));
         let p = parse(&w("exe /size"), false, false);
-        assert_eq!(p.nav_sort, Some(SortMode::Size));
-        assert_eq!(p.sort_ascending, Some(0));
-        let p = parse(&w("exe /dm"), false, false);
-        assert_eq!(p.nav_sort, Some(SortMode::DateModified));
-        let p = parse(&w("exe /dc"), false, false);
-        assert_eq!(p.nav_sort, Some(SortMode::DateCreated));
-        let p = parse(&w("exe /path"), false, false);
-        assert_eq!(p.nav_sort, Some(SortMode::FullPath));
+        let c = config_of(&p);
+        assert_eq!(c.nav_sort, Some(SortMode::Size));
+        assert_eq!(c.sort_ascending, Some(0));
+        assert_eq!(
+            config_of(&parse(&w("exe /dm"), false, false)).nav_sort,
+            Some(SortMode::DateModified)
+        );
+        assert_eq!(
+            config_of(&parse(&w("exe /dc"), false, false)).nav_sort,
+            Some(SortMode::DateCreated)
+        );
+        assert_eq!(
+            config_of(&parse(&w("exe /path"), false, false)).nav_sort,
+            Some(SortMode::FullPath)
+        );
     }
 
     #[test]
     fn bare_direction_switches_and_last_write_wins() {
-        let p = parse(&w("exe /size /ascending"), false, false);
-        assert_eq!(p.nav_sort, Some(SortMode::Size));
-        assert_eq!(p.sort_ascending, Some(1));
-        let p = parse(&w("exe /name /descending /dm"), false, false);
+        let c = config_of(&parse(&w("exe /size /ascending"), false, false));
+        assert_eq!(c.nav_sort, Some(SortMode::Size));
+        assert_eq!(c.sort_ascending, Some(1));
         // /dm is the last mode write; /descending stays the last direction.
-        assert_eq!(p.nav_sort, Some(SortMode::DateModified));
-        assert_eq!(p.sort_ascending, Some(0));
+        let c = config_of(&parse(&w("exe /name /descending /dm"), false, false));
+        assert_eq!(c.nav_sort, Some(SortMode::DateModified));
+        assert_eq!(c.sort_ascending, Some(0));
     }
 
     #[test]
     fn shuffle_and_isrunas_are_recognized() {
         let p = parse(&w("exe /shuffle /isrunas"), false, false);
-        assert!(p.shuffle);
+        assert!(config_of(&p).shuffle);
         assert!(p.unknown.is_empty());
     }
 
