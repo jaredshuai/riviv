@@ -589,7 +589,7 @@ mod tests {
         // commands, #39's 9 sort/shuffle/jumpto rows, #41's 5 clipboard
         // commands, #48's command-line options row, #44's 16 panscan rows
         // and #45's 3 toolbar rows).
-        assert_eq!(c.to_pairs(false).len(), 149, "the upstream save table");
+        assert_eq!(c.to_pairs(false).len(), 166, "the upstream save table");
     }
 
     #[test]
@@ -639,7 +639,7 @@ mod tests {
         let c = Config::default();
         assert_eq!(
             c.to_pairs(true).len(),
-            149,
+            166,
             "active store writes the full table"
         );
         let c = Config {

@@ -92,6 +92,7 @@ mod cursor;
 mod custom_rate_dlg;
 mod everything;
 mod fit;
+mod frame;
 mod ini;
 mod jumpto_dlg;
 mod keys;

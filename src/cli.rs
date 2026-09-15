@@ -153,6 +153,11 @@ pub(crate) enum ClAction {
     Random(Vec<u16>),
     /// A config-writing switch arm landed (last write wins per field).
     ConfigWrite(ConfigWrite),
+    /// A command-dispatching switch landed (#46): `/ontop` runs the
+    /// View→On Top→Always command, `/minimal`/`/compact` the Preset 1/2
+    /// commands (upstream `_viv_command`s them mid-walk, viv.c:4853-4888
+    /// — the toggle quirks ride along through the shared handlers).
+    Command(crate::menu::Cmd),
 }
 
 /// The parsed second-pass outcome. The shell replays `actions` in order,
@@ -223,9 +228,11 @@ pub(crate) fn parse(cl: &[u16], is_add: bool, has_current: bool) -> Parsed {
                 out.start_window = true;
                 out.start_maximized = true;
             } else if eq_switch(arm, "ontop") {
-                // Upstream runs the View→On Top command (#46 in riviv's
-                // backlog); recognized so it stays usage-free, inert until
-                // the feature lands.
+                // Upstream runs the View→On Top→Always command in place
+                // (viv.c:4853-4855) — the TOGGLE semantics ride along
+                // through the shared handler.
+                out.actions
+                    .push(ClAction::Command(crate::menu::Cmd::ViewOntopAlways));
             } else if eq_switch(arm, "shuffle") {
                 out.actions.push(ClAction::ConfigWrite(ConfigWrite {
                     shuffle: true,
@@ -236,7 +243,14 @@ pub(crate) fn parse(cl: &[u16], is_add: bool, has_current: bool) -> Parsed {
             } else if eq_switch(arm, "random") {
                 out.actions.push(ClAction::Random(param(&mut i)));
             } else if eq_switch(arm, "minimal") || eq_switch(arm, "compact") {
-                // The view-preset pair (#46 backlog) — recognized, inert.
+                // The view-preset pair (#46): upstream `_viv_command`s
+                // Preset 1 / Preset 2 in place (viv.c:4879-4888).
+                out.actions
+                    .push(ClAction::Command(if eq_switch(arm, "minimal") {
+                        crate::menu::Cmd::ViewPreset1
+                    } else {
+                        crate::menu::Cmd::ViewPreset2
+                    }));
             } else if eq_switch(arm, "x") {
                 out.rect.x = Some(to_int(&param(&mut i)));
             } else if eq_switch(arm, "y") {

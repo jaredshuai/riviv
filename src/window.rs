@@ -82,23 +82,24 @@ use windows::Win32::UI::WindowsAndMessaging::{
     DestroyMenu, DestroyWindow, DispatchMessageW, EnableMenuItem, FindWindowA, GWL_EXSTYLE,
     GWL_STYLE, GWLP_USERDATA, GetClientRect, GetCursorPos, GetForegroundWindow, GetMenu,
     GetMessageW, GetSystemMetrics, GetWindowLongPtrW, GetWindowRect, HICON, HMENU, HTCAPTION,
-    HTMENU, HWND_TOP, IDC_ARROW, IMAGE_ICON, IsIconic, IsZoomed, KillTimer, LR_DEFAULTCOLOR,
-    LoadCursorW, LoadImageW, MB_ICONERROR, MB_ICONQUESTION, MB_OK, MENU_ITEM_FLAGS, MF_BYCOMMAND,
-    MF_CHECKED, MF_ENABLED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MF_UNCHECKED,
-    MFT_RADIOCHECK, MINMAXINFO, MSG, MenuItemFromPoint, MessageBoxW, PostMessageW, PostQuitMessage,
-    RegisterClassExW, SC_MONITORPOWER, SHOW_WINDOW_CMD, SM_CXICON, SM_CXSMICON, SM_CYICON,
-    SM_CYSMICON, SW_MAXIMIZE, SW_RESTORE, SW_SHOW, SW_SHOWNORMAL, SWP_FRAMECHANGED, SWP_NOACTIVATE,
-    SWP_NOCOPYBITS, SWP_NOZORDER, SYSTEM_METRICS_INDEX, SendMessageW, SetCursorPos,
-    SetForegroundWindow, SetMenu, SetProcessDPIAware, SetTimer, SetWindowLongPtrW, SetWindowPos,
-    SetWindowTextW, ShowCursor, ShowWindow, TPM_CENTERALIGN, TPM_LEFTBUTTON, TPM_VCENTERALIGN,
-    TrackPopupMenu, TranslateMessage, USER_TIMER_MINIMUM, WINDOW_EX_STYLE, WINDOW_STYLE,
-    WM_ACTIVATE, WM_COMMAND, WM_CONTEXTMENU, WM_COPYDATA, WM_DESTROY, WM_DROPFILES, WM_ENDSESSION,
-    WM_ERASEBKGND, WM_GETMINMAXINFO, WM_INITMENU, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_MOVE, WM_NCCREATE,
-    WM_NCDESTROY, WM_NCLBUTTONDOWN, WM_NCXBUTTONDBLCLK, WM_NCXBUTTONDOWN, WM_NULL, WM_PAINT,
-    WM_PASTE, WM_QUERYENDSESSION, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SIZE,
-    WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_TIMER, WM_XBUTTONDBLCLK, WM_XBUTTONDOWN, WNDCLASSEXW,
-    WS_CAPTION, WS_EX_ACCEPTFILES, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_THICKFRAME, WS_VISIBLE,
+    HTMENU, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST, IDC_ARROW, IMAGE_ICON, IsIconic, IsZoomed,
+    KillTimer, LR_DEFAULTCOLOR, LoadCursorW, LoadImageW, MB_ICONERROR, MB_ICONQUESTION, MB_OK,
+    MENU_ITEM_FLAGS, MF_BYCOMMAND, MF_CHECKED, MF_ENABLED, MF_GRAYED, MF_POPUP, MF_SEPARATOR,
+    MF_STRING, MF_UNCHECKED, MFT_RADIOCHECK, MINMAXINFO, MSG, MenuItemFromPoint, MessageBoxW,
+    PostMessageW, PostQuitMessage, RegisterClassExW, SC_MONITORPOWER, SHOW_WINDOW_CMD, SM_CXICON,
+    SM_CXSMICON, SM_CYICON, SM_CYSMICON, SW_MAXIMIZE, SW_RESTORE, SW_SHOW, SW_SHOWNORMAL,
+    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+    SYSTEM_METRICS_INDEX, SendMessageW, SetCursorPos, SetForegroundWindow, SetMenu,
+    SetProcessDPIAware, SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowCursor,
+    ShowWindow, TPM_CENTERALIGN, TPM_LEFTBUTTON, TPM_VCENTERALIGN, TrackPopupMenu,
+    TranslateMessage, USER_TIMER_MINIMUM, WINDOW_EX_STYLE, WINDOW_STYLE, WM_ACTIVATE, WM_COMMAND,
+    WM_CONTEXTMENU, WM_COPYDATA, WM_DESTROY, WM_DROPFILES, WM_ENDSESSION, WM_ERASEBKGND,
+    WM_GETMINMAXINFO, WM_INITMENU, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_MOVE, WM_NCCREATE, WM_NCDESTROY,
+    WM_NCLBUTTONDOWN, WM_NCXBUTTONDBLCLK, WM_NCXBUTTONDOWN, WM_NULL, WM_PAINT, WM_PASTE,
+    WM_QUERYENDSESSION, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SIZE, WM_SYSCOMMAND,
+    WM_SYSKEYDOWN, WM_TIMER, WM_XBUTTONDBLCLK, WM_XBUTTONDOWN, WNDCLASSEXW, WS_CAPTION,
+    WS_EX_ACCEPTFILES, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_SYSMENU, WS_THICKFRAME, WS_VISIBLE,
     WindowFromPoint,
 };
 use windows::core::{HSTRING, PCSTR, PCWSTR, w};
@@ -709,12 +710,14 @@ fn toggle_fullscreen(hwnd: HWND) {
                 },
             )
         };
-        // The bar is RECREATED first (upstream `_viv_status_show(1)` at
-        // 6645 precedes the style commit at 6648; it destroys and recreates
-        // rather than hiding, viv.c:10932-10963).
-        // SAFETY: returns this exe's module handle; no side effects.
-        match unsafe { GetModuleHandleW(None) } {
-            Ok(hinstance) => {
+        // The bar is RECREATED first — per config (#46; upstream
+        // `_viv_status_show(config_show_status)` at 6645 precedes the
+        // style commit at 6648; it destroys and recreates rather than
+        // hiding, viv.c:10932-10963).
+        // SAFETY: read-only config read, then the creation pass.
+        if (unsafe { state_of(hwnd) }).is_some_and(|state| state.config.show_status != 0) {
+            // SAFETY: returns this exe's module handle; no side effects.
+            if let Ok(hinstance) = unsafe { GetModuleHandleW(None) } {
                 let bar = match status::create(hwnd, hinstance.into()) {
                     Ok(bar) => bar,
                     Err(msg) => {
@@ -729,7 +732,6 @@ fn toggle_fullscreen(hwnd: HWND) {
                     state.status = bar;
                 }
             }
-            Err(e) => eprintln!("GetModuleHandleW failed: {e} (no status bar)"),
         }
         // The strip is recreated right behind the bar, per config (upstream
         // `_viv_controls_show(config_show_controls)` at 6646, second in its
@@ -741,16 +743,30 @@ fn toggle_fullscreen(hwnd: HWND) {
         }
         // SAFETY: read-modify-write of the style on the owning thread.
         let style = unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) } as u32;
-        // SAFETY: hwnd is live; riviv always shows caption + thick frame
-        // (upstream restores per config, whose defaults are both on —
-        // config.c:85-86).
-        unsafe {
-            SetWindowLongPtrW(
-                hwnd,
-                GWL_STYLE,
-                (style | WS_CAPTION.0 | WS_THICKFRAME.0) as isize,
-            );
+        // The caption/frame bits come back per config (#46; upstream
+        // rebuilds the style from `config_show_caption`/`thickframe` here
+        // — its defaults are both on, config.c:85-86).
+        // SAFETY: the borrow spans only the two config reads.
+        let (show_caption, show_thickframe) =
+            (unsafe { state_of(hwnd) }).map_or((true, true), |state| {
+                (
+                    state.config.show_caption != 0,
+                    state.config.show_thickframe != 0,
+                )
+            });
+        let mut restored = style;
+        if show_caption {
+            restored |= WS_CAPTION.0 | WS_SYSMENU.0;
+        } else {
+            restored &= !(WS_CAPTION.0 | WS_SYSMENU.0);
         }
+        if show_thickframe {
+            restored |= WS_THICKFRAME.0;
+        } else {
+            restored &= !WS_THICKFRAME.0;
+        }
+        // SAFETY: hwnd is live.
+        unsafe { SetWindowLongPtrW(hwnd, GWL_STYLE, restored as isize) };
         // SAFETY: the borrow spans only the copies out.
         let (rect, offset) = (unsafe { state_of(hwnd) })
             .map(|state| (state.fullscreen_restore_rect, state.fullscreen_zoom_offset))
@@ -1300,6 +1316,103 @@ fn zoom_reset(hwnd: HWND) {
     // The Best Fit gray flips here (upstream's ZOOM_RESET ends in
     // `_viv_view_set` → the toolbar refresh, viv.c:6571).
     refresh_toolbar(hwnd);
+}
+
+/// The three View fit rows (#46; upstream viv.c:2015-2044): which config a
+/// row's toggle lands on.
+enum FitInput {
+    AllowShrinking,
+    KeepAspect,
+    FillWindow,
+}
+
+/// One View fit-row command (upstream viv.c:2015-2044): 1:1 dies first
+/// (`_viv_1to1 = 0` — the toggle's view math re-derives from the fit
+/// level), the config flips, then the same size pass + repaint a resize
+/// does re-anchors the render at the new fit inputs. The Fill row reads
+/// the CURRENT mode: fullscreen toggles `fullscreen_fill_window`,
+/// windowed `fill_window` (upstream's own branch, viv.c:2033-2044).
+fn toggle_fit_input(hwnd: HWND, input: FitInput) {
+    // SAFETY: the borrow spans the 1:1 clear, the config flip and the
+    // mode read — nothing pumps.
+    if let Some(state) = unsafe { state_of(hwnd) } {
+        state.view.leave_one_to_one();
+        let fullscreen = state.fullscreen;
+        match input {
+            FitInput::AllowShrinking => {
+                state.config.allow_shrinking = i32::from(state.config.allow_shrinking == 0);
+            }
+            FitInput::KeepAspect => {
+                state.config.keep_aspect_ratio = i32::from(state.config.keep_aspect_ratio == 0);
+            }
+            FitInput::FillWindow => {
+                if fullscreen {
+                    state.config.fullscreen_fill_window =
+                        i32::from(state.config.fullscreen_fill_window == 0);
+                } else {
+                    state.config.fill_window = i32::from(state.config.fill_window == 0);
+                }
+            }
+        }
+    }
+    on_size(hwnd);
+    repaint(hwnd);
+}
+
+/// `_viv_refresh` (upstream viv.c:14539-14552) — View→Refresh / F5: drop
+/// the last-image cache and the parked preload, blank the display (the
+/// current file's name stays — upstream's `_viv_clear` keeps the fd and
+/// the title, viv.c:1268-1293), and re-open the same path so the file is
+/// re-read from disk. No current file: a no-op (upstream's `_viv_open`
+/// with an empty fd does nothing).
+fn refresh_current(hwnd: HWND) {
+    // SAFETY: the borrow spans the entry clone, the cache drops and the
+    // display clear — nothing pumps.
+    let entry = (unsafe { state_of(hwnd) }).and_then(|state| {
+        let entry = state.nav_current.clone()?;
+        state.last_cache = None;
+        state.preload = None;
+        // The `_viv_clear` body: the frames die, the fd/title stay. The
+        // animation marks and the view reset ride along (viv.c:1278-1288).
+        state.image = None;
+        state.displayed_from = None;
+        state.displayed_entry = None;
+        state.displayed_file_bytes = None;
+        state.pending_file_bytes = None;
+        state.session = None;
+        state.view.reset();
+        state.animation_looped = false;
+        state.animation_playing = true;
+        state.slideshow_timeup = false;
+        let stop_timer = state.animation_timer_running;
+        state.animation_timer_running = false;
+        Some((entry, stop_timer))
+    });
+    let Some((entry, stop_timer)) = entry else {
+        return;
+    };
+    if stop_timer {
+        // SAFETY: hwnd is live; a failed kill leaves a stale timer that
+        // the WM_TIMER guard no-ops on.
+        let _ = unsafe { KillTimer(Some(hwnd), ANIMATION_TIMER_ID) };
+        // The animation timer stopping is a prevent-sleep transition
+        // point (upstream `_viv_timer_stop`, viv.c:9633).
+        update_prevent_sleep(hwnd);
+        // And an on-top while-playing decision point (riviv superset:
+        // upstream re-evaluates only on slideshow events and menu opens).
+        update_ontop(hwnd);
+    }
+    refresh_status(hwnd);
+    // A blanked display can never hide the cursor — reconcile it
+    // (upstream `_viv_start_first_frame` → `_viv_update_show_cursor`,
+    // viv.c:7928 + 14338).
+    update_cursor(hwnd);
+    // SAFETY: queues a WM_PAINT; never pumps messages.
+    let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+    // The re-open itself — the display adopts the fresh decode's first
+    // frame (upstream `_viv_open(&fd, 0)` re-opens the CURRENT fd, id and
+    // all: a navigation onto itself, not a fresh direct entry).
+    request_open(hwnd, entry.path.as_os_str(), OpenOrigin::Nav(&entry));
 }
 
 /// Ctrl+Alt+0 — toggle the temporary 1:1 pixel-exact mode (upstream
@@ -2600,6 +2713,8 @@ fn slideshow_start(hwnd: HWND) {
     // The strip's play/pause radio flips here (upstream viv.c:6839).
     refresh_toolbar(hwnd);
     update_prevent_sleep(hwnd);
+    // The on-top bit follows the run starting (upstream viv.c:6840).
+    update_ontop(hwnd);
 }
 
 /// `_viv_pause` (viv.c:7594-7621): the running-state toggle behind Space,
@@ -2628,6 +2743,9 @@ fn slideshow_toggle(hwnd: HWND) {
     // The strip's play/pause radio flips here (upstream viv.c:7617).
     refresh_toolbar(hwnd);
     update_prevent_sleep(hwnd);
+    // The on-top bit follows the running-state toggle (upstream
+    // viv.c:7618).
+    update_ontop(hwnd);
 }
 
 /// `_viv_set_rate` (viv.c:7582-7601): store the rate; a running timer is
@@ -2808,6 +2926,8 @@ fn blank_display(hwnd: HWND) {
         // (upstream `_viv_timer_stop` → `_viv_update_prevent_sleep`,
         // viv.c:9633).
         update_prevent_sleep(hwnd);
+        // And an on-top while-playing decision point (riviv superset).
+        update_ontop(hwnd);
     }
     // SAFETY: hwnd is live; the HSTRING outlives the call. Fail-soft like
     // every other title update (upstream viv.c:1249 ignores it too).
@@ -2934,6 +3054,10 @@ fn process_parsed_cl(hwnd: HWND, parsed: &cli::Parsed) {
                     playlist::add_filename(&mut state.playlist, Path::new(&path));
                 }
             }
+            // `/ontop` / `/minimal` / `/compact` (#46; viv.c:4853-4888):
+            // upstream `_viv_command`s them mid-walk — the same handlers
+            // the menu rows use, quirks included.
+            cli::ClAction::Command(cmd) => on_command(hwnd, *cmd),
         }
     }
     // The add-mode end block (viv.c:5027-5041): the current file seeds an
@@ -3523,6 +3647,8 @@ fn on_load_replies(hwnd: HWND) {
         // (upstream `_viv_timer_stop` → `_viv_update_prevent_sleep`,
         // viv.c:9633).
         update_prevent_sleep(hwnd);
+        // And an on-top while-playing decision point (riviv superset).
+        update_ontop(hwnd);
     }
     if start_timer {
         // SAFETY: hwnd is live and owned by this thread. Fail-soft like
@@ -3533,6 +3659,8 @@ fn on_load_replies(hwnd: HWND) {
         // (upstream `_viv_timer_start` → `_viv_update_prevent_sleep`,
         // viv.c:9147).
         update_prevent_sleep(hwnd);
+        // And an on-top while-playing decision point (riviv superset).
+        update_ontop(hwnd);
     }
     if let Some(title) = title.as_ref() {
         // SAFETY: hwnd is live; the HSTRING outlives the call. Fail-soft on
@@ -3636,6 +3764,8 @@ fn animation_pause(hwnd: HWND) {
     if flipped {
         // A playing⇄paused transition is a prevent-sleep decision point.
         update_prevent_sleep(hwnd);
+        // And an on-top while-playing one (riviv superset).
+        update_ontop(hwnd);
     }
 }
 
@@ -3660,6 +3790,8 @@ fn frame_command(hwnd: HWND, walk: impl Fn(&mut LoadedImage, u64) -> bool) {
     // The unconditional pause is a prevent-sleep transition (viv.c:
     // 3929-3936) whether or not the walk moved.
     update_prevent_sleep(hwnd);
+    // And an on-top while-playing one (riviv superset).
+    update_ontop(hwnd);
     if walked.unwrap_or(false) {
         // The frame counter ("n / m") tracks the walk (upstream
         // `_viv_status_update` in the handler body, viv.c:9278).
@@ -4159,6 +4291,7 @@ fn on_initmenu(hwnd: HWND) {
         });
         menu::MenuState {
             show_menu: state.config.show_menu != 0,
+            show_status: state.config.show_status != 0,
             show_controls: state.config.show_controls != 0,
             fullscreen: state.fullscreen,
             one_to_one,
@@ -4176,6 +4309,17 @@ fn on_initmenu(hwnd: HWND) {
                 state.status_file_not_found,
                 state.status_load_failed,
             ),
+            // The #46 fit trio and on-top radios (viv.c:7127-7136): the
+            // Fill row reads the CURRENT mode's fill config (upstream's
+            // `_viv_check_menus` branch, viv.c:7098-7100).
+            allow_shrinking: state.config.allow_shrinking != 0,
+            keep_aspect: state.config.keep_aspect_ratio != 0,
+            fill_window: if state.fullscreen {
+                state.config.fullscreen_fill_window != 0
+            } else {
+                state.config.fill_window != 0
+            },
+            ontop: state.config.ontop,
         }
     });
     let Some(state) = snapshot else {
@@ -4184,11 +4328,11 @@ fn on_initmenu(hwnd: HWND) {
     // Upstream refreshes the status bar, the strip and the on-top state
     // right here when a slideshow runs fullscreen (viv.c:7081-7090) — a
     // slideshow started while fullscreen never passes through the normal
-    // refresh points' windowed paths before the menu opens. The on-top
-    // half is #46's.
+    // refresh points' windowed paths before the menu opens.
     if state.fullscreen && state.slideshow {
         refresh_status(hwnd);
         refresh_toolbar(hwnd);
+        update_ontop(hwnd);
     }
     // SAFETY: read-only query of the window's own menu.
     let bar = unsafe { GetMenu(hwnd) };
@@ -4344,10 +4488,42 @@ fn on_command(hwnd: HWND, cmd: menu::Cmd) {
             }
         }
         menu::Cmd::EditCut => clipboard::copy_current(hwnd, true),
+        menu::Cmd::ViewCaption => toggle_caption(hwnd),
+        menu::Cmd::ViewThickFrame => toggle_thickframe(hwnd),
         menu::Cmd::ViewMenu => toggle_menu(hwnd),
+        menu::Cmd::ViewStatus => toggle_status(hwnd),
         menu::Cmd::ViewControls => toggle_controls(hwnd),
+        // The Preset trio (#46; viv.c:1990-2013 — assign all five configs,
+        // one frame rebuild).
+        menu::Cmd::ViewPreset1 => apply_preset(hwnd, crate::frame::Preset::Minimal),
+        menu::Cmd::ViewPreset2 => apply_preset(hwnd, crate::frame::Preset::Compact),
+        menu::Cmd::ViewPreset3 => apply_preset(hwnd, crate::frame::Preset::Normal),
         menu::Cmd::ViewFullscreen => toggle_fullscreen(hwnd),
         menu::Cmd::ViewOneToOne => toggle_one_to_one(hwnd),
+        // The Window Size quartet (#46; viv.c:2076-2240) — the #24 sizing
+        // engine behind the menu rows.
+        cmd @ (menu::Cmd::ViewWindowSize50
+        | menu::Cmd::ViewWindowSize100
+        | menu::Cmd::ViewWindowSize200
+        | menu::Cmd::ViewWindowSizeAutoFit) => {
+            if let Some(kind) = cmd.window_size_kind() {
+                window_size_to_image(hwnd, kind);
+            }
+        }
+        // Refresh (#46; `_viv_refresh`, viv.c:14539-14552): drop the caches
+        // and re-read the current file from disk.
+        menu::Cmd::ViewRefresh => refresh_current(hwnd),
+        // The fit trio (#46; viv.c:2015-2044): 1:1 dies, the config flips,
+        // the size pass re-anchors at the new fit inputs, one repaint. The
+        // Fill row toggles the FULLSCREEN fill config while fullscreen —
+        // upstream's own quirk.
+        menu::Cmd::ViewAllowShrinking => toggle_fit_input(hwnd, FitInput::AllowShrinking),
+        menu::Cmd::ViewKeepAspect => toggle_fit_input(hwnd, FitInput::KeepAspect),
+        menu::Cmd::ViewFillWindow => toggle_fit_input(hwnd, FitInput::FillWindow),
+        // The on-top radios (#46; viv.c:2317-2328).
+        menu::Cmd::ViewOntopAlways => set_ontop(hwnd, SetOntop::Always),
+        menu::Cmd::ViewOntopWhilePlaying => set_ontop(hwnd, SetOntop::WhilePlaying),
+        menu::Cmd::ViewOntopNever => set_ontop(hwnd, SetOntop::Never),
         // Upstream's two fit commands both collapse the zoom position back
         // to the fit level (`VIV_ID_VIEW_BESTFIT` zeroes the zoom position
         // and refits, `VIV_ID_VIEW_ZOOM_RESET` drops 1:1 and the zoom
@@ -4534,92 +4710,244 @@ fn shuffle_toggle(hwnd: HWND) {
 }
 
 /// View→Menu (upstream `VIV_ID_VIEW_MENU`, viv.c:1975-1978): flip
-/// `config_show_menu` and rebuild the frame around the unchanged client
-/// area. Unreachable while fullscreen (the windowed shell carrying the
-/// bar is hidden there and the command has no accelerator) — and a strict
-/// no-op there rather than a bare config flip, so the flag can never
-/// desync from the attached bar (cubic round 1).
+/// `config_show_menu` and rebuild the frame. In fullscreen the flip still
+/// lands (upstream's `_viv_update_frame` early-returns there, viv.c:9828 —
+/// the exit rebuild applies the new config to the restored window).
 fn toggle_menu(hwnd: HWND) {
-    // SAFETY: the borrow spans the fullscreen read, the config flip and
-    // the handle copy — nothing pumps.
-    let next = (unsafe { state_of(hwnd) }).and_then(|state| {
-        if state.fullscreen {
-            return None;
-        }
+    // SAFETY: the borrow spans the config flip — nothing pumps.
+    if let Some(state) = unsafe { state_of(hwnd) } {
         state.config.show_menu = i32::from(state.config.show_menu == 0);
-        Some((state.config.show_menu != 0, state.menu))
-    });
-    if let Some((show, menu)) = next {
-        update_menu_frame(hwnd, show, menu);
     }
+    update_frame(hwnd);
 }
 
-/// The frame rebuild around a menu attach/detach (upstream
-/// `_viv_update_frame`'s menu arm, viv.c:9840-9925 — riviv keeps caption
-/// and thick frame permanently, so only the menu presence changes):
-/// re-seat the menu, then shift the outer rect by the AdjustWindowRect
-/// delta of the SAME client area so the client — the image — stays
-/// exactly where it was when the bar appears or disappears.
-fn update_menu_frame(hwnd: HWND, show: bool, menu: HMENU) {
+/// View→Caption (`VIV_ID_VIEW_CAPTION`, viv.c:1966-1970) and View→Frame
+/// (`VIV_ID_VIEW_THICKFRAME`, viv.c:1971-1974) — the two hidden style-bit
+/// toggles (#46): flip the config, then the same frame rebuild (the
+/// WS_CAPTION|WS_SYSMENU / WS_THICKFRAME pair is recomputed inside).
+fn toggle_caption(hwnd: HWND) {
+    // SAFETY: the borrow spans the config flip — nothing pumps.
+    if let Some(state) = unsafe { state_of(hwnd) } {
+        state.config.show_caption = i32::from(state.config.show_caption == 0);
+    }
+    update_frame(hwnd);
+}
+
+fn toggle_thickframe(hwnd: HWND) {
+    // SAFETY: the borrow spans the config flip — nothing pumps.
+    if let Some(state) = unsafe { state_of(hwnd) } {
+        state.config.show_thickframe = i32::from(state.config.show_thickframe == 0);
+    }
+    update_frame(hwnd);
+}
+
+/// View→Status Bar (`VIV_ID_VIEW_STATUS`, viv.c:1979-1983): flip
+/// `config_show_status` and rebuild (the bar is created/destroyed inside
+/// the frame pass).
+fn toggle_status(hwnd: HWND) {
+    // SAFETY: the borrow spans the config flip — nothing pumps.
+    if let Some(state) = unsafe { state_of(hwnd) } {
+        state.config.show_status = i32::from(state.config.show_status == 0);
+    }
+    update_frame(hwnd);
+}
+
+/// The three Preset rows and the CLI `/minimal`//compact` pair (#46;
+/// upstream viv.c:1990-2013 / 4879-4888): all five chrome configs are
+/// ASSIGNED (no carry-over), then the frame rebuild applies them.
+fn apply_preset(hwnd: HWND, preset: crate::frame::Preset) {
+    let t = preset.toggles();
+    // SAFETY: the borrow spans the five config stores — nothing pumps.
+    if let Some(state) = unsafe { state_of(hwnd) } {
+        state.config.show_menu = i32::from(t.menu);
+        state.config.show_status = i32::from(t.status);
+        state.config.show_controls = i32::from(t.controls);
+        state.config.show_caption = i32::from(t.caption);
+        state.config.show_thickframe = i32::from(t.thickframe);
+    }
+    update_frame(hwnd);
+}
+
+/// The View→On Top rows (#46; upstream viv.c:2317-2328): Always is a TOGGLE
+/// (`!config_ontop` — from the while-playing value 2 the C `!` lands on 0,
+/// a quirk kept bug-for-bug), While-Playing assigns 2, Never assigns 0;
+/// every arm re-evaluates the topmost bit.
+fn set_ontop(hwnd: HWND, mode: SetOntop) {
+    // SAFETY: the borrow spans the config write — nothing pumps.
+    if let Some(state) = unsafe { state_of(hwnd) } {
+        state.config.ontop = match mode {
+            // The C toggle: 0↔1, and 2 collapses to 0.
+            SetOntop::Always => i32::from(state.config.ontop == 0),
+            SetOntop::WhilePlaying => 2,
+            SetOntop::Never => 0,
+        };
+    }
+    update_ontop(hwnd);
+}
+
+/// Which on-top row fired (the three WM_COMMAND arms' payload).
+enum SetOntop {
+    Always,
+    WhilePlaying,
+    Never,
+}
+
+/// `_viv_update_ontop` (upstream viv.c:9920-9940): push the topmost bit for
+/// the mode RIGHT NOW — mode 1 always, mode 2 while a slideshow runs or an
+/// animation plays (`_viv_frame_count > 1 && _viv_animation_play`; riviv's
+/// `is_animated()` is the same total-frame-count verdict), anything else
+/// never.
+fn update_ontop(hwnd: HWND) {
+    // SAFETY: the borrow spans only the mode/flag reads.
+    let want = (unsafe { state_of(hwnd) }).is_some_and(|state| {
+        let animating =
+            state.animation_playing && state.image.as_ref().is_some_and(|i| i.is_animated());
+        crate::frame::ontop_active(state.config.ontop, state.slideshow, animating)
+    });
+    // SAFETY: hwnd live; NOSIZE|NOMOVE|NOACTIVATE like upstream's
+    // SetWindowPos (viv.c:9939) — fail-soft is harmless: the flag-free
+    // z-order just stays until the next trigger re-runs this.
+    let _ = unsafe {
+        SetWindowPos(
+            hwnd,
+            Some(if want { HWND_TOPMOST } else { HWND_NOTOPMOST }),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE,
+        )
+    };
+}
+
+/// `_viv_update_frame` (upstream viv.c:9823-9925) — the one frame rebuild
+/// every chrome change funnels through (#46 generalizes the menu and
+/// controls arms to the full upstream contract): in fullscreen it is a
+/// no-op (the borderless cover carries none of this chrome; the exit
+/// rebuild applies the configs). Otherwise: get out of the maximized state
+/// first, capture the old frame around the CURRENT style/menu/children,
+/// apply the five configs (style bits, menu attach, status bar and toolbar
+/// create/destroy), then shift the outer rect by the new-minus-old delta so
+/// the VIEWPORT — the client minus the status bar and the strip — keeps its
+/// exact on-screen rectangle, and re-maximize only when both the caption
+/// and the thick frame survive (upstream's condition, viv.c:9921-9924 — a
+/// borderless window must not re-zoom onto our resize borders).
+fn update_frame(hwnd: HWND) {
+    // The fullscreen skip FIRST (viv.c:9828).
+    // SAFETY: read-only borrow ends inside is_some_and.
+    if (unsafe { state_of(hwnd) }).is_some_and(|state| state.fullscreen) {
+        return;
+    }
+    // Get out of the maximized state (viv.c:9832-9839) — the explicit rect
+    // below would land on the zoomed placement otherwise.
+    // SAFETY: read-only zoomed query on the live window.
+    let was_maximized = unsafe { IsZoomed(hwnd) }.as_bool();
+    if was_maximized {
+        // SAFETY: live window.
+        let _ = unsafe { ShowWindow(hwnd, SW_RESTORE) };
+    }
     let mut client = RECT::default();
-    // SAFETY: read-only client query on the live window; a failure reads
-    // the zeroed rect and the deltas collapse to a no-op shift.
+    // SAFETY: read-only client query; a failure reads the zeroed rect and
+    // the shift collapses to a no-op.
     let _ = unsafe { GetClientRect(hwnd, &mut client) };
-    let mut with_menu = client;
-    // SAFETY: in/out rect valid for the call; the BOOL return is ignored
-    // like upstream (a failure leaves the frame delta at zero).
-    let _ = unsafe { AdjustWindowRect(&mut with_menu, WS_OVERLAPPEDWINDOW, true) };
-    let mut without_menu = client;
-    // SAFETY: same call with bMenu false.
-    let _ = unsafe { AdjustWindowRect(&mut without_menu, WS_OVERLAPPEDWINDOW, false) };
-    // Attach/detach FIRST (upstream SetMenu before the rect math,
-    // viv.c:9879-9889) so the SWP_FRAMECHANGED below applies the final
-    // state in one pass.
-    // SAFETY: `menu` is the state's own bar when attaching, None detaches;
-    // the BOOL return is ignored like upstream (a failure keeps the old
-    // attach state, and the rect shift still matches the menu-less frame).
+    // The old outer rect BEFORE anything changes: the CURRENT style, the
+    // CURRENT menu attach and the CURRENT chrome-children heights
+    // (upstream reads oldrect before the SetMenu/status/controls block,
+    // viv.c:9840-9853).
+    // SAFETY: read-only style query on the live window.
+    let old_style = WINDOW_STYLE(unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) } as u32);
+    // SAFETY: read-only menu query on the live window.
+    let old_has_menu = !unsafe { GetMenu(hwnd) }.is_invalid();
+    // SAFETY: the borrow spans only the height reads.
+    let (old_status, old_controls) = (unsafe { state_of(hwnd) }).map_or((0, 0), |state| {
+        (crate::status::height(state.status), state.controls.height())
+    });
+    let mut old_outer = client;
+    // SAFETY: in/out rect valid; failure leaves a zero frame delta like
+    // upstream's unchecked AdjustWindowRect.
+    let _ = unsafe { AdjustWindowRect(&mut old_outer, old_style, old_has_menu) };
+    old_outer.bottom += old_status + old_controls;
+    // The five target values (the config was already written by the
+    // caller — upstream's case arms, viv.c:1966-2013).
+    // SAFETY: the borrow spans only the config reads and the handle copy.
+    let (show_menu, show_status, show_controls, show_caption, show_thickframe, menu) =
+        (unsafe { state_of(hwnd) }).map_or((true, true, true, true, true, HMENU::default()), |s| {
+            (
+                s.config.show_menu != 0,
+                s.config.show_status != 0,
+                s.config.show_controls != 0,
+                s.config.show_caption != 0,
+                s.config.show_thickframe != 0,
+                s.menu,
+            )
+        });
+    // The style bits (viv.c:9855-9871): caption and sysmenu travel
+    // together, the thick frame alone.
+    let mut new_style = old_style;
+    if show_caption {
+        new_style |= WS_CAPTION | WS_SYSMENU;
+    } else {
+        new_style &= !(WS_CAPTION | WS_SYSMENU);
+    }
+    if show_thickframe {
+        new_style |= WS_THICKFRAME;
+    } else {
+        new_style &= !WS_THICKFRAME;
+    }
+    // Menu attach/detach (viv.c:9873-9889) — `menu` is the state's own bar
+    // when attaching; None detaches. The BOOL return is ignored like
+    // upstream (a failure keeps the old attach state, and the rect shift
+    // still matches the menu-less frame).
+    // SAFETY: hwnd is live and owned by this thread.
     let _ = unsafe {
         SetMenu(
             hwnd,
-            if show && !menu.is_invalid() {
+            if show_menu && !menu.is_invalid() {
                 Some(menu)
             } else {
                 None
             },
         )
     };
+    // The chrome children (viv.c:9891-9892): create/destroy per config —
+    // each ends with its own on_size docking pass against the current
+    // client.
+    status_show(hwnd, show_status);
+    controls_show(hwnd, show_controls);
+    // The new outer rect over the same client: the NEW style, the TARGET
+    // menu attach and the AFTER children heights (viv.c:9894-9903).
+    // SAFETY: the borrow spans only the height reads.
+    let (new_status, new_controls) = (unsafe { state_of(hwnd) }).map_or((0, 0), |state| {
+        (crate::status::height(state.status), state.controls.height())
+    });
+    let mut new_outer = client;
+    // SAFETY: same call as above with the new style/menu.
+    let _ = unsafe { AdjustWindowRect(&mut new_outer, new_style, show_menu && !menu.is_invalid()) };
+    new_outer.bottom += new_status + new_controls;
     let mut window = RECT::default();
-    // SAFETY: read-only outer-rect query; fail-soft like upstream's
-    // unchecked GetWindowRect (viv.c:9908).
+    // SAFETY: read-only outer-rect query, fail-soft like upstream's
+    // unchecked GetWindowRect (viv.c:9905).
     let _ = unsafe { GetWindowRect(hwnd, &mut window) };
-    // Shift by the frame delta — NEW frame minus OLD (viv.c:9910-9913:
-    // windowrect += newrect - oldrect over the same client): attaching
-    // moves the top up by the bar, detaching pulls it back down. Wrapping
-    // like the rest of riviv's rect math so pathological values cannot
-    // panic.
-    let (new_frame, old_frame) = if show {
-        (&with_menu, &without_menu)
-    } else {
-        (&without_menu, &with_menu)
-    };
+    // Shift by new-minus-old per edge over the same client (viv.c:9907-
+    // 9913). Wrapping like the rest of riviv's rect math so pathological
+    // values cannot panic.
     window.left = window
         .left
-        .wrapping_add(new_frame.left.wrapping_sub(old_frame.left));
+        .wrapping_add(new_outer.left.wrapping_sub(old_outer.left));
     window.top = window
         .top
-        .wrapping_add(new_frame.top.wrapping_sub(old_frame.top));
+        .wrapping_add(new_outer.top.wrapping_sub(old_outer.top));
     window.right = window
         .right
-        .wrapping_add(new_frame.right.wrapping_sub(old_frame.right));
+        .wrapping_add(new_outer.right.wrapping_sub(old_outer.right));
     window.bottom = window
         .bottom
-        .wrapping_add(new_frame.bottom.wrapping_sub(old_frame.bottom));
-    // SAFETY: read-only zoomed query — the restore below needs the
-    // pre-change state.
-    let was_maximized = unsafe { IsZoomed(hwnd) }.as_bool();
+        .wrapping_add(new_outer.bottom.wrapping_sub(old_outer.bottom));
+    // SAFETY: read-modify-write of the style on the owning thread.
+    unsafe { SetWindowLongPtrW(hwnd, GWL_STYLE, new_style.0 as isize) };
     // SAFETY: live window; re-asserts top like upstream's HWND_TOP
-    // (viv.c:9918-9920) and applies the frame change synchronously —
-    // WM_SIZE re-docks the status bar with no borrow live out here.
+    // (viv.c:9918-9920) and applies the style + rect in one FRAMECHANGED
+    // pass — the WM_SIZE it triggers re-docks whatever children remain.
     let _ = unsafe {
         SetWindowPos(
             hwnd,
@@ -4631,13 +4959,56 @@ fn update_menu_frame(hwnd: HWND, show: bool, menu: HMENU) {
             SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_NOCOPYBITS,
         )
     };
-    // A maximized window loses its zoom under the explicit rect — restore
-    // it like upstream (viv.c:9921-9924; its caption/thickframe conditions
-    // are permanently true in riviv).
-    if was_maximized {
+    // Re-maximize only with both the caption and the resize frame present
+    // (viv.c:9921-9924: "if there is no caption or thick frame we should
+    // not allow maximize / avoid our resize borders when maximized").
+    if was_maximized && show_caption && show_thickframe {
         // SAFETY: live window.
         let _ = unsafe { ShowWindow(hwnd, SW_MAXIMIZE) };
     }
+}
+
+/// `_viv_status_show` (upstream viv.c:10932-10963) — the status-bar half
+/// of the frame rebuild (#46): create the bar when it should exist,
+/// destroy it when it should not (upstream hides by DESTROYING, never
+/// ShowWindow), then re-run the size pass so the remaining chrome docks
+/// (upstream ends the function with `_viv_on_size`, viv.c:10961).
+fn status_show(hwnd: HWND, show: bool) {
+    // SAFETY: the borrow spans only the liveness read.
+    let alive = (unsafe { state_of(hwnd) }).is_some_and(|state| !state.status.is_invalid());
+    if show && !alive {
+        // SAFETY: returns this exe's module handle; no side effects.
+        if let Ok(hinstance) = unsafe { GetModuleHandleW(None) } {
+            match crate::status::create(hwnd, hinstance.into()) {
+                Ok(bar) => {
+                    // SAFETY: the borrow spans only the field store;
+                    // nothing below pumps.
+                    if let Some(state) = unsafe { state_of(hwnd) } {
+                        state.status = bar;
+                    }
+                }
+                // Same graceful degradation as the startup create — a NULL
+                // bar no-ops everywhere (upstream leaves the global NULL
+                // on a CreateWindow failure too).
+                Err(msg) => eprintln!("status bar unavailable: {msg}"),
+            }
+        }
+    } else if !show && alive {
+        // Take the handle out of the state INSIDE the borrow, destroy
+        // OUTSIDE: DestroyWindow delivers messages (the child's teardown
+        // plus a WM_PARENTNOTIFY here) and no future handler arm on those
+        // may alias this borrow.
+        let bar = {
+            // SAFETY: the borrow spans only the take-and-clear.
+            let Some(state) = (unsafe { state_of(hwnd) }) else {
+                return;
+            };
+            std::mem::take(&mut state.status)
+        };
+        // SAFETY: our live child window, torn down on the owning thread.
+        let _ = unsafe { DestroyWindow(bar) };
+    }
+    on_size(hwnd);
 }
 
 // ---- Toolbar (#45; upstream viv.c:10963-11088 / 11441-11704 / 2667-2691) ----
@@ -4723,111 +5094,15 @@ fn controls_show(hwnd: HWND, show: bool) {
 }
 
 /// View → Controls (`VIV_ID_VIEW_CONTROLS`, viv.c:1985-1988): flip the
-/// config and rebuild the frame around the strip appearing/disappearing.
-/// In fullscreen riviv no-ops without flipping the config — the sibling
-/// View→Menu toggle's established pattern (upstream flips the config
-/// unconditionally but only rebuilds when windowed).
+/// config and rebuild the frame around the strip appearing/disappearing
+/// (in fullscreen the flip still lands; the rebuild waits for the exit,
+/// like upstream's `_viv_update_frame` early return).
 fn toggle_controls(hwnd: HWND) {
-    // SAFETY: the borrow spans the fullscreen read, the config flip and
-    // the flag copy — nothing pumps.
-    let next = (unsafe { state_of(hwnd) }).and_then(|state| {
-        if state.fullscreen {
-            return None;
-        }
+    // SAFETY: the borrow spans the config flip — nothing pumps.
+    if let Some(state) = unsafe { state_of(hwnd) } {
         state.config.show_controls = i32::from(state.config.show_controls == 0);
-        Some(state.config.show_controls != 0)
-    });
-    if let Some(show) = next {
-        update_controls_frame(hwnd, show);
     }
-}
-
-/// The frame rebuild around a strip appear/disappear (upstream
-/// `_viv_update_frame`'s status/controls arms, viv.c:9823-9925 — riviv
-/// keeps caption/frame/menu fixed, so only the strip's height changes):
-/// shift the outer rect by the SAME-client delta so the image area stays
-/// exactly where it was.
-fn update_controls_frame(hwnd: HWND, show: bool) {
-    // Get out of the maximized state first (upstream `_viv_update_frame`'s
-    // opening, viv.c:9832-9839) — the explicit rect below would otherwise
-    // land on the zoomed placement, and the flag re-maximizes at the end.
-    // SAFETY: read-only zoomed query on the live window.
-    let was_maximized = unsafe { IsZoomed(hwnd) }.as_bool();
-    if was_maximized {
-        // SAFETY: live window.
-        let _ = unsafe { ShowWindow(hwnd, SW_RESTORE) };
-    }
-    let mut client = RECT::default();
-    // SAFETY: read-only client query; a failure reads the zeroed rect and
-    // the shift collapses to a no-op.
-    let _ = unsafe { GetClientRect(hwnd, &mut client) };
-    // The old heights BEFORE the strip change (upstream reads oldrect
-    // before `_viv_status_show`/`_viv_controls_show`, viv.c:9850-9853).
-    // SAFETY: the borrow spans only the height reads.
-    let (old_status, old_controls, has_menu) =
-        (unsafe { state_of(hwnd) }).map_or((0, 0, false), |state| {
-            (
-                crate::status::height(state.status),
-                state.controls.height(),
-                state.config.show_menu != 0 && !state.menu.is_invalid(),
-            )
-        });
-    let mut old_outer = client;
-    // SAFETY: in/out rect valid; failure leaves a zero frame delta.
-    let _ = unsafe { AdjustWindowRect(&mut old_outer, WS_OVERLAPPEDWINDOW, has_menu) };
-    old_outer.bottom += old_status + old_controls;
-    // Create/destroy the set FIRST (upstream's order, viv.c:9879-9889) —
-    // its own on_size docks the new strip against the current client.
-    controls_show(hwnd, show);
-    let new_controls = if show {
-        crate::toolbar::controls_height(crate::toolbar::logical_dpi())
-    } else {
-        0
-    };
-    let mut new_outer = client;
-    // SAFETY: same call as above — the style/menu did not change.
-    let _ = unsafe { AdjustWindowRect(&mut new_outer, WS_OVERLAPPEDWINDOW, has_menu) };
-    new_outer.bottom += old_status + new_controls;
-    let mut window = RECT::default();
-    // SAFETY: read-only outer-rect query, fail-soft like upstream's
-    // unchecked GetWindowRect (viv.c:9908).
-    let _ = unsafe { GetWindowRect(hwnd, &mut window) };
-    // Shift by new-minus-old per edge over the same client (viv.c:9910-
-    // 9913) — only the bottom moves (the strip height). Wrapping like the
-    // rest of riviv's rect math so pathological values cannot panic.
-    window.left = window
-        .left
-        .wrapping_add(new_outer.left.wrapping_sub(old_outer.left));
-    window.top = window
-        .top
-        .wrapping_add(new_outer.top.wrapping_sub(old_outer.top));
-    window.right = window
-        .right
-        .wrapping_add(new_outer.right.wrapping_sub(old_outer.right));
-    window.bottom = window
-        .bottom
-        .wrapping_add(new_outer.bottom.wrapping_sub(old_outer.bottom));
-    // SAFETY: live window; re-asserts top like upstream's HWND_TOP
-    // (viv.c:9918-9920), FRAMECHANGED applying the final state in one
-    // pass.
-    let _ = unsafe {
-        SetWindowPos(
-            hwnd,
-            Some(HWND_TOP),
-            window.left,
-            window.top,
-            window.right.wrapping_sub(window.left),
-            window.bottom.wrapping_sub(window.top),
-            SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_NOCOPYBITS,
-        )
-    };
-    // A maximized window re-maximizes onto the adjusted placement
-    // (upstream viv.c:9921-9924; its caption/thickframe conditions are
-    // permanently true in riviv).
-    if was_maximized {
-        // SAFETY: live window.
-        let _ = unsafe { ShowWindow(hwnd, SW_MAXIMIZE) };
-    }
+    update_frame(hwnd);
 }
 
 /// `_viv_start_move_window` (viv.c:14720-14729): enter the system move
@@ -6181,22 +6456,51 @@ pub(crate) fn run() -> Result<(), String> {
     }
     .map_err(|e| format!("CreateWindowExW failed: {e}"))?;
 
-    // Create the status bar child now that the parent window exists (#5;
-    // upstream `_viv_status_show(config_show_status)` at init, viv.c:5415).
-    // Creation failure degrades gracefully like upstream — its `_viv_status_hwnd`
-    // stays NULL and `_viv_status_update` no-ops — the viewer must keep
-    // working; the handle stays invalid and every status call guards on it.
-    let bar = match status::create(hwnd, hinstance.into()) {
-        Ok(bar) => bar,
-        Err(msg) => {
-            eprintln!("status bar unavailable: {msg}");
-            HWND::default()
-        }
-    };
-    // SAFETY: the borrow spans only the field store; the window is created
-    // and owned by this thread, nothing below pumps messages.
+    // Hand the bar to the state FIRST (upstream keeps `_viv_hmenu` in a
+    // global set before creation, viv.c:718 — the frame pass below and the
+    // View→Menu toggle re-attach this handle; a detach leaves GetMenu
+    // empty).
+    // SAFETY: the borrow spans only the field store; nothing pumps.
     if let Some(state) = unsafe { state_of(hwnd) } {
-        state.status = bar;
+        state.menu = menu_bar;
+    }
+
+    // Apply a remembered caption/thickframe-off pair right after creation
+    // (upstream viv.c:5398-5401: only when either is off — the creation
+    // style already matches the both-on default), BEFORE the chrome
+    // children exist so the height math runs over zeroes exactly like
+    // upstream's call site.
+    // SAFETY: read-only config reads; update_frame takes its own borrows.
+    if (unsafe { state_of(hwnd) })
+        .is_some_and(|state| state.config.show_caption == 0 || state.config.show_thickframe == 0)
+    {
+        update_frame(hwnd);
+    }
+
+    // Create the status bar child now that the parent window exists —
+    // per config (#46; upstream `_viv_status_show(config_show_status)` at
+    // init, viv.c:5415). Creation failure degrades gracefully like
+    // upstream — its `_viv_status_hwnd` stays NULL and
+    // `_viv_status_update` no-ops — the viewer must keep working; the
+    // handle stays invalid and every status call guards on it.
+    // SAFETY: read-only config read, then the creation pass.
+    if (unsafe { state_of(hwnd) }).is_some_and(|state| state.config.show_status != 0) {
+        // SAFETY: returns this exe's module handle; no side effects.
+        if let Ok(hinstance) = unsafe { GetModuleHandleW(None) } {
+            let bar = match status::create(hwnd, hinstance.into()) {
+                Ok(bar) => bar,
+                Err(msg) => {
+                    eprintln!("status bar unavailable: {msg}");
+                    HWND::default()
+                }
+            };
+            // SAFETY: the borrow spans only the field store; the window is
+            // created and owned by this thread, nothing below pumps
+            // messages.
+            if let Some(state) = unsafe { state_of(hwnd) } {
+                state.status = bar;
+            }
+        }
     }
 
     // The toolbar strip per config (upstream `_viv_controls_show(
@@ -6209,13 +6513,9 @@ pub(crate) fn run() -> Result<(), String> {
         controls_show(hwnd, true);
     }
 
-    // Hand the bar to the state for the View→Menu toggle (upstream keeps
-    // `_viv_hmenu` in a global, viv.c:718 — the toggle re-attaches this
-    // handle after a detach left GetMenu empty).
-    // SAFETY: the borrow spans only the field store; nothing pumps.
-    if let Some(state) = unsafe { state_of(hwnd) } {
-        state.menu = menu_bar;
-    }
+    // The on-top bit for a remembered mode (upstream `_viv_update_ontop`
+    // at init, viv.c:5422 — mode 1 pins the window before it shows).
+    update_ontop(hwnd);
 
     // Pull the startup rect fully onto a visible monitor and re-seat the
     // window (upstream viv.c:5404-5406, right after creation): a

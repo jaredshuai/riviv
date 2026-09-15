@@ -41,6 +41,7 @@ const VK_DOWN: u16 = 0x28;
 const VK_NEXT: u16 = 0x22;
 const VK_PRIOR: u16 = 0x21;
 const VK_F1: u16 = 0x70;
+const VK_F5: u16 = 0x74;
 const VK_F11: u16 = 0x7a;
 const VK_SPACE: u16 = 0x20;
 const VK_ADD: u16 = 0x6b;
@@ -115,15 +116,37 @@ const DEFAULT_KEYS: &[(Cmd, &[KeyDef])] = &[
         &[key(true, false, true, b'C' as u16)],
     ),
     (Cmd::EditPaste, &[key(true, false, false, b'V' as u16)]),
+    // The #46 view-preset trio (viv.c:991-993, right after the clipboard
+    // quartet and before the 1:1 row — bare digit keys).
+    (Cmd::ViewPreset1, &[key(false, false, false, b'1' as u16)]),
+    (Cmd::ViewPreset2, &[key(false, false, false, b'2' as u16)]),
+    (Cmd::ViewPreset3, &[key(false, false, false, b'3' as u16)]),
     (Cmd::ViewOneToOne, &[key(true, true, false, b'0' as u16)]),
     (Cmd::ViewFullscreen, &[key(false, true, false, VK_RETURN)]),
     // View → Slideshow owns F11 (viv.c:996, upstream row order: after the
     // fullscreen row) — #37.
     (Cmd::ViewSlideshow, &[key(false, false, false, VK_F11)]),
-    // The Pan/Scan family (#44; upstream viv.c:1001-1016, between the
-    // window-size presets and the zoom rows — riviv has no preset rows
-    // yet, so directly after F11). The four diagonals and Move Center
-    // are Ctrl-modified; the six size steps and Reset are bare NUMPAD.
+    // The #46 window-size quartet (viv.c:997-1000, between F11 and the
+    // Pan/Scan rows — Alt-modified digits).
+    (
+        Cmd::ViewWindowSize50,
+        &[key(false, true, false, b'1' as u16)],
+    ),
+    (
+        Cmd::ViewWindowSize100,
+        &[key(false, true, false, b'2' as u16)],
+    ),
+    (
+        Cmd::ViewWindowSize200,
+        &[key(false, true, false, b'3' as u16)],
+    ),
+    (
+        Cmd::ViewWindowSizeAutoFit,
+        &[key(false, true, false, b'4' as u16)],
+    ),
+    // The Pan/Scan family (#44; upstream viv.c:1001-1016). The four
+    // diagonals and Move Center are Ctrl-modified; the six size steps and
+    // Reset are bare NUMPAD.
     (
         Cmd::ViewPanScanIncreaseSize,
         &[key(false, false, false, VK_NUMPAD9)],
@@ -205,9 +228,16 @@ const DEFAULT_KEYS: &[(Cmd, &[KeyDef])] = &[
         ],
     ),
     (Cmd::ViewZoomReset, &[key(true, false, false, b'0' as u16)]),
+    // The #46 on-top toggle (viv.c:1024, right after the zoom rows) and
+    // Refresh F5 (viv.c:1026, right after the Options row).
+    (
+        Cmd::ViewOntopAlways,
+        &[key(true, false, false, b'T' as u16)],
+    ),
     (Cmd::ViewOptions, &[key(false, false, false, b'O' as u16)]),
-    // The slideshow trio lands right after the Options row in upstream's
-    // table (viv.c:1035-1037, between Options and the navigation rows).
+    (Cmd::ViewRefresh, &[key(false, false, false, VK_F5)]),
+    // The slideshow trio lands right after the Refresh row in upstream's
+    // table (viv.c:1027-1029, between Refresh and the animation rows).
     (Cmd::SlideshowPause, &[key(false, false, false, VK_SPACE)]),
     (
         Cmd::SlideshowRateDecrease,
@@ -582,6 +612,34 @@ mod tests {
             vks(Cmd::FileOpenFile),
             vec![k(true, false, false, b'O' as u16)]
         );
+        // The #46 additions: presets on bare digits, window sizes on
+        // Alt+digits, Ctrl+T on-top, F5 refresh (viv.c:991-993/997-1000/
+        // 1024/1026).
+        assert_eq!(
+            vks(Cmd::ViewPreset1),
+            vec![k(false, false, false, b'1' as u16)]
+        );
+        assert_eq!(
+            vks(Cmd::ViewPreset2),
+            vec![k(false, false, false, b'2' as u16)]
+        );
+        assert_eq!(
+            vks(Cmd::ViewPreset3),
+            vec![k(false, false, false, b'3' as u16)]
+        );
+        assert_eq!(
+            vks(Cmd::ViewWindowSize50),
+            vec![k(false, true, false, b'1' as u16)]
+        );
+        assert_eq!(
+            vks(Cmd::ViewWindowSizeAutoFit),
+            vec![k(false, true, false, b'4' as u16)]
+        );
+        assert_eq!(
+            vks(Cmd::ViewOntopAlways),
+            vec![k(true, false, false, b'T' as u16)]
+        );
+        assert_eq!(vks(Cmd::ViewRefresh), vec![k(false, false, false, VK_F5)]);
         assert_eq!(
             vks(Cmd::ViewZoomIn),
             vec![
@@ -846,7 +904,33 @@ mod tests {
                 "file_add_everything_search_keys",
             ),
             (Cmd::FileExit, "file_exit_keys"),
+            // The #46 View block: the two hidden style toggles ("Caption",
+            // "Frame"), Status Bar, the Preset trio, the Window Size
+            // quartet ("50%" drops its '%'), Refresh, the fit trio and the
+            // on-top radios ("On &Top" → on_top; the While-Playing row
+            // nests its full caption).
+            (Cmd::ViewCaption, "view_caption_keys"),
+            (Cmd::ViewThickFrame, "view_frame_keys"),
             (Cmd::ViewMenu, "view_menu_keys"),
+            (Cmd::ViewStatus, "view_status_bar_keys"),
+            (Cmd::ViewControls, "view_controls_keys"),
+            (Cmd::ViewPreset1, "view_preset_minimal_keys"),
+            (Cmd::ViewPreset2, "view_preset_compact_keys"),
+            (Cmd::ViewPreset3, "view_preset_normal_keys"),
+            (Cmd::ViewWindowSize50, "view_window_size_50_keys"),
+            (Cmd::ViewWindowSize100, "view_window_size_100_keys"),
+            (Cmd::ViewWindowSize200, "view_window_size_200_keys"),
+            (Cmd::ViewWindowSizeAutoFit, "view_window_size_auto_fit_keys"),
+            (Cmd::ViewRefresh, "view_refresh_keys"),
+            (Cmd::ViewAllowShrinking, "view_allow_shrinking_keys"),
+            (Cmd::ViewKeepAspect, "view_keep_aspect_ratio_keys"),
+            (Cmd::ViewFillWindow, "view_fill_window_keys"),
+            (Cmd::ViewOntopAlways, "view_on_top_always_keys"),
+            (
+                Cmd::ViewOntopWhilePlaying,
+                "view_on_top_while_playing_slideshow_or_animating_keys",
+            ),
+            (Cmd::ViewOntopNever, "view_on_top_never_keys"),
             (Cmd::ViewFullscreen, "view_fullscreen_keys"),
             (Cmd::ViewSlideshow, "view_slideshow_keys"),
             (Cmd::ViewOneToOne, "view_11_keys"),

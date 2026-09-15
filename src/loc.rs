@@ -376,12 +376,54 @@ pub(crate) enum Id {
     ToolbarPauseSlideshow,
     ToolbarBestFit,
     ToolbarActualSize,
+    /// ---- #46: view presets / window size / on-top / view toggles ----
+    /// View → "Caption" toggle (en_us.h:68 / zh_cn.h:68).
+    MenuCaption,
+    /// View → "Frame" toggle (en_us.h:69 / zh_cn.h:69).
+    MenuThickFrame,
+    /// View → "Status &Bar" (en_us.h:71 / zh_cn.h:71).
+    MenuStatusBar,
+    /// View → "&Preset" popup (en_us.h:73 / zh_cn.h:73).
+    MenuPreset,
+    /// Preset → "&Minimal" (en_us.h:74 / zh_cn.h:74).
+    MenuMinimal,
+    /// Preset → "&Compact" (en_us.h:75 / zh_cn.h:75).
+    MenuCompact,
+    /// Preset → "&Normal" (en_us.h:76 / zh_cn.h:76).
+    MenuNormal,
+    /// View → "&Window Size" popup (en_us.h:79 / zh_cn.h:79).
+    MenuWindowSize,
+    /// Window Size → "50%" (en_us.h:80 / zh_cn.h:80).
+    MenuWindowSize50,
+    /// Window Size → "100%" (en_us.h:81 / zh_cn.h:81).
+    MenuWindowSize100,
+    /// Window Size → "200%" (en_us.h:82 / zh_cn.h:82).
+    MenuWindowSize200,
+    /// Window Size → "&Auto Fit" (en_us.h:83 / zh_cn.h:83).
+    MenuWindowSizeAutoFit,
+    /// View → "&Refresh" (en_us.h:84 / zh_cn.h:84).
+    MenuRefresh,
+    /// View → "&Allow Shrinking" (en_us.h:85 / zh_cn.h:85).
+    MenuAllowShrinking,
+    /// View → "&Keep Aspect Ratio" (en_us.h:86 / zh_cn.h:86).
+    MenuKeepAspectRatio,
+    /// View → "&Fill Window" (en_us.h:87 / zh_cn.h:87).
+    MenuFillWindow,
+    /// View → "On &Top" popup (en_us.h:111 / zh_cn.h:111).
+    MenuOnTop,
+    /// On Top → "&Always" (en_us.h:112 / zh_cn.h:112).
+    MenuAlways,
+    /// On Top → "&While Playing Slideshow or Animating" (en_us.h:113 /
+    /// zh_cn.h:113).
+    MenuWhilePlaying,
+    /// On Top → "&Never" (en_us.h:114 / zh_cn.h:114).
+    MenuNever,
 }
 
 impl Id {
     /// Variant count; array-typing both tables against this keeps them
     /// length-locked to the enum by construction.
-    pub(crate) const COUNT: usize = Self::ToolbarActualSize as usize + 1;
+    pub(crate) const COUNT: usize = Self::MenuNever as usize + 1;
 }
 
 /// Table choice (upstream `LOCALIZATION_LANGUAGE_*`, localization.h:30-32).
@@ -611,6 +653,27 @@ const EN_US: [&str; Id::COUNT] = [
     "Pause Slideshow", // ToolbarPauseSlideshow (en_us.h:191)
     "Best Fit",        // ToolbarBestFit (en_us.h:192)
     "Actual Size",     // ToolbarActualSize (en_us.h:193)
+    // #46 block (en_us.h:68-87/111-114).
+    "Caption",                               // MenuCaption (en_us.h:68)
+    "Frame",                                 // MenuThickFrame (en_us.h:69)
+    "Status &Bar",                           // MenuStatusBar (en_us.h:71)
+    "&Preset",                               // MenuPreset (en_us.h:73)
+    "&Minimal",                              // MenuMinimal (en_us.h:74)
+    "&Compact",                              // MenuCompact (en_us.h:75)
+    "&Normal",                               // MenuNormal (en_us.h:76)
+    "&Window Size",                          // MenuWindowSize (en_us.h:79)
+    "50%",                                   // MenuWindowSize50 (en_us.h:80)
+    "100%",                                  // MenuWindowSize100 (en_us.h:81)
+    "200%",                                  // MenuWindowSize200 (en_us.h:82)
+    "&Auto Fit",                             // MenuWindowSizeAutoFit (en_us.h:83)
+    "&Refresh",                              // MenuRefresh (en_us.h:84)
+    "&Allow Shrinking",                      // MenuAllowShrinking (en_us.h:85)
+    "&Keep Aspect Ratio",                    // MenuKeepAspectRatio (en_us.h:86)
+    "&Fill Window",                          // MenuFillWindow (en_us.h:87)
+    "On &Top",                               // MenuOnTop (en_us.h:111)
+    "&Always",                               // MenuAlways (en_us.h:112)
+    "&While Playing Slideshow or Animating", // MenuWhilePlaying (en_us.h:113)
+    "&Never",                                // MenuNever (en_us.h:114)
 ];
 
 /// zh-CN table — upstream localization_zh_cn.h:31/197-199/261-263.
@@ -831,6 +894,27 @@ const ZH_CN: [&str; Id::COUNT] = [
     "暂停",     // ToolbarPauseSlideshow (zh_cn.h:191)
     "最佳适应", // ToolbarBestFit (zh_cn.h:192)
     "实际大小", // ToolbarActualSize (zh_cn.h:193)
+    // #46 block (zh_cn.h:68-87/111-114).
+    "标题栏",                 // MenuCaption (zh_cn.h:68)
+    "边框",                   // MenuThickFrame (zh_cn.h:69)
+    "状态栏(&B)",             // MenuStatusBar (zh_cn.h:71)
+    "预设(&P)",               // MenuPreset (zh_cn.h:73)
+    "最小(&M)",               // MenuMinimal (zh_cn.h:74)
+    "紧凑(&C)",               // MenuCompact (zh_cn.h:75)
+    "正常(&N)",               // MenuNormal (zh_cn.h:76)
+    "窗口大小(&W)",           // MenuWindowSize (zh_cn.h:79)
+    "50%",                    // MenuWindowSize50 (zh_cn.h:80)
+    "100%",                   // MenuWindowSize100 (zh_cn.h:81)
+    "200%",                   // MenuWindowSize200 (zh_cn.h:82)
+    "自动适应(&A)",           // MenuWindowSizeAutoFit (zh_cn.h:83)
+    "刷新(&R)",               // MenuRefresh (zh_cn.h:84)
+    "允许缩小(&A)",           // MenuAllowShrinking (zh_cn.h:85)
+    "保持纵横比(&K)",         // MenuKeepAspectRatio (zh_cn.h:86)
+    "填充窗口(&F)",           // MenuFillWindow (zh_cn.h:87)
+    "置顶(&T)",               // MenuOnTop (zh_cn.h:111)
+    "总是(&A)",               // MenuAlways (zh_cn.h:112)
+    "播放幻灯片或动画时(&W)", // MenuWhilePlaying (zh_cn.h:113)
+    "从不(&N)",               // MenuNever (zh_cn.h:114)
 ];
 
 /// Map a `GetUserDefaultUILanguage` LANGID onto the table choice
