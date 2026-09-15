@@ -49,16 +49,64 @@ pub(crate) enum Cmd {
     /// Edit → &Paste (#41; `VIV_ID_EDIT_PASTE`, viv.c:830 — MF_OWNERDRAW
     /// upstream, keyboard Ctrl+V).
     EditPaste,
+    /// View → Caption toggle (#46; `VIV_ID_VIEW_CAPTION`, viv.c:843 —
+    /// MF_OWNERDRAW upstream, menu-hidden: the WS_CAPTION|WS_SYSMENU style
+    /// bits are reachable through the ini and custom bindings only).
+    ViewCaption,
+    /// View → Frame toggle (#46; `VIV_ID_VIEW_THICKFRAME`, viv.c:844 —
+    /// MF_OWNERDRAW upstream, menu-hidden like Caption).
+    ViewThickFrame,
     /// View → Menu toggle (`VIV_ID_VIEW_MENU`).
     ViewMenu,
+    /// View → Status Bar toggle (#46; `VIV_ID_VIEW_STATUS`, viv.c:846).
+    ViewStatus,
     /// View → Controls toggle (#45; `VIV_ID_VIEW_CONTROLS`, viv.c:844 —
     /// upstream order puts it between the Status Bar row and Preset).
     ViewControls,
+    /// View → Preset → Minimal (#46; `VIV_ID_VIEW_PRESET_1`, viv.c:849 —
+    /// key '1'): every chrome piece off (viv.c:1990-1996).
+    ViewPreset1,
+    /// View → Preset → Compact (#46; `VIV_ID_VIEW_PRESET_2`, viv.c:850 —
+    /// key '2'): only the thick frame stays (viv.c:1998-2004).
+    ViewPreset2,
+    /// View → Preset → Normal (#46; `VIV_ID_VIEW_PRESET_3`, viv.c:851 —
+    /// key '3'): everything on (viv.c:2006-2013).
+    ViewPreset3,
     /// View → Fullscreen (`VIV_ID_VIEW_FULLSCREEN`).
     ViewFullscreen,
     /// View → Slideshow (`VIV_ID_VIEW_SLIDESHOW`, viv.c:854) — #37: the
     /// start-only toggle (enters fullscreen first when windowed).
     ViewSlideshow,
+    /// View → Window Size → 50% (#46; `VIV_ID_VIEW_WINDOW_SIZE_50`,
+    /// viv.c:856 — Alt+1): size the window around half the image
+    /// (viv.c:2114-2116).
+    ViewWindowSize50,
+    /// View → Window Size → 100% (#46; `VIV_ID_VIEW_WINDOW_SIZE_100`,
+    /// viv.c:857 — Alt+2).
+    ViewWindowSize100,
+    /// View → Window Size → 200% (#46; `VIV_ID_VIEW_WINDOW_SIZE_200`,
+    /// viv.c:858 — Alt+3).
+    ViewWindowSize200,
+    /// View → Window Size → Auto Fit (#46;
+    /// `VIV_ID_VIEW_WINDOW_SIZE_AUTO_FIT`, viv.c:859 — Alt+4): the
+    /// auto-fit monitor fraction (the #24 `auto_fit_*` config).
+    ViewWindowSizeAutoFit,
+    /// View → Refresh (#46; `VIV_ID_VIEW_REFRESH`, viv.c:860 — F5):
+    /// re-read the current file off disk (upstream `_viv_refresh`,
+    /// viv.c:14539-14552).
+    ViewRefresh,
+    /// View → Allow Shrinking (#46; `VIV_ID_VIEW_ALLOW_SHRINKING`,
+    /// viv.c:862): the `allow_shrinking` fit input (the fit-level ladder's
+    /// shrink half).
+    ViewAllowShrinking,
+    /// View → Keep Aspect Ratio (#46; `VIV_ID_VIEW_KEEP_ASPECT_RATIO`,
+    /// viv.c:863): the `keep_aspect_ratio` fit input.
+    ViewKeepAspect,
+    /// View → Fill Window (#46; `VIV_ID_VIEW_FILL_WINDOW`, viv.c:864):
+    /// the `fill_window` fit input — in fullscreen the
+    /// `fullscreen_fill_window` one instead (upstream's own quirk,
+    /// viv.c:2033-2044).
+    ViewFillWindow,
     /// View → 1:1 (`VIV_ID_VIEW_1TO1`).
     ViewOneToOne,
     /// View → Best Fit (`VIV_ID_VIEW_BESTFIT`).
@@ -118,6 +166,18 @@ pub(crate) enum Cmd {
     ViewZoomOut,
     /// Zoom → Reset (`VIV_ID_VIEW_ZOOM_RESET`).
     ViewZoomReset,
+    /// View → On Top → Always (#46; `VIV_ID_VIEW_ONTOP_ALWAYS`, viv.c:890
+    /// — Ctrl+T): a TOGGLE upstream (`config_ontop = !config_ontop`,
+    /// viv.c:2317-2319 — from the "while" value 2 the C `!` lands on 0,
+    /// a quirk kept bug-for-bug).
+    ViewOntopAlways,
+    /// View → On Top → While Playing Slideshow or Animating (#46;
+    /// `VIV_ID_VIEW_ONTOP_WHILE_PLAYING_OR_ANIMATING`, viv.c:891):
+    /// `config_ontop = 2`.
+    ViewOntopWhilePlaying,
+    /// View → On Top → Never (#46; `VIV_ID_VIEW_ONTOP_NEVER`, viv.c:892):
+    /// `config_ontop = 0`.
+    ViewOntopNever,
     /// View → Options... (`VIV_ID_VIEW_OPTIONS`) — opens the modal Options
     /// dialog (#24; upstream viv.c:2332).
     ViewOptions,
@@ -284,6 +344,20 @@ impl Cmd {
         }
     }
 
+    /// The window-size kind a Window Size submenu row selects (#46; the
+    /// `kind` argument of `window_size_to_image` / `fit::window_size_
+    /// client`, matching #24's auto_zoom_type values): `None` for every
+    /// non-window-size command.
+    pub(crate) fn window_size_kind(self) -> Option<i32> {
+        match self {
+            Self::ViewWindowSize50 => Some(0),
+            Self::ViewWindowSize100 => Some(1),
+            Self::ViewWindowSize200 => Some(2),
+            Self::ViewWindowSizeAutoFit => Some(3),
+            _ => None,
+        }
+    }
+
     /// Inverse of [`Cmd::id`] for the WM_COMMAND dispatch (upstream's
     /// `_viv_command` switch default: unknown ids fall through untouched).
     pub(crate) fn from_id(id: u16) -> Option<Self> {
@@ -310,10 +384,24 @@ impl Cmd {
         Self::EditCopyFilename,
         Self::EditCopyImage,
         Self::EditPaste,
+        Self::ViewCaption,
+        Self::ViewThickFrame,
         Self::ViewMenu,
+        Self::ViewStatus,
         Self::ViewControls,
+        Self::ViewPreset1,
+        Self::ViewPreset2,
+        Self::ViewPreset3,
         Self::ViewFullscreen,
         Self::ViewSlideshow,
+        Self::ViewWindowSize50,
+        Self::ViewWindowSize100,
+        Self::ViewWindowSize200,
+        Self::ViewWindowSizeAutoFit,
+        Self::ViewRefresh,
+        Self::ViewAllowShrinking,
+        Self::ViewKeepAspect,
+        Self::ViewFillWindow,
         Self::ViewOneToOne,
         Self::ViewBestFit,
         Self::ViewPanScanIncreaseSize,
@@ -335,6 +423,9 @@ impl Cmd {
         Self::ViewZoomIn,
         Self::ViewZoomOut,
         Self::ViewZoomReset,
+        Self::ViewOntopAlways,
+        Self::ViewOntopWhilePlaying,
+        Self::ViewOntopNever,
         Self::ViewOptions,
         Self::SlideshowPause,
         Self::SlideshowPlayOnly,
@@ -401,10 +492,20 @@ pub(crate) enum Slot {
     /// — between File and View in the root order).
     Edit,
     View,
+    /// The View → Preset popup (#46; upstream `_VIV_MENU_VIEW_PRESET`,
+    /// viv.c:848 — between Controls and the fullscreen separator).
+    ViewPreset,
+    /// The View → Window Size popup (#46; upstream
+    /// `_VIV_MENU_VIEW_WINDOW_SIZE`, viv.c:855 — between Slideshow and
+    /// Refresh).
+    ViewWindowSize,
     /// The View → Pan/Scan popup (#44; upstream `_VIV_MENU_VIEW_PANSCAN`,
     /// viv.c:870 — between Best Fit and Zoom).
     ViewPanScan,
     ViewZoom,
+    /// The View → On Top popup (#46; upstream `_VIV_MENU_VIEW_ONTOP`,
+    /// viv.c:889 — after the Zoom popup's separator, before Options).
+    ViewOntop,
     /// The Slideshow top-level menu (#37; upstream `_VIV_MENU_SLIDESHOW`,
     /// viv.c:892 — between View and Animation in the root order).
     Slideshow,
@@ -557,25 +658,65 @@ pub(crate) const ENTRIES: &[Entry] = &[
         parent: Slot::Edit,
         cmd: Cmd::EditPaste,
     },
-    // View (viv.c:839-935): Menu toggle, fullscreen, 1:1 / Best Fit, the
-    // Zoom submenu, Options last — upstream's relative order, gaps dropped.
+    // View (viv.c:839-935): the five chrome toggles (Caption/Frame
+    // MF_OWNERDRAW = menu-hidden upstream), the Preset popup, fullscreen/
+    // slideshow, the Window Size popup, Refresh, the three fit rows,
+    // 1:1 / Best Fit, the Pan/Scan and Zoom popups, the On Top popup and
+    // Options last — upstream's full order.
     Entry::Popup {
         loc: loc::Id::MenuView,
         parent: Slot::Root,
         slot: Slot::View,
+    },
+    // The two style-bit toggles (#46; viv.c:843-844): MF_OWNERDRAW upstream
+    // — hidden rows, ini/custom-binding reachable like the #38 jump family.
+    Entry::HiddenItem {
+        loc: loc::Id::MenuCaption,
+        parent: Slot::View,
+        cmd: Cmd::ViewCaption,
+    },
+    Entry::HiddenItem {
+        loc: loc::Id::MenuThickFrame,
+        parent: Slot::View,
+        cmd: Cmd::ViewThickFrame,
     },
     Entry::Item {
         loc: loc::Id::MenuMenu,
         parent: Slot::View,
         cmd: Cmd::ViewMenu,
     },
-    // View → Controls (#45; upstream viv.c:844 sits it right after the
-    // Menu row — its Status Bar sibling row lands with #47's status
-    // toggles).
+    // View → Status Bar (#46; viv.c:846, between Menu and Controls).
+    Entry::Item {
+        loc: loc::Id::MenuStatusBar,
+        parent: Slot::View,
+        cmd: Cmd::ViewStatus,
+    },
+    // View → Controls (#45; upstream viv.c:847 after the Status Bar row).
     Entry::Item {
         loc: loc::Id::MenuControls,
         parent: Slot::View,
         cmd: Cmd::ViewControls,
+    },
+    // View → Preset (#46; viv.c:848-851): Minimal/Compact/Normal.
+    Entry::Popup {
+        loc: loc::Id::MenuPreset,
+        parent: Slot::View,
+        slot: Slot::ViewPreset,
+    },
+    Entry::Item {
+        loc: loc::Id::MenuMinimal,
+        parent: Slot::ViewPreset,
+        cmd: Cmd::ViewPreset1,
+    },
+    Entry::Item {
+        loc: loc::Id::MenuCompact,
+        parent: Slot::ViewPreset,
+        cmd: Cmd::ViewPreset2,
+    },
+    Entry::Item {
+        loc: loc::Id::MenuNormal,
+        parent: Slot::ViewPreset,
+        cmd: Cmd::ViewPreset3,
     },
     Entry::Separator { parent: Slot::View },
     Entry::Item {
@@ -589,6 +730,56 @@ pub(crate) const ENTRIES: &[Entry] = &[
         parent: Slot::View,
         cmd: Cmd::ViewSlideshow,
     },
+    // View → Window Size (#46; viv.c:855-859): the four sizing rows.
+    Entry::Popup {
+        loc: loc::Id::MenuWindowSize,
+        parent: Slot::View,
+        slot: Slot::ViewWindowSize,
+    },
+    Entry::Item {
+        loc: loc::Id::MenuWindowSize50,
+        parent: Slot::ViewWindowSize,
+        cmd: Cmd::ViewWindowSize50,
+    },
+    Entry::Item {
+        loc: loc::Id::MenuWindowSize100,
+        parent: Slot::ViewWindowSize,
+        cmd: Cmd::ViewWindowSize100,
+    },
+    Entry::Item {
+        loc: loc::Id::MenuWindowSize200,
+        parent: Slot::ViewWindowSize,
+        cmd: Cmd::ViewWindowSize200,
+    },
+    Entry::Item {
+        loc: loc::Id::MenuWindowSizeAutoFit,
+        parent: Slot::ViewWindowSize,
+        cmd: Cmd::ViewWindowSizeAutoFit,
+    },
+    // View → Refresh (#46; viv.c:860, after the Window Size popup).
+    Entry::Item {
+        loc: loc::Id::MenuRefresh,
+        parent: Slot::View,
+        cmd: Cmd::ViewRefresh,
+    },
+    Entry::Separator { parent: Slot::View },
+    // The three fit rows (#46; viv.c:862-864 — the toggles behind
+    // Allow Shrinking / Keep Aspect Ratio / Fill Window).
+    Entry::Item {
+        loc: loc::Id::MenuAllowShrinking,
+        parent: Slot::View,
+        cmd: Cmd::ViewAllowShrinking,
+    },
+    Entry::Item {
+        loc: loc::Id::MenuKeepAspectRatio,
+        parent: Slot::View,
+        cmd: Cmd::ViewKeepAspect,
+    },
+    Entry::Item {
+        loc: loc::Id::MenuFillWindow,
+        parent: Slot::View,
+        cmd: Cmd::ViewFillWindow,
+    },
     Entry::Item {
         loc: loc::Id::MenuOneToOne,
         parent: Slot::View,
@@ -599,6 +790,9 @@ pub(crate) const ENTRIES: &[Entry] = &[
         parent: Slot::View,
         cmd: Cmd::ViewBestFit,
     },
+    // Upstream's separator between Best Fit and the Pan/Scan popup
+    // (viv.c:867) — restored with #46's full View rebuild.
+    Entry::Separator { parent: Slot::View },
     // View → Pan/Scan (#44; upstream viv.c:870-896): the popup after Best
     // Fit, six size steps, a separator, the move family (the four
     // diagonals MF_OWNERDRAW = menu-hidden, viv.c:881-884), a separator,
@@ -716,6 +910,28 @@ pub(crate) const ENTRIES: &[Entry] = &[
         cmd: Cmd::ViewZoomReset,
     },
     Entry::Separator { parent: Slot::View },
+    // View → On Top (#46; viv.c:889-892): the three radio rows after the
+    // Zoom popup's separator, before Options.
+    Entry::Popup {
+        loc: loc::Id::MenuOnTop,
+        parent: Slot::View,
+        slot: Slot::ViewOntop,
+    },
+    Entry::Item {
+        loc: loc::Id::MenuAlways,
+        parent: Slot::ViewOntop,
+        cmd: Cmd::ViewOntopAlways,
+    },
+    Entry::Item {
+        loc: loc::Id::MenuWhilePlaying,
+        parent: Slot::ViewOntop,
+        cmd: Cmd::ViewOntopWhilePlaying,
+    },
+    Entry::Item {
+        loc: loc::Id::MenuNever,
+        parent: Slot::ViewOntop,
+        cmd: Cmd::ViewOntopNever,
+    },
     Entry::Item {
         loc: loc::Id::MenuOptions,
         parent: Slot::View,
@@ -1092,6 +1308,9 @@ pub(crate) fn item_text(label: &str, key: Option<&str>) -> String {
 pub(crate) struct MenuState {
     /// View → Menu's checkmark: `config_show_menu` (viv.c:7125).
     pub(crate) show_menu: bool,
+    /// View → Status Bar's checkmark (#46): `config_show_status`
+    /// (viv.c:7128).
+    pub(crate) show_status: bool,
     /// View → Controls' checkmark (#45): `config_show_controls`
     /// (viv.c:7126).
     pub(crate) show_controls: bool,
@@ -1126,6 +1345,16 @@ pub(crate) struct MenuState {
     /// stands). Gates the clipboard quartet; Paste stays ungated (upstream
     /// has no EnableMenuItem row for it).
     pub(crate) image_enabled: bool,
+    /// The Allow Shrinking / Keep Aspect / Fill Window trio's config
+    /// snapshot (#46; upstream viv.c:7127-7129): the Fill row reads the
+    /// fullscreen or windowed `fill_window` flag per the CURRENT mode
+    /// (upstream's `_viv_check_menus` quirk, viv.c:7098-7100).
+    pub(crate) allow_shrinking: bool,
+    pub(crate) keep_aspect: bool,
+    pub(crate) fill_window: bool,
+    /// The on-top mode (#46; upstream viv.c:7134-7136 — the three radio
+    /// rows check on 1 / 2 / 0).
+    pub(crate) ontop: i32,
 }
 
 /// Whether `cmd`'s menu item carries a check in `state` (upstream
@@ -1133,11 +1362,20 @@ pub(crate) struct MenuState {
 pub(crate) fn checked(cmd: Cmd, state: &MenuState) -> bool {
     match cmd {
         Cmd::ViewMenu => state.show_menu,
+        Cmd::ViewStatus => state.show_status,
         Cmd::ViewControls => state.show_controls,
         Cmd::ViewFullscreen => state.fullscreen,
         Cmd::ViewOneToOne => state.one_to_one,
         Cmd::ViewSlideshow | Cmd::SlideshowPause => state.slideshow,
         Cmd::AnimationPlayPause => state.animation_playing,
+        // The #46 fit trio (viv.c:7127-7129) and the on-top radios
+        // (viv.c:7134-7136 — checked on the exact config value).
+        Cmd::ViewAllowShrinking => state.allow_shrinking,
+        Cmd::ViewKeepAspect => state.keep_aspect,
+        Cmd::ViewFillWindow => state.fill_window,
+        Cmd::ViewOntopAlways => state.ontop == 1,
+        Cmd::ViewOntopWhilePlaying => state.ontop == 2,
+        Cmd::ViewOntopNever => state.ontop == 0,
         // The sort radios (#39): the equal mode checks; an Unknown config
         // value checks none of the five (viv.c:7188-7192). The direction
         // pair checks on the flag (viv.c:7194-7195); Shuffle is a plain
@@ -1171,7 +1409,14 @@ pub(crate) fn radio(cmd: Cmd) -> bool {
     cmd.slideshow_rate_ms().is_some()
         || cmd == Cmd::SlideshowRateCustom
         || cmd.sort_mode().is_some()
-        || matches!(cmd, Cmd::NavSortAscending | Cmd::NavSortDescending)
+        || matches!(
+            cmd,
+            Cmd::NavSortAscending
+                | Cmd::NavSortDescending
+                | Cmd::ViewOntopAlways
+                | Cmd::ViewOntopWhilePlaying
+                | Cmd::ViewOntopNever
+        )
 }
 
 /// Whether `cmd`'s menu item is selectable. Everything riviv registers is
@@ -1258,77 +1503,102 @@ mod tests {
     fn slideshow_and_animation_command_ids_are_pinned_for_the_wire() {
         // smoke37/smoke38 post these as raw WM_COMMAND wparams; inserting a
         // command ahead of the block would silently shift every wire id.
-        // The #41 Edit block runs 7-11 (viv.c:826-830 table order), pushing
-        // every later id by 5: ViewSlideshow 9 → 14, NavNext 51 → 56,
-        // HelpAbout 64 → 69.
+        // The #41 Edit block runs 7-11 (viv.c:826-830 table order).
         assert_eq!(Cmd::EditCut.id(), 7);
         assert_eq!(Cmd::EditCopy.id(), 8);
         assert_eq!(Cmd::EditCopyFilename.id(), 9);
         assert_eq!(Cmd::EditCopyImage.id(), 10);
         assert_eq!(Cmd::EditPaste.id(), 11);
-        // The #45 View→Controls row sits right after ViewMenu (12),
-        // pushing every later id by 1; the toolbar-only slideshow pair
-        // after SlideshowPause pushes the tail by 2 more (+3 total from
-        // the Pan/Scan block down).
-        assert_eq!(Cmd::ViewControls.id(), 13);
-        assert_eq!(Cmd::ViewSlideshow.id(), 15);
-        // The #44 Pan/Scan block runs 18-33 (viv.h:110-125 order, right
-        // after ViewBestFit=17), pushing every later id by 16 (+1).
-        assert_eq!(Cmd::ViewPanScanIncreaseSize.id(), 18);
-        assert_eq!(Cmd::ViewPanScanDecreaseSize.id(), 19);
-        assert_eq!(Cmd::ViewPanScanIncreaseWidth.id(), 20);
-        assert_eq!(Cmd::ViewPanScanDecreaseWidth.id(), 21);
-        assert_eq!(Cmd::ViewPanScanIncreaseHeight.id(), 22);
-        assert_eq!(Cmd::ViewPanScanDecreaseHeight.id(), 23);
-        assert_eq!(Cmd::ViewPanScanMoveUp.id(), 24);
-        assert_eq!(Cmd::ViewPanScanMoveDown.id(), 25);
-        assert_eq!(Cmd::ViewPanScanMoveLeft.id(), 26);
-        assert_eq!(Cmd::ViewPanScanMoveRight.id(), 27);
-        assert_eq!(Cmd::ViewPanScanMoveUpLeft.id(), 28);
-        assert_eq!(Cmd::ViewPanScanMoveUpRight.id(), 29);
-        assert_eq!(Cmd::ViewPanScanMoveDownLeft.id(), 30);
-        assert_eq!(Cmd::ViewPanScanMoveDownRight.id(), 31);
-        assert_eq!(Cmd::ViewPanScanMoveCenter.id(), 32);
-        assert_eq!(Cmd::ViewPanScanReset.id(), 33);
-        // The #45 toolbar-only pair: 39/40.
-        assert_eq!(Cmd::SlideshowPause.id(), 38);
-        assert_eq!(Cmd::SlideshowPlayOnly.id(), 39);
-        assert_eq!(Cmd::SlideshowPauseOnly.id(), 40);
-        assert_eq!(Cmd::SlideshowRateDecrease.id(), 41);
-        assert_eq!(Cmd::SlideshowRateIncrease.id(), 42);
-        assert_eq!(Cmd::SlideshowRate250.id(), 43);
-        assert_eq!(Cmd::SlideshowRate500.id(), 44);
-        assert_eq!(Cmd::SlideshowRateCustom.id(), 60);
-        // The #38 Animation block lands 61-77 with the #41/#44/#45 shifts.
-        assert_eq!(Cmd::AnimationPlayPause.id(), 61);
-        assert_eq!(Cmd::AnimationJumpForwardMedium.id(), 62);
-        assert_eq!(Cmd::AnimationJumpBackwardMedium.id(), 63);
-        assert_eq!(Cmd::AnimationJumpForwardShort.id(), 64);
-        assert_eq!(Cmd::AnimationJumpBackwardShort.id(), 65);
-        assert_eq!(Cmd::AnimationJumpForwardLong.id(), 66);
-        assert_eq!(Cmd::AnimationJumpBackwardLong.id(), 67);
-        assert_eq!(Cmd::AnimationFrameStep.id(), 68);
-        assert_eq!(Cmd::AnimationFramePrev.id(), 69);
-        assert_eq!(Cmd::AnimationFirstFrame.id(), 70);
-        assert_eq!(Cmd::AnimationLastFrame.id(), 71);
-        assert_eq!(Cmd::AnimationRateDecrease.id(), 72);
-        assert_eq!(Cmd::AnimationRateIncrease.id(), 73);
-        assert_eq!(Cmd::AnimationRateReset.id(), 74);
-        assert_eq!(Cmd::NavNext.id(), 75);
+        // The #46 View head grows to upstream's full order (viv.c:843-864):
+        // hidden Caption/ThickFrame (12/13), Menu 14, Status 15, Controls
+        // 16, the Preset trio 17-19, Fullscreen 20, Slideshow 21, the
+        // Window Size quartet 22-25, Refresh 26, the fit trio 27-29,
+        // 1:1 30 and Best Fit 31.
+        assert_eq!(Cmd::ViewCaption.id(), 12);
+        assert_eq!(Cmd::ViewThickFrame.id(), 13);
+        assert_eq!(Cmd::ViewMenu.id(), 14);
+        assert_eq!(Cmd::ViewStatus.id(), 15);
+        assert_eq!(Cmd::ViewControls.id(), 16);
+        assert_eq!(Cmd::ViewPreset1.id(), 17);
+        assert_eq!(Cmd::ViewPreset2.id(), 18);
+        assert_eq!(Cmd::ViewPreset3.id(), 19);
+        assert_eq!(Cmd::ViewFullscreen.id(), 20);
+        assert_eq!(Cmd::ViewSlideshow.id(), 21);
+        assert_eq!(Cmd::ViewWindowSize50.id(), 22);
+        assert_eq!(Cmd::ViewWindowSize100.id(), 23);
+        assert_eq!(Cmd::ViewWindowSize200.id(), 24);
+        assert_eq!(Cmd::ViewWindowSizeAutoFit.id(), 25);
+        assert_eq!(Cmd::ViewRefresh.id(), 26);
+        assert_eq!(Cmd::ViewAllowShrinking.id(), 27);
+        assert_eq!(Cmd::ViewKeepAspect.id(), 28);
+        assert_eq!(Cmd::ViewFillWindow.id(), 29);
+        assert_eq!(Cmd::ViewOneToOne.id(), 30);
+        assert_eq!(Cmd::ViewBestFit.id(), 31);
+        // The #44 Pan/Scan block runs 32-47 (viv.h:110-125 order).
+        assert_eq!(Cmd::ViewPanScanIncreaseSize.id(), 32);
+        assert_eq!(Cmd::ViewPanScanDecreaseSize.id(), 33);
+        assert_eq!(Cmd::ViewPanScanIncreaseWidth.id(), 34);
+        assert_eq!(Cmd::ViewPanScanDecreaseWidth.id(), 35);
+        assert_eq!(Cmd::ViewPanScanIncreaseHeight.id(), 36);
+        assert_eq!(Cmd::ViewPanScanDecreaseHeight.id(), 37);
+        assert_eq!(Cmd::ViewPanScanMoveUp.id(), 38);
+        assert_eq!(Cmd::ViewPanScanMoveDown.id(), 39);
+        assert_eq!(Cmd::ViewPanScanMoveLeft.id(), 40);
+        assert_eq!(Cmd::ViewPanScanMoveRight.id(), 41);
+        assert_eq!(Cmd::ViewPanScanMoveUpLeft.id(), 42);
+        assert_eq!(Cmd::ViewPanScanMoveUpRight.id(), 43);
+        assert_eq!(Cmd::ViewPanScanMoveDownLeft.id(), 44);
+        assert_eq!(Cmd::ViewPanScanMoveDownRight.id(), 45);
+        assert_eq!(Cmd::ViewPanScanMoveCenter.id(), 46);
+        assert_eq!(Cmd::ViewPanScanReset.id(), 47);
+        // Zoom trio 48-50, the #46 on-top trio 51-53, Options 54.
+        assert_eq!(Cmd::ViewZoomIn.id(), 48);
+        assert_eq!(Cmd::ViewZoomOut.id(), 49);
+        assert_eq!(Cmd::ViewZoomReset.id(), 50);
+        assert_eq!(Cmd::ViewOntopAlways.id(), 51);
+        assert_eq!(Cmd::ViewOntopWhilePlaying.id(), 52);
+        assert_eq!(Cmd::ViewOntopNever.id(), 53);
+        assert_eq!(Cmd::ViewOptions.id(), 54);
+        // The #45 toolbar-only pair: 56/57.
+        assert_eq!(Cmd::SlideshowPause.id(), 55);
+        assert_eq!(Cmd::SlideshowPlayOnly.id(), 56);
+        assert_eq!(Cmd::SlideshowPauseOnly.id(), 57);
+        assert_eq!(Cmd::SlideshowRateDecrease.id(), 58);
+        assert_eq!(Cmd::SlideshowRateIncrease.id(), 59);
+        assert_eq!(Cmd::SlideshowRate250.id(), 60);
+        assert_eq!(Cmd::SlideshowRate500.id(), 61);
+        assert_eq!(Cmd::SlideshowRateCustom.id(), 77);
+        // The #38 Animation block lands 78-91 with the #41/#44/#45/#46
+        // shifts.
+        assert_eq!(Cmd::AnimationPlayPause.id(), 78);
+        assert_eq!(Cmd::AnimationJumpForwardMedium.id(), 79);
+        assert_eq!(Cmd::AnimationJumpBackwardMedium.id(), 80);
+        assert_eq!(Cmd::AnimationJumpForwardShort.id(), 81);
+        assert_eq!(Cmd::AnimationJumpBackwardShort.id(), 82);
+        assert_eq!(Cmd::AnimationJumpForwardLong.id(), 83);
+        assert_eq!(Cmd::AnimationJumpBackwardLong.id(), 84);
+        assert_eq!(Cmd::AnimationFrameStep.id(), 85);
+        assert_eq!(Cmd::AnimationFramePrev.id(), 86);
+        assert_eq!(Cmd::AnimationFirstFrame.id(), 87);
+        assert_eq!(Cmd::AnimationLastFrame.id(), 88);
+        assert_eq!(Cmd::AnimationRateDecrease.id(), 89);
+        assert_eq!(Cmd::AnimationRateIncrease.id(), 90);
+        assert_eq!(Cmd::AnimationRateReset.id(), 91);
+        assert_eq!(Cmd::NavNext.id(), 92);
         // The #39 sort/shuffle/jumpto block (menu-table order,
-        // viv.c:946-956); HelpCommandLineOptions lands 88, HelpAbout 89.
-        assert_eq!(Cmd::NavSortName.id(), 79);
-        assert_eq!(Cmd::NavSortFullPath.id(), 80);
-        assert_eq!(Cmd::NavSortSize.id(), 81);
-        assert_eq!(Cmd::NavSortDateModified.id(), 82);
-        assert_eq!(Cmd::NavSortDateCreated.id(), 83);
-        assert_eq!(Cmd::NavSortAscending.id(), 84);
-        assert_eq!(Cmd::NavSortDescending.id(), 85);
-        assert_eq!(Cmd::NavShuffle.id(), 86);
-        assert_eq!(Cmd::NavJumpTo.id(), 87);
-        // The #48 Help→Command Line Options row: 88, HelpAbout 89.
-        assert_eq!(Cmd::HelpCommandLineOptions.id(), 88);
-        assert_eq!(Cmd::HelpAbout.id(), 89);
+        // viv.c:946-956); HelpCommandLineOptions lands 105, HelpAbout 106.
+        assert_eq!(Cmd::NavSortName.id(), 96);
+        assert_eq!(Cmd::NavSortFullPath.id(), 97);
+        assert_eq!(Cmd::NavSortSize.id(), 98);
+        assert_eq!(Cmd::NavSortDateModified.id(), 99);
+        assert_eq!(Cmd::NavSortDateCreated.id(), 100);
+        assert_eq!(Cmd::NavSortAscending.id(), 101);
+        assert_eq!(Cmd::NavSortDescending.id(), 102);
+        assert_eq!(Cmd::NavShuffle.id(), 103);
+        assert_eq!(Cmd::NavJumpTo.id(), 104);
+        // The #48 Help→Command Line Options row: 105, HelpAbout 106.
+        assert_eq!(Cmd::HelpCommandLineOptions.id(), 105);
+        assert_eq!(Cmd::HelpAbout.id(), 106);
     }
 
     #[test]
@@ -1404,6 +1674,7 @@ mod tests {
         // Descending direction, shuffle off).
         let on = MenuState {
             show_menu: true,
+            show_status: true,
             show_controls: true,
             fullscreen: true,
             one_to_one: true,
@@ -1414,9 +1685,14 @@ mod tests {
             nav_sort_ascending: true,
             shuffle: true,
             image_enabled: true,
+            allow_shrinking: true,
+            keep_aspect: true,
+            fill_window: true,
+            ontop: 1,
         };
         let off = MenuState {
             show_menu: false,
+            show_status: false,
             show_controls: false,
             fullscreen: false,
             one_to_one: false,
@@ -1427,11 +1703,16 @@ mod tests {
             nav_sort_ascending: false,
             shuffle: false,
             image_enabled: true,
+            allow_shrinking: false,
+            keep_aspect: false,
+            fill_window: false,
+            ontop: 0,
         };
         for cmd in Cmd::ALL {
             let expected_on = matches!(
                 cmd,
                 Cmd::ViewMenu
+                    | Cmd::ViewStatus
                     | Cmd::ViewControls
                     | Cmd::ViewFullscreen
                     | Cmd::ViewOneToOne
@@ -1442,17 +1723,61 @@ mod tests {
                     | Cmd::NavSortName
                     | Cmd::NavSortAscending
                     | Cmd::NavShuffle
+                    | Cmd::ViewAllowShrinking
+                    | Cmd::ViewKeepAspect
+                    | Cmd::ViewFillWindow
+                    | Cmd::ViewOntopAlways
             );
             assert_eq!(checked(cmd, &on), expected_on, "{cmd:?} with everything on");
             let expected_off = matches!(
                 cmd,
-                Cmd::SlideshowRate5000 | Cmd::NavSortFullPath | Cmd::NavSortDescending
+                Cmd::SlideshowRate5000
+                    | Cmd::NavSortFullPath
+                    | Cmd::NavSortDescending
+                    | Cmd::ViewOntopNever
             );
             assert_eq!(
                 checked(cmd, &off),
                 expected_off,
                 "{cmd:?} with toggles off keeps the rate radio and the FullPath/Descending radios"
             );
+        }
+    }
+
+    /// The On Top popup checks exactly one radio row for any config value
+    /// (viv.c:7134-7136 — checked on the exact equality; an unknown ini
+    /// value checks none of the three, like the sort modes' Unknown).
+    #[test]
+    fn the_ontop_radios_follow_the_config_value() {
+        for (mode, on) in [
+            (0, Cmd::ViewOntopNever),
+            (1, Cmd::ViewOntopAlways),
+            (2, Cmd::ViewOntopWhilePlaying),
+        ] {
+            let state = MenuState {
+                ontop: mode,
+                ..plain_state()
+            };
+            for cmd in [
+                Cmd::ViewOntopAlways,
+                Cmd::ViewOntopWhilePlaying,
+                Cmd::ViewOntopNever,
+            ] {
+                assert_eq!(checked(cmd, &state), cmd == on, "ontop={mode} {cmd:?}");
+                assert!(radio(cmd), "the on-top rows render as radios");
+            }
+        }
+        // A garbage ini value checks none (the `== value` compares).
+        let state = MenuState {
+            ontop: 7,
+            ..plain_state()
+        };
+        for cmd in [
+            Cmd::ViewOntopAlways,
+            Cmd::ViewOntopWhilePlaying,
+            Cmd::ViewOntopNever,
+        ] {
+            assert!(!checked(cmd, &state));
         }
     }
 
@@ -1566,6 +1891,7 @@ mod tests {
     fn plain_state() -> MenuState {
         MenuState {
             show_menu: false,
+            show_status: false,
             show_controls: false,
             fullscreen: false,
             one_to_one: false,
@@ -1576,6 +1902,10 @@ mod tests {
             nav_sort_ascending: false,
             shuffle: false,
             image_enabled: true,
+            allow_shrinking: false,
+            keep_aspect: false,
+            fill_window: false,
+            ontop: 0,
         }
     }
 
@@ -1670,6 +2000,8 @@ mod tests {
             vec![
                 Cmd::EditCopyFilename,
                 Cmd::EditPaste,
+                Cmd::ViewCaption,
+                Cmd::ViewThickFrame,
                 Cmd::ViewPanScanMoveUpLeft,
                 Cmd::ViewPanScanMoveUpRight,
                 Cmd::ViewPanScanMoveDownLeft,
