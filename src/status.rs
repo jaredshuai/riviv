@@ -3,13 +3,13 @@
 //! text/width model in `text.rs` (upstream `_viv_status_show`,
 //! `_viv_get_status_high`, `_viv_status_update`, viv.c:10932-11440).
 //!
-//! Layout: `[main text (elastic)] [preload indicator] [frame counter
-//! "n / m"] [dimensions "W x H (N KB)"]` — the preload part exists only
-//! while its text is non-empty (upstream pushes its SB_SETPARTS boundary
-//! inside the non-empty check, viv.c:11312-11316), so the part count
-//! alternates between 3 and 4. The pixel-info parts are still skipped
-//! (riviv has neither feature — #47); the counter and dimension parts keep
-//! upstream's trailing-slot semantics.
+//! Layout: `[main text (elastic)] [preload indicator] [POS] [RGB] [frame
+//! counter "n / m"] [dimensions "W x H (N KB)"]` — the preload part exists
+//! only while its text is non-empty (upstream pushes its SB_SETPARTS
+//! boundary inside the non-empty check, viv.c:11312-11316); the POS/RGB
+//! parts (#47) ALWAYS exist (upstream's part-array guards test the array
+//! pointer, viv.c:11320-11329 — always true), sitting zero-width and
+//! invisible until pixel-info shows text in them.
 
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
@@ -28,11 +28,15 @@ use windows::core::{PCWSTR, w};
 
 use crate::text::{
     min_status_part_wide, status_dimension_text, status_frame_text, status_main_text,
-    status_part_edges, status_preload_text, to_wide,
+    status_part_edges, status_pixel_pos_text, status_pixel_rgb_text, status_preload_text, to_wide,
 };
 
 /// Child-window id for the status bar (upstream `VIV_ID_STATUS`, viv.h:196).
 pub(crate) const STATUS_BAR_ID: u16 = 100;
+
+/// The temp-text expiry timer (#47; upstream `VIV_ID_STATUS_TEMP_TEXT_TIMER`
+/// — armed at 3000 ms whenever a flash text lands, viv.c:11757).
+pub(crate) const TEMP_TEXT_TIMER_ID: usize = 4;
 
 /// Everything the status bar shows, handed to `update` as one snapshot so
 /// the pure text model decides what each part says.
@@ -47,10 +51,21 @@ pub(crate) struct StatusSnapshot {
     /// A slideshow is running — "Slideshow playing" below every verdict
     /// (#37; upstream viv.c:11374-11377).
     pub(crate) slideshow: bool,
+    /// The 3-second flash text — outranks every verdict while it runs
+    /// (#47; upstream `_viv_status_temp_text`, viv.c:11351-11353).
+    pub(crate) temp_text: Option<String>,
     /// A preload load is decoding its first frame — the "PRELOAD" part
     /// shows and the elastic main part shrinks (upstream viv.c:11210-11214,
     /// #40).
     pub(crate) preload_pending: bool,
+    /// The source-pixel coordinate under the cursor, when pixel-info is on
+    /// and the cursor is over the image — the POS part's text (#47;
+    /// upstream viv.c:11217-11219).
+    pub(crate) pixel: Option<(i32, i32)>,
+    /// The sampled color of that source pixel — the RGB part's text
+    /// (upstream viv.c:11220-11221; kept from the last valid sample while
+    /// the coordinate is off-image — unobservable, the part goes empty).
+    pub(crate) pixel_rgb: (u8, u8, u8),
     /// 1-based frame position / loaded frame count; `None` when blank.
     pub(crate) frame: Option<(usize, usize)>,
     /// The frames-remaining form (`config_frame_minus`, viv.c:11187-11203).
@@ -223,13 +238,30 @@ pub(crate) fn update(hwnd: HWND, snapshot: &StatusSnapshot) {
     if hwnd.is_invalid() {
         return; // no bar (creation failed / not yet created)
     }
-    let main = status_main_text(
-        snapshot.loading,
-        snapshot.file_not_found,
-        snapshot.load_failed,
-        snapshot.slideshow,
-    );
+    // The flash text outranks every verdict (upstream's temp-text arm sits
+    // at the TOP of the main-text chain, viv.c:11351-11353).
+    let main = match &snapshot.temp_text {
+        Some(temp) => temp.clone(),
+        None => status_main_text(
+            snapshot.loading,
+            snapshot.file_not_found,
+            snapshot.load_failed,
+            snapshot.slideshow,
+        )
+        .to_string(),
+    };
     let preload_text = status_preload_text(snapshot.preload_pending);
+    // Both pixel parts carry text only for a valid coordinate (upstream
+    // gates on x/y >= 0, viv.c:11217-11219); the PARTS themselves always
+    // exist (see the module header).
+    let pixel_pos_text = snapshot
+        .pixel
+        .map(|(x, y)| status_pixel_pos_text(x, y))
+        .unwrap_or_default();
+    let pixel_rgb_text = snapshot
+        .pixel
+        .map(|_| status_pixel_rgb_text(snapshot.pixel_rgb))
+        .unwrap_or_default();
     let frame_text = match snapshot.frame {
         Some((position, total)) => status_frame_text(position, total, snapshot.frame_remaining),
         None => String::new(),
@@ -285,6 +317,16 @@ pub(crate) fn update(hwnd: HWND, snapshot: &StatusSnapshot) {
                 } else {
                     text_extent(hdc, preload_text).max(1)
                 },
+                if pixel_pos_text.is_empty() {
+                    0
+                } else {
+                    text_extent(hdc, &pixel_pos_text).max(1)
+                },
+                if pixel_rgb_text.is_empty() {
+                    0
+                } else {
+                    text_extent(hdc, &pixel_rgb_text).max(1)
+                },
                 text_extent(hdc, &frame_text),
                 text_extent(hdc, &dimension_text),
             );
@@ -294,13 +336,15 @@ pub(crate) fn update(hwnd: HWND, snapshot: &StatusSnapshot) {
             sizes
         };
         let _ = ReleaseDC(Some(hwnd), hdc);
-        let (preload_w, frame_w, dimension_w) = sizes;
+        let (preload_w, pos_w, rgb_w, frame_w, dimension_w) = sizes;
 
         let margin = GetSystemMetrics(SM_CXEDGE) * 5;
         let grip = GetSystemMetrics(SM_CXVSCROLL) + GetSystemMetrics(SM_CXBORDER);
         let edges = status_part_edges(
             snapshot.client_wide,
             preload_w,
+            pos_w,
+            rgb_w,
             frame_w,
             dimension_w,
             margin,
@@ -315,13 +359,19 @@ pub(crate) fn update(hwnd: HWND, snapshot: &StatusSnapshot) {
         );
         // Part indices follow the edges: the preload part sits at 1 and
         // exists only while its text is non-empty (upstream's dynamic
-        // part push, viv.c:11312-11316); frame/dimension shift with it.
-        set_text(hwnd, 0, main);
+        // part push, viv.c:11312-11316); the POS/RGB parts ALWAYS take
+        // their slots (with empty text when nothing is under the cursor);
+        // frame/dimension shift with the pair (viv.c:11382-11412).
+        set_text(hwnd, 0, &main);
         let mut part = 1;
         if !preload_text.is_empty() {
             set_text(hwnd, part, preload_text);
             part += 1;
         }
+        set_text(hwnd, part, &pixel_pos_text);
+        part += 1;
+        set_text(hwnd, part, &pixel_rgb_text);
+        part += 1;
         set_text(hwnd, part, &frame_text);
         part += 1;
         set_text(hwnd, part, &dimension_text);

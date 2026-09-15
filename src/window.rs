@@ -41,8 +41,9 @@ use windows::Win32::Foundation::{
     RECT, SetLastError, WIN32_ERROR, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
-    COLOR_BTNFACE, GetMonitorInfoW, HBRUSH, InvalidateRect, MONITOR_DEFAULTTOPRIMARY, MONITORINFO,
-    MonitorFromPoint, MonitorFromRect, MonitorFromWindow, PtInRect, ScreenToClient, UpdateWindow,
+    COLOR_BTNFACE, GetMonitorInfoW, GetPixel, HBRUSH, InvalidateRect, MONITOR_DEFAULTTOPRIMARY,
+    MONITORINFO, MonitorFromPoint, MonitorFromRect, MonitorFromWindow, PtInRect, ScreenToClient,
+    UpdateWindow,
 };
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoCreateInstance,
@@ -64,7 +65,7 @@ use windows::Win32::UI::Controls::Dialogs::{
 };
 use windows::Win32::UI::Controls::{
     ICC_BAR_CLASSES, ICC_STANDARD_CLASSES, ICC_WIN95_CLASSES, INITCOMMONCONTROLSEX,
-    InitCommonControlsEx, WM_MOUSELEAVE,
+    InitCommonControlsEx, NM_CLICK, NMHDR, NMMOUSE, SB_GETPARTS, WM_MOUSELEAVE,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetCapture, GetKeyNameTextW, GetKeyState, GetKeyboardLayout, MAPVK_VK_TO_VSC, MapVirtualKeyExW,
@@ -96,7 +97,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_CONTEXTMENU, WM_COPYDATA, WM_DESTROY, WM_DROPFILES, WM_ENDSESSION, WM_ERASEBKGND,
     WM_GETMINMAXINFO, WM_INITMENU, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
     WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_MOVE, WM_NCCREATE, WM_NCDESTROY,
-    WM_NCLBUTTONDOWN, WM_NCXBUTTONDBLCLK, WM_NCXBUTTONDOWN, WM_NULL, WM_PAINT, WM_PASTE,
+    WM_NCLBUTTONDOWN, WM_NCXBUTTONDBLCLK, WM_NCXBUTTONDOWN, WM_NOTIFY, WM_NULL, WM_PAINT, WM_PASTE,
     WM_QUERYENDSESSION, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SIZE, WM_SYSCOMMAND,
     WM_SYSKEYDOWN, WM_TIMER, WM_XBUTTONDBLCLK, WM_XBUTTONDOWN, WNDCLASSEXW, WS_CAPTION,
     WS_EX_ACCEPTFILES, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_SYSMENU, WS_THICKFRAME, WS_VISIBLE,
@@ -109,7 +110,7 @@ use crate::cli;
 use crate::clipboard;
 use crate::config::Config;
 use crate::copydata;
-use crate::cursor::{self, CursorVisibility};
+use crate::cursor::{self, CursorEffects, CursorVisibility};
 use crate::custom_rate_dlg;
 use crate::everything;
 use crate::loader::{LoadReply, LoadedImage, UiAction, apply_reply, map_reply_frame};
@@ -122,7 +123,10 @@ use crate::preload::{self, AdoptDecision, LastCache, PreloadSlot, PreloadState};
 use crate::slideshow;
 use crate::status;
 use crate::surface::{DibFrame, Surface};
-use crate::text::{dialog_filter, title_wide, to_wide};
+use crate::text::{
+    TitleFormat, dialog_filter, temp_animation_rate_text, temp_pos_zoom_text,
+    temp_slideshow_rate_text, title_wide, to_wide,
+};
 use crate::zoom::{FitPolicy, View, Viewport};
 use windows::Win32::System::Power::{
     ES_CONTINUOUS, ES_DISPLAY_REQUIRED, ES_SYSTEM_REQUIRED, SetThreadExecutionState,
@@ -237,6 +241,24 @@ pub(crate) struct WindowState {
     /// show/restart cycle; (-1, -1) while the mouse is away (reset by
     /// WM_MOUSELEAVE).
     pub(crate) last_cursor_pt: POINT,
+    /// The source-pixel coordinate under the cursor (#47; upstream
+    /// `_viv_src_pixel_x/y`, viv.c:786-787): (-1, -1) while pixel-info is
+    /// off or the cursor is off-image; the POS part shows only for a valid
+    /// pair. Resampled on mouse moves and every frame change (the RGB
+    /// under a fixed point moves with the frame).
+    pub(crate) src_pixel: (i32, i32),
+    /// The color sampled at the last valid `src_pixel` (#47; upstream
+    /// `_viv_src_pixel_r/g/b`, viv.c:788-790) — upstream leaves stale
+    /// values when the coordinate goes invalid (its else-path reads an
+    /// uninitialized COLORREF); the pair is unobservable there because the
+    /// part empties with the coordinate.
+    pub(crate) src_rgb: (u8, u8, u8),
+    /// The 3-second status flash text (#47; upstream
+    /// `_viv_status_temp_text`, viv.c:735): `Some` while a
+    /// panscan/zoom-rate/slideshow-rate readout is showing — it outranks
+    /// every main-part verdict until `status::TEMP_TEXT_TIMER_ID` clears
+    /// it (viv.c:3135-3137).
+    pub(crate) status_temp: Option<String>,
     /// Suppress the WM_ACTIVATE deactivate-show during the fullscreen
     /// dummy-window dance (upstream `_viv_prevent_on_deactivate`,
     /// viv.c:784/6712/6780): the momentary deactivate must not force-show
@@ -364,11 +386,18 @@ fn status_snapshot(state: &WindowState, hwnd: HWND) -> status::StatusSnapshot {
         file_not_found: state.status_file_not_found,
         load_failed: state.status_load_failed,
         slideshow: state.slideshow,
-        // The PRELOAD part while a preload decodes its first frame (upstream
+        // The flash text outranks the whole verdict chain (upstream
+        // viv.c:11351-11353).
+        temp_text: state.status_temp.clone(),
+        // The preload part while a preload decodes its first frame (upstream
         // viv.c:11210-11214, #40).
         preload_pending: state.preload.as_ref().is_some_and(|s| {
             preload::indicator_visible(s.state, s.image.is_some(), s.activate_on_load)
         }),
+        // The POS/RGB parts show text only for a valid coordinate pair
+        // (upstream's x/y >= 0 gate, viv.c:11217-11219).
+        pixel: (state.src_pixel.0 >= 0 && state.src_pixel.1 >= 0).then_some(state.src_pixel),
+        pixel_rgb: state.src_rgb,
         frame: state
             .image
             .as_ref()
@@ -395,6 +424,232 @@ pub(crate) fn refresh_status(hwnd: HWND) {
 fn snapshot_status_bar(hwnd: HWND) -> HWND {
     // SAFETY: read-only field copy.
     unsafe { state_of(hwnd) }.map_or(HWND::default(), |s| s.status)
+}
+
+/// Rebuild the caption from the current path and `title_bar_format`
+/// (#47; upstream `_viv_update_title`, called whenever the format or the
+/// path changes). The SetWindowTextW runs OUTSIDE the state borrow like
+/// every title update here.
+pub(crate) fn refresh_title(hwnd: HWND) {
+    // SAFETY: the borrow spans only the path/format read for the title.
+    let title = (unsafe { state_of(hwnd) }).map(|state| {
+        (HSTRING::from_wide(&title_wide(
+            state.path.as_deref(),
+            TitleFormat::from_config(state.config.title_bar_format),
+        )),)
+    });
+    if let Some((title,)) = title {
+        // SAFETY: hwnd is live; the HSTRING outlives the call. Fail-soft
+        // like every other title update (upstream viv.c:1249 ignores the
+        // SetWindowTextW return too).
+        let _ = unsafe { SetWindowTextW(hwnd, &title) };
+    }
+}
+
+/// Sample the source pixel under the cursor (#47; upstream
+/// `_viv_update_src_pixel`, viv.c:9173-9240). Returns whether the status
+/// bar must refresh — upstream performs the refresh inside the same call
+/// only when pixel-info is on AND (forced OR the coordinate moved);
+/// `update_statusbar=false` leaves the refresh to the caller's explicit
+/// status update (every frame-change site pairs the two, viv.c:1901-1902/
+/// 9277-9278/14325-14326). With pixel-info off the coordinate resets and
+/// no refresh is owed (the parts sit empty either way).
+fn update_src_pixel(hwnd: HWND, force: bool, update_statusbar: bool) -> bool {
+    // SAFETY: the borrow spans the coordinate math and the read-only
+    // GetPixel on the displayed frame's DC — neither pumps messages, so no
+    // reentrant state_of borrow can interleave.
+    (unsafe { state_of(hwnd) }).is_some_and(|state| {
+        if state.config.pixel_info == 0 {
+            // Upstream's else-arm resets the coordinate only; the stale rgb
+            // stays (unobservable — the POS part empties with it).
+            state.src_pixel = (-1, -1);
+            return false;
+        }
+        let mut screen = POINT::default();
+        // SAFETY: read-only cursor query; fail-soft leaves (0, 0), which
+        // reads as a coordinate change at most once.
+        let _ = unsafe { GetCursorPos(&mut screen) };
+        let mut client = screen;
+        // SAFETY: screen -> client of our own window; pumps nothing.
+        let _ = unsafe { ScreenToClient(hwnd, &mut client) };
+        // The render rect exactly as paint anchors it (upstream
+        // `_viv_get_src_pixel_pos`, viv.c:15020-15057): the panscan-scaled
+        // render size, centered by the pan term minus the drag offset,
+        // against the viewport (client minus status bar and controls).
+        let (vp, src) = viewport_and_src(hwnd, state);
+        // Upstream gates the whole walk on a frame being displayed
+        // (viv.c:15030's `_viv_frame_count` check).
+        let new_pt = if state.image.is_some() {
+            (|| {
+                if vp.wide <= 0 || vp.high <= 0 || src.0 <= 0 || src.1 <= 0 {
+                    return None;
+                }
+                let fit = fit_policy(state);
+                let (rw0, rh0) = state.view.render_size(src.0, src.1, vp, fit);
+                let rw = crate::panscan::scale(rw0, state.view.panscan.zoom_x);
+                let rh = crate::panscan::scale(rh0, state.view.panscan.zoom_y);
+                if rw <= 0 || rh <= 0 {
+                    return None;
+                }
+                let rx = crate::panscan::center_term(vp.wide, state.view.panscan.pos_x)
+                    - rw / 2
+                    - state.view.view_x;
+                let ry = crate::panscan::center_term(vp.high, state.view.panscan.pos_y)
+                    - rh / 2
+                    - state.view.view_y;
+                (client.x >= rx && client.y >= ry && client.x < rx + rw && client.y < ry + rh).then(
+                    || {
+                        (
+                            (((client.x - rx) as i64) * src.0 as i64 / rw as i64) as i32,
+                            (((client.y - ry) as i64) * src.1 as i64 / rh as i64) as i32,
+                        )
+                    },
+                )
+            })()
+        } else {
+            None
+        }
+        .unwrap_or((-1, -1));
+        let changed = force || new_pt != state.src_pixel;
+        if !changed {
+            return false;
+        }
+        state.src_pixel = new_pt;
+        if new_pt.0 >= 0
+            && new_pt.1 >= 0
+            && let Some(image) = state.image.as_ref()
+        {
+            // The displayed frame's own DC, read-only (upstream builds a
+            // scratch DC for the same GetPixel, viv.c:15063-15109; riviv's
+            // persistent mem DC serves the identical read — the #41
+            // clipboard blit set the precedent).
+            let dc = image.surface().mem_dc();
+            // SAFETY: read-only GetPixel on the surface's selected frame;
+            // no selection change, no messages. A failed read returns
+            // CLR_INVALID (0xFFFFFFFF → 255,255,255) unchecked, like
+            // upstream's GetRValue chain (viv.c:9212-9214).
+            let cref = unsafe { GetPixel(dc, new_pt.0, new_pt.1) };
+            // COLORREF is 0x00BBGGRR (the GetRValue/GValue/BValue macros).
+            state.src_rgb = (
+                (cref.0 & 0xFF) as u8,
+                ((cref.0 >> 8) & 0xFF) as u8,
+                ((cref.0 >> 16) & 0xFF) as u8,
+            );
+        }
+        update_statusbar
+    })
+}
+
+/// The force-resample + refresh pair every frame-change site performs
+/// (upstream `_viv_update_src_pixel(1,0)` + the explicit
+/// `_viv_status_update()`, viv.c:1901-1902/9277-9278/10097-10098/
+/// 14325-14326): the color under a fixed screen point moves with the
+/// frame, so stepping/jumping/advancing/adopting resamples unconditionally.
+fn resample_pixel_refresh(hwnd: HWND) {
+    update_src_pixel(hwnd, true, false);
+    refresh_status(hwnd);
+}
+
+/// Land a 3-second status flash (#47; upstream `_viv_status_set_temp_text`,
+/// viv.c:11737-11758): a showing text's timer dies first, the text replaces
+/// whatever was there, the bar refreshes, and a fresh timer arms only when
+/// a text landed. `None` clears (the timer's own expiry path).
+fn status_set_temp_text(hwnd: HWND, text: Option<String>) {
+    // SAFETY: the borrow spans the swap only.
+    let had_text = (unsafe { state_of(hwnd) }).is_some_and(|state| {
+        let had = state.status_temp.is_some();
+        state.status_temp = text;
+        had
+    });
+    if had_text {
+        // SAFETY: hwnd is live; a failed kill leaves a stale timer whose
+        // WM_TIMER handler no-ops on the already-cleared text.
+        let _ = unsafe { KillTimer(Some(hwnd), status::TEMP_TEXT_TIMER_ID) };
+    }
+    refresh_status(hwnd);
+    // SAFETY: read-only probe.
+    let showing = (unsafe { state_of(hwnd) }).is_some_and(|s| s.status_temp.is_some());
+    if showing {
+        // SAFETY: hwnd is live and owned by this thread. Fail-soft like
+        // upstream's unchecked SetTimer (viv.c:11757): a failed timer only
+        // costs the auto-fallback (the text stays until the next verdict).
+        let _ = unsafe { SetTimer(Some(hwnd), status::TEMP_TEXT_TIMER_ID, 3000, None) };
+    }
+}
+
+/// The panscan/zoom flash (`_viv_status_update_temp_pos_zoom` fires from
+/// `_viv_dst_pos_set`/`_viv_dst_zoom_set` tails, viv.c:9996/10029 —
+/// UNCONDITIONALLY, a clamped no-op step still flashes).
+fn flash_pos_zoom(hwnd: HWND) {
+    // SAFETY: the borrow spans the read of the panscan state and image
+    // dims; the pure text builder runs on the copies.
+    let text = (unsafe { state_of(hwnd) }).map(|state| {
+        let (w, h) = state
+            .image
+            .as_ref()
+            .map(|i| (i.width(), i.height()))
+            .unwrap_or((0, 0));
+        temp_pos_zoom_text(
+            state.view.panscan.pos_x,
+            state.view.panscan.pos_y,
+            state.view.panscan.zoom_x,
+            state.view.panscan.zoom_y,
+            w,
+            h,
+        )
+    });
+    if let Some(text) = text {
+        status_set_temp_text(hwnd, Some(text));
+    }
+}
+
+/// The animation-rate flash (`_viv_increase_animation_rate`/
+/// `_viv_reset_animation_rate` tails, viv.c:7673/7680).
+fn flash_animation_rate(hwnd: HWND) {
+    // SAFETY: the borrow spans the rate-position read.
+    let text = (unsafe { state_of(hwnd) })
+        .map(|s| temp_animation_rate_text(crate::anim::RATE_TABLE[s.animation_rate_pos]));
+    if let Some(text) = text {
+        status_set_temp_text(hwnd, Some(text));
+    }
+}
+
+/// The slideshow-rate flash (`_viv_set_rate` tail and the custom-rate path,
+/// viv.c:7053/7068).
+fn flash_slideshow_rate(hwnd: HWND) {
+    // SAFETY: the borrow spans the config read.
+    let text =
+        (unsafe { state_of(hwnd) }).map(|s| temp_slideshow_rate_text(s.config.slideshow_rate));
+    if let Some(text) = text {
+        status_set_temp_text(hwnd, Some(text));
+    }
+}
+
+/// The status bar's NM_CLICK (#47; upstream WM_NOTIFY arm, viv.c:3976-4010):
+/// a click that hit nothing (the size grip, or past the last measured part)
+/// resolves to the LAST part; part 1 toggles `config_frame_minus`. With the
+/// layout [main][preload?][pos][rgb][frame][dimension], part 1 is the
+/// PRELOAD slot while its text shows, else the POS part — zero-width when
+/// pixel-info is off, making the toggle unclickable in that state.
+/// Upstream hardcodes the index; kept bug-for-bug.
+fn on_status_nm_click(hwnd: HWND, nm: &NMMOUSE) {
+    let bar = snapshot_status_bar(hwnd);
+    if bar.is_invalid() {
+        return;
+    }
+    let mut item = nm.dwItemSpec as isize;
+    if item < 0 {
+        // "if we hit nothing use the last part" (viv.c:3989-3992).
+        // SAFETY: count-only SB_GETPARTS on our own child (no buffer).
+        item = unsafe { SendMessageW(bar, SB_GETPARTS, Some(WPARAM(0)), None) }.0 as isize - 1;
+    }
+    if item == 1 {
+        // SAFETY: the borrow spans the one-field flip.
+        if let Some(state) = unsafe { state_of(hwnd) } {
+            state.config.frame_minus ^= 1;
+        }
+        refresh_status(hwnd);
+    }
 }
 
 /// The zoom/pan geometry inputs from the current state: the render viewport
@@ -532,19 +787,27 @@ fn on_hide_cursor_timer(hwnd: HWND) {
 
 /// WM_MOUSELEAVE (upstream viv.c:3562-3588): the TME_LEAVE tracking
 /// expired — the mouse left the window. Clear the mouseover verdict and
-/// the movement dedupe, and make sure the cursor is visible (the hide
-/// conditions can no longer hold). The src-pixel part of upstream's
-/// handler belongs to the unimplemented pixel-info feature.
+/// the movement dedupe, make sure the cursor is visible (the hide
+/// conditions can no longer hold), and drop the pixel coordinate (the
+/// POS/RGB parts empty — the refresh only when pixel-info is on and a
+/// coordinate was showing, upstream's conditional `_viv_status_update`,
+/// viv.c:3570-3579).
 fn on_mouse_leave(hwnd: HWND) {
-    // SAFETY: the borrow spans the flag resets and the pure cursor step.
-    let effects = (unsafe { state_of(hwnd) }).map(|state| {
-        state.tracking_mouse = false;
-        state.is_mouseover = false;
-        state.last_cursor_pt = POINT { x: -1, y: -1 };
-        state.cursor.show()
-    });
-    if let Some(effects) = effects {
-        apply_cursor(hwnd, effects);
+    // SAFETY: the borrow spans the flag resets, the coordinate clear, and
+    // the pure cursor step.
+    let (effects, had_pixel) = (unsafe { state_of(hwnd) })
+        .map(|state| {
+            state.tracking_mouse = false;
+            state.is_mouseover = false;
+            state.last_cursor_pt = POINT { x: -1, y: -1 };
+            let had = state.src_pixel != (-1, -1);
+            state.src_pixel = (-1, -1);
+            (state.cursor.show(), had)
+        })
+        .unwrap_or((CursorEffects::default(), false));
+    apply_cursor(hwnd, effects);
+    if had_pixel {
+        refresh_status(hwnd);
     }
 }
 
@@ -910,7 +1173,7 @@ fn toggle_fullscreen(hwnd: HWND) {
                     ..Default::default()
                 })
             };
-            let title = HSTRING::from_wide(&title_wide(None));
+            let title = HSTRING::from_wide(&title_wide(None, TitleFormat::FilenameOnly));
             // SAFETY: all parameters are valid for the call; the dummy is
             // created, foregrounded and destroyed in the same sweep.
             let dummy = unsafe {
@@ -1118,6 +1381,10 @@ fn panscan_step(hwnd: HWND, dx: i32, dy: i32) {
     if changed {
         repaint(hwnd);
     }
+    // The readout flashes even when the step clamped to a no-op (upstream's
+    // `_viv_dst_zoom_set` calls the temp text outside the changed check,
+    // viv.c:10029).
+    flash_pos_zoom(hwnd);
 }
 
 /// One Pan/Scan Move arrow (#44; upstream the eight MOVE commands →
@@ -1129,17 +1396,21 @@ fn panscan_pan(hwnd: HWND, dx: i32, dy: i32) {
     if changed {
         repaint(hwnd);
     }
+    // Unconditional flash (upstream `_viv_dst_pos_set` tail, viv.c:9996).
+    flash_pos_zoom(hwnd);
 }
 
 /// Move Center / Pan-Scan Reset (#44; upstream viv.c:2302-2313): both write
 /// the position directly and invalidate UNCONDITIONALLY (no change check),
-/// Reset additionally restores the identity factor indices.
+/// Reset additionally restores the identity factor indices. Both flash the
+/// readout (Center directly, Reset through `_viv_dst_zoom_set`'s tail).
 fn panscan_center(hwnd: HWND) {
     // SAFETY: the borrow spans only the pure state write.
     if let Some(state) = unsafe { state_of(hwnd) } {
         state.view.panscan.center();
     }
     repaint(hwnd);
+    flash_pos_zoom(hwnd);
 }
 
 fn panscan_reset(hwnd: HWND) {
@@ -1148,6 +1419,7 @@ fn panscan_reset(hwnd: HWND) {
         state.view.panscan.reset();
     }
     repaint(hwnd);
+    flash_pos_zoom(hwnd);
 }
 
 /// A `+`/`-` keypress zoom step — anchored at the viewport center (upstream
@@ -1596,6 +1868,12 @@ fn on_mouse_move(hwnd: HWND, lparam: LPARAM) {
     if mscrolled {
         repaint(hwnd);
     }
+    // The pixel-info resample closes the move (upstream's final
+    // `_viv_update_src_pixel(0,1)`, viv.c:3662 — after the drag arms, so
+    // the POS readout tracks a panning image too).
+    if update_src_pixel(hwnd, false, true) {
+        refresh_status(hwnd);
+    }
 }
 
 /// WM_LBUTTONUP — end the drag (upstream `_viv_doing_cancel`,
@@ -1749,7 +2027,10 @@ fn activate_last_flow(hwnd: HWND) {
         state.displayed_entry = Some(cache.entry.clone());
         state.displayed_file_bytes = Some(cache.entry.size);
         state.pending_file_bytes = None;
-        HSTRING::from_wide(&title_wide(state.path.as_deref()))
+        HSTRING::from_wide(&title_wide(
+            state.path.as_deref(),
+            TitleFormat::from_config(state.config.title_bar_format),
+        ))
     };
     adopt_display_tail(hwnd, Some(title), true);
     // Chain-preload the next neighbor (upstream viv.c:1493).
@@ -1807,7 +2088,10 @@ fn adopt_preload_flow(hwnd: HWND) {
                 state.nav_current = Some(entry.clone());
                 state.path = Some(entry.path.clone());
                 state.pending_file_bytes = Some(entry.size);
-                title = Some(HSTRING::from_wide(&title_wide(state.path.as_deref())));
+                title = Some(HSTRING::from_wide(&title_wide(
+                    state.path.as_deref(),
+                    TitleFormat::from_config(state.config.title_bar_format),
+                )));
             }
             AdoptDecision::AdoptComplete => {
                 // viv.c:15176-15182: cache the display, swap the whole
@@ -1818,7 +2102,10 @@ fn adopt_preload_flow(hwnd: HWND) {
                 } else {
                     invalidate = true;
                     chain_preload = true;
-                    title = Some(HSTRING::from_wide(&title_wide(state.path.as_deref())));
+                    title = Some(HSTRING::from_wide(&title_wide(
+                        state.path.as_deref(),
+                        TitleFormat::from_config(state.config.title_bar_format),
+                    )));
                 }
             }
             AdoptDecision::AdoptPartial => {
@@ -1829,7 +2116,10 @@ fn adopt_preload_flow(hwnd: HWND) {
                     fatal_msg = Some(e);
                 } else {
                     invalidate = true;
-                    title = Some(HSTRING::from_wide(&title_wide(state.path.as_deref())));
+                    title = Some(HSTRING::from_wide(&title_wide(
+                        state.path.as_deref(),
+                        TitleFormat::from_config(state.config.title_bar_format),
+                    )));
                 }
             }
             AdoptDecision::AdoptFailed => {
@@ -1853,7 +2143,10 @@ fn adopt_preload_flow(hwnd: HWND) {
                 state.pending_file_bytes = None;
                 invalidate = true;
                 chain_preload = true;
-                title = Some(HSTRING::from_wide(&title_wide(state.path.as_deref())));
+                title = Some(HSTRING::from_wide(&title_wide(
+                    state.path.as_deref(),
+                    TitleFormat::from_config(state.config.title_bar_format),
+                )));
             }
         }
     }
@@ -1942,7 +2235,10 @@ fn reset_display_marks(state: &mut WindowState) {
 /// `_viv_start_first_frame`'s tail, viv.c:14363-14383), the cursor
 /// reconcile and the repaint.
 fn adopt_display_tail(hwnd: HWND, title: Option<HSTRING>, invalidate: bool) {
-    refresh_status(hwnd);
+    // The force-resample pairs with the status refresh at the view-set
+    // tail (upstream viv.c:14325-14326) — the first frame lands under a
+    // possibly-stationary cursor.
+    resample_pixel_refresh(hwnd);
     // The strip's grays track the newly displayed size (upstream's
     // load-reply branch, viv.c:2872).
     refresh_toolbar(hwnd);
@@ -2239,7 +2535,10 @@ pub(crate) fn request_open(hwnd: HWND, path: &OsStr, origin: OpenOrigin<'_>) {
     // SetWindowTextW here.
     // SAFETY: the short borrow spans only the path read for the title.
     if let Some(state) = unsafe { state_of(hwnd) } {
-        let title = HSTRING::from_wide(&title_wide(state.path.as_deref()));
+        let title = HSTRING::from_wide(&title_wide(
+            state.path.as_deref(),
+            TitleFormat::from_config(state.config.title_bar_format),
+        ));
         // SAFETY: hwnd is live; the HSTRING outlives the call. Fail-soft
         // like every other title update (upstream viv.c:1249 ignores the
         // SetWindowTextW return too).
@@ -2749,9 +3048,9 @@ fn slideshow_toggle(hwnd: HWND) {
 }
 
 /// `_viv_set_rate` (viv.c:7582-7601): store the rate; a running timer is
-/// re-armed at it. (Upstream ends with the status temp-text readout — the
-/// temp-text line itself lands with #47; the pure decomposition is tested
-/// in slideshow.rs.)
+/// re-armed at it; every rate change flashes the readout (the temp-text
+/// call at the tail covers the preset ladder, the custom dialog, and the
+/// menu rows — upstream viv.c:7068).
 fn slideshow_set_rate(hwnd: HWND, rate_ms: u32) {
     // SAFETY: the borrow spans the config store and the running read.
     let running = (unsafe { state_of(hwnd) }).is_some_and(|state| {
@@ -2765,6 +3064,7 @@ fn slideshow_set_rate(hwnd: HWND, rate_ms: u32) {
         // SAFETY: same pair as the kill above.
         let _ = unsafe { SetTimer(Some(hwnd), slideshow::SLIDESHOW_TIMER_ID, rate_ms, None) };
     }
+    flash_slideshow_rate(hwnd);
 }
 
 /// `_viv_increase_rate` (viv.c:7594-7630): step through the preset table;
@@ -2912,6 +3212,10 @@ fn blank_display(hwnd: HWND) {
         state.slideshow_timeup = false;
         stop_timer = state.animation_timer_running;
         state.animation_timer_running = false;
+        // The pixel coordinate dies with the display (upstream's blank
+        // force-resamples onto a frame_count of 0, which reads invalid —
+        // viv.c:7921-7922).
+        state.src_pixel = (-1, -1);
     }
     refresh_status(hwnd);
     // A blanked display can never hide the cursor — reconcile it (upstream
@@ -2931,7 +3235,12 @@ fn blank_display(hwnd: HWND) {
     }
     // SAFETY: hwnd is live; the HSTRING outlives the call. Fail-soft like
     // every other title update (upstream viv.c:1249 ignores it too).
-    let _ = unsafe { SetWindowTextW(hwnd, &HSTRING::from_wide(&title_wide(None))) };
+    let _ = unsafe {
+        SetWindowTextW(
+            hwnd,
+            &HSTRING::from_wide(&title_wide(None, TitleFormat::FilenameOnly)),
+        )
+    };
     // SAFETY: queues a WM_PAINT; never pumps messages.
     let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
 }
@@ -3483,8 +3792,10 @@ fn on_load_replies(hwnd: HWND) {
                             if state.displayed_from == Some(session_id) && !displayed_before_reply {
                                 adopted_new_image = true;
                                 state.path = Some(session_path.clone());
-                                title =
-                                    Some(HSTRING::from_wide(&title_wide(state.path.as_deref())));
+                                title = Some(HSTRING::from_wide(&title_wide(
+                                    state.path.as_deref(),
+                                    TitleFormat::from_config(state.config.title_bar_format),
+                                )));
                                 // The navigation facts follow the adopted
                                 // image (upstream copies _viv_load_fd into
                                 // _viv_frame_fd at the first-frame reply,
@@ -3590,7 +3901,10 @@ fn on_load_replies(hwnd: HWND) {
                     Ok(()) => {
                         invalidate = true;
                         adopted_new_image = true;
-                        title = Some(HSTRING::from_wide(&title_wide(state.path.as_deref())));
+                        title = Some(HSTRING::from_wide(&title_wide(
+                            state.path.as_deref(),
+                            TitleFormat::from_config(state.config.title_bar_format),
+                        )));
                         // A stream that finished inside this drain has no
                         // reply left to chain from — the completion arm
                         // fires the next preload itself (viv.c:2824-2826/
@@ -3741,9 +4055,11 @@ fn on_animation_timer(hwnd: HWND) {
         nav_next(hwnd, false, true, false);
     }
     if repaint {
-        // The frame counter part ("n / m") tracks the displayed frame
-        // (upstream refreshes it in the timer body, viv.c:3277).
-        refresh_status(hwnd);
+        // The frame counter part ("n / m") tracks the displayed frame,
+        // and the RGB under the cursor moves with it (upstream pairs the
+        // force-resample with the status refresh in the timer body,
+        // viv.c:3276-3277).
+        resample_pixel_refresh(hwnd);
         // SAFETY: queues a WM_PAINT; never pumps messages. Erase is FALSE
         // like upstream viv.c:3284 — WM_PAINT fills the whole client itself.
         let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
@@ -3793,9 +4109,11 @@ fn frame_command(hwnd: HWND, walk: impl Fn(&mut LoadedImage, u64) -> bool) {
     // And an on-top while-playing one (riviv superset).
     update_ontop(hwnd);
     if walked.unwrap_or(false) {
-        // The frame counter ("n / m") tracks the walk (upstream
-        // `_viv_status_update` in the handler body, viv.c:9278).
-        refresh_status(hwnd);
+        // The frame counter ("n / m") tracks the walk, and the RGB under
+        // the cursor moves with the frame (upstream pairs the
+        // force-resample with the status update in the handler body,
+        // viv.c:9277-9278).
+        resample_pixel_refresh(hwnd);
         // SAFETY: queues a WM_PAINT; never pumps messages.
         let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
     }
@@ -3805,12 +4123,13 @@ fn frame_command(hwnd: HWND, walk: impl Fn(&mut LoadedImage, u64) -> bool) {
 /// `_viv_increase_animation_rate`/`_viv_reset_animation_rate`, viv.c:
 /// 7656-7681): step the table position (clamped, no wrap) or return to
 /// 1.0×. The position persists across images; the status-bar temp-text
-/// readout lands with the status work (#47).
+/// readout flashes on every command (#47, viv.c:7673/7680).
 fn animation_rate_step(hwnd: HWND, decrease: bool) {
     // SAFETY: the borrow spans the one-field update.
     let _ = (unsafe { state_of(hwnd) }).map(|state| {
         state.animation_rate_pos = rate_step(state.animation_rate_pos, decrease);
     });
+    flash_animation_rate(hwnd);
 }
 
 fn animation_rate_reset(hwnd: HWND) {
@@ -3818,6 +4137,7 @@ fn animation_rate_reset(hwnd: HWND) {
     let _ = (unsafe { state_of(hwnd) }).map(|state| {
         state.animation_rate_pos = RATE_ONE;
     });
+    flash_animation_rate(hwnd);
 }
 
 /// The jump budget a command spends (upstream `config_short_jump` /
@@ -5804,11 +6124,42 @@ unsafe extern "system" fn wnd_proc(
             } else if wparam.0 == cursor::HIDE_CURSOR_TIMER_ID {
                 on_hide_cursor_timer(hwnd);
                 LRESULT(0)
+            } else if wparam.0 == status::TEMP_TEXT_TIMER_ID {
+                // The 3-second flash expiry (upstream viv.c:3135-3137):
+                // clear the text; the refresh inside restores the verdict
+                // chain to the main part.
+                status_set_temp_text(hwnd, None);
+                LRESULT(0)
             } else {
                 // SAFETY: hwnd/msg are exactly what this callback received;
                 // the default procedure handles everything we do not.
                 unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
             }
+        }
+        // The status bar's click notifications (#47; upstream viv.c:
+        // 3976-4010 — NM_CLICK on part 1 toggles the frames-remaining
+        // counter). Only the status bar's idFrom is consumed; everything
+        // else (the rebar family reaches the strip's own proc, not here)
+        // rides the default handling.
+        WM_NOTIFY => {
+            // SAFETY: lParam points at the sender's NMHDR for the duration
+            // of the message — a same-process child (the status bar), so
+            // the read cannot fault.
+            let hdr = lparam.0 as *const NMHDR;
+            if !hdr.is_null()
+                // SAFETY: the two header fields sit at the block's front.
+                && unsafe { ((*hdr).idFrom, (*hdr).code) }
+                    == (status::STATUS_BAR_ID as usize, NM_CLICK)
+            {
+                // SAFETY: an NM_CLICK from the status bar carries NMMOUSE
+                // in the same notification block.
+                let nm = unsafe { &*(lparam.0 as *const NMMOUSE) };
+                on_status_nm_click(hwnd, nm);
+            }
+            // SAFETY: upstream breaks out of its switch onto the default
+            // return; the frame's own handling for unmatched notifications
+            // is the default procedure's.
+            LRESULT(unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }.0)
         }
         // Upstream viv.c:3907-3938: with prevent_sleep on, a running
         // slideshow or a PLAYING animation swallows the monitor-power /
@@ -6357,6 +6708,9 @@ pub(crate) fn run() -> Result<(), String> {
         tracking_mouse: false,
         is_mouseover: false,
         last_cursor_pt: POINT { x: -1, y: -1 },
+        src_pixel: (-1, -1),
+        src_rgb: (0, 0, 0),
+        status_temp: None,
         prevent_deactivate_show: false,
         last_cl_tick: None,
         last_open_folder: None,
@@ -6410,7 +6764,7 @@ pub(crate) fn run() -> Result<(), String> {
     }
 
     // The startup window rect (kept from the load above — viv.c:5354-5387).
-    let title = HSTRING::from_wide(&title_wide(None));
+    let title = HSTRING::from_wide(&title_wide(None, TitleFormat::FilenameOnly));
     // The loaded bindings (still borrowed from the state box; the menu bar
     // below needs them after the box moves into the window).
     let keys = state.config.keys.clone();

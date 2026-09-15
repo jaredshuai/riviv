@@ -300,6 +300,25 @@ pub(crate) enum Id {
     CustomRateMinutes,
     /// Status-bar main part while a slideshow runs (#37; en_us.h:200).
     StatusBarSlideshowPlaying,
+    /// Temp-text readout words (#47; upstream keeps one printf template
+    /// per flash — en_us.h:201-206/zh_cn.h:201-206. riviv composes the
+    /// labels around the same number slots (byte-identical output).
+    /// "Pos" — the panscan position flash's first word.
+    StatusBarPosLabel,
+    /// "Zoom" — the panscan position flash's second word.
+    StatusBarZoomLabel,
+    /// "Aspect Ratio" — the panscan position flash's third word.
+    StatusBarAspectLabel,
+    /// "Animation rate" — the animation-rate flash.
+    StatusBarAnimationRateLabel,
+    /// "Slideshow rate" — the slideshow-rate flash.
+    StatusBarSlideshowRateLabel,
+    /// Slideshow-rate unit, whole minutes (en_us.h:204).
+    StatusBarMinutes,
+    /// Slideshow-rate unit, whole seconds (en_us.h:205).
+    StatusBarSeconds,
+    /// Slideshow-rate unit, raw milliseconds (en_us.h:206).
+    StatusBarMilliseconds,
     /// Left-click action value 1 (#37; en_us.h:264).
     ActionPlayPauseSlideshow,
     /// Left-click action value 2 (#38; en_us.h:265).
@@ -359,6 +378,15 @@ pub(crate) enum Id {
     OptionsPreloadNext,
     /// Options View page: last-cache checkbox (en_us.h:232 / zh_cn.h:233).
     OptionsCacheLast,
+    /// Options View page: title-bar-format row (#47; en_us.h:276-279 /
+    /// zh_cn.h:277-280). The static label.
+    OptionsTitleBarFormat,
+    /// Combo item: full path (value 0).
+    OptionsTitleBarFormatFullPath,
+    /// Combo item: filename only (value 1).
+    OptionsTitleBarFormatFilenameOnly,
+    /// Combo item: none (value 2).
+    OptionsTitleBarFormatNone,
     /// ---- #48: second-pass CLI ----
     /// Help → "Command Line Options" (en_us.h:179 / zh_cn.h:179).
     MenuCommandLineOptions,
@@ -577,6 +605,14 @@ const EN_US: [&str; Id::COUNT] = [
     "seconds",              // CustomRateSeconds
     "minutes",              // CustomRateMinutes
     "Slideshow playing",    // StatusBarSlideshowPlaying
+    "Pos",                  // StatusBarPosLabel (en_us.h:201, composed)
+    "Zoom",                 // StatusBarZoomLabel (en_us.h:201, composed)
+    "Aspect Ratio",         // StatusBarAspectLabel (en_us.h:201, composed)
+    "Animation rate",       // StatusBarAnimationRateLabel (en_us.h:202)
+    "Slideshow rate",       // StatusBarSlideshowRateLabel (en_us.h:203)
+    "minutes",              // StatusBarMinutes (en_us.h:204)
+    "seconds",              // StatusBarSeconds (en_us.h:205)
+    "milliseconds",         // StatusBarMilliseconds (en_us.h:206)
     "Play/Pause Slideshow", // ActionPlayPauseSlideshow
     "Play/Pause Animation", // ActionPlayPauseAnimation
     // Animation menu block (#38; en_us.h:142/144-157).
@@ -610,7 +646,11 @@ const EN_US: [&str; Id::COUNT] = [
     "PRELOAD",                                     // StatusBarPreload (en_us.h:196)
     "Preload &next image",                         // OptionsPreloadNext (en_us.h:231)
     "Cache &last image",                           // OptionsCacheLast (en_us.h:232)
-    "&Command Line Options",                       // MenuCommandLineOptions (en_us.h:179)
+    "&Title bar format:",                          // OptionsTitleBarFormat (en_us.h:276)
+    "Full Path",                                   // OptionsTitleBarFormatFullPath (en_us.h:277)
+    "Filename Only",         // OptionsTitleBarFormatFilenameOnly (en_us.h:278)
+    "None",                  // OptionsTitleBarFormatNone (en_us.h:279)
+    "&Command Line Options", // MenuCommandLineOptions (en_us.h:179)
     // UsageText — upstream viv.c:11862-11894 verbatim except the exe name
     // brand swap; the /everything and /random rows stay hidden (upstream
     // comments them out).
@@ -819,6 +859,14 @@ const ZH_CN: [&str; Id::COUNT] = [
     "秒",              // CustomRateSeconds
     "分钟",            // CustomRateMinutes
     "幻灯片播放中",    // StatusBarSlideshowPlaying
+    "位置",            // StatusBarPosLabel (zh_cn.h:201, composed)
+    "缩放",            // StatusBarZoomLabel (zh_cn.h:201, composed)
+    "宽高比",          // StatusBarAspectLabel (zh_cn.h:201, composed)
+    "动画速率",        // StatusBarAnimationRateLabel (zh_cn.h:202)
+    "幻灯片播放间隔",  // StatusBarSlideshowRateLabel (zh_cn.h:203)
+    "分钟",            // StatusBarMinutes (zh_cn.h:204)
+    "秒",              // StatusBarSeconds (zh_cn.h:205)
+    "毫秒",            // StatusBarMilliseconds (zh_cn.h:206)
     "播放/暂停幻灯片", // ActionPlayPauseSlideshow
     "播放/暂停动画",   // ActionPlayPauseAnimation
     // Animation menu block (#38; zh_cn.h:143/144-157/231).
@@ -852,6 +900,10 @@ const ZH_CN: [&str; Id::COUNT] = [
     "预加载",                         // StatusBarPreload (zh_cn.h:196)
     "预加载下一张图像(&N)",           // OptionsPreloadNext (zh_cn.h:232)
     "缓存最后一张图像(&L)",           // OptionsCacheLast (zh_cn.h:233)
+    "标题栏格式(&T):",                // OptionsTitleBarFormat (zh_cn.h:277)
+    "完整路径",                       // OptionsTitleBarFormatFullPath (zh_cn.h:278)
+    "仅文件名",                       // OptionsTitleBarFormatFilenameOnly (zh_cn.h:279)
+    "无",                             // OptionsTitleBarFormatNone (zh_cn.h:280)
     "命令行选项(&C)",                 // MenuCommandLineOptions (zh_cn.h:179)
     // UsageText — riviv's translation of viv.c:11862-11894 (upstream
     // hardcodes English; the issue mandates the bilingual body).

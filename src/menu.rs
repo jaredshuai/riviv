@@ -1977,6 +1977,20 @@ mod tests {
     }
 
     #[test]
+    fn command_ids_stay_pinned_for_the_smoke_scripts() {
+        // The cross-process smokes post WM_COMMAND by raw id; inserting a
+        // Cmd variant shifts everything after it. This pins the load-bearing
+        // anchors (the #46 baseline; #47 reads panscan/rate/1:1/Options).
+        assert_eq!(Cmd::ViewOneToOne.id(), 30);
+        assert_eq!(Cmd::ViewPanScanIncreaseSize.id(), 32);
+        assert_eq!(Cmd::ViewOptions.id(), 54);
+        assert_eq!(Cmd::SlideshowRate1000.id(), 62);
+        assert_eq!(Cmd::AnimationRateDecrease.id(), 89);
+        assert_eq!(Cmd::HelpAbout.id(), 106);
+        assert_eq!(Cmd::COUNT, 106);
+    }
+
+    #[test]
     fn the_owner_draw_rows_hide_from_the_menu_bar_only() {
         // Upstream's MF_OWNERDRAW rows: present in the command table
         // (Controls list + WM_COMMAND + ini names), absent from the menu
