@@ -366,12 +366,22 @@ pub(crate) enum Id {
     /// upstream hardcodes the English text; riviv localizes it per the
     /// issue, with the exe name brand-swapped like AppName).
     UsageText,
+    /// ---- #45: toolbar ----
+    /// View → "Controls" toggle (en_us.h:72 / zh_cn.h:72).
+    MenuControls,
+    /// Toolbar button labels (en_us.h:188-193 / zh_cn.h:188-193).
+    ToolbarPreviousImage,
+    ToolbarNextImage,
+    ToolbarPlaySlideshow,
+    ToolbarPauseSlideshow,
+    ToolbarBestFit,
+    ToolbarActualSize,
 }
 
 impl Id {
     /// Variant count; array-typing both tables against this keeps them
     /// length-locked to the enum by construction.
-    pub(crate) const COUNT: usize = Self::UsageText as usize + 1;
+    pub(crate) const COUNT: usize = Self::ToolbarActualSize as usize + 1;
 }
 
 /// Table choice (upstream `LOCALIZATION_LANGUAGE_*`, localization.h:30-32).
@@ -594,6 +604,13 @@ const EN_US: [&str; Id::COUNT] = [
      /install <path>\tInstall to the specified path.\n\
      /install-options <...> Run with the specified options after installation.\n\
      /uninstall <path>\tUninstall from the specified path.",
+    "&Controls",       // MenuControls (en_us.h:72)
+    "Previous Image",  // ToolbarPreviousImage (en_us.h:188)
+    "Next Image",      // ToolbarNextImage (en_us.h:189)
+    "Play Slideshow",  // ToolbarPlaySlideshow (en_us.h:190)
+    "Pause Slideshow", // ToolbarPauseSlideshow (en_us.h:191)
+    "Best Fit",        // ToolbarBestFit (en_us.h:192)
+    "Actual Size",     // ToolbarActualSize (en_us.h:193)
 ];
 
 /// zh-CN table — upstream localization_zh_cn.h:31/197-199/261-263.
@@ -807,6 +824,13 @@ const ZH_CN: [&str; Id::COUNT] = [
      /install <路径>\t安装到指定路径。\n\
      /install-options <...> 安装后以指定选项运行。\n\
      /uninstall <路径>\t从指定路径卸载。",
+    "控件(&C)", // MenuControls (zh_cn.h:72)
+    "上一个",   // ToolbarPreviousImage (zh_cn.h:188)
+    "下一个",   // ToolbarNextImage (zh_cn.h:189)
+    "播放",     // ToolbarPlaySlideshow (zh_cn.h:190)
+    "暂停",     // ToolbarPauseSlideshow (zh_cn.h:191)
+    "最佳适应", // ToolbarBestFit (zh_cn.h:192)
+    "实际大小", // ToolbarActualSize (zh_cn.h:193)
 ];
 
 /// Map a `GetUserDefaultUILanguage` LANGID onto the table choice

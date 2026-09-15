@@ -202,6 +202,13 @@ impl View {
         self.one_to_one = false;
     }
 
+    /// Whether the temporary 1:1 mode is active (#45's Best Fit button
+    /// state reads it alongside the level, upstream
+    /// `_viv_zoom_pos == 0 && !_viv_1to1`, viv.c:11693-11697).
+    pub(crate) fn is_one_to_one(&self) -> bool {
+        self.one_to_one
+    }
+
     /// The render size at every level, computed in one sweep — upstream's
     /// zoom_wide/high_array precalculation in `_viv_toggle_fullscreen`
     /// (viv.c:6584-6601). The 1:1 quirk is inherited: the sweep runs BEFORE

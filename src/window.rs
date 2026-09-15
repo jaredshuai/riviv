@@ -77,28 +77,29 @@ use windows::Win32::UI::Shell::{
     SIGDN_FILESYSPATH,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AdjustWindowRect, AppendMenuW, CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW,
-    CheckMenuItem, CreateMenu, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu,
-    DestroyWindow, DispatchMessageW, EnableMenuItem, FindWindowA, GWL_STYLE, GWLP_USERDATA,
-    GetClientRect, GetCursorPos, GetForegroundWindow, GetMenu, GetMessageW, GetSystemMetrics,
-    GetWindowLongPtrW, GetWindowRect, HICON, HMENU, HWND_TOP, IDC_ARROW, IMAGE_ICON, IsIconic,
-    IsZoomed, KillTimer, LR_DEFAULTCOLOR, LoadCursorW, LoadImageW, MB_ICONERROR, MB_ICONQUESTION,
-    MB_OK, MENU_ITEM_FLAGS, MF_BYCOMMAND, MF_CHECKED, MF_ENABLED, MF_GRAYED, MF_POPUP,
-    MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MFT_RADIOCHECK, MINMAXINFO, MSG, MessageBoxW,
-    PostMessageW, PostQuitMessage, RegisterClassExW, SC_MONITORPOWER, SHOW_WINDOW_CMD, SM_CXICON,
-    SM_CXSMICON, SM_CYICON, SM_CYSMICON, SW_MAXIMIZE, SW_RESTORE, SW_SHOW, SW_SHOWNORMAL,
-    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOZORDER, SYSTEM_METRICS_INDEX,
-    SendMessageW, SetCursorPos, SetForegroundWindow, SetMenu, SetProcessDPIAware, SetTimer,
-    SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowCursor, ShowWindow, TPM_CENTERALIGN,
-    TPM_LEFTBUTTON, TPM_VCENTERALIGN, TrackPopupMenu, TranslateMessage, USER_TIMER_MINIMUM,
-    WINDOW_EX_STYLE, WINDOW_STYLE, WM_ACTIVATE, WM_COMMAND, WM_CONTEXTMENU, WM_COPYDATA,
-    WM_DESTROY, WM_DROPFILES, WM_ENDSESSION, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_INITMENU,
-    WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
-    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_MOVE, WM_NCCREATE, WM_NCDESTROY, WM_NCXBUTTONDBLCLK,
-    WM_NCXBUTTONDOWN, WM_NULL, WM_PAINT, WM_PASTE, WM_QUERYENDSESSION, WM_RBUTTONDBLCLK,
-    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SIZE, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_TIMER,
-    WM_XBUTTONDBLCLK, WM_XBUTTONDOWN, WNDCLASSEXW, WS_CAPTION, WS_EX_ACCEPTFILES,
-    WS_OVERLAPPEDWINDOW, WS_POPUP, WS_THICKFRAME, WS_VISIBLE, WindowFromPoint,
+    AdjustWindowRect, AdjustWindowRectEx, AppendMenuW, CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW,
+    CS_VREDRAW, CheckMenuItem, CreateMenu, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
+    DestroyMenu, DestroyWindow, DispatchMessageW, EnableMenuItem, FindWindowA, GWL_EXSTYLE,
+    GWL_STYLE, GWLP_USERDATA, GetClientRect, GetCursorPos, GetForegroundWindow, GetMenu,
+    GetMessageW, GetSystemMetrics, GetWindowLongPtrW, GetWindowRect, HICON, HMENU, HTCAPTION,
+    HTMENU, HWND_TOP, IDC_ARROW, IMAGE_ICON, IsIconic, IsZoomed, KillTimer, LR_DEFAULTCOLOR,
+    LoadCursorW, LoadImageW, MB_ICONERROR, MB_ICONQUESTION, MB_OK, MENU_ITEM_FLAGS, MF_BYCOMMAND,
+    MF_CHECKED, MF_ENABLED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MF_UNCHECKED,
+    MFT_RADIOCHECK, MINMAXINFO, MSG, MenuItemFromPoint, MessageBoxW, PostMessageW, PostQuitMessage,
+    RegisterClassExW, SC_MONITORPOWER, SHOW_WINDOW_CMD, SM_CXICON, SM_CXSMICON, SM_CYICON,
+    SM_CYSMICON, SW_MAXIMIZE, SW_RESTORE, SW_SHOW, SW_SHOWNORMAL, SWP_FRAMECHANGED, SWP_NOACTIVATE,
+    SWP_NOCOPYBITS, SWP_NOZORDER, SYSTEM_METRICS_INDEX, SendMessageW, SetCursorPos,
+    SetForegroundWindow, SetMenu, SetProcessDPIAware, SetTimer, SetWindowLongPtrW, SetWindowPos,
+    SetWindowTextW, ShowCursor, ShowWindow, TPM_CENTERALIGN, TPM_LEFTBUTTON, TPM_VCENTERALIGN,
+    TrackPopupMenu, TranslateMessage, USER_TIMER_MINIMUM, WINDOW_EX_STYLE, WINDOW_STYLE,
+    WM_ACTIVATE, WM_COMMAND, WM_CONTEXTMENU, WM_COPYDATA, WM_DESTROY, WM_DROPFILES, WM_ENDSESSION,
+    WM_ERASEBKGND, WM_GETMINMAXINFO, WM_INITMENU, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_MOVE, WM_NCCREATE,
+    WM_NCDESTROY, WM_NCLBUTTONDOWN, WM_NCXBUTTONDBLCLK, WM_NCXBUTTONDOWN, WM_NULL, WM_PAINT,
+    WM_PASTE, WM_QUERYENDSESSION, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SIZE,
+    WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_TIMER, WM_XBUTTONDBLCLK, WM_XBUTTONDOWN, WNDCLASSEXW,
+    WS_CAPTION, WS_EX_ACCEPTFILES, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_THICKFRAME, WS_VISIBLE,
+    WindowFromPoint,
 };
 use windows::core::{HSTRING, PCSTR, PCWSTR, w};
 
@@ -130,9 +131,6 @@ use windows::Win32::System::Power::{
 /// (class + mutex) so both viewers can coexist on one machine.
 const CLASS_NAME: PCWSTR = w!("riviv");
 
-/// Minimum trackable window size (upstream handles WM_GETMINMAXINFO in viv.c:4424).
-const MIN_TRACK: POINT = POINT { x: 160, y: 120 };
-
 pub(crate) struct WindowState {
     pub(crate) image: Option<LoadedImage>,
     pub(crate) path: Option<OsString>,
@@ -160,6 +158,13 @@ pub(crate) struct WindowState {
     /// The status-bar child window (#5; upstream `_viv_status_hwnd`).
     /// Created in WM_NCCREATE, destroyed with the parent by Windows.
     pub(crate) status: HWND,
+    /// The toolbar set (#45; upstream `_viv_rebar_hwnd` /
+    /// `_viv_toolbar_hwnd` / `_viv_toolbar_image_list`, viv.c:662-664):
+    /// strip + toolbar + image list, created per `config_show_controls`,
+    /// destroyed on fullscreen entry and recreated on exit (viv.c:6646/
+    /// 6681). Default = absent (creation failed / hidden) — every
+    /// consumer guards on it.
+    pub(crate) controls: crate::toolbar::ControlsSet,
     /// The menu bar (#23; upstream `_viv_hmenu`, viv.c:718/5352) — built
     /// once in `run` before the window exists, attached at creation when
     /// `config_show_menu` is set, and re-attached/detached by the
@@ -402,9 +407,13 @@ pub(crate) fn viewport_and_src(hwnd: HWND, state: &WindowState) -> (Viewport, (i
     // zeroed rect and collapses the viewport (the zoom math no-ops).
     let _ = unsafe { GetClientRect(hwnd, &mut client) };
     let status_h = crate::status::height(state.status);
+    // The strip rides above the status bar (upstream subtracts BOTH from
+    // the render area, viv.c:13956-13959/1621-1634) — a hidden/absent
+    // strip reports 0 (viv.c:11448-11450).
+    let controls_h = state.controls.height();
     let vp = Viewport {
         wide: (client.right - client.left).max(0),
-        high: (client.bottom - client.top - status_h).max(0),
+        high: (client.bottom - client.top - status_h - controls_h).max(0),
     };
     let src = state
         .image
@@ -722,6 +731,14 @@ fn toggle_fullscreen(hwnd: HWND) {
             }
             Err(e) => eprintln!("GetModuleHandleW failed: {e} (no status bar)"),
         }
+        // The strip is recreated right behind the bar, per config (upstream
+        // `_viv_controls_show(config_show_controls)` at 6646, second in its
+        // exit order). Its own on_size docks it against the restore pass
+        // below.
+        // SAFETY: read-only config read, then the creation pass.
+        if (unsafe { state_of(hwnd) }).is_some_and(|state| state.config.show_controls != 0) {
+            controls_show(hwnd, true);
+        }
         // SAFETY: read-modify-write of the style on the owning thread.
         let style = unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) } as u32;
         // SAFETY: hwnd is live; riviv always shows caption + thick frame
@@ -820,6 +837,17 @@ fn toggle_fullscreen(hwnd: HWND) {
         // SAFETY: detaching our own bar; the bool return is ignored like
         // upstream's unchecked SetMenu.
         let _ = unsafe { SetMenu(hwnd, None) };
+        // The toolbar strip leaves too (upstream `_viv_controls_show(0)`
+        // right after the menu, viv.c:6681 — the monitor goes to the
+        // image). Taken out of the state inside a borrow, torn down
+        // outside it like the bar above (DestroyWindow delivers messages).
+        {
+            // SAFETY: the borrow spans only the set take.
+            let set = (unsafe { state_of(hwnd) }).map(|state| std::mem::take(&mut state.controls));
+            if let Some(mut set) = set {
+                crate::toolbar::destroy(&mut set);
+            }
+        }
         // SAFETY: hwnd is live; covers the monitor, reentering wnd_proc
         // with WM_SIZE (no borrow live). Failure diagnosed like the restore
         // path (upstream viv.c:6683 ignores the result too).
@@ -1058,6 +1086,9 @@ fn zoom_at(hwnd: HWND, out: bool, cursor: (i32, i32)) {
     });
     if changed {
         repaint(hwnd);
+        // Upstream's `_viv_zoom_in` ends in `_viv_view_set`, which closes
+        // with the toolbar refresh (viv.c:6571).
+        refresh_toolbar(hwnd);
     }
 }
 
@@ -1142,9 +1173,10 @@ fn window_size_to_image(hwnd: HWND, kind: i32) {
             ),
             state.config.show_menu != 0 && !state.menu.is_invalid(),
             crate::status::height(state.status),
+            state.controls.height(),
         )
     });
-    let Some((fullscreen, image, auto_fit, has_menu, status_h)) = gathered else {
+    let Some((fullscreen, image, auto_fit, has_menu, status_h, controls_h)) = gathered else {
         return;
     };
     // Get out of fullscreen first (upstream viv.c:2081-2085).
@@ -1187,13 +1219,14 @@ fn window_size_to_image(hwnd: HWND, kind: i32) {
     // SAFETY: read-only rect query.
     let _ = unsafe { GetWindowRect(hwnd, &mut rect) };
     let (midx, midy) = ((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2);
-    // The outer rect for client + status bar (upstream viv.c:2139-2143:
-    // AdjustWindowRect over the client target, then + status height).
+    // The outer rect for client + status bar + toolbar strip (upstream
+    // viv.c:2139-2143/2155: AdjustWindowRect over the client target, then
+    // + both heights).
     let mut outer = RECT {
         left: 0,
         top: 0,
         right: client.0,
-        bottom: client.1 + status_h,
+        bottom: client.1 + status_h + controls_h,
     };
     // SAFETY: live style read; the rect is a valid in/out.
     let style = WINDOW_STYLE(unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) } as u32);
@@ -1264,6 +1297,9 @@ fn zoom_reset(hwnd: HWND) {
         state.view.reset_zoom(src.0, src.1, vp, fit);
     }
     repaint(hwnd);
+    // The Best Fit gray flips here (upstream's ZOOM_RESET ends in
+    // `_viv_view_set` → the toolbar refresh, viv.c:6571).
+    refresh_toolbar(hwnd);
 }
 
 /// Ctrl+Alt+0 — toggle the temporary 1:1 pixel-exact mode (upstream
@@ -1276,6 +1312,9 @@ fn toggle_one_to_one(hwnd: HWND) {
         state.view.toggle_one_to_one(src.0, src.1, vp, fit);
     }
     repaint(hwnd);
+    // Both the 1:1 and Best Fit grays flip here (upstream's
+    // `_viv_view_1to1` ends in `_viv_view_set` → the toolbar refresh).
+    refresh_toolbar(hwnd);
 }
 
 /// WM_LBUTTONDOWN — show the cursor, restart its cycle, then start a drag
@@ -1407,6 +1446,10 @@ fn on_mouse_move(hwnd: HWND, lparam: LPARAM) {
     });
     if panned {
         repaint(hwnd);
+        // The drag pans through `_viv_view_set` upstream, which refreshes
+        // the strip every tick (viv.c:6571) — the render-size grays track
+        // a pan that crosses the fit boundary.
+        refresh_toolbar(hwnd);
     }
     // The middle-drag scroll (#44; upstream `_VIV_DOING_MSCROLL` arm,
     // viv.c:3610-3625): the delta is the SCREEN anchor minus the live
@@ -1787,6 +1830,9 @@ fn reset_display_marks(state: &mut WindowState) {
 /// reconcile and the repaint.
 fn adopt_display_tail(hwnd: HWND, title: Option<HSTRING>, invalidate: bool) {
     refresh_status(hwnd);
+    // The strip's grays track the newly displayed size (upstream's
+    // load-reply branch, viv.c:2872).
+    refresh_toolbar(hwnd);
     // SAFETY: a fresh short borrow for the config/mode read.
     let auto = (unsafe { state_of(hwnd) }).and_then(|s| {
         (!s.fullscreen && s.config.auto_zoom != 0).then_some(s.config.auto_zoom_type)
@@ -2551,6 +2597,8 @@ fn slideshow_start(hwnd: HWND) {
     // the flag is the truth, a failed arm just never advances.
     let _ = unsafe { SetTimer(Some(hwnd), slideshow::SLIDESHOW_TIMER_ID, rate, None) };
     refresh_status(hwnd);
+    // The strip's play/pause radio flips here (upstream viv.c:6839).
+    refresh_toolbar(hwnd);
     update_prevent_sleep(hwnd);
 }
 
@@ -2577,6 +2625,8 @@ fn slideshow_toggle(hwnd: HWND) {
         let _ = unsafe { KillTimer(Some(hwnd), slideshow::SLIDESHOW_TIMER_ID) };
     }
     refresh_status(hwnd);
+    // The strip's play/pause radio flips here (upstream viv.c:7617).
+    refresh_toolbar(hwnd);
     update_prevent_sleep(hwnd);
 }
 
@@ -4109,6 +4159,7 @@ fn on_initmenu(hwnd: HWND) {
         });
         menu::MenuState {
             show_menu: state.config.show_menu != 0,
+            show_controls: state.config.show_controls != 0,
             fullscreen: state.fullscreen,
             one_to_one,
             slideshow: state.slideshow,
@@ -4130,6 +4181,15 @@ fn on_initmenu(hwnd: HWND) {
     let Some(state) = snapshot else {
         return;
     };
+    // Upstream refreshes the status bar, the strip and the on-top state
+    // right here when a slideshow runs fullscreen (viv.c:7081-7090) — a
+    // slideshow started while fullscreen never passes through the normal
+    // refresh points' windowed paths before the menu opens. The on-top
+    // half is #46's.
+    if state.fullscreen && state.slideshow {
+        refresh_status(hwnd);
+        refresh_toolbar(hwnd);
+    }
     // SAFETY: read-only query of the window's own menu.
     let bar = unsafe { GetMenu(hwnd) };
     if bar.is_invalid() {
@@ -4285,6 +4345,7 @@ fn on_command(hwnd: HWND, cmd: menu::Cmd) {
         }
         menu::Cmd::EditCut => clipboard::copy_current(hwnd, true),
         menu::Cmd::ViewMenu => toggle_menu(hwnd),
+        menu::Cmd::ViewControls => toggle_controls(hwnd),
         menu::Cmd::ViewFullscreen => toggle_fullscreen(hwnd),
         menu::Cmd::ViewOneToOne => toggle_one_to_one(hwnd),
         // Upstream's two fit commands both collapse the zoom position back
@@ -4322,6 +4383,21 @@ fn on_command(hwnd: HWND, cmd: menu::Cmd) {
         // steps and rows, and the Custom dialog.
         menu::Cmd::ViewSlideshow => slideshow_start(hwnd),
         menu::Cmd::SlideshowPause => slideshow_toggle(hwnd),
+        // The toolbar-only pair (#45; upstream viv.c:1818-1831): both are
+        // the same running-state TOGGLE, each gated to its half — Play
+        // fires only when NOT running, Pause only when running.
+        menu::Cmd::SlideshowPlayOnly => {
+            // SAFETY: the borrow spans only the running read.
+            if (unsafe { state_of(hwnd) }).is_some_and(|state| !state.slideshow) {
+                slideshow_toggle(hwnd);
+            }
+        }
+        menu::Cmd::SlideshowPauseOnly => {
+            // SAFETY: the borrow spans only the running read.
+            if (unsafe { state_of(hwnd) }).is_some_and(|state| state.slideshow) {
+                slideshow_toggle(hwnd);
+            }
+        }
         menu::Cmd::SlideshowRateDecrease => slideshow_step(hwnd, true),
         menu::Cmd::SlideshowRateIncrease => slideshow_step(hwnd, false),
         menu::Cmd::SlideshowRateCustom => slideshow_open_custom_dialog(hwnd),
@@ -4564,6 +4640,279 @@ fn update_menu_frame(hwnd: HWND, show: bool, menu: HMENU) {
     }
 }
 
+// ---- Toolbar (#45; upstream viv.c:10963-11088 / 11441-11704 / 2667-2691) ----
+
+/// Gather the four dynamic button states from the live state (the inputs
+/// of upstream `_viv_toolbar_update_buttons`, viv.c:11665-11704): the
+/// slideshow flag, the render-equals-source compare for 1:1, and the
+/// at-fit-level-outside-1:1 verdict for Best Fit. `None` = no toolbar.
+fn toolbar_states(state: &WindowState, hwnd: HWND) -> Option<crate::toolbar::ButtonStates> {
+    if !state.controls.is_alive() {
+        return None;
+    }
+    // The 1:1 comparator is upstream's raw `_viv_get_render_size` equality
+    // (viv.c:11686-11690) — zoom-level size only, panscan-blind by
+    // construction, the same compare the menu check uses.
+    let render_eq_image = state.image.as_ref().is_some_and(|image| {
+        let (vp, src) = viewport_and_src(hwnd, state);
+        let fit = fit_policy(state);
+        let (rw, rh) = state.view.render_size(src.0, src.1, vp, fit);
+        (rw, rh) == (image.width(), image.height())
+    });
+    let at_best_fit = state.view.level() == 0 && !state.view.is_one_to_one();
+    Some(crate::toolbar::ButtonStates::compute(
+        state.slideshow,
+        render_eq_image,
+        at_best_fit,
+    ))
+}
+
+/// Push the dynamic button states (`_viv_toolbar_update_buttons` —
+/// upstream calls it from `_viv_view_set`, the slideshow start/pause, the
+/// load-reply adoption, `_viv_on_size` and the fullscreen-slideshow slice
+/// of `_viv_check_menus`, viv.c:6571/6839/7088/7617/1654/2872).
+fn refresh_toolbar(hwnd: HWND) {
+    // SAFETY: the borrow spans the pure state gather; the TB sends run
+    // outside it.
+    let pushed = (unsafe { state_of(hwnd) }).and_then(|state| {
+        toolbar_states(state, hwnd).map(|states| (state.controls.toolbar, states))
+    });
+    if let Some((toolbar, states)) = pushed {
+        crate::toolbar::apply_states(toolbar, &states);
+    }
+}
+
+/// Create/destroy the strip+toolbar+image-list set per `show` (upstream
+/// `_viv_controls_show`, viv.c:10963-11088) and re-run the size pass —
+/// upstream ends the function with `_viv_on_size()` whatever happened
+/// (viv.c:11090).
+fn controls_show(hwnd: HWND, show: bool) {
+    // SAFETY: the borrow spans only the liveness check.
+    let alive = (unsafe { state_of(hwnd) }).is_some_and(|state| state.controls.is_alive());
+    if show && !alive {
+        // SAFETY: module handle query, no side effects.
+        match unsafe { GetModuleHandleW(None) } {
+            Ok(hinstance) => {
+                match crate::toolbar::create(hwnd, hinstance.into()) {
+                    Ok(set) => {
+                        // SAFETY: the borrow spans only the field store;
+                        // the initial button states push below happens
+                        // outside it.
+                        if let Some(state) = unsafe { state_of(hwnd) } {
+                            state.controls = set;
+                        }
+                    }
+                    Err(msg) => {
+                        // Same graceful degradation as the status bar
+                        // (upstream's CreateWindow failures leave the
+                        // globals NULL).
+                        eprintln!("toolbar unavailable: {msg}");
+                    }
+                }
+            }
+            Err(e) => eprintln!("toolbar unavailable: GetModuleHandleW failed: {e}"),
+        }
+    } else if !show && alive {
+        // SAFETY: the borrow spans only the set take-and-clear.
+        if let Some(state) = unsafe { state_of(hwnd) } {
+            let mut set = std::mem::take(&mut state.controls);
+            crate::toolbar::destroy(&mut set);
+        }
+    }
+    on_size(hwnd);
+}
+
+/// View → Controls (`VIV_ID_VIEW_CONTROLS`, viv.c:1985-1988): flip the
+/// config and rebuild the frame around the strip appearing/disappearing.
+/// In fullscreen riviv no-ops without flipping the config — the sibling
+/// View→Menu toggle's established pattern (upstream flips the config
+/// unconditionally but only rebuilds when windowed).
+fn toggle_controls(hwnd: HWND) {
+    // SAFETY: the borrow spans the fullscreen read, the config flip and
+    // the flag copy — nothing pumps.
+    let next = (unsafe { state_of(hwnd) }).and_then(|state| {
+        if state.fullscreen {
+            return None;
+        }
+        state.config.show_controls = i32::from(state.config.show_controls == 0);
+        Some(state.config.show_controls != 0)
+    });
+    if let Some(show) = next {
+        update_controls_frame(hwnd, show);
+    }
+}
+
+/// The frame rebuild around a strip appear/disappear (upstream
+/// `_viv_update_frame`'s status/controls arms, viv.c:9823-9925 — riviv
+/// keeps caption/frame/menu fixed, so only the strip's height changes):
+/// shift the outer rect by the SAME-client delta so the image area stays
+/// exactly where it was.
+fn update_controls_frame(hwnd: HWND, show: bool) {
+    // Get out of the maximized state first (upstream `_viv_update_frame`'s
+    // opening, viv.c:9832-9839) — the explicit rect below would otherwise
+    // land on the zoomed placement, and the flag re-maximizes at the end.
+    // SAFETY: read-only zoomed query on the live window.
+    let was_maximized = unsafe { IsZoomed(hwnd) }.as_bool();
+    if was_maximized {
+        // SAFETY: live window.
+        let _ = unsafe { ShowWindow(hwnd, SW_RESTORE) };
+    }
+    let mut client = RECT::default();
+    // SAFETY: read-only client query; a failure reads the zeroed rect and
+    // the shift collapses to a no-op.
+    let _ = unsafe { GetClientRect(hwnd, &mut client) };
+    // The old heights BEFORE the strip change (upstream reads oldrect
+    // before `_viv_status_show`/`_viv_controls_show`, viv.c:9850-9853).
+    // SAFETY: the borrow spans only the height reads.
+    let (old_status, old_controls, has_menu) =
+        (unsafe { state_of(hwnd) }).map_or((0, 0, false), |state| {
+            (
+                crate::status::height(state.status),
+                state.controls.height(),
+                state.config.show_menu != 0 && !state.menu.is_invalid(),
+            )
+        });
+    let mut old_outer = client;
+    // SAFETY: in/out rect valid; failure leaves a zero frame delta.
+    let _ = unsafe { AdjustWindowRect(&mut old_outer, WS_OVERLAPPEDWINDOW, has_menu) };
+    old_outer.bottom += old_status + old_controls;
+    // Create/destroy the set FIRST (upstream's order, viv.c:9879-9889) —
+    // its own on_size docks the new strip against the current client.
+    controls_show(hwnd, show);
+    let new_controls = if show {
+        crate::toolbar::controls_height(crate::toolbar::logical_dpi())
+    } else {
+        0
+    };
+    let mut new_outer = client;
+    // SAFETY: same call as above — the style/menu did not change.
+    let _ = unsafe { AdjustWindowRect(&mut new_outer, WS_OVERLAPPEDWINDOW, has_menu) };
+    new_outer.bottom += old_status + new_controls;
+    let mut window = RECT::default();
+    // SAFETY: read-only outer-rect query, fail-soft like upstream's
+    // unchecked GetWindowRect (viv.c:9908).
+    let _ = unsafe { GetWindowRect(hwnd, &mut window) };
+    // Shift by new-minus-old per edge over the same client (viv.c:9910-
+    // 9913) — only the bottom moves (the strip height). Wrapping like the
+    // rest of riviv's rect math so pathological values cannot panic.
+    window.left = window
+        .left
+        .wrapping_add(new_outer.left.wrapping_sub(old_outer.left));
+    window.top = window
+        .top
+        .wrapping_add(new_outer.top.wrapping_sub(old_outer.top));
+    window.right = window
+        .right
+        .wrapping_add(new_outer.right.wrapping_sub(old_outer.right));
+    window.bottom = window
+        .bottom
+        .wrapping_add(new_outer.bottom.wrapping_sub(old_outer.bottom));
+    // SAFETY: live window; re-asserts top like upstream's HWND_TOP
+    // (viv.c:9918-9920), FRAMECHANGED applying the final state in one
+    // pass.
+    let _ = unsafe {
+        SetWindowPos(
+            hwnd,
+            Some(HWND_TOP),
+            window.left,
+            window.top,
+            window.right.wrapping_sub(window.left),
+            window.bottom.wrapping_sub(window.top),
+            SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_NOCOPYBITS,
+        )
+    };
+    // A maximized window re-maximizes onto the adjusted placement
+    // (upstream viv.c:9921-9924; its caption/thickframe conditions are
+    // permanently true in riviv).
+    if was_maximized {
+        // SAFETY: live window.
+        let _ = unsafe { ShowWindow(hwnd, SW_MAXIMIZE) };
+    }
+}
+
+/// `_viv_start_move_window` (viv.c:14720-14729): enter the system move
+/// loop by feeding the main window a synthetic WM_NCLBUTTONDOWN over its
+/// caption, anchored at the live cursor. `from` is any window of ours —
+/// the strip, the status bar — the main window is its parent.
+pub(crate) fn start_move_window(from: HWND) {
+    // SAFETY: parent query on our own child; the main window is the
+    // result (the strip/status have no other parent).
+    let main =
+        unsafe { windows::Win32::UI::WindowsAndMessaging::GetParent(from) }.unwrap_or_default();
+    if main.is_invalid() {
+        return;
+    }
+    enter_move_loop(main);
+}
+
+/// The move loop entry itself — the synthetic caption press at the live
+/// cursor (upstream's SendMessage, viv.c:14726-14728).
+fn enter_move_loop(hwnd: HWND) {
+    let mut pt = POINT::default();
+    // SAFETY: read-only cursor query on this thread.
+    let _ = unsafe { GetCursorPos(&mut pt) };
+    // SAFETY: hwnd is live and owned by this thread; the WM_NCLBUTTONDOWN
+    // enters the modal move loop (pumps until button release), exactly
+    // upstream's SendMessage.
+    let _ = unsafe {
+        SendMessageW(
+            hwnd,
+            WM_NCLBUTTONDOWN,
+            Some(WPARAM(HTCAPTION as usize)),
+            Some(LPARAM(((pt.y as isize) << 16) | (pt.x as isize & 0xffff))),
+        )
+    };
+}
+
+/// The `config_toolbar_move_window` gate read from the main window behind
+/// `child` (upstream's three drag arms all consult it: strip viv.c:11457,
+/// status part 0 viv.c:11557, empty menu bar viv.c:2668).
+pub(crate) fn toolbar_move_window_enabled(child: HWND) -> bool {
+    // SAFETY: parent query on our own child.
+    let main =
+        unsafe { windows::Win32::UI::WindowsAndMessaging::GetParent(child) }.unwrap_or_default();
+    if main.is_invalid() {
+        return false;
+    }
+    // SAFETY: the borrow spans only the config read.
+    (unsafe { state_of(main) }).is_some_and(|state| state.config.toolbar_move_window != 0)
+}
+
+/// The WM_NCLBUTTONDOWN empty-menu-bar drag (upstream viv.c:2665-2691):
+/// with `toolbar_move_window` set, a press on the menu bar that lands on
+/// NO item starts the move loop instead. Returns whether it was handled
+/// (the caller then skips DefWindowProc).
+fn on_nclbuttondown_menu_drag(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> bool {
+    if wparam.0 != HTMENU as usize {
+        return false;
+    }
+    // SAFETY: read-only menu query on the live window.
+    let menu = unsafe { GetMenu(hwnd) };
+    if menu.is_invalid() {
+        return false;
+    }
+    // SAFETY: the borrow spans only the config read.
+    let enabled =
+        (unsafe { state_of(hwnd) }).is_some_and(|state| state.config.toolbar_move_window != 0);
+    if !enabled {
+        return false;
+    }
+    // The press point is in SCREEN coordinates (WM_NCLBUTTONDOWN
+    // contract) — what MenuItemFromPoint takes (viv.c:2677-2683).
+    let pt = POINT {
+        x: (lparam.0 & 0xffff) as i16 as i32,
+        y: ((lparam.0 >> 16) & 0xffff) as i16 as i32,
+    };
+    // SAFETY: read-only hit test against our own menu.
+    let hit = unsafe { MenuItemFromPoint(Some(hwnd), menu, pt) };
+    if hit == -1 {
+        enter_move_loop(hwnd);
+        true
+    } else {
+        false
+    }
+}
+
 /// WM_KEYDOWN / WM_SYSKEYDOWN (upstream viv.c:6346-6406): the ESC arm
 /// first (cancel drag / leave fullscreen), then the binding-table route —
 /// exact modifier+VK match, first command in table order wins — into the
@@ -4762,6 +5111,54 @@ fn on_size(hwnd: HWND) {
             SendMessageW(bar, WM_SIZE, None, None);
         }
     }
+    // Dock the toolbar strip (#45; upstream viv.c:1621-1634): spanning
+    // the full width at the bottom of the space the status bar left,
+    // with the toolbar itself centered inside. The handles are copied
+    // out first — the measure below sends to the toolbar.
+    // SAFETY: the borrow spans only the handle copy and the client read.
+    let docked = (unsafe { state_of(hwnd) }).and_then(|state| {
+        if !state.controls.is_alive() {
+            return None;
+        }
+        let mut client = RECT::default();
+        // SAFETY: read-only rect query on the live window.
+        let _ = unsafe { GetClientRect(hwnd, &mut client) };
+        Some((
+            state.controls.rebar,
+            state.controls.toolbar,
+            client.right - client.left,
+            client.bottom - client.top,
+        ))
+    });
+    if let Some((rebar, toolbar_hwnd, wide, high)) = docked {
+        let status_h = crate::status::height(bar);
+        let controls_h = crate::toolbar::controls_height(crate::toolbar::logical_dpi());
+        let toolbar_wide = crate::toolbar::toolbar_wide(toolbar_hwnd);
+        let (rebar_rect, tb_rect) =
+            crate::toolbar::strip_layout(wide, high - status_h, controls_h, toolbar_wide);
+        // SAFETY: both are our live child windows; the pair is fail-soft
+        // like upstream's unchecked SetWindowPos calls (viv.c:1631-1632).
+        unsafe {
+            let _ = SetWindowPos(
+                rebar,
+                None,
+                rebar_rect.left,
+                rebar_rect.top,
+                rebar_rect.right - rebar_rect.left,
+                rebar_rect.bottom - rebar_rect.top,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+            let _ = SetWindowPos(
+                toolbar_hwnd,
+                None,
+                tb_rect.left,
+                tb_rect.top,
+                tb_rect.right - tb_rect.left,
+                tb_rect.bottom - tb_rect.top,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
+    }
     // Re-anchor the pan offset for the new viewport (upstream WM_SIZE,
     // viv.c:1643-1651: reproject the center-source anchor onto the new
     // render size and re-clamp). CS_HREDRAW/CS_VREDRAW already repaint
@@ -4775,6 +5172,11 @@ fn on_size(hwnd: HWND) {
     if reclamped {
         repaint(hwnd);
     }
+    // The strip's button states close the resize (upstream ends
+    // `_viv_on_size` with `_viv_toolbar_update_buttons()`, viv.c:1654 —
+    // the render-size-dependent 1:1/Best Fit grays track the new
+    // viewport).
+    refresh_toolbar(hwnd);
 }
 
 /// The screensaver system-command value (winuser.h 0xF140 — the windows
@@ -4885,10 +5287,60 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         WM_GETMINMAXINFO => {
-            // SAFETY: lparam points to a MINMAXINFO for the duration of the message.
+            // Upstream viv.c:4424-4450: the minimum track size wrap the
+            // toolbar's width and the status+controls heights through
+            // AdjustWindowRectEx. With the strip hidden (or before the
+            // state exists — this message can precede WM_NCCREATE) the
+            // inputs collapse and the system's own SM_CXMINTRACK floor
+            // takes over.
+            // SAFETY: lparam points to a MINMAXINFO for the duration of
+            // the message.
             let mmi = unsafe { &mut *(lparam.0 as *mut MINMAXINFO) };
-            mmi.ptMinTrackSize = MIN_TRACK;
+            // SAFETY: the borrow spans the three reads; the sends and the
+            // style queries below run outside it.
+            let (toolbar_wide, status_h, controls_h) =
+                (unsafe { state_of(hwnd) }).map_or((0, 0, 0), |state| {
+                    (
+                        crate::toolbar::toolbar_wide(state.controls.toolbar),
+                        crate::status::height(state.status),
+                        state.controls.height(),
+                    )
+                });
+            let (w, h) = crate::toolbar::min_track_client(toolbar_wide, status_h, controls_h);
+            let mut rect = RECT {
+                left: 0,
+                top: 0,
+                right: w,
+                bottom: h,
+            };
+            // SAFETY: read-only style queries on the live window.
+            let style = WINDOW_STYLE(unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) } as u32);
+            // SAFETY: read-only ex-style query on the live window.
+            let ex_style = WINDOW_EX_STYLE(unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } as u32);
+            // SAFETY: read-only menu query on the live window.
+            let has_menu = !unsafe { GetMenu(hwnd) }.is_invalid();
+            // SAFETY: in/out rect valid; a failure leaves the raw client
+            // mins (the system floor still applies, upstream never checks
+            // either).
+            let _ = unsafe { AdjustWindowRectEx(&mut rect, style, has_menu, ex_style) };
+            mmi.ptMinTrackSize = POINT {
+                x: rect.right - rect.left,
+                y: rect.bottom - rect.top,
+            };
             LRESULT(0)
+        }
+        // The empty-menu-bar drag (#45; upstream viv.c:2665-2691): with
+        // `toolbar_move_window` set, a press on the menu bar that hits no
+        // item starts the move loop. Everything else (real items, the
+        // caption, edges) falls through to the default procedure.
+        WM_NCLBUTTONDOWN => {
+            if on_nclbuttondown_menu_drag(hwnd, wparam, lparam) {
+                LRESULT(0)
+            } else {
+                // SAFETY: the parameters are exactly this callback's own;
+                // the default procedure owns the caption/system handling.
+                unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+            }
         }
         WM_KEYDOWN => {
             on_keydown(hwnd, wparam, lparam);
@@ -5133,6 +5585,15 @@ unsafe extern "system" fn wnd_proc(
             // SAFETY: the borrow spans only the save's file I/O.
             if let Some(state) = unsafe { state_of(hwnd) } {
                 state.config.save();
+            }
+            // Tear the toolbar set down before the window dies (upstream
+            // `_viv_controls_show(0)` ahead of DestroyWindow, viv.c:5500 —
+            // the children would go with the parent anyway; the image list
+            // is the real resource being freed).
+            // SAFETY: the borrow spans only the set take-and-clear.
+            if let Some(state) = unsafe { state_of(hwnd) } {
+                let mut set = std::mem::take(&mut state.controls);
+                crate::toolbar::destroy(&mut set);
             }
             // SAFETY: legal on the owning thread while quitting the message loop.
             unsafe { PostQuitMessage(0) };
@@ -5602,6 +6063,7 @@ pub(crate) fn run() -> Result<(), String> {
         // The status bar is created in WM_NCCREATE (the window handle must
         // exist first) and written into the state there.
         status: HWND::default(),
+        controls: crate::toolbar::ControlsSet::default(),
         menu: HMENU::default(),
         status_file_not_found: false,
         status_load_failed: false,
@@ -5735,6 +6197,16 @@ pub(crate) fn run() -> Result<(), String> {
     // and owned by this thread, nothing below pumps messages.
     if let Some(state) = unsafe { state_of(hwnd) } {
         state.status = bar;
+    }
+
+    // The toolbar strip per config (upstream `_viv_controls_show(
+    // config_show_controls)` right after the status bar, viv.c:5416) —
+    // inside controls_show the strip docks itself and the button states
+    // see their first push. Creation failure degrades silently like the
+    // status bar's.
+    // SAFETY: read-only config read, then the creation pass.
+    if (unsafe { state_of(hwnd) }).is_some_and(|state| state.config.show_controls != 0) {
+        controls_show(hwnd, true);
     }
 
     // Hand the bar to the state for the View→Menu toggle (upstream keeps

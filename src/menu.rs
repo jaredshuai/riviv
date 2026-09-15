@@ -51,6 +51,9 @@ pub(crate) enum Cmd {
     EditPaste,
     /// View → Menu toggle (`VIV_ID_VIEW_MENU`).
     ViewMenu,
+    /// View → Controls toggle (#45; `VIV_ID_VIEW_CONTROLS`, viv.c:844 —
+    /// upstream order puts it between the Status Bar row and Preset).
+    ViewControls,
     /// View → Fullscreen (`VIV_ID_VIEW_FULLSCREEN`).
     ViewFullscreen,
     /// View → Slideshow (`VIV_ID_VIEW_SLIDESHOW`, viv.c:854) — #37: the
@@ -121,6 +124,14 @@ pub(crate) enum Cmd {
     /// Slideshow → Play/Pause (`VIV_ID_SLIDESHOW_PAUSE`, viv.c:894) — #37:
     /// the running-state TOGGLE (no fullscreen entry, unlike F11).
     SlideshowPause,
+    /// The toolbar-only slideshow pair (#45; `VIV_ID_SLIDESHOW_PLAY_ONLY`
+    /// / `VIV_ID_SLIDESHOW_PAUSE_ONLY`, viv.h:132-133 — upstream keeps
+    /// them OUT of `_viv_commands[]` entirely; riviv registers them as
+    /// hidden rows so the command table's every-command-has-a-row
+    /// invariant holds — a small superset: they become bindable, README
+    /// Differences).
+    SlideshowPlayOnly,
+    SlideshowPauseOnly,
     /// Slideshow → Rate → Decrease Rate (`VIV_ID_SLIDESHOW_RATE_DEC`,
     /// viv.c:898).
     SlideshowRateDecrease,
@@ -300,6 +311,7 @@ impl Cmd {
         Self::EditCopyImage,
         Self::EditPaste,
         Self::ViewMenu,
+        Self::ViewControls,
         Self::ViewFullscreen,
         Self::ViewSlideshow,
         Self::ViewOneToOne,
@@ -325,6 +337,8 @@ impl Cmd {
         Self::ViewZoomReset,
         Self::ViewOptions,
         Self::SlideshowPause,
+        Self::SlideshowPlayOnly,
+        Self::SlideshowPauseOnly,
         Self::SlideshowRateDecrease,
         Self::SlideshowRateIncrease,
         Self::SlideshowRate250,
@@ -555,6 +569,14 @@ pub(crate) const ENTRIES: &[Entry] = &[
         parent: Slot::View,
         cmd: Cmd::ViewMenu,
     },
+    // View → Controls (#45; upstream viv.c:844 sits it right after the
+    // Menu row — its Status Bar sibling row lands with #47's status
+    // toggles).
+    Entry::Item {
+        loc: loc::Id::MenuControls,
+        parent: Slot::View,
+        cmd: Cmd::ViewControls,
+    },
     Entry::Separator { parent: Slot::View },
     Entry::Item {
         loc: loc::Id::MenuFullscreen,
@@ -710,6 +732,19 @@ pub(crate) const ENTRIES: &[Entry] = &[
         loc: loc::Id::MenuSlideshowPlayPause,
         parent: Slot::Slideshow,
         cmd: Cmd::SlideshowPause,
+    },
+    // The toolbar-only pair (#45; upstream viv.h:132-133 keeps them out
+    // of `_viv_commands[]` — riviv registers them as hidden rows so the
+    // table invariants hold, making them additionally bindable).
+    Entry::HiddenItem {
+        loc: loc::Id::ToolbarPlaySlideshow,
+        parent: Slot::Slideshow,
+        cmd: Cmd::SlideshowPlayOnly,
+    },
+    Entry::HiddenItem {
+        loc: loc::Id::ToolbarPauseSlideshow,
+        parent: Slot::Slideshow,
+        cmd: Cmd::SlideshowPauseOnly,
     },
     Entry::Separator {
         parent: Slot::Slideshow,
@@ -1057,6 +1092,9 @@ pub(crate) fn item_text(label: &str, key: Option<&str>) -> String {
 pub(crate) struct MenuState {
     /// View → Menu's checkmark: `config_show_menu` (viv.c:7125).
     pub(crate) show_menu: bool,
+    /// View → Controls' checkmark (#45): `config_show_controls`
+    /// (viv.c:7126).
+    pub(crate) show_controls: bool,
     /// View → Fullscreen's checkmark: `_viv_is_fullscreen` (viv.c:7132).
     pub(crate) fullscreen: bool,
     /// View → 1:1's checkmark: render size == image size (viv.c:7131).
@@ -1095,6 +1133,7 @@ pub(crate) struct MenuState {
 pub(crate) fn checked(cmd: Cmd, state: &MenuState) -> bool {
     match cmd {
         Cmd::ViewMenu => state.show_menu,
+        Cmd::ViewControls => state.show_controls,
         Cmd::ViewFullscreen => state.fullscreen,
         Cmd::ViewOneToOne => state.one_to_one,
         Cmd::ViewSlideshow | Cmd::SlideshowPause => state.slideshow,
@@ -1227,65 +1266,69 @@ mod tests {
         assert_eq!(Cmd::EditCopyFilename.id(), 9);
         assert_eq!(Cmd::EditCopyImage.id(), 10);
         assert_eq!(Cmd::EditPaste.id(), 11);
-        assert_eq!(Cmd::ViewSlideshow.id(), 14);
-        // The #44 Pan/Scan block runs 17-32 (viv.h:110-125 order, right
-        // after ViewBestFit=16), pushing every later id by 16.
-        assert_eq!(Cmd::ViewPanScanIncreaseSize.id(), 17);
-        assert_eq!(Cmd::ViewPanScanDecreaseSize.id(), 18);
-        assert_eq!(Cmd::ViewPanScanIncreaseWidth.id(), 19);
-        assert_eq!(Cmd::ViewPanScanDecreaseWidth.id(), 20);
-        assert_eq!(Cmd::ViewPanScanIncreaseHeight.id(), 21);
-        assert_eq!(Cmd::ViewPanScanDecreaseHeight.id(), 22);
-        assert_eq!(Cmd::ViewPanScanMoveUp.id(), 23);
-        assert_eq!(Cmd::ViewPanScanMoveDown.id(), 24);
-        assert_eq!(Cmd::ViewPanScanMoveLeft.id(), 25);
-        assert_eq!(Cmd::ViewPanScanMoveRight.id(), 26);
-        assert_eq!(Cmd::ViewPanScanMoveUpLeft.id(), 27);
-        assert_eq!(Cmd::ViewPanScanMoveUpRight.id(), 28);
-        assert_eq!(Cmd::ViewPanScanMoveDownLeft.id(), 29);
-        assert_eq!(Cmd::ViewPanScanMoveDownRight.id(), 30);
-        assert_eq!(Cmd::ViewPanScanMoveCenter.id(), 31);
-        assert_eq!(Cmd::ViewPanScanReset.id(), 32);
-        assert_eq!(Cmd::SlideshowPause.id(), 37);
-        assert_eq!(Cmd::SlideshowRateDecrease.id(), 38);
-        assert_eq!(Cmd::SlideshowRateIncrease.id(), 39);
-        assert_eq!(Cmd::SlideshowRate250.id(), 40);
-        assert_eq!(Cmd::SlideshowRate500.id(), 41);
-        assert_eq!(Cmd::SlideshowRateCustom.id(), 57);
-        // The #38 Animation block runs 37-50 upstream-side (#37's NavNext
-        // was 37; the 14 Animation commands pushed it to 51) — with the
-        // #41 and #44 shifts it lands 58-71.
-        assert_eq!(Cmd::AnimationPlayPause.id(), 58);
-        assert_eq!(Cmd::AnimationJumpForwardMedium.id(), 59);
-        assert_eq!(Cmd::AnimationJumpBackwardMedium.id(), 60);
-        assert_eq!(Cmd::AnimationJumpForwardShort.id(), 61);
-        assert_eq!(Cmd::AnimationJumpBackwardShort.id(), 62);
-        assert_eq!(Cmd::AnimationJumpForwardLong.id(), 63);
-        assert_eq!(Cmd::AnimationJumpBackwardLong.id(), 64);
-        assert_eq!(Cmd::AnimationFrameStep.id(), 65);
-        assert_eq!(Cmd::AnimationFramePrev.id(), 66);
-        assert_eq!(Cmd::AnimationFirstFrame.id(), 67);
-        assert_eq!(Cmd::AnimationLastFrame.id(), 68);
-        assert_eq!(Cmd::AnimationRateDecrease.id(), 69);
-        assert_eq!(Cmd::AnimationRateIncrease.id(), 70);
-        assert_eq!(Cmd::AnimationRateReset.id(), 71);
-        assert_eq!(Cmd::NavNext.id(), 72);
+        // The #45 View→Controls row sits right after ViewMenu (12),
+        // pushing every later id by 1; the toolbar-only slideshow pair
+        // after SlideshowPause pushes the tail by 2 more (+3 total from
+        // the Pan/Scan block down).
+        assert_eq!(Cmd::ViewControls.id(), 13);
+        assert_eq!(Cmd::ViewSlideshow.id(), 15);
+        // The #44 Pan/Scan block runs 18-33 (viv.h:110-125 order, right
+        // after ViewBestFit=17), pushing every later id by 16 (+1).
+        assert_eq!(Cmd::ViewPanScanIncreaseSize.id(), 18);
+        assert_eq!(Cmd::ViewPanScanDecreaseSize.id(), 19);
+        assert_eq!(Cmd::ViewPanScanIncreaseWidth.id(), 20);
+        assert_eq!(Cmd::ViewPanScanDecreaseWidth.id(), 21);
+        assert_eq!(Cmd::ViewPanScanIncreaseHeight.id(), 22);
+        assert_eq!(Cmd::ViewPanScanDecreaseHeight.id(), 23);
+        assert_eq!(Cmd::ViewPanScanMoveUp.id(), 24);
+        assert_eq!(Cmd::ViewPanScanMoveDown.id(), 25);
+        assert_eq!(Cmd::ViewPanScanMoveLeft.id(), 26);
+        assert_eq!(Cmd::ViewPanScanMoveRight.id(), 27);
+        assert_eq!(Cmd::ViewPanScanMoveUpLeft.id(), 28);
+        assert_eq!(Cmd::ViewPanScanMoveUpRight.id(), 29);
+        assert_eq!(Cmd::ViewPanScanMoveDownLeft.id(), 30);
+        assert_eq!(Cmd::ViewPanScanMoveDownRight.id(), 31);
+        assert_eq!(Cmd::ViewPanScanMoveCenter.id(), 32);
+        assert_eq!(Cmd::ViewPanScanReset.id(), 33);
+        // The #45 toolbar-only pair: 39/40.
+        assert_eq!(Cmd::SlideshowPause.id(), 38);
+        assert_eq!(Cmd::SlideshowPlayOnly.id(), 39);
+        assert_eq!(Cmd::SlideshowPauseOnly.id(), 40);
+        assert_eq!(Cmd::SlideshowRateDecrease.id(), 41);
+        assert_eq!(Cmd::SlideshowRateIncrease.id(), 42);
+        assert_eq!(Cmd::SlideshowRate250.id(), 43);
+        assert_eq!(Cmd::SlideshowRate500.id(), 44);
+        assert_eq!(Cmd::SlideshowRateCustom.id(), 60);
+        // The #38 Animation block lands 61-77 with the #41/#44/#45 shifts.
+        assert_eq!(Cmd::AnimationPlayPause.id(), 61);
+        assert_eq!(Cmd::AnimationJumpForwardMedium.id(), 62);
+        assert_eq!(Cmd::AnimationJumpBackwardMedium.id(), 63);
+        assert_eq!(Cmd::AnimationJumpForwardShort.id(), 64);
+        assert_eq!(Cmd::AnimationJumpBackwardShort.id(), 65);
+        assert_eq!(Cmd::AnimationJumpForwardLong.id(), 66);
+        assert_eq!(Cmd::AnimationJumpBackwardLong.id(), 67);
+        assert_eq!(Cmd::AnimationFrameStep.id(), 68);
+        assert_eq!(Cmd::AnimationFramePrev.id(), 69);
+        assert_eq!(Cmd::AnimationFirstFrame.id(), 70);
+        assert_eq!(Cmd::AnimationLastFrame.id(), 71);
+        assert_eq!(Cmd::AnimationRateDecrease.id(), 72);
+        assert_eq!(Cmd::AnimationRateIncrease.id(), 73);
+        assert_eq!(Cmd::AnimationRateReset.id(), 74);
+        assert_eq!(Cmd::NavNext.id(), 75);
         // The #39 sort/shuffle/jumpto block (menu-table order,
-        // viv.c:946-956); HelpCommandLineOptions lands 85, HelpAbout 86.
-        assert_eq!(Cmd::NavSortName.id(), 76);
-        assert_eq!(Cmd::NavSortFullPath.id(), 77);
-        assert_eq!(Cmd::NavSortSize.id(), 78);
-        assert_eq!(Cmd::NavSortDateModified.id(), 79);
-        assert_eq!(Cmd::NavSortDateCreated.id(), 80);
-        assert_eq!(Cmd::NavSortAscending.id(), 81);
-        assert_eq!(Cmd::NavSortDescending.id(), 82);
-        assert_eq!(Cmd::NavShuffle.id(), 83);
-        assert_eq!(Cmd::NavJumpTo.id(), 84);
-        // The #48 Help→Command Line Options row takes upstream's slot
-        // between the (unshipped) help rows and About: 85, pushing
-        // HelpAbout to 86.
-        assert_eq!(Cmd::HelpCommandLineOptions.id(), 85);
-        assert_eq!(Cmd::HelpAbout.id(), 86);
+        // viv.c:946-956); HelpCommandLineOptions lands 88, HelpAbout 89.
+        assert_eq!(Cmd::NavSortName.id(), 79);
+        assert_eq!(Cmd::NavSortFullPath.id(), 80);
+        assert_eq!(Cmd::NavSortSize.id(), 81);
+        assert_eq!(Cmd::NavSortDateModified.id(), 82);
+        assert_eq!(Cmd::NavSortDateCreated.id(), 83);
+        assert_eq!(Cmd::NavSortAscending.id(), 84);
+        assert_eq!(Cmd::NavSortDescending.id(), 85);
+        assert_eq!(Cmd::NavShuffle.id(), 86);
+        assert_eq!(Cmd::NavJumpTo.id(), 87);
+        // The #48 Help→Command Line Options row: 88, HelpAbout 89.
+        assert_eq!(Cmd::HelpCommandLineOptions.id(), 88);
+        assert_eq!(Cmd::HelpAbout.id(), 89);
     }
 
     #[test]
@@ -1361,6 +1404,7 @@ mod tests {
         // Descending direction, shuffle off).
         let on = MenuState {
             show_menu: true,
+            show_controls: true,
             fullscreen: true,
             one_to_one: true,
             slideshow: true,
@@ -1373,6 +1417,7 @@ mod tests {
         };
         let off = MenuState {
             show_menu: false,
+            show_controls: false,
             fullscreen: false,
             one_to_one: false,
             slideshow: false,
@@ -1387,6 +1432,7 @@ mod tests {
             let expected_on = matches!(
                 cmd,
                 Cmd::ViewMenu
+                    | Cmd::ViewControls
                     | Cmd::ViewFullscreen
                     | Cmd::ViewOneToOne
                     | Cmd::ViewSlideshow
@@ -1520,6 +1566,7 @@ mod tests {
     fn plain_state() -> MenuState {
         MenuState {
             show_menu: false,
+            show_controls: false,
             fullscreen: false,
             one_to_one: false,
             slideshow: false,
@@ -1605,10 +1652,12 @@ mod tests {
         // (Controls list + WM_COMMAND + ini names), absent from the menu
         // bar build (viv.c:12328). The animation quartet (viv.c:925-928),
         // the #41 clipboard pair — Copy Filename (viv.c:828) and Paste
-        // (viv.c:830), keyboard Ctrl+Shift+C / Ctrl+V upstream — and #44's
+        // (viv.c:830), keyboard Ctrl+Shift+C / Ctrl+V upstream — #44's
         // four diagonal Pan/Scan moves (viv.c:881-884, Ctrl+NUMPAD
-        // corners). The table marks them HiddenItem; the visible rows
-        // stay Item.
+        // corners), and #45's toolbar-only slideshow pair (upstream keeps
+        // them out of the table entirely; riviv's hidden-row superset,
+        // README Differences). The table marks them HiddenItem; the
+        // visible rows stay Item.
         let hidden: Vec<Cmd> = ENTRIES
             .iter()
             .filter_map(|e| match e {
@@ -1625,6 +1674,8 @@ mod tests {
                 Cmd::ViewPanScanMoveUpRight,
                 Cmd::ViewPanScanMoveDownLeft,
                 Cmd::ViewPanScanMoveDownRight,
+                Cmd::SlideshowPlayOnly,
+                Cmd::SlideshowPauseOnly,
                 Cmd::AnimationJumpForwardShort,
                 Cmd::AnimationJumpBackwardShort,
                 Cmd::AnimationJumpForwardLong,
