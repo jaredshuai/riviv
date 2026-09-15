@@ -142,6 +142,24 @@ pub(crate) const BLIT_MODES: &[ComboEntry] = &[
     },
 ];
 
+/// The title-bar-format combo (#47; upstream
+/// IDC_TITLE_BAR_FORMAT on the View page, viv.c:8372-8376 — the index IS
+/// the config value: 0 full path / 1 filename / 2 none).
+pub(crate) const TITLE_BAR_FORMATS: &[ComboEntry] = &[
+    ComboEntry {
+        label: loc::Id::OptionsTitleBarFormatFullPath,
+        value: 0,
+    },
+    ComboEntry {
+        label: loc::Id::OptionsTitleBarFormatFilenameOnly,
+        value: 1,
+    },
+    ComboEntry {
+        label: loc::Id::OptionsTitleBarFormatNone,
+        value: 2,
+    },
+];
+
 /// The combo index a config value maps to, if the table carries that value
 /// (upstream `ComboBox_SetCurSel` with an out-of-range value leaves the
 /// combo blank — CB_ERR — and a blank combo at OK preserves the value
@@ -158,6 +176,9 @@ pub(crate) enum Field {
     MultipleInstances,
     ShrinkBlitMode,
     MagFilter,
+    /// The title-bar-format combo (#47; upstream IDC_TITLE_BAR_FORMAT,
+    /// viv.c:8372-8376/8769 — 0 full path / 1 filename / 2 none).
+    TitleBarFormat,
     KeepAspectRatio,
     FillWindow,
     FullscreenFillWindow,
@@ -270,13 +291,25 @@ pub(crate) const VIEW: &[Ctrl] = &[
         w: 119,
         h: 30,
     },
+    // Title bar format (rc:77-78: label (0,36) 74x12, combo (74,34)
+    // 119x30 — upstream IDD_VIEW's third row; #47).
+    Ctrl {
+        kind: Kind::Combo(TITLE_BAR_FORMATS),
+        label: loc::Id::OptionsTitleBarFormat,
+        field: Field::TitleBarFormat,
+        label_w: 74,
+        x: 0,
+        y: 34,
+        w: 119,
+        h: 30,
+    },
     Ctrl {
         kind: Kind::Checkbox,
         label: loc::Id::OptionsKeepAspectRatio,
         field: Field::KeepAspectRatio,
         label_w: 0,
         x: 0,
-        y: 36,
+        y: 53,
         w: 186,
         h: 10,
     },
@@ -286,7 +319,7 @@ pub(crate) const VIEW: &[Ctrl] = &[
         field: Field::FillWindow,
         label_w: 0,
         x: 0,
-        y: 53,
+        y: 70,
         w: 186,
         h: 10,
     },
@@ -296,7 +329,7 @@ pub(crate) const VIEW: &[Ctrl] = &[
         field: Field::FullscreenFillWindow,
         label_w: 0,
         x: 0,
-        y: 70,
+        y: 87,
         w: 186,
         h: 10,
     },
@@ -306,7 +339,7 @@ pub(crate) const VIEW: &[Ctrl] = &[
         field: Field::AutoZoom,
         label_w: 0,
         x: 0,
-        y: 87,
+        y: 104,
         w: 74,
         h: 10,
     },
@@ -316,7 +349,7 @@ pub(crate) const VIEW: &[Ctrl] = &[
         field: Field::AutoZoomType,
         label_w: 0,
         x: 74,
-        y: 85,
+        y: 102,
         w: 60,
         h: 100,
     },
@@ -328,7 +361,7 @@ pub(crate) const VIEW: &[Ctrl] = &[
         field: Field::LoopAnimationsOnce,
         label_w: 0,
         x: 0,
-        y: 104,
+        y: 121,
         w: 186,
         h: 10,
     },
@@ -340,7 +373,7 @@ pub(crate) const VIEW: &[Ctrl] = &[
         field: Field::PreloadNext,
         label_w: 0,
         x: 0,
-        y: 121,
+        y: 138,
         w: 186,
         h: 10,
     },
@@ -350,7 +383,7 @@ pub(crate) const VIEW: &[Ctrl] = &[
         field: Field::CacheLast,
         label_w: 0,
         x: 0,
-        y: 138,
+        y: 155,
         w: 186,
         h: 10,
     },
@@ -360,7 +393,7 @@ pub(crate) const VIEW: &[Ctrl] = &[
         field: Field::FrameMinus,
         label_w: 0,
         x: 0,
-        y: 155,
+        y: 172,
         w: 186,
         h: 10,
     },
@@ -370,7 +403,7 @@ pub(crate) const VIEW: &[Ctrl] = &[
         field: Field::WindowedBg,
         label_w: 96,
         x: 0,
-        y: 173,
+        y: 190,
         w: 50,
         h: 14,
     },
@@ -380,7 +413,7 @@ pub(crate) const VIEW: &[Ctrl] = &[
         field: Field::FullscreenBg,
         label_w: 96,
         x: 0,
-        y: 191,
+        y: 208,
         w: 50,
         h: 14,
     },
@@ -460,6 +493,7 @@ pub(crate) struct OptionsModel {
     pub(crate) multiple_instances: bool,
     pub(crate) shrink_blit_mode: Option<i32>,
     pub(crate) mag_filter: Option<i32>,
+    pub(crate) title_bar_format: Option<i32>,
     pub(crate) keep_aspect_ratio: bool,
     pub(crate) fill_window: bool,
     pub(crate) fullscreen_fill_window: bool,
@@ -520,6 +554,7 @@ impl OptionsModel {
         match field {
             Field::ShrinkBlitMode => self.shrink_blit_mode,
             Field::MagFilter => self.mag_filter,
+            Field::TitleBarFormat => self.title_bar_format,
             Field::AutoZoomType => self.auto_zoom_type,
             Field::LeftClickAction => self.left_click_action,
             Field::RightClickAction => self.right_click_action,
@@ -533,6 +568,7 @@ impl OptionsModel {
         match field {
             Field::ShrinkBlitMode => self.shrink_blit_mode = Some(value),
             Field::MagFilter => self.mag_filter = Some(value),
+            Field::TitleBarFormat => self.title_bar_format = Some(value),
             Field::AutoZoomType => self.auto_zoom_type = Some(value),
             Field::LeftClickAction => self.left_click_action = Some(value),
             Field::RightClickAction => self.right_click_action = Some(value),
@@ -568,6 +604,7 @@ impl OptionsModel {
             multiple_instances: to_bool(config.multiple_instances),
             shrink_blit_mode: Some(config.shrink_blit_mode),
             mag_filter: Some(config.mag_filter),
+            title_bar_format: Some(config.title_bar_format),
             keep_aspect_ratio: to_bool(config.keep_aspect_ratio),
             fill_window: to_bool(config.fill_window),
             fullscreen_fill_window: to_bool(config.fullscreen_fill_window),
@@ -604,6 +641,9 @@ impl OptionsModel {
         }
         if let Some(v) = self.mag_filter {
             config.mag_filter = v;
+        }
+        if let Some(v) = self.title_bar_format {
+            config.title_bar_format = v;
         }
         if let Some(v) = self.auto_zoom_type {
             config.auto_zoom_type = v;
@@ -711,7 +751,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!((bools, values, colors), (10, 7, 2));
+        assert_eq!((bools, values, colors), (10, 8, 2));
     }
 
     #[test]
@@ -759,7 +799,7 @@ mod tests {
                 );
             }
         }
-        assert_eq!(seen.len(), 19);
+        assert_eq!(seen.len(), 20);
     }
 
     #[test]
@@ -814,6 +854,7 @@ mod tests {
             multiple_instances: true,
             shrink_blit_mode: Some(0),
             mag_filter: Some(1),
+            title_bar_format: Some(2),
             keep_aspect_ratio: false,
             fill_window: true,
             fullscreen_fill_window: false,
@@ -836,6 +877,7 @@ mod tests {
         assert_eq!(config.multiple_instances, 1);
         assert_eq!(config.shrink_blit_mode, 0);
         assert_eq!(config.mag_filter, 1);
+        assert_eq!(config.title_bar_format, 2);
         assert_eq!(config.keep_aspect_ratio, 0);
         assert_eq!(config.fill_window, 1);
         assert_eq!(config.fullscreen_fill_window, 0);

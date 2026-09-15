@@ -118,9 +118,9 @@ const EDIT_KEY_CLASS: PCWSTR = w!("riviv_edit_key");
 /// where upstream parks its page dialogs; riviv sizes the host to the
 /// page so nothing clips), buttons bottom-right.
 const DLG_WIDE: i32 = 310;
-const DLG_HIGH: i32 = 271;
+const DLG_HIGH: i32 = 288;
 const TREE: (i32, i32, i32, i32) = (6, 6, 84, 240);
-const PAGE: (i32, i32, i32, i32) = (106, 26, 194, 216);
+const PAGE: (i32, i32, i32, i32) = (106, 26, 194, 233);
 const BTN_W: i32 = 50;
 const BTN_H: i32 = 14;
 
@@ -1391,6 +1391,11 @@ fn on_ok(dlg: HWND) {
         // SAFETY: no state borrow is live (the map above ended).
         crate::window::refresh_status(owner);
     }
+    // The title follows the format unconditionally — upstream refreshes
+    // it right after reading the combo, changed or not (viv.c:8769-8770).
+    // SAFETY: no borrow is live (the map above ended); refresh_title
+    // takes its own short borrow and pumps nothing.
+    crate::window::refresh_title(owner);
     if keys_changed {
         // SAFETY: no borrow is live (both maps above ended); the rebuild
         // takes its own short borrows and pumps nothing.

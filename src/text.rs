@@ -12,6 +12,33 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 
 use crate::loc::{self, Id};
+use crate::panscan;
+
+/// The title-bar filename clause (`config_title_bar_format`, #47; upstream
+/// `_viv_update_title`'s switch, viv.c:1226-1246). Upstream's `default:`
+/// arm joins case 1 — an unknown ini value (3+) shows the filename, which
+/// the clamped `from_config` encodes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TitleFormat {
+    /// 0 — the full path.
+    FullPath,
+    /// 1 (and every unknown value, upstream's `default:`) — the final path
+    /// component only.
+    FilenameOnly,
+    /// 2 — no filename clause at all.
+    None,
+}
+
+impl TitleFormat {
+    pub(crate) fn from_config(value: i32) -> Self {
+        match value {
+            0 => TitleFormat::FullPath,
+            2 => TitleFormat::None,
+            // 1 and out-of-range values take upstream's default arm.
+            _ => TitleFormat::FilenameOnly,
+        }
+    }
+}
 
 /// Upstream title format (`_viv_update_title`): `filename - AppName`,
 /// app name only when no image is loaded. Built from raw wide code units so
@@ -19,9 +46,14 @@ use crate::loc::{self, Id};
 /// of collapsing into U+FFFD replacement characters. The app name comes
 /// from the loc tables (viv.c:1247) — an untranslated brand, so the title
 /// itself is language-independent.
-pub(crate) fn title_wide(path: Option<&OsStr>) -> Vec<u16> {
+pub(crate) fn title_wide(path: Option<&OsStr>, format: TitleFormat) -> Vec<u16> {
     let mut title: Vec<u16> = Vec::new();
-    if let Some(name) = path.and_then(|p| Path::new(p).file_name()) {
+    let name = match format {
+        TitleFormat::FullPath => path,
+        TitleFormat::FilenameOnly => path.and_then(|p| Path::new(p).file_name()),
+        TitleFormat::None => None,
+    };
+    if let Some(name) = name {
         title.extend(name.encode_wide());
         title.extend(" - ".encode_utf16());
     }
@@ -158,24 +190,115 @@ pub(crate) fn min_status_part_wide(dpi: u32) -> i32 {
     (72 * dpi / 96) as i32
 }
 
-/// Right-edge layout for SB_SETPARTS: `[main][preload?][frame][dimension]`
-/// (viv.c:11296-11342 minus the pixel-info parts riviv does not have —
-/// #47). The preload part EXISTS only while its text is non-empty (upstream
-/// pushes its boundary inside `if (*preload_buf)`, so the part count
-/// alternates between 3 and 4); `frame_w`/`dimension_w` are the measured
-/// text widths; each part gets a `SM_CXEDGE * 5` text margin, the frame and
-/// dimension parts are floored at `min_wide` (the preload part is not —
-/// upstream measures it raw, viv.c:11266-11271), and the dimension part
-/// additionally reserves the size-grip strip (SM_CXVSCROLL + SM_CXBORDER,
-/// viv.c:11292). The main part takes what is left (floor 0); the dimension
-/// part runs to the right edge (-1). When the window is too cramped, the
-/// trailing dimension part keeps its width and the LEADING parts collapse
-/// first — upstream accumulates each boundary from the unclamped remainder
-/// (viv.c:11305-11341), which makes the frame boundary
-/// `client_w - dimension_w` (possibly negative = a collapsed part).
+// ---------------------------------------------------------------------------
+// Temp text (#47 — upstream `_viv_status_set_temp_text`, viv.c:11737-11758:
+// the flash replaces the main part for 3 s, then the timer clears it)
+// ---------------------------------------------------------------------------
+
+/// The panscan/zoom flash (`_viv_status_update_temp_pos_zoom`, viv.c:
+/// 11760-11791): pan position as −1..+1 (the 0..=1000 scale over 500, in
+/// f32 division like upstream, then nudged ±0.0005 in f64 — upstream's
+/// rounding shove), the two factor-table values, and the aspect ratio
+/// `(zx * wide) / (zy * high)` in f32 like the C expression. Upstream
+/// composes one localized printf template; riviv composes the three labels
+/// (byte-identical output — the languages only swap the words around the
+/// same number slots).
+pub(crate) fn temp_pos_zoom_text(
+    pos_x: i32,
+    pos_y: i32,
+    zoom_x: usize,
+    zoom_y: usize,
+    image_wide: i32,
+    image_high: i32,
+) -> String {
+    let nudge = |pos: i32| -> f64 {
+        let v = ((pos - 500) as f32 / 500.0f32) as f64;
+        if v < 0.0 { v - 0.0005 } else { v + 0.0005 }
+    };
+    let (zx, zy) = (panscan::value_at(zoom_x), panscan::value_at(zoom_y));
+    let aspect = (zx * image_wide as f32) / (zy * image_high as f32);
+    format!(
+        "{} {:.3} {:.3}, {} {:.3} {:.3}, {} {:.3}",
+        loc::get(Id::StatusBarPosLabel),
+        nudge(pos_x),
+        nudge(pos_y),
+        loc::get(Id::StatusBarZoomLabel),
+        zx,
+        zy,
+        loc::get(Id::StatusBarAspectLabel),
+        aspect,
+    )
+}
+
+/// The animation-rate flash (`_viv_status_update_temp_animation_rate`,
+/// viv.c:11793-11801): the 21-entry table's value at the current index.
+pub(crate) fn temp_animation_rate_text(rate: f32) -> String {
+    format!("{} {:.3}", loc::get(Id::StatusBarAnimationRateLabel), rate)
+}
+
+/// The slideshow-rate flash (`_viv_status_update_slideshow_rate`, viv.c:
+/// 11823-11850): the coarsest unit that divides the rate exactly — minutes,
+/// then seconds, else raw milliseconds (0 and inexact values read as ms).
+pub(crate) fn temp_slideshow_rate_text(rate_ms: i32) -> String {
+    let (r, unit) = if rate_ms / 60000 != 0 && rate_ms % 60000 == 0 {
+        (rate_ms / 60000, Id::StatusBarMinutes)
+    } else if rate_ms / 1000 != 0 && rate_ms % 1000 == 0 {
+        (rate_ms / 1000, Id::StatusBarSeconds)
+    } else {
+        (rate_ms, Id::StatusBarMilliseconds)
+    };
+    format!(
+        "{} {} {}",
+        loc::get(Id::StatusBarSlideshowRateLabel),
+        r,
+        loc::get(unit)
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Pixel-info parts (#47 — upstream viv.c:11217-11221, raw literals, not
+// localized)
+// ---------------------------------------------------------------------------
+
+/// The POS part: the source-pixel coordinate under the cursor.
+pub(crate) fn status_pixel_pos_text(x: i32, y: i32) -> String {
+    format!("POS: {x},{y}")
+}
+
+/// The RGB part: the source pixel's color.
+pub(crate) fn status_pixel_rgb_text(rgb: (u8, u8, u8)) -> String {
+    format!("RGB: {},{},{}", rgb.0, rgb.1, rgb.2)
+}
+
+/// Right-edge layout for SB_SETPARTS: `[main][preload?][pos][rgb][frame]
+/// [dimension]` (viv.c:11296-11342). The preload part EXISTS only while
+/// its text is non-empty (upstream pushes its boundary inside
+/// `if (*preload_buf)`, so the part count alternates); the POS and RGB
+/// parts ALWAYS exist — upstream's `if (pixel_pos_buf)` tests the ARRAY
+/// pointer, which is always true (viv.c:11320-11329), so with pixel-info
+/// off they sit between main and frame as zero-width invisible parts
+/// (bug-for-bug: it is what makes upstream's NM_CLICK part-1 toggle land
+/// on the POS readout when pixel-info is on, and on dead space when off).
+/// `frame_w`/`dimension_w` are the measured text widths; each part gets a
+/// `SM_CXEDGE * 5` text margin, the frame and dimension parts are floored
+/// at `min_wide` (preload/pos/rgb are not — upstream measures them raw,
+/// viv.c:11266-11290), and the dimension part additionally reserves the
+/// size-grip strip (SM_CXVSCROLL + SM_CXBORDER, viv.c:11292). The main
+/// part takes what is left (floor 0); the dimension part runs to the right
+/// edge (-1). When the window is too cramped, the trailing dimension part
+/// keeps its width and the LEADING parts collapse first — upstream
+/// accumulates each boundary from the unclamped remainder (viv.c:
+/// 11305-11341), which makes the frame boundary `client_w - dimension_w`
+/// (possibly negative = a collapsed part).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the upstream part walk, one width per part"
+)]
 pub(crate) fn status_part_edges(
     client_w: i32,
     preload_text_w: i32,
+    pixel_pos_w: i32,
+    pixel_rgb_w: i32,
     frame_text_w: i32,
     dimension_text_w: i32,
     margin: i32,
@@ -185,9 +308,20 @@ pub(crate) fn status_part_edges(
     // An empty part shows no text, so it takes no width (upstream only
     // measures non-empty buffers, viv.c:11241-11290) and — for the preload
     // part — does not exist at all (the boundary push sits inside the
-    // non-empty check).
+    // non-empty check). The POS/RGB parts take their raw width when their
+    // text shows (no minimum floor, like the preload part).
     let preload_w = if preload_text_w > 0 {
         preload_text_w + margin
+    } else {
+        0
+    };
+    let pos_w = if pixel_pos_w > 0 {
+        pixel_pos_w + margin
+    } else {
+        0
+    };
+    let rgb_w = if pixel_rgb_w > 0 {
+        pixel_rgb_w + margin
     } else {
         0
     };
@@ -206,12 +340,14 @@ pub(crate) fn status_part_edges(
     // client_w - dimension_w regardless of the floor above — a cramped
     // window starves the frame counter, never the dimension part
     // (Codex PR #13 round 3).
-    let raw = client_w - preload_w - frame_w - dimension_w;
+    let raw = client_w - preload_w - pos_w - rgb_w - frame_w - dimension_w;
     let mut edges = vec![raw.max(0)];
     if preload_w > 0 {
         edges.push(raw + preload_w);
     }
-    edges.push(raw + preload_w + frame_w);
+    edges.push(raw + preload_w + pos_w);
+    edges.push(raw + preload_w + pos_w + rgb_w);
+    edges.push(raw + preload_w + pos_w + rgb_w + frame_w);
     edges.push(-1);
     edges
 }
@@ -224,7 +360,10 @@ mod tests {
 
     #[test]
     fn title_is_filename_first_then_app_name() {
-        let title = title_wide(Some(OsStr::new(r"C:\pics\cat.png")));
+        let title = title_wide(
+            Some(OsStr::new(r"C:\pics\cat.png")),
+            TitleFormat::FilenameOnly,
+        );
         assert_eq!(String::from_utf16_lossy(&title), "cat.png - riviv");
     }
 
@@ -233,7 +372,7 @@ mod tests {
         // Windows filenames may contain unpaired UTF-16 surrogates; they must
         // reach the title verbatim (upstream SetWindowTextW takes wide strings).
         let name = OsString::from_wide(&[0xD800, u16::from(b'a')]);
-        let title = title_wide(Some(name.as_os_str()));
+        let title = title_wide(Some(name.as_os_str()), TitleFormat::FilenameOnly);
         let expected: Vec<u16> = [0xD800, u16::from(b'a')]
             .into_iter()
             .chain(" - riviv".encode_utf16())
@@ -243,7 +382,34 @@ mod tests {
 
     #[test]
     fn title_without_image_is_app_name_only() {
-        assert_eq!(String::from_utf16_lossy(&title_wide(None)), "riviv");
+        assert_eq!(
+            String::from_utf16_lossy(&title_wide(None, TitleFormat::FilenameOnly)),
+            "riviv"
+        );
+    }
+
+    #[test]
+    fn title_format_full_path_shows_the_whole_path() {
+        // viv.c:1226-1234: format 0 uses cFileName — upstream's full path.
+        let title = title_wide(Some(OsStr::new(r"C:\pics\cat.png")), TitleFormat::FullPath);
+        assert_eq!(String::from_utf16_lossy(&title), r"C:\pics\cat.png - riviv");
+    }
+
+    #[test]
+    fn title_format_none_shows_the_app_name_alone() {
+        let title = title_wide(Some(OsStr::new(r"C:\pics\cat.png")), TitleFormat::None);
+        assert_eq!(String::from_utf16_lossy(&title), "riviv");
+    }
+
+    #[test]
+    fn title_format_from_config_takes_upstreams_default_arm() {
+        // viv.c:1235-1246: case 1 AND default share the filename arm, so
+        // out-of-range ini values (3+) show the filename, not nothing.
+        assert_eq!(TitleFormat::from_config(0), TitleFormat::FullPath);
+        assert_eq!(TitleFormat::from_config(1), TitleFormat::FilenameOnly);
+        assert_eq!(TitleFormat::from_config(2), TitleFormat::None);
+        assert_eq!(TitleFormat::from_config(3), TitleFormat::FilenameOnly);
+        assert_eq!(TitleFormat::from_config(-1), TitleFormat::FilenameOnly);
     }
 
     #[test]
@@ -377,9 +543,12 @@ mod tests {
         // 1000 px client, frame text 40 px, dimension text 120 px,
         // margin 10 (SM_CXEDGE*5 at 2 px), grip 17 (SM_CXVSCROLL+BORDER),
         // min 72: frame = max(50, 72) = 72; dimension = max(130, 72)+17 = 147.
+        // The POS/RGB parts exist but are empty (pixel-info off) — two
+        // zero-width boundaries at the raw remainder (upstream's always-true
+        // pointer checks, viv.c:11320-11329).
         assert_eq!(
-            status_part_edges(1000, 0, 40, 120, 10, 17, 72),
-            [781, 853, -1],
+            status_part_edges(1000, 0, 0, 0, 40, 120, 10, 17, 72),
+            [781, 781, 781, 853, -1],
             "main fills the remainder, dimension runs to the right edge"
         );
     }
@@ -389,21 +558,21 @@ mod tests {
         // frame: text 5 + margin 10 = 15 -> floored to 72; dimension empty
         // takes nothing (upstream only measures non-empty buffers).
         assert_eq!(
-            status_part_edges(1000, 0, 5, 0, 10, 17, 72),
-            [928, 1000, -1]
+            status_part_edges(1000, 0, 0, 0, 5, 0, 10, 17, 72),
+            [928, 928, 928, 1000, -1]
         );
     }
 
     #[test]
     fn a_nonempty_preload_inserts_its_part_between_main_and_frame() {
         // Upstream pushes the preload boundary inside `if (*preload_buf)`
-        // (viv.c:11312-11316): the part count goes 3 -> 4, the preload text
+        // (viv.c:11312-11316): the part count goes up, the preload text
         // takes width+margin with NO minimum floor (viv.c:11266-11271), and
         // the main part shrinks by it. preload 50 -> 60 wide; raw remainder
         // = 1000 - 60 - 72 - 147 = 721; boundaries accumulate unclamped.
         assert_eq!(
-            status_part_edges(1000, 50, 40, 120, 10, 17, 72),
-            [721, 781, 853, -1],
+            status_part_edges(1000, 50, 0, 0, 40, 120, 10, 17, 72),
+            [721, 781, 781, 781, 853, -1],
             "main shrinks by the preload part, frame/dimension edges keep upstream's accumulation"
         );
     }
@@ -414,8 +583,33 @@ mod tests {
         // unlike the frame counter): preload 5+10 = 15; the frame counter
         // (5+10 = 15) floors at 72; dimension empty. raw = 1000-15-72.
         assert_eq!(
-            status_part_edges(1000, 5, 5, 0, 10, 17, 72),
-            [913, 928, 1000, -1]
+            status_part_edges(1000, 5, 0, 0, 5, 0, 10, 17, 72),
+            [913, 928, 928, 928, 1000, -1]
+        );
+    }
+
+    #[test]
+    fn pixel_parts_take_their_raw_width_between_main_and_frame() {
+        // With pixel-info on and the cursor over the image, POS measures
+        // 40+10 = 50 and RGB 50+10 = 60 (no minimum floor, like preload);
+        // the layout is [main][pos][rgb][frame][dimension] (viv.c:
+        // 11320-11329 — upstream's always-true pointer checks push both
+        // parts unconditionally; with text they take real width).
+        assert_eq!(
+            status_part_edges(1000, 0, 40, 50, 40, 120, 10, 17, 72),
+            [671, 721, 781, 853, -1],
+            "pos/rgb parts sit between main and frame at raw width"
+        );
+    }
+
+    #[test]
+    fn pixel_parts_have_no_minimum_floor() {
+        // A tiny POS text (5+10 = 15) is not floored at min_wide — only
+        // the frame and dimension parts are (viv.c:11266-11290 measures
+        // preload/pos/rgb raw).
+        assert_eq!(
+            status_part_edges(1000, 0, 5, 0, 5, 0, 10, 17, 72),
+            [913, 928, 928, 1000, -1]
         );
     }
 
@@ -423,17 +617,18 @@ mod tests {
     fn a_cramped_window_starves_the_frame_counter_not_the_dimension_part() {
         // frame: 500+10 floored at 72 -> 510; dimension: 510+17 = 527 —
         // both far beyond a 100 px client. Part 0 floors at 0 (viv.c:11308);
-        // the frame boundary continues from the UNCLAMPED remainder
-        // (client - dimension, viv.c:11331-11336) and may go negative (a
-        // collapsed part) — the dimension part keeps its width instead.
-        let edges = status_part_edges(100, 0, 500, 500, 10, 17, 72);
+        // the zero-width pos/rgb and the frame boundary continue from the
+        // UNCLAMPED remainder (client - dimension, viv.c:11331-11336) and
+        // may go negative (a collapsed part) — the dimension part keeps its
+        // width instead.
+        let edges = status_part_edges(100, 0, 0, 0, 500, 500, 10, 17, 72);
         assert_eq!(edges[0], 0, "main part floored at 0 (viv.c:11308)");
         assert_eq!(
-            edges[1],
+            edges[3],
             100 - 527,
             "frame boundary = client - dimension, negative = collapsed"
         );
-        assert_eq!(edges[2], -1);
+        assert_eq!(edges[4], -1);
     }
 
     #[test]
@@ -441,16 +636,106 @@ mod tests {
         // client 150, frame needs 72, dimension needs 89: the dimension
         // part keeps its 89 px; the frame counter is squeezed to 61 and the
         // main part to 0 — the trailing dimension text stays readable.
-        assert_eq!(status_part_edges(150, 0, 5, 60, 10, 17, 72), [0, 61, -1]);
+        assert_eq!(
+            status_part_edges(150, 0, 0, 0, 5, 60, 10, 17, 72),
+            [0, -11, -11, 61, -1]
+        );
         // Comfortable case unchanged: main fills the remainder, frame gets
         // its full width, dimension runs to the right edge.
-        assert_eq!(status_part_edges(500, 0, 5, 60, 10, 17, 72), [339, 411, -1]);
+        assert_eq!(
+            status_part_edges(500, 0, 0, 0, 5, 60, 10, 17, 72),
+            [339, 339, 339, 411, -1]
+        );
     }
 
     #[test]
     fn an_empty_window_shows_only_the_dimension_part_at_the_edge() {
         // No image and no frame counter: everything collapses to the main
         // part plus the (empty, zero-width) slots.
-        assert_eq!(status_part_edges(640, 0, 0, 0, 10, 17, 72), [640, 640, -1]);
+        assert_eq!(
+            status_part_edges(640, 0, 0, 0, 0, 0, 10, 17, 72),
+            [640, 640, 640, 640, -1]
+        );
+    }
+
+    #[test]
+    fn temp_pos_zoom_at_center_reads_the_nudge_not_zero() {
+        // Upstream's ±0.0005 shove (viv.c:11766-11785) moves a centered
+        // position to 0.0005, which %.3f renders as "0.001" — the binary
+        // double sits just above the decimal midpoint. C printf and Rust
+        // format the identical f64 identically, so this is bug-for-bug.
+        assert_eq!(
+            temp_pos_zoom_text(
+                500,
+                500,
+                panscan::DST_ZOOM_ONE,
+                panscan::DST_ZOOM_ONE,
+                300,
+                200
+            ),
+            "Pos 0.001 0.001, Zoom 1.000 1.000, Aspect Ratio 1.500"
+        );
+    }
+
+    #[test]
+    fn temp_pos_zoom_carries_the_f32_asymmetry_of_the_c_expressions() {
+        // One arrow right (pos 505): (5/500) in f32 lands at
+        // 0.009999999776… + 0.0005 → "0.010"; one arrow left (pos 499):
+        // f32(−0.002) = −0.002000000094… − 0.0005 → "−0.003" — the two
+        // sides round differently because the f32 quotients do (viv.c:
+        // 11763-11785 computes the division in float like this).
+        assert_eq!(
+            temp_pos_zoom_text(
+                505,
+                499,
+                panscan::DST_ZOOM_ONE,
+                panscan::DST_ZOOM_ONE,
+                300,
+                200
+            ),
+            "Pos 0.010 -0.003, Zoom 1.000 1.000, Aspect Ratio 1.500"
+        );
+    }
+
+    #[test]
+    fn temp_pos_zoom_extremes_and_one_factor_step() {
+        // Pan fully left/right = ±1.000; one size step up = factor
+        // 1.02 on both axes (the ±1.02 table's first step); the aspect
+        // follows the image (300x200 = 1.5) since both axes step together.
+        let one_up = panscan::DST_ZOOM_ONE + 1;
+        assert_eq!(
+            temp_pos_zoom_text(0, 1000, one_up, one_up, 300, 200),
+            "Pos -1.000 1.000, Zoom 1.020 1.020, Aspect Ratio 1.500"
+        );
+    }
+
+    #[test]
+    fn temp_animation_rate_formats_to_three_decimals() {
+        assert_eq!(temp_animation_rate_text(1.0), "Animation rate 1.000");
+        assert_eq!(temp_animation_rate_text(0.5), "Animation rate 0.500");
+    }
+
+    #[test]
+    fn temp_slideshow_rate_picks_the_coarsest_exact_unit() {
+        // viv.c:11823-11845: whole minutes, then whole seconds, else raw
+        // milliseconds; zero and inexact values read as ms.
+        assert_eq!(temp_slideshow_rate_text(60000), "Slideshow rate 1 minutes");
+        assert_eq!(temp_slideshow_rate_text(120000), "Slideshow rate 2 minutes");
+        assert_eq!(temp_slideshow_rate_text(1000), "Slideshow rate 1 seconds");
+        assert_eq!(temp_slideshow_rate_text(30000), "Slideshow rate 30 seconds");
+        assert_eq!(
+            temp_slideshow_rate_text(1500),
+            "Slideshow rate 1500 milliseconds"
+        );
+        assert_eq!(temp_slideshow_rate_text(0), "Slideshow rate 0 milliseconds");
+    }
+
+    #[test]
+    fn pixel_part_texts_are_upstreams_raw_literals() {
+        // viv.c:11219-11220 — not localized, printf shapes.
+        assert_eq!(status_pixel_pos_text(150, 100), "POS: 150,100");
+        assert_eq!(status_pixel_pos_text(0, 0), "POS: 0,0");
+        assert_eq!(status_pixel_rgb_text((255, 0, 0)), "RGB: 255,0,0");
+        assert_eq!(status_pixel_rgb_text((1, 22, 255)), "RGB: 1,22,255");
     }
 }
