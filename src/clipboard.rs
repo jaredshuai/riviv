@@ -2,8 +2,11 @@
 //! viv.c:7376-7447), Copy Filename (`_viv_copy_filename`, 7449-7480), Copy
 //! Image (`_viv_copy_image` + `_viv_set_clipboard_image`,
 //! 7537-7552/7485-7530) and Paste (`WM_PASTE`, 4021-4047, reached through
-//! the EditPaste command, viv.c:2347-2349). The wire formats are pure and
-//! unit-tested; the Win32 clipboard session is the thin shell half.
+//! the EditPaste command, viv.c:2347-2349) — plus the READ side (#66,
+//! upstream wishlist viv.c:80/105): the `clipboard:` pseudo-filename's
+//! DIB-family reader feeding the virtual display. The wire formats are
+//! pure and unit-tested; the Win32 clipboard session is the thin shell
+//! half.
 //!
 //! Upstream routes the paste's HDROP through the real WM_DROPFILES
 //! handler (`SendMessage(hwnd, WM_DROPFILES, hdrop, 0)`, viv.c:4038).
@@ -16,24 +19,36 @@
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{RecvTimeoutError, channel};
+use std::time::Duration;
 
-use windows::Win32::Foundation::{GlobalFree, HANDLE, HWND};
+use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL, HWND};
 use windows::Win32::Graphics::Gdi::{
-    BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, HDC,
-    HGDIOBJ, ReleaseDC, SRCCOPY, SelectObject,
+    BI_RGB, BITMAP, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CreateCompatibleBitmap,
+    CreateCompatibleDC, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, GetDIBits, GetObjectW,
+    HBITMAP, HDC, HGDIOBJ, ReleaseDC, SRCCOPY, SelectObject,
 };
 use windows::Win32::System::DataExchange::{
-    CloseClipboard, EmptyClipboard, GetClipboardData, OpenClipboard, RegisterClipboardFormatW,
-    SetClipboardData,
+    CloseClipboard, EmptyClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
+    RegisterClipboardFormatW, SetClipboardData,
 };
 use windows::Win32::System::Memory::{
     GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
 };
-use windows::Win32::System::Ole::{CF_BITMAP, CF_HDROP, CF_UNICODETEXT};
+use windows::Win32::System::Ole::{CF_BITMAP, CF_DIB, CF_DIBV5, CF_HDROP, CF_UNICODETEXT};
 use windows::Win32::UI::Shell::HDROP;
 use windows::core::w;
 
-use crate::window::{apply_drop_files, state_of};
+use crate::window::{apply_drop_files, request_open_clipboard, state_of};
+
+/// The `clipboard:` display name (#66; upstream wishlist viv.c:80 — "open
+/// a file with the filename clipboard: to open the clipboard"): the
+/// literal pseudo-name the virtual display carries (window title,
+/// verdicts), the clipboard family's counterpart of
+/// `loadthread::STDIN_NAME`. NTFS reserves ':' the same way, so no real
+/// file can collide.
+pub(crate) const CLIPBOARD_NAME: &str = "clipboard:";
 
 /// The DROPFILES header is 20 bytes on every architecture (DWORD pFiles +
 /// POINT pt + two DWORDs — no tail padding); upstream sets
@@ -348,12 +363,17 @@ pub(crate) fn hdrop_payload_is_sound(payload: &[u8]) -> bool {
     false
 }
 
-/// WM_PASTE (upstream viv.c:4021-4047), reached through the EditPaste
-/// command (viv.c:2347-2349): a CF_HDROP clipboard becomes a file drop on
-/// the viewer; every other clipboard shape (text, bare images) is a
-/// silent no-op — the CF_DIB paste of the upstream wish list is not
-/// implemented (issue #41 scope).
+/// WM_PASTE (upstream viv.c:4021-4047, reached through the EditPaste
+/// command, viv.c:2347-2349), widened by #66: a CF_HDROP clipboard stays
+/// the #41 file drop with priority; with no HDROP, the DIB family
+/// (CF_DIBV5 / CF_DIB / CF_BITMAP, upstream wishlist viv.c:105) opens
+/// the `clipboard:` virtual display through the load worker. Every other
+/// clipboard shape (text, empty) remains the silent no-op upstream has.
 pub(crate) fn on_paste(hwnd: HWND) {
+    // The image request is deferred until AFTER CloseClipboard: the load
+    // worker re-opens the clipboard for its read, and a request issued
+    // under OUR open session would arrive to a busy clipboard.
+    let mut paste_image = false;
     // SAFETY: the clipboard session runs on the owning UI thread. The
     // GetClipboardData block is system-owned: locked only for the drop
     // application, never DragFinish'd, unlocked before CloseClipboard.
@@ -362,7 +382,7 @@ pub(crate) fn on_paste(hwnd: HWND) {
             return;
         }
         if let Ok(handle) = GetClipboardData(CF_HDROP.0 as u32) {
-            let hmem = windows::Win32::Foundation::HGLOBAL(handle.0);
+            let hmem = HGLOBAL(handle.0);
             // SAFETY: a clipboard HGLOBAL is lockable for the session's
             // duration (upstream GlobalLocks it at viv.c:4033).
             let ptr = GlobalLock(hmem);
@@ -382,8 +402,228 @@ pub(crate) fn on_paste(hwnd: HWND) {
                 // SAFETY: paired with the lock above.
                 let _ = GlobalUnlock(hmem);
             }
+        } else if dib_family_available() {
+            // No HDROP — the bitmap family takes the paste (#66).
+            paste_image = true;
         }
         let _ = CloseClipboard();
+    }
+    if paste_image {
+        request_open_clipboard(hwnd);
+    }
+}
+
+/// Whether the clipboard offers any of the DIB family formats (#66) —
+/// the paste path's cheap probe (IsClipboardFormatAvailable needs no
+/// open session) deciding between the #41 file path (HDROP) and the
+/// `clipboard:` virtual display. Text and other shapes answer false and
+/// paste stays a no-op.
+pub(crate) fn dib_family_available() -> bool {
+    // SAFETY: pure format-presence queries; no session, no handles.
+    [CF_DIBV5.0 as u32, CF_DIB.0 as u32, CF_BITMAP.0 as u32]
+        .iter()
+        .any(|&f| unsafe { IsClipboardFormatAvailable(f) }.is_ok())
+}
+
+/// Read the clipboard's IMAGE as one DIB payload (#66; the `clipboard:`
+/// pseudo-filename's source): CF_DIBV5, then CF_DIB (raw GlobalLock'd
+/// copies), then CF_BITMAP — converted through GetDIBits into the same
+/// 32bpp BI_RGB top-down shape, so the pure `dib` parser handles every
+/// path uniformly (and any-depth DDBs display even though the first two
+/// formats reject them). First format OFFERED wins; a payload that then
+/// fails to parse fails the load honestly — no per-format fallback that
+/// would mask what a producer actually wrote. The session is short
+/// (open, copy, close — nothing parsed under the lock). `Ok(None)` = no
+/// image format on the clipboard; `Err` = the clipboard would not open
+/// (busy). Both are user-level failures upstream of here.
+pub(crate) fn read_clipboard_dib() -> Result<Option<Vec<u8>>, String> {
+    // SAFETY: the caller owns the threading contract (the detached reader
+    // below). OpenClipboard(None) associates the session with the calling
+    // task; every handle below is system-owned clipboard memory locked
+    // only for the copy; CloseClipboard runs on every path.
+    unsafe {
+        if OpenClipboard(None).is_err() {
+            return Err("the clipboard is busy".into());
+        }
+        let out = read_clipboard_dib_locked();
+        let _ = CloseClipboard();
+        out
+    }
+}
+
+/// The `clipboard:` read, terminate-aware (#66): the blocking session
+/// runs on a DETACHED helper thread — the same contract as stdin's
+/// reader (loadthread.rs). A clipboard owner using DELAYED RENDERING can
+/// stall GetClipboardData indefinitely (the system waits for its
+/// WM_RENDERFORMAT reply while the owner hangs), and a stalled decode
+/// worker would hang the window-teardown join ("it's critical we wait
+/// for load image to finish", viv.c:5476). The worker polls the channel
+/// and abandons the reader at the terminate flag; the abandoned reader
+/// holds only its buffers until the owner finally answers (or process
+/// exit reclaims the session — nothing else is shared). `None` =
+/// terminated mid-read: exit silently, like a file decode between
+/// frames.
+pub(crate) fn read_clipboard_dib_terminated(
+    terminate: &AtomicBool,
+) -> Option<Result<Option<Vec<u8>>, String>> {
+    let (sender, receiver) = channel::<Result<Option<Vec<u8>>, String>>();
+    // Builder::spawn, not thread::spawn (the stdin lesson, #65): an OS
+    // thread-creation failure is THIS load's user-level failure, not a
+    // panic that kills the decode worker.
+    let reader = std::thread::Builder::new()
+        .name("riviv-clipboard".into())
+        .spawn(move || {
+            // SAFETY: the reader thread owns the whole session, as above.
+            let outcome = read_clipboard_dib();
+            // The sender drops silently if nobody waits (terminated job).
+            let _ = sender.send(outcome);
+        });
+    if let Err(e) = reader {
+        return Some(Err(format!("reader thread spawn failed: {e}")));
+    }
+    // On success the JoinHandle is deliberately dropped: DETACHED, for
+    // exactly the stall the helper exists to survive.
+    loop {
+        match receiver.recv_timeout(Duration::from_millis(100)) {
+            Ok(outcome) => return Some(outcome),
+            Err(RecvTimeoutError::Timeout) => {
+                if terminate.load(Ordering::Relaxed) {
+                    return None; // abandon the detached reader
+                }
+            }
+            // Unreachable (the reader always sends or dies with the
+            // process); treat as a failed read so the wait can never spin.
+            Err(RecvTimeoutError::Disconnected) => {
+                return Some(Err("the reader vanished".into()));
+            }
+        }
+    }
+}
+
+/// The open-session body of `read_clipboard_dib` (the probe ladder).
+///
+/// SAFETY (callers): the clipboard is open.
+unsafe fn read_clipboard_dib_locked() -> Result<Option<Vec<u8>>, String> {
+    // SAFETY: blanket for the edition-2024 block — the clipboard is open
+    // (the caller's contract); every block below is system-owned
+    // clipboard memory locked only for the stated copy.
+    unsafe {
+        for format in [CF_DIBV5.0 as u32, CF_DIB.0 as u32] {
+            let Ok(handle) = GetClipboardData(format) else {
+                continue; // not offered — next format
+            };
+            let hmem = HGLOBAL(handle.0);
+            // SAFETY: a clipboard HGLOBAL is lockable for the session's
+            // duration (the same contract on_paste relies on).
+            let ptr = GlobalLock(hmem);
+            if ptr.is_null() {
+                continue;
+            }
+            // SAFETY: GlobalSize reports the block's full allocation; the
+            // lock makes exactly that many bytes readable at ptr, and the
+            // slice borrows only locked clipboard memory for the copy.
+            let size = GlobalSize(hmem);
+            let bytes = std::ptr::slice_from_raw_parts(ptr.cast::<u8>(), size);
+            let copied = (*bytes).to_vec();
+            // SAFETY: paired with the lock above.
+            let _ = GlobalUnlock(hmem);
+            return Ok(Some(copied));
+        }
+        // CF_BITMAP: the DDB the system synthesizes for older producers.
+        if let Ok(handle) = GetClipboardData(CF_BITMAP.0 as u32)
+            && let Some(dib) = bitmap_to_dib(HBITMAP(handle.0))
+        {
+            return Ok(Some(dib));
+        }
+        Ok(None)
+    }
+}
+
+/// One CF_BITMAP → DIB payload conversion, run while the clipboard is
+/// open (the HBITMAP is only valid for the session): GetObject for the
+/// extent, then GetDIBits into a fresh 32bpp BI_RGB top-down buffer —
+/// the exact shape `dib::parse_dib` handles. `None` on any GDI step
+/// failure (the format then reads as absent, a user-level no-image).
+///
+/// SAFETY (callers): `bitmap` is the clipboard's live CF_BITMAP handle —
+/// valid while the clipboard is open, selected into no DC, and never to
+/// be deleted by us (the system owns it).
+unsafe fn bitmap_to_dib(bitmap: HBITMAP) -> Option<Vec<u8>> {
+    // SAFETY: blanket for the edition-2024 block — `bitmap` is the
+    // clipboard's live CF_BITMAP (open session, selected nowhere, never
+    // deleted by us); the GDI handles created here are torn down on
+    // every path their comments describe.
+    unsafe {
+        let mut bm = BITMAP::default();
+        // SAFETY: `bm` outlives the call and GetObjectW only writes it.
+        if GetObjectW(
+            HGDIOBJ(bitmap.0),
+            size_of::<BITMAP>() as i32,
+            Some((&mut bm as *mut BITMAP).cast()),
+        ) == 0
+        {
+            return None;
+        }
+        if bm.bmWidth <= 0 || bm.bmHeight <= 0 {
+            return None;
+        }
+        let (w, h) = (bm.bmWidth, bm.bmHeight);
+        // SAFETY: the screen DC is released on every path below.
+        let screen = GetDC(None);
+        if screen.is_invalid() {
+            return None;
+        }
+        // SAFETY: plain DC creation; deleted on every path below.
+        let mem = CreateCompatibleDC(Some(screen));
+        if mem.is_invalid() {
+            let _ = ReleaseDC(None, screen);
+            return None;
+        }
+        let mut info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: w,
+                biHeight: -h, // top-down — parse_dib's output convention
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        // The byte counts are usize math from the start — an extreme
+        // bitmap's w*h would overflow i32 long before the allocation.
+        let mut rows = vec![0u8; w as usize * h as usize * 4];
+        // SAFETY: `rows` holds exactly w*h*4 writable bytes; `info` is a
+        // valid BITMAPINFO for the request; the bitmap is valid and
+        // selected nowhere. The return is the number of scan lines
+        // copied — `h` means the whole bitmap came through.
+        let copied = GetDIBits(
+            mem,
+            bitmap,
+            0,
+            h as u32,
+            Some(rows.as_mut_ptr().cast()),
+            &mut info,
+            DIB_RGB_COLORS,
+        );
+        // SAFETY: the DC is ours to delete; the screen DC is released.
+        let _ = DeleteDC(mem);
+        let _ = ReleaseDC(None, screen);
+        if copied != h {
+            return None;
+        }
+        // Serialize header + rows as one CF_DIB-shaped payload.
+        // SAFETY: reading the repr(C) header as its 40 raw bytes —
+        // BITMAPINFOHEADER is exactly 40 bytes of plain fields.
+        let header = std::slice::from_raw_parts(
+            (&info.bmiHeader as *const BITMAPINFOHEADER).cast::<u8>(),
+            size_of::<BITMAPINFOHEADER>(),
+        );
+        let mut payload = Vec::with_capacity(header.len() + rows.len());
+        payload.extend_from_slice(header);
+        payload.extend_from_slice(&rows);
+        Some(payload)
     }
 }
 

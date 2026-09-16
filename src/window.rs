@@ -2581,18 +2581,34 @@ fn request_render_viewport(hwnd: HWND, state: &WindowState) -> (i32, i32) {
 }
 
 /// The `stdin:` virtual open (#65; upstream wishlist viv.c:81 — "open a
-/// file with the filename stdin: to open stdin"): decode the process's
-/// stdin as one in-memory stream and display it under the literal
-/// pseudo-name. No backing file exists, so this mirrors `request_open`'s
-/// fresh-start arm minus everything a file's metadata feeds: no
-/// navigation entry (`nav_current` empties — the display is virtual:
-/// file-dependent commands gray, Next/Prev return to the playlist, never
-/// a cwd scan), no status-bar byte size, and nothing enters the playlist
-/// (the pseudo-name is filtered out of the CLI's file-word ladder before
-/// it could ever resolve). The blocking read runs on the decode worker —
-/// its detach-on-terminate contract (a console stdin that never sees EOF
-/// must not hang the window's exit) lives in `loadthread.rs`.
+/// file with the filename stdin: to open stdin"): the shared virtual
+/// request under the literal pseudo-name (see `request_open_virtual`).
 fn request_open_stdin(hwnd: HWND) {
+    request_open_virtual(hwnd, STDIN_NAME, LoadSource::Stdin);
+}
+
+/// The `clipboard:` virtual open (#66; upstream wishlist viv.c:80 — "open
+/// a file with the filename clipboard: to open the clipboard"): the
+/// shared virtual request; the load worker reads the GLOBAL clipboard
+/// and decodes its DIB payload (see `clipboard::read_clipboard_dib`).
+/// Reached from the CLI ladder and Ctrl+V's no-HDROP arm alike.
+pub(crate) fn request_open_clipboard(hwnd: HWND) {
+    request_open_virtual(
+        hwnd,
+        crate::clipboard::CLIPBOARD_NAME,
+        LoadSource::Clipboard,
+    );
+}
+
+/// The virtual-open request body (#65/#66): decode a source with NO
+/// backing file and display it under the literal pseudo-name — the
+/// `request_open` fresh-start arm minus everything a file's metadata
+/// feeds: no navigation entry (`nav_current` empties — the display is
+/// virtual: file-dependent commands gray, Next/Prev return to the
+/// playlist, never a cwd scan), no status-bar byte size, and nothing
+/// enters the playlist (the pseudo-names are filtered out of the CLI's
+/// file-word ladder before they could ever resolve).
+fn request_open_virtual(hwnd: HWND, name: &str, source: LoadSource) {
     // SAFETY: the borrow spans the worker request and the session/status
     // stores — the same contract as request_open's tail (the channel send
     // never blocks; the old session's Drop sets an atomic flag).
@@ -2607,17 +2623,16 @@ fn request_open_stdin(hwnd: HWND) {
         // empties (the playlist itself survives — Next returns to it) and
         // the request-time title shows the pseudo-name while Loading.
         state.nav_current = None;
-        state.path = Some(OsString::from(STDIN_NAME));
+        state.path = Some(OsString::from(name));
         // No file behind the stream: no size clause for the status bar.
         state.pending_file_bytes = None;
         // A fresh start drops any parked preload (viv.c:1512-1513).
         state.preload = None;
         let render_viewport = request_render_viewport(hwnd, state);
         let background = state.config.windowed_bg();
-        let session =
-            state
-                .load_thread
-                .request(hwnd, LoadSource::Stdin, render_viewport, background);
+        let session = state
+            .load_thread
+            .request(hwnd, source, render_viewport, background);
         state.session = Some(session);
     }
     refresh_title(hwnd);
@@ -3619,10 +3634,11 @@ fn process_parsed_cl(hwnd: HWND, parsed: &cli::Parsed) {
                 }
             }
             cli::ClAction::AddFile(word) => {
-                // The `stdin:` pseudo-name never resolves to a file — it
-                // cannot enter the playlist (#65; the extension filter
-                // would drop it too, this is the intent layer).
-                if crate::cli::is_stdin_word(word) {
+                // The `stdin:` / `clipboard:` pseudo-names never resolve
+                // to a file — they cannot enter the playlist (#65/#66; the
+                // extension filter would drop them too, this is the
+                // intent layer).
+                if crate::cli::is_stdin_word(word) || crate::cli::is_clipboard_word(word) {
                     continue;
                 }
                 // Relative words resolve against the CWD (upstream's
@@ -3650,6 +3666,7 @@ fn process_parsed_cl(hwnd: HWND, parsed: &cli::Parsed) {
             if parsed.file_count == 1
                 && let Some(word) = &parsed.single
                 && !crate::cli::is_stdin_word(word)
+                && !crate::cli::is_clipboard_word(word)
             {
                 let path = absolutize(word);
                 playlist::add_filename(&mut state.playlist, Path::new(&path));
@@ -3658,16 +3675,28 @@ fn process_parsed_cl(hwnd: HWND, parsed: &cli::Parsed) {
     }
     // Show the first image — never in add-mode (viv.c:5046-5098).
     if !parsed.is_add && parsed.file_count >= 1 {
-        let resolved = if parsed.file_count == 1
+        let lone_stdin = parsed.file_count == 1
             && parsed
                 .single
                 .as_deref()
-                .is_some_and(crate::cli::is_stdin_word)
-        {
+                .is_some_and(crate::cli::is_stdin_word);
+        let lone_clipboard = parsed.file_count == 1
+            && parsed
+                .single
+                .as_deref()
+                .is_some_and(crate::cli::is_clipboard_word);
+        let resolved = if lone_stdin {
             // The lone `stdin:` word (#65): the virtual open — the pipe
             // is this process's own stdin (the single-instance gate let
             // this launch through for exactly that reason).
             request_open_stdin(hwnd);
+            true
+        } else if lone_clipboard {
+            // The lone `clipboard:` word (#66): the virtual open of the
+            // GLOBAL clipboard — works identically at startup and in the
+            // handed-off first instance (which is why the launch
+            // forwards instead of keeping its own window).
+            request_open_clipboard(hwnd);
             true
         } else if parsed.file_count == 1 {
             let path = absolutize(parsed.single.as_ref().unwrap());
@@ -3997,7 +4026,7 @@ fn on_load_replies(hwnd: HWND) {
             let replies = session.drain();
             let session_id = session.id();
             let session_path = session.path().to_os_string();
-            let session_is_stdin = session.is_stdin();
+            let session_is_virtual = session.is_virtual();
             for reply in replies {
                 // Frames cross the thread boundary as bare DIBs; the DC-carrying
                 // Surface is built here, on the UI thread that renders with it
@@ -4077,10 +4106,11 @@ fn on_load_replies(hwnd: HWND) {
                                 adopted_new_image = true;
                                 state.path = Some(session_path.clone());
                                 // The display-kind flag follows the same
-                                // edge as the path (#65): a stdin session
-                                // adopts a VIRTUAL display (no backing
-                                // file), a file session adopts a real one.
-                                state.virtual_display = session_is_stdin;
+                                // edge as the path (#65/#66): a virtual
+                                // session (stdin:/clipboard:) adopts a
+                                // VIRTUAL display (no backing file), a
+                                // file session adopts a real one.
+                                state.virtual_display = session_is_virtual;
                                 title = Some(HSTRING::from_wide(&title_wide(
                                     state.path.as_deref(),
                                     TitleFormat::from_config(state.config.title_bar_format),
