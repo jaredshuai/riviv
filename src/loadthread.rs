@@ -246,21 +246,28 @@ fn worker(receiver: Receiver<Job>) {
                 Some(StdinOutcome::Failed(msg)) => sink(LoadReply::FailedUser(msg)),
                 None => {} // terminated mid-read: exit silently
             },
-            // The clipboard read is a short open-copy-close session on
-            // this thread (#66); every read problem is user-level (keep
-            // old image, no dialog, no exit — ADR 0001), exactly like a
-            // foreign pipe's bytes.
-            LoadSource::Clipboard => match crate::clipboard::read_clipboard_dib() {
-                Ok(Some(payload)) => decode_dib_to_sink(&payload, env, &mut sink),
-                Ok(None) => sink(LoadReply::FailedUser(format!(
-                    "{} no image on the clipboard",
-                    crate::clipboard::CLIPBOARD_NAME
-                ))),
-                Err(msg) => sink(LoadReply::FailedUser(format!(
-                    "{} {msg}",
-                    crate::clipboard::CLIPBOARD_NAME
-                ))),
-            },
+            // The clipboard read is a short open-copy-close session on a
+            // DETACHED helper thread, terminate-aware (#66): a delayed-
+            // rendering clipboard owner can stall GetClipboardData
+            // forever, and the stall must not hang this worker (the
+            // window teardown joins it) — the stdin reader's contract
+            // (see read_stdin_terminated). Every read problem is
+            // user-level (keep old image, no dialog, no exit — ADR
+            // 0001), exactly like a foreign pipe's bytes.
+            LoadSource::Clipboard => {
+                match crate::clipboard::read_clipboard_dib_terminated(&terminate) {
+                    Some(Ok(Some(payload))) => decode_dib_to_sink(&payload, env, &mut sink),
+                    Some(Ok(None)) => sink(LoadReply::FailedUser(format!(
+                        "{} no image on the clipboard",
+                        crate::clipboard::CLIPBOARD_NAME
+                    ))),
+                    Some(Err(msg)) => sink(LoadReply::FailedUser(format!(
+                        "{} {msg}",
+                        crate::clipboard::CLIPBOARD_NAME
+                    ))),
+                    None => {} // terminated mid-read: exit silently
+                }
+            }
         }
     }
 }

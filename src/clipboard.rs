@@ -19,6 +19,9 @@
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{RecvTimeoutError, channel};
+use std::time::Duration;
 
 use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL, HWND};
 use windows::Win32::Graphics::Gdi::{
@@ -434,10 +437,10 @@ pub(crate) fn dib_family_available() -> bool {
 /// image format on the clipboard; `Err` = the clipboard would not open
 /// (busy). Both are user-level failures upstream of here.
 pub(crate) fn read_clipboard_dib() -> Result<Option<Vec<u8>>, String> {
-    // SAFETY: the caller owns the threading contract (the load worker).
-    // OpenClipboard(None) associates the session with the calling task;
-    // every handle below is system-owned clipboard memory locked only
-    // for the copy; CloseClipboard runs on every path.
+    // SAFETY: the caller owns the threading contract (the detached reader
+    // below). OpenClipboard(None) associates the session with the calling
+    // task; every handle below is system-owned clipboard memory locked
+    // only for the copy; CloseClipboard runs on every path.
     unsafe {
         if OpenClipboard(None).is_err() {
             return Err("the clipboard is busy".into());
@@ -445,6 +448,55 @@ pub(crate) fn read_clipboard_dib() -> Result<Option<Vec<u8>>, String> {
         let out = read_clipboard_dib_locked();
         let _ = CloseClipboard();
         out
+    }
+}
+
+/// The `clipboard:` read, terminate-aware (#66): the blocking session
+/// runs on a DETACHED helper thread — the same contract as stdin's
+/// reader (loadthread.rs). A clipboard owner using DELAYED RENDERING can
+/// stall GetClipboardData indefinitely (the system waits for its
+/// WM_RENDERFORMAT reply while the owner hangs), and a stalled decode
+/// worker would hang the window-teardown join ("it's critical we wait
+/// for load image to finish", viv.c:5476). The worker polls the channel
+/// and abandons the reader at the terminate flag; the abandoned reader
+/// holds only its buffers until the owner finally answers (or process
+/// exit reclaims the session — nothing else is shared). `None` =
+/// terminated mid-read: exit silently, like a file decode between
+/// frames.
+pub(crate) fn read_clipboard_dib_terminated(
+    terminate: &AtomicBool,
+) -> Option<Result<Option<Vec<u8>>, String>> {
+    let (sender, receiver) = channel::<Result<Option<Vec<u8>>, String>>();
+    // Builder::spawn, not thread::spawn (the stdin lesson, #65): an OS
+    // thread-creation failure is THIS load's user-level failure, not a
+    // panic that kills the decode worker.
+    let reader = std::thread::Builder::new()
+        .name("riviv-clipboard".into())
+        .spawn(move || {
+            // SAFETY: the reader thread owns the whole session, as above.
+            let outcome = read_clipboard_dib();
+            // The sender drops silently if nobody waits (terminated job).
+            let _ = sender.send(outcome);
+        });
+    if let Err(e) = reader {
+        return Some(Err(format!("reader thread spawn failed: {e}")));
+    }
+    // On success the JoinHandle is deliberately dropped: DETACHED, for
+    // exactly the stall the helper exists to survive.
+    loop {
+        match receiver.recv_timeout(Duration::from_millis(100)) {
+            Ok(outcome) => return Some(outcome),
+            Err(RecvTimeoutError::Timeout) => {
+                if terminate.load(Ordering::Relaxed) {
+                    return None; // abandon the detached reader
+                }
+            }
+            // Unreachable (the reader always sends or dies with the
+            // process); treat as a failed read so the wait can never spin.
+            Err(RecvTimeoutError::Disconnected) => {
+                return Some(Err("the reader vanished".into()));
+            }
+        }
     }
 }
 
