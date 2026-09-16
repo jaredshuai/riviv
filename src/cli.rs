@@ -106,26 +106,19 @@ pub(crate) fn is_stdin_word(word: &[u16]) -> bool {
         })
 }
 
-/// Whether a raw command line contains the `stdin:` pseudo-filename as
-/// any word (#65): the single-instance gate reads this BEFORE forwarding
-/// — a piped launch must keep its own stdin (the pipe belongs to this
-/// process; see the run() handoff block) — and nothing else may resolve
-/// the word to a path.
-pub(crate) fn has_stdin_word(cl: &[u16]) -> bool {
-    let mut i = 0usize;
-    while i < cl.len() && is_ws(cl[i]) {
-        i += 1;
-    }
-    let _exe = next_word(cl, &mut i);
-    loop {
-        if i >= cl.len() {
-            return false;
-        }
-        let word = next_word(cl, &mut i);
-        if is_stdin_word(&word.text) {
-            return true;
-        }
-    }
+/// Whether this raw command line, parsed as a STARTUP line (add-mode
+/// false, no current file — exactly how the launching process will run
+/// it), ends in the `stdin:` virtual open (#65): the pseudo-name as the
+/// LONE file word. The single-instance gate reads this BEFORE
+/// forwarding — a launch that will read its own pipe must keep its own
+/// stdin (the bytes cannot cross WM_COPYDATA; see run()'s handoff
+/// block). Lines that merely CONTAIN the word do not qualify: switch
+/// parameters (`/everything stdin:` — the word is the search term),
+/// mixed file words (`a.png stdin:` — the multi-word ladder drops the
+/// pseudo-name) and `/add` lines forward like any other launch.
+pub(crate) fn stdin_launch_keeps_own_window(cl: &[u16]) -> bool {
+    let parsed = parse(cl, false, false);
+    !parsed.is_add && parsed.file_count == 1 && parsed.single.as_deref().is_some_and(is_stdin_word)
 }
 
 /// ASCII case-insensitive compare against a switch name (upstream
@@ -668,17 +661,35 @@ mod tests {
     }
 
     #[test]
-    fn stdin_word_scan_walks_the_raw_command_line() {
-        // Any word position counts, quoted or not (the tokenizer strips
-        // quoting); the exe word and switches do not false-positive.
-        assert!(has_stdin_word(&w("riviv stdin:")));
-        assert!(has_stdin_word(&w("riviv /fullscreen stdin:")));
-        assert!(has_stdin_word(&w("riviv \"stdin:\"")));
-        assert!(has_stdin_word(&w("riviv a.png stdin:")));
-        assert!(has_stdin_word(&w("riviv /x 100 stdin:")));
-        assert!(!has_stdin_word(&w("riviv a.png")));
-        assert!(!has_stdin_word(&w("riviv /stdin:")));
-        assert!(!has_stdin_word(&w("riviv stdin.png")));
-        assert!(!has_stdin_word(&w("riviv")));
+    fn stdin_word_scan_matches_only_effective_virtual_opens() {
+        // The handoff exemption (cli::stdin_launch_keeps_own_window) fires
+        // only for the line that will really read the pipe: the pseudo-name
+        // as the lone file word. Parameter consumption, the multi-word
+        // ladder and the switch form all keep the normal forwarding.
+        let w = |s: &str| s.encode_utf16().collect::<Vec<u16>>();
+        let yes = [
+            "riviv stdin:",
+            "riviv /fullscreen stdin:",
+            "riviv \"stdin:\"",
+            "riviv STDIN:",
+            "riviv /x 100 stdin:",
+            "riviv /add stdin:", // /add needs a current file: inert at startup
+        ];
+        for cl in yes {
+            assert!(stdin_launch_keeps_own_window(&w(cl)), "{cl}");
+        }
+        let no = [
+            "riviv a.png stdin:",       // multi-word: pseudo-name dropped
+            "riviv stdin: b.png",       // ditto (first word stashed+added)
+            "riviv /everything stdin:", // the word is the search TERM
+            "riviv /random stdin:",     // ditto
+            "riviv /stdin:",            // a switch (unknown -> usage)
+            "riviv a.png",
+            "riviv",
+            "riviv stdin.png",
+        ];
+        for cl in no {
+            assert!(!stdin_launch_keeps_own_window(&w(cl)), "{cl}");
+        }
     }
 }

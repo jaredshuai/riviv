@@ -24,7 +24,6 @@
 
 use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
-use std::io::Read as _;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
@@ -246,9 +245,15 @@ fn worker(receiver: Receiver<Job>) {
 /// The raw byte cap for the `stdin:` stream (#65): without one a hostile
 /// pipe could push the read into an OOM that kills the viewer — the same
 /// posture as the decoder's own allocation caps (user-level failure, not
-/// a crash; ADR 0001). One byte over is read so the cap edge is
-/// detectable.
-const MAX_STDIN_BYTES: u64 = crate::loader::MAX_TOTAL_FRAME_BYTES as u64;
+/// a crash; ADR 0001).
+const MAX_STDIN_BYTES: usize = crate::loader::MAX_TOTAL_FRAME_BYTES;
+
+/// The stdin read chunk (Codex P1): a fixed buffer keeps the stream's Vec
+/// from ever growing past the cap — a plain `read_to_end` doubles capacity
+/// amortized, so a >512 MiB pipe would transiently allocate ~1 GiB before
+/// the length check could reject it. The loop bails at the cap edge,
+/// before the offending chunk is appended.
+const STDIN_CHUNK: usize = 64 * 1024;
 
 /// What the stdin read produced (#65): the stream's bytes, or a
 /// user-level failure message (already prefixed `stdin:` like the file
@@ -266,49 +271,72 @@ enum StdinOutcome {
 /// GDI, no window: nothing the process teardown needs to reclaim) and
 /// the worker polls the channel, abandoning the reader when this job is
 /// superseded or the window dies. The abandoned reader holds only its
-/// growing buffer until the pipe closes (or forever, until process exit
-/// reclaims it — the reader never touches shared state either way).
-/// `None` = the job was terminated while reading: exit silently, exactly
-/// like a file decode between frames.
+/// buffer until the pipe closes (or forever, until process exit reclaims
+/// it — the reader never touches shared state either way). `None` = the
+/// job was terminated while reading: exit silently, exactly like a file
+/// decode between frames.
 fn read_stdin_terminated(terminate: &AtomicBool) -> Option<StdinOutcome> {
-    let (sender, receiver) = channel();
-    std::thread::spawn(move || {
-        // take() bounds the read so the cap edge is detectable; the cap
-        // verdict itself lands in the caller as a user-level failure.
-        let mut bytes = Vec::new();
-        let mut stdin = std::io::stdin();
-        let mut limited = (&mut stdin).take(MAX_STDIN_BYTES + 1);
-        let read = std::io::Read::read_to_end(&mut limited, &mut bytes);
-        // An unreadable stdin (no console/pipe — e.g. an Explorer launch)
-        // arrives as the Err; the sender drops silently if nobody waits.
-        let _ = sender.send(read.map(|_| bytes));
-    });
+    let (sender, receiver) = channel::<StdinOutcome>();
+    // Builder::spawn, not thread::spawn (Codex P2): an OS thread-creation
+    // failure must surface as THIS load's user-level failure, not a panic
+    // that kills the decode worker (every later load would hang Loading).
+    let reader = std::thread::Builder::new()
+        .name("riviv-stdin".into())
+        .spawn(move || {
+            let outcome = read_stdin_once();
+            // The sender drops silently if nobody waits (terminated job).
+            let _ = sender.send(outcome);
+        });
+    if let Err(e) = reader {
+        // The failed spawn leaves nothing behind — this load fails
+        // user-level and the worker lives on.
+        return Some(StdinOutcome::Failed(format!(
+            "stdin: reader thread spawn failed: {e}"
+        )));
+    }
+    // On success the JoinHandle is deliberately dropped: the thread is
+    // DETACHED — joining it would reintroduce the blocked-read hang the
+    // whole helper exists to avoid.
     loop {
         match receiver.recv_timeout(Duration::from_millis(100)) {
-            Ok(Ok(bytes)) => {
-                return Some(if bytes.len() as u64 > MAX_STDIN_BYTES {
-                    StdinOutcome::Failed(format!(
-                        "stdin: exceeds the {MAX_STDIN_BYTES} byte read cap"
-                    ))
-                } else {
-                    StdinOutcome::Bytes(bytes)
-                });
-            }
-            // The stream's read failed (unreadable handle): a user-level
-            // verdict, like an unopenable file.
-            Ok(Err(e)) => return Some(StdinOutcome::Failed(format!("stdin: {e}"))),
+            Ok(outcome) => return Some(outcome),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 if terminate.load(Ordering::Relaxed) {
                     return None; // abandon the detached reader
                 }
             }
+            // Unreachable (the reader always sends or dies with the
+            // process); treat as a failed read so the wait can never spin.
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                // Unreachable (the reader always sends or panics); treat as
-                // a failed read so the wait can never spin forever.
                 return Some(StdinOutcome::Failed(
                     "stdin: the reader vanished".to_string(),
                 ));
             }
+        }
+    }
+}
+
+/// One blocking stdin-to-EOF read, cap-enforced without over-allocation:
+/// fixed-size chunks, the cap verdict landing BEFORE the chunk that
+/// crosses it is appended (see STDIN_CHUNK). An unreadable stdin (no
+/// console/pipe — e.g. an Explorer launch) reads as the Err.
+fn read_stdin_once() -> StdinOutcome {
+    use std::io::Read as _;
+    let mut stdin = std::io::stdin();
+    let mut bytes = Vec::new();
+    let mut chunk = vec![0u8; STDIN_CHUNK];
+    loop {
+        match stdin.read(&mut chunk) {
+            Ok(0) => return StdinOutcome::Bytes(bytes), // EOF
+            Ok(n) => {
+                if bytes.len() + n > MAX_STDIN_BYTES {
+                    return StdinOutcome::Failed(format!(
+                        "stdin: exceeds the {MAX_STDIN_BYTES} byte read cap"
+                    ));
+                }
+                bytes.extend_from_slice(&chunk[..n]);
+            }
+            Err(e) => return StdinOutcome::Failed(format!("stdin: {e}")),
         }
     }
 }

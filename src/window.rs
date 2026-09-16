@@ -7012,14 +7012,17 @@ pub(crate) fn run() -> Result<(), String> {
         );
         // SAFETY: reading the thread's last error immediately after the call.
         if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
-            // #65: a piped `stdin:` launch keeps its own stdin. The pipe's
-            // bytes belong to THIS process and cannot cross the handoff —
-            // the owning instance would read its own (foreign) stdin: an
-            // instant read failure from a GUI launch, a forever-blocked
-            // read from a console one. The handoff is skipped and this
-            // process shows the piped image in its own window (README
-            // Differences; the decision record lives on issue #65).
-            if !cli::has_stdin_word(&crate::assoc::command_line_wide()) {
+            // #65: a launch whose line will really read the pipe keeps its
+            // own stdin. The bytes belong to THIS process and cannot cross
+            // the handoff — the owning instance would read its own (foreign)
+            // stdin: an instant read failure from a GUI launch, a
+            // forever-blocked read from a console one. The predicate parses
+            // the line as this process's own startup parse (the pseudo-name
+            // as the lone file word), so lines that merely CONTAIN the word
+            // (`/everything stdin:`'s term, `a.png stdin:`'s dropped word)
+            // still forward like any other launch (README Differences; the
+            // decision record lives on issue #65).
+            if !cli::stdin_launch_keeps_own_window(&crate::assoc::command_line_wide()) {
                 // Find the owner's window and hand off (viv.c:5286-5334).
                 // No window (the owner is mid-startup, before its class
                 // exists) is upstream's accepted race: the handoff is lost
