@@ -50,9 +50,7 @@ use windows::Win32::System::Com::{
     CoInitializeEx, CoTaskMemFree, IBindCtx,
 };
 use windows::Win32::System::DataExchange::COPYDATASTRUCT;
-use windows::Win32::System::Environment::{
-    GetCommandLineW, GetCurrentDirectoryW, SetCurrentDirectoryW,
-};
+use windows::Win32::System::Environment::{GetCurrentDirectoryW, SetCurrentDirectoryW};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows::Win32::System::SystemInformation::GetTickCount;
@@ -114,7 +112,7 @@ use crate::cursor::{self, CursorEffects, CursorVisibility};
 use crate::custom_rate_dlg;
 use crate::everything;
 use crate::loader::{LoadReply, LoadedImage, UiAction, apply_reply, map_reply_frame};
-use crate::loadthread::{LoadSession, LoadThread, REPLY_KICK_MESSAGE};
+use crate::loadthread::{LoadSession, LoadSource, LoadThread, REPLY_KICK_MESSAGE, STDIN_NAME};
 use crate::loc;
 use crate::menu;
 use crate::paint::paint;
@@ -340,6 +338,14 @@ pub(crate) struct WindowState {
     /// first-frame reply, viv.c:2962): what
     /// `viv_copy_current_image_to_last_image` caches (viv.c:14441).
     pub(crate) displayed_entry: Option<PlaylistEntry>,
+    /// The displayed image has NO backing file (#65; upstream wishlist —
+    /// the `stdin:` virtual display): frames exist but `nav_current`
+    /// stays `None`, so file-dependent commands gray, navigation returns
+    /// to the playlist (never a cwd scan), and the last cache never
+    /// parks it. Set at the display's adoption edge, exactly where
+    /// `path` lands; cleared by every real-file adoption, blank, and the
+    /// failed-load clear.
+    pub(crate) virtual_display: bool,
 }
 
 /// Window state pointer stored in GWLP_USERDATA between WM_NCCREATE and
@@ -2036,6 +2042,8 @@ fn activate_last_flow(hwnd: HWND) {
         // current_fd = last_fd + title (viv.c:14499-14501).
         state.nav_current = Some(cache.entry.clone());
         state.path = Some(cache.entry.path.clone());
+        // A real file takes the display — the virtual flag dies with it.
+        state.virtual_display = false;
         state.displayed_entry = Some(cache.entry.clone());
         state.displayed_file_bytes = Some(cache.entry.size);
         state.pending_file_bytes = None;
@@ -2099,6 +2107,9 @@ fn adopt_preload_flow(hwnd: HWND) {
                 }
                 state.nav_current = Some(entry.clone());
                 state.path = Some(entry.path.clone());
+                // A real file takes the display — the virtual flag dies
+                // with it (its first frame adoption lands the same clear).
+                state.virtual_display = false;
                 state.pending_file_bytes = Some(entry.size);
                 title = Some(HSTRING::from_wide(&title_wide(
                     state.path.as_deref(),
@@ -2151,6 +2162,8 @@ fn adopt_preload_flow(hwnd: HWND) {
                 state.nav_current = Some(slot.entry.clone());
                 state.path = Some(slot.entry.path.clone());
                 state.displayed_entry = None;
+                // The cleared display is blank: never virtual (#65).
+                state.virtual_display = false;
                 state.displayed_file_bytes = None;
                 state.pending_file_bytes = None;
                 invalidate = true;
@@ -2201,6 +2214,8 @@ fn adopt_parked_image(state: &mut WindowState, now: u64, keep_session: bool) -> 
     }
     state.nav_current = Some(entry.clone());
     state.path = Some(entry.path.clone());
+    // A real file takes the display — the virtual flag dies with it.
+    state.virtual_display = false;
     state.displayed_entry = Some(entry.clone());
     state.displayed_file_bytes = Some(entry.size);
     state.pending_file_bytes = None;
@@ -2345,9 +2360,12 @@ fn queue_preload(hwnd: HWND, entry: &PlaylistEntry) {
         (client.bottom - client.top - bar_h).max(0),
     );
     let background = state.config.windowed_bg();
-    let session = state
-        .load_thread
-        .request(hwnd, entry.path.clone(), render_viewport, background);
+    let session = state.load_thread.request(
+        hwnd,
+        LoadSource::File(entry.path.clone()),
+        render_viewport,
+        background,
+    );
     state.preload = Some(PreloadSlot {
         session,
         entry: entry.clone(),
@@ -2505,28 +2523,7 @@ pub(crate) fn request_open(hwnd: HWND, path: &OsStr, origin: OpenOrigin<'_>) {
         // (cubic PR #13). Committed to `displayed_file_bytes` when this
         // session's first frame takes the display.
         state.pending_file_bytes = file_bytes;
-        // The request-time render area rides the job for the worker's mip
-        // pre-generation (upstream `_viv_load_render_wide/high`,
-        // viv.c:1557-1558): the client WIDTH as-is, the height minus the
-        // status bar — upstream subtracts the bar from the height only.
-        // GetClientRect is a pure window query (no pumping), safe inside
-        // this borrow like the stores around it.
-        let mut client = RECT::default();
-        // SAFETY: a pure window query on the live hwnd — no pumping, safe
-        // inside this borrow like the stores around it.
-        let _ = unsafe { GetClientRect(hwnd, &mut client) };
-        // The startup request can race the bar's first layout (it is
-        // created 0x0 and self-sizes) — a zero measured height would make
-        // the pre-generation viewport too tall; fall back to the same
-        // formula run() sized the initial window with (cubic, PR #18).
-        let bar_h = match status::height(state.status) {
-            0 => initial_status_height(),
-            h => h,
-        };
-        let render_viewport = (
-            client.right - client.left,
-            (client.bottom - client.top - bar_h).max(0),
-        );
+        let render_viewport = request_render_viewport(hwnd, state);
         // The composite background snapshots at request time — a color
         // change mid-load must not flip frames already in flight.
         let background = state.config.windowed_bg();
@@ -2536,10 +2533,12 @@ pub(crate) fn request_open(hwnd: HWND, path: &OsStr, origin: OpenOrigin<'_>) {
         // upstream never passes through `_viv_open` (viv.c:5094-5098), so
         // a missing file does not kill a parked preload.
         state.preload = None;
-        let session =
-            state
-                .load_thread
-                .request(hwnd, path.to_os_string(), render_viewport, background);
+        let session = state.load_thread.request(
+            hwnd,
+            LoadSource::File(path.to_os_string()),
+            render_viewport,
+            background,
+        );
         state.session = Some(session);
     }
     // The request-time title update (upstream viv.c:1577-1578 — see the
@@ -2556,6 +2555,72 @@ pub(crate) fn request_open(hwnd: HWND, path: &OsStr, origin: OpenOrigin<'_>) {
         // SetWindowTextW return too).
         let _ = unsafe { SetWindowTextW(hwnd, &title) };
     }
+    refresh_status(hwnd);
+}
+
+/// The request-time render area for a decode job (upstream
+/// `_viv_load_render_wide/high`, viv.c:1557-1558): the client WIDTH
+/// as-is, the height minus the status bar — upstream subtracts the bar
+/// from the height only. The startup request can race the bar's first
+/// layout (it is created 0x0 and self-sizes) — a zero measured height
+/// falls back to the formula run() sized the initial window with (cubic,
+/// PR #18).
+fn request_render_viewport(hwnd: HWND, state: &WindowState) -> (i32, i32) {
+    let mut client = RECT::default();
+    // SAFETY: a pure window query on the live hwnd — no pumping, safe
+    // inside the caller's borrow like the stores around it.
+    let _ = unsafe { GetClientRect(hwnd, &mut client) };
+    let bar_h = match status::height(state.status) {
+        0 => initial_status_height(),
+        h => h,
+    };
+    (
+        client.right - client.left,
+        (client.bottom - client.top - bar_h).max(0),
+    )
+}
+
+/// The `stdin:` virtual open (#65; upstream wishlist viv.c:81 — "open a
+/// file with the filename stdin: to open stdin"): decode the process's
+/// stdin as one in-memory stream and display it under the literal
+/// pseudo-name. No backing file exists, so this mirrors `request_open`'s
+/// fresh-start arm minus everything a file's metadata feeds: no
+/// navigation entry (`nav_current` empties — the display is virtual:
+/// file-dependent commands gray, Next/Prev return to the playlist, never
+/// a cwd scan), no status-bar byte size, and nothing enters the playlist
+/// (the pseudo-name is filtered out of the CLI's file-word ladder before
+/// it could ever resolve). The blocking read runs on the decode worker —
+/// its detach-on-terminate contract (a console stdin that never sees EOF
+/// must not hang the window's exit) lives in `loadthread.rs`.
+fn request_open_stdin(hwnd: HWND) {
+    // SAFETY: the borrow spans the worker request and the session/status
+    // stores — the same contract as request_open's tail (the channel send
+    // never blocks; the old session's Drop sets an atomic flag).
+    if let Some(state) = unsafe { state_of(hwnd) } {
+        // The fresh-open verdict resets (viv.c:1447-1458) and the
+        // per-image animation marks die with the open (viv.c:1278-1279).
+        state.status_file_not_found = false;
+        state.status_load_failed = false;
+        state.animation_looped = false;
+        state.slideshow_timeup = false;
+        // The virtual display has no navigation entity: the reference
+        // empties (the playlist itself survives — Next returns to it) and
+        // the request-time title shows the pseudo-name while Loading.
+        state.nav_current = None;
+        state.path = Some(OsString::from(STDIN_NAME));
+        // No file behind the stream: no size clause for the status bar.
+        state.pending_file_bytes = None;
+        // A fresh start drops any parked preload (viv.c:1512-1513).
+        state.preload = None;
+        let render_viewport = request_render_viewport(hwnd, state);
+        let background = state.config.windowed_bg();
+        let session =
+            state
+                .load_thread
+                .request(hwnd, LoadSource::Stdin, render_viewport, background);
+        state.session = Some(session);
+    }
+    refresh_title(hwnd);
     refresh_status(hwnd);
 }
 
@@ -2788,6 +2853,20 @@ fn home_open_inner(hwnd: HWND, end: bool, preload: bool) {
         }
         return;
     }
+    // The playlist held nothing to home onto. From a virtual display
+    // (#65) the cwd scan must NOT run — the virtual display has no file
+    // parent to scan around, and "return to the list" with no list is an
+    // empty display, not a surprise tour of the working directory.
+    // SAFETY: the borrow spans one bool read.
+    let virtual_home = (unsafe { state_of(hwnd) }).is_some_and(|s| s.virtual_display);
+    match home_fallback(virtual_home, preload) {
+        HomeFallback::ScanDir => {}
+        HomeFallback::Blank => {
+            blank_display(hwnd);
+            return;
+        }
+        HomeFallback::Inert => return,
+    }
     let entries = scan_entries(&scan_dir(hwnd));
     match playlist::home(&entries, end, mode, ascending) {
         Some(entry) => {
@@ -2802,6 +2881,25 @@ fn home_open_inner(hwnd: HWND, end: bool, preload: bool) {
                 blank_display(hwnd);
             }
         }
+    }
+}
+
+/// What the home arm does once no playlist target exists (#65): the
+/// upstream behavior is the directory scan (viv.c:6184-6238); a VIRTUAL
+/// display has no file parent, so its empty-list end is a blank display
+/// (manual) or nothing at all (the preload flavor never blanks,
+/// viv.c:6247-6252).
+enum HomeFallback {
+    ScanDir,
+    Blank,
+    Inert,
+}
+
+fn home_fallback(virtual_display: bool, preload: bool) -> HomeFallback {
+    match (virtual_display, preload) {
+        (true, false) => HomeFallback::Blank,
+        (true, true) => HomeFallback::Inert,
+        (false, _) => HomeFallback::ScanDir,
     }
 }
 
@@ -3222,6 +3320,8 @@ fn blank_display(hwnd: HWND) {
         state.random_search = None;
         state.displayed_file_bytes = None;
         state.pending_file_bytes = None;
+        // The blanked display is never virtual (#65).
+        state.virtual_display = false;
         state.session = None;
         // The frame fd empties with the display (upstream `_viv_clear`
         // clears _viv_frame_fd's name, viv.c:1273) — nothing left to cache.
@@ -3519,6 +3619,12 @@ fn process_parsed_cl(hwnd: HWND, parsed: &cli::Parsed) {
                 }
             }
             cli::ClAction::AddFile(word) => {
+                // The `stdin:` pseudo-name never resolves to a file — it
+                // cannot enter the playlist (#65; the extension filter
+                // would drop it too, this is the intent layer).
+                if crate::cli::is_stdin_word(word) {
+                    continue;
+                }
                 // Relative words resolve against the CWD (upstream's
                 // string_path_combine — the handoff adopts the sender's
                 // cwd before this runs).
@@ -3543,6 +3649,7 @@ fn process_parsed_cl(hwnd: HWND, parsed: &cli::Parsed) {
             playlist_add_current_if_empty(state);
             if parsed.file_count == 1
                 && let Some(word) = &parsed.single
+                && !crate::cli::is_stdin_word(word)
             {
                 let path = absolutize(word);
                 playlist::add_filename(&mut state.playlist, Path::new(&path));
@@ -3551,7 +3658,18 @@ fn process_parsed_cl(hwnd: HWND, parsed: &cli::Parsed) {
     }
     // Show the first image — never in add-mode (viv.c:5046-5098).
     if !parsed.is_add && parsed.file_count >= 1 {
-        let resolved = if parsed.file_count == 1 {
+        let resolved = if parsed.file_count == 1
+            && parsed
+                .single
+                .as_deref()
+                .is_some_and(crate::cli::is_stdin_word)
+        {
+            // The lone `stdin:` word (#65): the virtual open — the pipe
+            // is this process's own stdin (the single-instance gate let
+            // this launch through for exactly that reason).
+            request_open_stdin(hwnd);
+            true
+        } else if parsed.file_count == 1 {
             let path = absolutize(parsed.single.as_ref().unwrap());
             open_from_filename(hwnd, path.as_os_str())
         } else {
@@ -3879,6 +3997,7 @@ fn on_load_replies(hwnd: HWND) {
             let replies = session.drain();
             let session_id = session.id();
             let session_path = session.path().to_os_string();
+            let session_is_stdin = session.is_stdin();
             for reply in replies {
                 // Frames cross the thread boundary as bare DIBs; the DC-carrying
                 // Surface is built here, on the UI thread that renders with it
@@ -3957,6 +4076,11 @@ fn on_load_replies(hwnd: HWND) {
                             if state.displayed_from == Some(session_id) && !displayed_before_reply {
                                 adopted_new_image = true;
                                 state.path = Some(session_path.clone());
+                                // The display-kind flag follows the same
+                                // edge as the path (#65): a stdin session
+                                // adopts a VIRTUAL display (no backing
+                                // file), a file session adopts a real one.
+                                state.virtual_display = session_is_stdin;
                                 title = Some(HSTRING::from_wide(&title_wide(
                                     state.path.as_deref(),
                                     TitleFormat::from_config(state.config.title_bar_format),
@@ -3964,7 +4088,9 @@ fn on_load_replies(hwnd: HWND) {
                                 // The navigation facts follow the adopted
                                 // image (upstream copies _viv_load_fd into
                                 // _viv_frame_fd at the first-frame reply,
-                                // viv.c:2962 — the last-cache source).
+                                // viv.c:2962 — the last-cache source). A
+                                // virtual adoption parks nothing: there is
+                                // no entry to cache (nav_current is None).
                                 state.displayed_entry = state.nav_current.clone();
                                 // Commit the staged size now that THIS session's
                                 // image is on screen (a failed replacement never
@@ -3980,7 +4106,9 @@ fn on_load_replies(hwnd: HWND) {
                                 // (viv.c:7919-7923). The status bar's "(N KB)"
                                 // still clears with the display, and the frame
                                 // fd empties with it (viv.c:1273) — nothing to
-                                // cache.
+                                // cache. The cleared display is blank: never
+                                // virtual (#65).
+                                state.virtual_display = false;
                                 state.displayed_file_bytes = None;
                                 state.displayed_entry = None;
                             }
@@ -4056,6 +4184,8 @@ fn on_load_replies(hwnd: HWND) {
                 state.status_load_failed = true;
                 reset_display_marks(state);
                 state.displayed_entry = None;
+                // The cleared display is blank: never virtual (#65).
+                state.virtual_display = false;
                 state.displayed_file_bytes = None;
                 state.pending_file_bytes = None;
                 invalidate = true;
@@ -4811,6 +4941,16 @@ fn refresh_menu_state(hwnd: HWND, target: HMENU) {
             // is_image_enabled, viv.c:7103).
             image_enabled: clipboard::image_gate(
                 state.nav_current.is_some(),
+                state.status_file_not_found,
+                state.status_load_failed,
+            ),
+            // The display-kind gate (#65): frames on screen with no
+            // verdict standing — Copy Image / Close act on the pixels and
+            // must survive the `stdin:` virtual display. Identical to
+            // image_enabled for every real-file state (the two inputs
+            // only diverge when frames exist without a current file).
+            display_enabled: clipboard::image_gate(
+                state.image.is_some() || state.nav_current.is_some(),
                 state.status_file_not_found,
                 state.status_load_failed,
             ),
@@ -6872,87 +7012,89 @@ pub(crate) fn run() -> Result<(), String> {
         );
         // SAFETY: reading the thread's last error immediately after the call.
         if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
-            // Find the owner's window and hand off (viv.c:5286-5334). No
-            // window (the owner is mid-startup, before its class exists) is
-            // upstream's accepted race: the handoff is lost and this
-            // process still exits (viv.c:5336-5340) rather than show a
-            // second window.
-            // SAFETY: a pure top-level window search by static class name.
-            let other = unsafe { FindWindowA(copydata::FIND_CLASS, PCSTR::null()) }
-                .ok()
-                .filter(|h| !h.is_invalid());
-            if let Some(hwnd) = other {
-                // Let this process hand over the foreground (viv.c:5302) —
-                // the receiver foregrounds itself too; a lock denial is
-                // ignored like upstream.
-                // SAFETY: the found window is not ours but is live.
-                let _ = unsafe { SetForegroundWindow(hwnd) };
-                // The payload: this launch's ORIGINAL command line verbatim,
-                // its cwd, and its effective show command (the launcher's
-                // wShowWindow when STARTF_USESHOWWINDOW is set, else nCmdShow
-                // — SW_SHOWNORMAL for a plain launch — viv.c:5303-5310).
-                // SAFETY: GetCommandLineW returns this process's
-                // NUL-terminated command line, valid for the process
-                // lifetime; the walk reads up to that NUL.
-                let cl = unsafe {
-                    let cl = GetCommandLineW();
-                    let mut n = 0usize;
-                    while *cl.0.add(n) != 0 {
-                        n += 1;
-                    }
-                    std::slice::from_raw_parts(cl.0, n)
-                };
-                let mut cwd_buf = [0u16; copydata::STRING_SIZE];
-                // SAFETY: cwd_buf outlives the call; returns the length in
-                // u16 units WITHOUT the NUL on success, or the REQUIRED size
-                // WITH it when the buffer is too small. Upstream's
-                // GetCurrentDirectory(STRING_SIZE, …) truncates identically;
-                // a cwd longer than STRING_SIZE-1 is sent empty rather than
-                // upstream's uninitialized stack (the receiver's
-                // SetCurrentDirectory just fails either way).
-                let cwd_len = unsafe { GetCurrentDirectoryW(Some(&mut cwd_buf)) } as usize;
-                let cwd: &[u16] = if cwd_len < copydata::STRING_SIZE {
-                    &cwd_buf[..cwd_len]
-                } else {
-                    &[]
-                };
-                let mut si = STARTUPINFOW {
-                    cb: size_of::<STARTUPINFOW>() as u32,
-                    ..Default::default()
-                };
-                // SAFETY: fills this process's STARTUPINFOW; a read-only query.
-                unsafe { GetStartupInfoW(&mut si) };
-                let show_cmd = if (si.dwFlags & STARTF_USESHOWWINDOW).0 != 0 {
-                    u32::from(si.wShowWindow)
-                } else {
-                    SW_SHOWNORMAL.0 as u32
-                };
-                let payload = copydata::encode(show_cmd, cl, cwd);
-                let cds = COPYDATASTRUCT {
-                    dwData: copydata::COPYDATA_COMMAND_LINE,
-                    cbData: payload.len() as u32,
-                    // The receiver reads its copy during the synchronous
-                    // send — the const is a lie the API demands (lpData is
-                    // *mut), nothing writes through it.
-                    lpData: payload.as_ptr() as *mut c_void,
-                };
-                // SAFETY: cds outlives the synchronous send; WM_COPYDATA
-                // copies the payload into the receiver — the pointer is not
-                // retained past the call (and must not be: SendMessage
-                // blocks until the receiver returns, viv.c:5332).
-                let _ = unsafe {
-                    SendMessageW(
-                        hwnd,
-                        WM_COPYDATA,
-                        None,
-                        Some(LPARAM(&cds as *const COPYDATASTRUCT as isize)),
-                    )
-                };
+            // #65: a launch whose line will really read the pipe keeps its
+            // own stdin. The bytes belong to THIS process and cannot cross
+            // the handoff — the owning instance would read its own (foreign)
+            // stdin: an instant read failure from a GUI launch, a
+            // forever-blocked read from a console one. The predicate parses
+            // the line as this process's own startup parse (the pseudo-name
+            // as the lone file word), so lines that merely CONTAIN the word
+            // (`/everything stdin:`'s term, `a.png stdin:`'s dropped word)
+            // still forward like any other launch (README Differences; the
+            // decision record lives on issue #65).
+            if !cli::stdin_launch_keeps_own_window(&crate::assoc::command_line_wide()) {
+                // Find the owner's window and hand off (viv.c:5286-5334).
+                // No window (the owner is mid-startup, before its class
+                // exists) is upstream's accepted race: the handoff is lost
+                // and this process still exits (viv.c:5336-5340) rather
+                // than show a second window.
+                // SAFETY: a pure top-level window search by static class name.
+                let other = unsafe { FindWindowA(copydata::FIND_CLASS, PCSTR::null()) }
+                    .ok()
+                    .filter(|h| !h.is_invalid());
+                if let Some(hwnd) = other {
+                    // Let this process hand over the foreground (viv.c:5302) —
+                    // the receiver foregrounds itself too; a lock denial is
+                    // ignored like upstream.
+                    // SAFETY: the found window is not ours but is live.
+                    let _ = unsafe { SetForegroundWindow(hwnd) };
+                    // The payload: this launch's ORIGINAL command line verbatim,
+                    // its cwd, and its effective show command (the launcher's
+                    // wShowWindow when STARTF_USESHOWWINDOW is set, else nCmdShow
+                    // — SW_SHOWNORMAL for a plain launch — viv.c:5303-5310).
+                    let cl = crate::assoc::command_line_wide();
+                    let mut cwd_buf = [0u16; copydata::STRING_SIZE];
+                    // SAFETY: cwd_buf outlives the call; returns the length in
+                    // u16 units WITHOUT the NUL on success, or the REQUIRED size
+                    // WITH it when the buffer is too small. Upstream's
+                    // GetCurrentDirectory(STRING_SIZE, …) truncates identically;
+                    // a cwd longer than STRING_SIZE-1 is sent empty rather than
+                    // upstream's uninitialized stack (the receiver's
+                    // SetCurrentDirectory just fails either way).
+                    let cwd_len = unsafe { GetCurrentDirectoryW(Some(&mut cwd_buf)) } as usize;
+                    let cwd: &[u16] = if cwd_len < copydata::STRING_SIZE {
+                        &cwd_buf[..cwd_len]
+                    } else {
+                        &[]
+                    };
+                    let mut si = STARTUPINFOW {
+                        cb: size_of::<STARTUPINFOW>() as u32,
+                        ..Default::default()
+                    };
+                    // SAFETY: fills this process's STARTUPINFOW; a read-only query.
+                    unsafe { GetStartupInfoW(&mut si) };
+                    let show_cmd = if (si.dwFlags & STARTF_USESHOWWINDOW).0 != 0 {
+                        u32::from(si.wShowWindow)
+                    } else {
+                        SW_SHOWNORMAL.0 as u32
+                    };
+                    let payload = copydata::encode(show_cmd, &cl, cwd);
+                    let cds = COPYDATASTRUCT {
+                        dwData: copydata::COPYDATA_COMMAND_LINE,
+                        cbData: payload.len() as u32,
+                        // The receiver reads its copy during the synchronous
+                        // send — the const is a lie the API demands (lpData is
+                        // *mut), nothing writes through it.
+                        lpData: payload.as_ptr() as *mut c_void,
+                    };
+                    // SAFETY: cds outlives the synchronous send; WM_COPYDATA
+                    // copies the payload into the receiver — the pointer is not
+                    // retained past the call (and must not be: SendMessage
+                    // blocks until the receiver returns, viv.c:5332).
+                    let _ = unsafe {
+                        SendMessageW(
+                            hwnd,
+                            WM_COPYDATA,
+                            None,
+                            Some(LPARAM(&cds as *const COPYDATASTRUCT as isize)),
+                        )
+                    };
+                }
+                // Exit without a window (viv.c:5336-5340); the OwnedMutex Drop
+                // closes the handle on the way out (upstream _viv_kill,
+                // viv.c:5528).
+                return Ok(());
             }
-            // Exit without a window (viv.c:5336-5340); the OwnedMutex Drop
-            // closes the handle on the way out (upstream _viv_kill,
-            // viv.c:5528).
-            return Ok(());
         }
         Some(mutex)
     } else {
@@ -7021,6 +7163,7 @@ pub(crate) fn run() -> Result<(), String> {
         last_cache: None,
         last_nav_prev: false,
         displayed_entry: None,
+        virtual_display: false,
     };
 
     // SAFETY: returns the module handle of this exe; no side effects.
@@ -7335,6 +7478,21 @@ mod tests {
         // A hand-edited negative ini value reaches C as a huge DWORD —
         // effectively "always rapid"; riviv's `as u32` mirrors the cast.
         assert!(handoff_add_mode(1_000, Some(999), -1, true));
+    }
+
+    // ---- the virtual display's home fallback (#65) ----
+
+    #[test]
+    fn home_from_a_virtual_display_never_scans_the_working_directory() {
+        // An empty playlist behind a `stdin:` display: "return to the
+        // list" ends at a BLANK display (manual) or nothing at all (the
+        // preload flavor never blanks, viv.c:6247-6252) — never the
+        // upstream cwd scan, which has no file parent to scan around.
+        assert!(matches!(home_fallback(true, false), HomeFallback::Blank));
+        assert!(matches!(home_fallback(true, true), HomeFallback::Inert));
+        // A real (file-backed or blank) display keeps the upstream arm.
+        assert!(matches!(home_fallback(false, false), HomeFallback::ScanDir));
+        assert!(matches!(home_fallback(false, true), HomeFallback::ScanDir));
     }
 
     #[test]

@@ -187,17 +187,21 @@ pub(crate) fn copy_image(hwnd: HWND) {
         };
         // The bare current-file gate (viv.c:7538) plus the frame check
         // `_viv_set_clipboard_image` makes (viv.c:7487) — no display, no
-        // blit.
-        match state.nav_current.clone() {
-            Some(_) => state.image.as_ref().map(|i| {
-                (
-                    i.surface().mem_dc(),
-                    i.surface().width(),
-                    i.surface().height(),
-                )
-            }),
-            None => return,
+        // blit. #65 widens the gate to the `stdin:` VIRTUAL display:
+        // frames on screen with no backing file still blit (the keyboard
+        // mirror of the menu's display-kind split; a failed load over a
+        // kept display still has its current file — upstream's keyboard
+        // quirk unchanged).
+        if state.nav_current.is_none() && !state.virtual_display {
+            return;
         }
+        state.image.as_ref().map(|i| {
+            (
+                i.surface().mem_dc(),
+                i.surface().width(),
+                i.surface().height(),
+            )
+        })
     };
     let Some((src, w, h)) = frame else {
         return;

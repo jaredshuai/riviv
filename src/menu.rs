@@ -1710,6 +1710,13 @@ pub(crate) struct MenuState {
     /// stands). Gates the clipboard quartet; Paste stays ungated (upstream
     /// has no EnableMenuItem row for it).
     pub(crate) image_enabled: bool,
+    /// Whether FRAMES are on screen with no verdict standing (#65) — the
+    /// display-kind gate: Copy Image and Close work from the pixels alone
+    /// and must stay available on the `stdin:` VIRTUAL display (no
+    /// backing file). For every real-file state this reads exactly like
+    /// `image_enabled` (upstream's is_image_enabled covers them together);
+    /// the two differ only when frames exist without a current file.
+    pub(crate) display_enabled: bool,
     /// The Allow Shrinking / Keep Aspect / Fill Window trio's config
     /// snapshot (#46; upstream viv.c:7127-7129): the Fill row reads the
     /// fullscreen or windowed `fill_window` flag per the CURRENT mode
@@ -1793,20 +1800,17 @@ pub(crate) fn enabled(cmd: Cmd, state: &MenuState) -> bool {
         // The clipboard quartet (#41), the #42 shell septet, and #43's
         // six visible file-management rows: upstream grays them all
         // through the same `is_image_enabled` gate (viv.c:7104-7108 +
-        // 7114-7121). Paste is not in that list — an empty clipboard just
-        // makes the handler a no-op — and neither are the two hidden
-        // delete rows (upstream never grays them; their handlers' bare
-        // current-file guard is the only defense, viv.c:7202).
+        // 7114-7121) — a CURRENT FILE with no verdict standing. The
+        // `stdin:` virtual display (#65) has no file: this whole family
+        // grays on it.
         Cmd::EditCut
         | Cmd::EditCopy
         | Cmd::EditCopyFilename
-        | Cmd::EditCopyImage
         | Cmd::FileOpenFileLocation
         | Cmd::FileEdit
         | Cmd::FilePreview
         | Cmd::FilePrint
         | Cmd::FileSetDesktopWallpaper
-        | Cmd::FileClose
         | Cmd::FileDelete
         | Cmd::FileRename
         | Cmd::FileProperties
@@ -1814,6 +1818,14 @@ pub(crate) fn enabled(cmd: Cmd, state: &MenuState) -> bool {
         | Cmd::EditRotate270
         | Cmd::EditCopyTo
         | Cmd::EditMoveTo => state.image_enabled,
+        // Copy Image blits the DISPLAYED frame (upstream viv.c:7487) and
+        // Close blanks the viewer — both act on the pixels, not the file,
+        // so they ride the display-kind gate instead (#65): available on
+        // the virtual display, upstream-identical elsewhere. (Paste and
+        // the two hidden delete rows stay ungated like upstream — an
+        // empty clipboard no-ops and the hidden rows' handlers carry the
+        // bare current-file guard, viv.c:7202.)
+        Cmd::EditCopyImage | Cmd::FileClose => state.display_enabled,
         _ => true,
     }
 }
@@ -2081,6 +2093,7 @@ mod tests {
             nav_sort_ascending: true,
             shuffle: true,
             image_enabled: true,
+            display_enabled: true,
             allow_shrinking: true,
             keep_aspect: true,
             fill_window: true,
@@ -2099,6 +2112,7 @@ mod tests {
             nav_sort_ascending: false,
             shuffle: false,
             image_enabled: true,
+            display_enabled: true,
             allow_shrinking: false,
             keep_aspect: false,
             fill_window: false,
@@ -2298,6 +2312,7 @@ mod tests {
             nav_sort_ascending: false,
             shuffle: false,
             image_enabled: true,
+            display_enabled: true,
             allow_shrinking: false,
             keep_aspect: false,
             fill_window: false,
@@ -2331,7 +2346,8 @@ mod tests {
         // Location/Preview/Print/Properties/Wallpaper (viv.c:7114-7116)
         // through `is_image_enabled` — Paste has NO EnableMenuItem row (an
         // empty clipboard is just a no-op). Every other riviv command
-        // stays always-selectable.
+        // stays always-selectable. #65 splits the gate by display kind:
+        // a blank display (both flags down) grays the whole family.
         let gated_cmds = [
             Cmd::EditCut,
             Cmd::EditCopy,
@@ -2353,10 +2369,50 @@ mod tests {
         }
         let mut gated = plain_state();
         gated.image_enabled = false;
+        gated.display_enabled = false;
         for cmd in gated_cmds {
             assert!(!enabled(cmd, &gated), "{cmd:?}");
         }
         assert!(enabled(Cmd::EditPaste, &gated), "{:?}", Cmd::EditPaste);
+    }
+
+    #[test]
+    fn a_virtual_display_grays_the_file_family_but_keeps_the_pixel_commands() {
+        // #65's `stdin:` display: frames exist with no backing file — the
+        // file family grays (nothing to cut/copy/verb/delete/rename) while
+        // Copy Image (blits the displayed frame, viv.c:7487) and Close
+        // (blanks the viewer) stay available on the display gate.
+        let mut virtual_state = plain_state();
+        virtual_state.image_enabled = false;
+        virtual_state.display_enabled = true;
+        for cmd in [
+            Cmd::EditCut,
+            Cmd::EditCopy,
+            Cmd::EditCopyFilename,
+            Cmd::FileOpenFileLocation,
+            Cmd::FileEdit,
+            Cmd::FilePreview,
+            Cmd::FilePrint,
+            Cmd::FileSetDesktopWallpaper,
+            Cmd::FileDelete,
+            Cmd::FileRename,
+            Cmd::FileProperties,
+            Cmd::EditRotate90,
+            Cmd::EditRotate270,
+            Cmd::EditCopyTo,
+            Cmd::EditMoveTo,
+        ] {
+            assert!(!enabled(cmd, &virtual_state), "{cmd:?}");
+        }
+        assert!(enabled(Cmd::EditCopyImage, &virtual_state));
+        assert!(enabled(Cmd::FileClose, &virtual_state));
+        // The ungated family stays ungated (Paste), and a standing verdict
+        // (a dropped missing file over the kept virtual display) grays
+        // the display gate too — exactly like upstream's flag chain.
+        assert!(enabled(Cmd::EditPaste, &virtual_state));
+        virtual_state.display_enabled = false;
+        assert!(!enabled(Cmd::EditCopyImage, &virtual_state));
+        assert!(!enabled(Cmd::FileClose, &virtual_state));
     }
 
     #[test]
@@ -2400,6 +2456,7 @@ mod tests {
         assert_eq!(Cmd::ViewOptions.id(), 69);
         assert_eq!(Cmd::SlideshowRate1000.id(), 77);
         assert_eq!(Cmd::AnimationRateDecrease.id(), 104);
+        assert_eq!(Cmd::NavNext.id(), 107); // smoke65 posts Next by raw id
         assert_eq!(Cmd::HelpAbout.id(), 121);
         assert_eq!(Cmd::COUNT, 121);
     }
