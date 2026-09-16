@@ -279,6 +279,63 @@ impl Playlist {
         let &index = if end { order.last()? } else { order.first()? };
         self.entries.get(index as usize)
     }
+
+    /// Remove the first entry whose insertion id equals `id` (#43; upstream
+    /// `_viv_playlist_delete`, viv.c:9383-9443 — the delete-current
+    /// convergence). Identity is the id pair exactly like upstream's
+    /// `_viv_playlist_from_fd` / `_viv_playlist_shuffle_index_from_fd`
+    /// (dwReserved0/1 equality, viv.c:13527-13567), collisions included:
+    /// a direct-open current (id 0) removes the first id-0 node — the same
+    /// collision `add_current_if_empty` relies on. In shuffle mode the scan
+    /// runs over the ORDER array (first slot holding the id) and the slot is
+    /// spliced out of the order — upstream's memmove over
+    /// `_viv_playlist_shuffle_indexes` — before the entry leaves the Vec,
+    /// sliding every later index down one.
+    pub(crate) fn remove_by_id(&mut self, id: u64) -> bool {
+        let pos = if self.shuffle_order.is_some() {
+            // Upstream skips the whole removal when the order lookup misses
+            // (the `index != -1` gate, viv.c:9389) — the order covers every
+            // entry, so a miss means the id is absent, same as below.
+            let Some(slot) = self.shuffle_order.as_ref().and_then(|order| {
+                order
+                    .iter()
+                    .position(|&i| self.entries[i as usize].id == id)
+            }) else {
+                return false;
+            };
+            let Some(order) = self.shuffle_order.as_mut() else {
+                return false;
+            };
+            let pos = order.remove(slot) as usize;
+            for v in order.iter_mut() {
+                if *v as usize > pos {
+                    *v -= 1;
+                }
+            }
+            pos
+        } else {
+            let Some(pos) = self.entries.iter().position(|e| e.id == id) else {
+                return false;
+            };
+            pos
+        };
+        self.entries.remove(pos);
+        true
+    }
+
+    /// Point the first entry whose path equals `old` (byte-exact, the
+    /// OsString compare upstream's case-sensitive `string_compare` makes of
+    /// `cFileName`, viv.c:9453-9468) at `new`. Only the path moves — the
+    /// size/timestamps stay as added, like upstream's bare `string_copy` of
+    /// the name field.
+    pub(crate) fn rename_path(&mut self, old: &OsStr, new: &OsStr) -> bool {
+        if let Some(entry) = self.entries.iter_mut().find(|e| e.path == *old) {
+            entry.path = new.to_os_string();
+            true
+        } else {
+            false
+        }
+    }
 }
 
 /// One xorshift64* draw reduced into `[0, modulus)` (the shuffle's
@@ -1439,5 +1496,96 @@ mod tests {
             pl.shuffle_target(&only, true).map(|e| e.path.clone()),
             Some(OsString::from("only.png"))
         );
+    }
+
+    // #43: delete-current convergence — id match (first in insertion order),
+    // no-op on absent id.
+    #[test]
+    fn remove_by_id_deletes_the_first_matching_entry() {
+        let mut pl = Playlist::new();
+        pl.add(OsString::from("a.png"), 1, 0, 0); // id 0
+        pl.add(OsString::from("b.png"), 2, 0, 0); // id 1
+        pl.add(OsString::from("c.png"), 3, 0, 0); // id 2
+        assert!(pl.remove_by_id(1));
+        let paths: Vec<OsString> = pl.entries().iter().map(|e| e.path.clone()).collect();
+        assert_eq!(
+            paths,
+            vec![OsString::from("a.png"), OsString::from("c.png")]
+        );
+        assert!(!pl.remove_by_id(99));
+        assert_eq!(pl.entries().len(), 2);
+    }
+
+    // The direct-open collision (id 0) removes the first id-0 node — the
+    // same identity upstream's unguarded id compare builds (viv.c:13548+).
+    #[test]
+    fn remove_by_id_honors_the_id_zero_collision() {
+        let mut pl = Playlist::new();
+        pl.add(OsString::from("scan0.png"), 1, 0, 0); // id 0
+        pl.add(OsString::from("added.png"), 2, 0, 0); // id 1
+        pl.add(OsString::from("scan0-twin.png"), 3, 0, 0); // id 2
+        // Direct-open carries id 0 — the FIRST id-0 entry goes.
+        assert!(pl.remove_by_id(0));
+        assert_eq!(pl.entries()[0].path, OsString::from("added.png"));
+        assert_eq!(pl.entries()[1].path, OsString::from("scan0-twin.png"));
+    }
+
+    // Shuffle mode: the id's slot leaves the order and later entry indices
+    // slide down — upstream's array splice (viv.c:9396-9400).
+    #[test]
+    fn remove_by_id_splices_the_shuffle_order_too() {
+        let mut pl = Playlist::new();
+        for name in ["a.png", "b.png", "c.png", "d.png"] {
+            pl.add(OsString::from(name), 1, 0, 0);
+        }
+        pl.ensure_shuffle(7);
+        let before: Vec<u32> = pl.shuffle_order.clone().expect("built");
+        // Remove the middle entry (b, insertion index 1).
+        assert!(pl.remove_by_id(1));
+        let order = pl.shuffle_order.as_ref().expect("order survives");
+        assert_eq!(order.len(), 3);
+        // The order is a permutation of the surviving entry indices 0..3
+        // minus b's slot, with every index past 1 slid down by one.
+        let mut sorted = order.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, vec![0, 1, 2]);
+        // Every remaining slot still points at the same FILE as before the
+        // removal (identity by path, not by stale index).
+        let names_before: Vec<OsString> = before
+            .iter()
+            .filter_map(|&i| {
+                let name = ["a.png", "b.png", "c.png", "d.png"][i as usize];
+                (name != "b.png").then(|| OsString::from(name))
+            })
+            .collect();
+        let names_after: Vec<OsString> = order
+            .iter()
+            .map(|&i| pl.entries()[i as usize].path.clone())
+            .collect();
+        assert_eq!(names_after, names_before);
+        // And a miss inside a built order still no-ops everything.
+        assert!(!pl.remove_by_id(77));
+    }
+
+    // #43: rename sync — first exact path match, byte compare (case
+    // sensitive like upstream string_compare), path field only.
+    #[test]
+    fn rename_path_retargets_the_first_exact_match() {
+        let mut pl = Playlist::new();
+        pl.add(OsString::from(r"C:\dir\a.png"), 1, 0, 0);
+        pl.add(OsString::from(r"C:\dir\b.png"), 2, 0, 0);
+        assert!(pl.rename_path(
+            OsStr::new(r"C:\dir\a.png"),
+            OsStr::new(r"C:\dir\renamed.png")
+        ));
+        assert_eq!(pl.entries()[0].path, OsString::from(r"C:\dir\renamed.png"));
+        // Stats untouched — upstream copies the name field only (viv.c:9465).
+        assert_eq!(pl.entries()[0].modified, 1);
+        assert_eq!(pl.entries()[0].id, 0);
+        assert_eq!(pl.entries()[1].path, OsString::from(r"C:\dir\b.png"));
+        // No match: no-op, false.
+        assert!(!pl.rename_path(OsStr::new(r"C:\dir\zz.png"), OsStr::new("x")));
+        // Case difference is a different path — upstream compares raw.
+        assert!(!pl.rename_path(OsStr::new(r"C:\dir\B.PNG"), OsStr::new("x")));
     }
 }

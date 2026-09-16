@@ -38,6 +38,8 @@ const VK_LEFT: u16 = 0x25;
 const VK_UP: u16 = 0x26;
 const VK_RIGHT: u16 = 0x27;
 const VK_DOWN: u16 = 0x28;
+const VK_DELETE: u16 = 0x2e;
+const VK_F2: u16 = 0x71;
 const VK_NEXT: u16 = 0x22;
 const VK_PRIOR: u16 = 0x21;
 const VK_F1: u16 = 0x70;
@@ -117,6 +119,19 @@ const DEFAULT_KEYS: &[(Cmd, &[KeyDef])] = &[
     ),
     (Cmd::FilePrint, &[key(true, false, false, b'P' as u16)]),
     (Cmd::FileClose, &[key(true, false, false, b'W' as u16)]),
+    // #43 (viv.c:984-985, between Close and Exit): the two hidden delete
+    // rows carry Del / Shift+Del, Rename takes F2. The menu-visible
+    // Delete row has NO key upstream — its Shift probe only runs on a
+    // menu/bar dispatch.
+    (
+        Cmd::FileDeleteRecycle,
+        &[key(false, false, false, VK_DELETE)],
+    ),
+    (
+        Cmd::FileDeletePermanently,
+        &[key(false, false, true, VK_DELETE)],
+    ),
+    (Cmd::FileRename, &[key(false, false, false, VK_F2)]),
     (Cmd::FileExit, &[key(true, false, false, b'Q' as u16)]),
     // The #41 clipboard quartet (viv.c:987-990, right after the exit row
     // and before the view presets — upstream table order).
@@ -639,10 +654,27 @@ mod tests {
             vks(Cmd::FileClose),
             vec![k(true, false, false, b'W' as u16)]
         );
+        // #43 (viv.c:984-985): Del / Shift+Del / F2 between Close and
+        // Exit. The menu-visible Delete row itself never registered a key
+        // upstream — Del belongs to the hidden Recycle row.
+        assert_eq!(
+            vks(Cmd::FileDeleteRecycle),
+            vec![k(false, false, false, VK_DELETE)]
+        );
+        assert_eq!(
+            vks(Cmd::FileDeletePermanently),
+            vec![k(false, false, true, VK_DELETE)]
+        );
+        assert_eq!(vks(Cmd::FileRename), vec![k(false, false, false, VK_F2)]);
+        assert!(vks(Cmd::FileDelete).is_empty());
         assert!(vks(Cmd::FileEdit).is_empty());
         assert!(vks(Cmd::FilePreview).is_empty());
         assert!(vks(Cmd::FileSetDesktopWallpaper).is_empty());
         assert!(vks(Cmd::FileProperties).is_empty());
+        assert!(vks(Cmd::EditRotate90).is_empty());
+        assert!(vks(Cmd::EditRotate270).is_empty());
+        assert!(vks(Cmd::EditCopyTo).is_empty());
+        assert!(vks(Cmd::EditMoveTo).is_empty());
         // The #46 additions: presets on bare digits, window sizes on
         // Alt+digits, Ctrl+T on-top, F5 refresh (viv.c:991-993/997-1000/
         // 1024/1026).
@@ -945,8 +977,20 @@ mod tests {
                 "file_set_desktop_wallpaper_keys",
             ),
             (Cmd::FileClose, "file_close_keys"),
+            // #43's delete/rename quartet ("Delete (Recycle)" drops its
+            // parens, "Rena&me" its mnemonic).
+            (Cmd::FileDelete, "file_delete_keys"),
+            (Cmd::FileDeleteRecycle, "file_delete_recycle_keys"),
+            (Cmd::FileDeletePermanently, "file_delete_permanently_keys"),
+            (Cmd::FileRename, "file_rename_keys"),
             (Cmd::FileProperties, "file_properties_keys"),
             (Cmd::FileExit, "file_exit_keys"),
+            // #43's Edit tail: rotations and the copy/move pair ("Copy to
+            // &Folder..." keeps its inner spaces, drops the dots).
+            (Cmd::EditRotate90, "edit_rotate_clockwise_keys"),
+            (Cmd::EditRotate270, "edit_rotate_counterclockwise_keys"),
+            (Cmd::EditCopyTo, "edit_copy_to_folder_keys"),
+            (Cmd::EditMoveTo, "edit_move_to_folder_keys"),
             // The #46 View block: the two hidden style toggles ("Caption",
             // "Frame"), Status Bar, the Preset trio, the Window Size
             // quartet ("50%" drops its '%'), Refresh, the fit trio and the

@@ -234,6 +234,14 @@ impl LoadSession {
         &self.path
     }
 
+    /// #43 rename follow-up: retitle an in-flight session whose file was
+    /// just renamed, so the adoption arm lands the NEW name in the title
+    /// (upstream has a single `current_fd.cFileName` to update; riviv's
+    /// session carries its own copy).
+    pub(crate) fn set_path(&mut self, path: OsString) {
+        self.path = path;
+    }
+
     /// Ask the worker to abandon this job at its next check (immediately
     /// for queued jobs, between frames for animations, after the single
     /// decode for stills — upstream granularity, viv.c:10610).

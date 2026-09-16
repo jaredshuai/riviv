@@ -585,9 +585,10 @@ mod tests {
         let back = parse_apply(&text, true);
         assert_eq!(back, c, "every save key must be a load key");
         // 60 int keys + one *_keys line per command in Cmd::ALL order —
-        // 89 bound, the rest empty (#42 adds the shell septet: three
-        // bound, four empty).
-        assert_eq!(c.to_pairs(false).len(), 173, "the upstream save table");
+        // 92 bound, the rest empty (#42 adds the shell septet: three
+        // bound, four empty; #43 adds the file-management octet: Del /
+        // Shift+Del / F2 bound, five empty).
+        assert_eq!(c.to_pairs(false).len(), 181, "the upstream save table");
     }
 
     #[test]
@@ -637,7 +638,7 @@ mod tests {
         let c = Config::default();
         assert_eq!(
             c.to_pairs(true).len(),
-            173,
+            181,
             "active store writes the full table"
         );
         let c = Config {

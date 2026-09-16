@@ -32,9 +32,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use windows::Win32::Foundation::GetLastError;
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleBitmap, CreateCompatibleDC,
-    CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetCurrentObject, GetDC, HALFTONE,
-    HBITMAP, HDC, HGDIOBJ, OBJ_BITMAP, ReleaseDC, SRCCOPY, STRETCH_BLT_MODE, SelectObject,
-    SetStretchBltMode, StretchBlt,
+    CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetCurrentObject, GetDC, GetDIBits,
+    HALFTONE, HBITMAP, HDC, HGDIOBJ, OBJ_BITMAP, ReleaseDC, SRCCOPY, STRETCH_BLT_MODE,
+    SelectObject, SetStretchBltMode, StretchBlt,
 };
 
 use crate::mip;
@@ -360,6 +360,85 @@ fn generate_mip(
     })
 }
 
+/// The GDI half of #43's rotation: GetDIBits the source bitmap into a
+/// BGRA buffer, run the pure rotation, and CreateDIBSection the result —
+/// returning the new bitmap with its swapped dimensions, or `None` on any
+/// GDI failure (the caller keeps the old frame then, upstream's
+/// fail-soft).
+fn rotate_dib(
+    probe_dc: &HDC,
+    bitmap: HBITMAP,
+    wide: usize,
+    high: usize,
+    clockwise: bool,
+) -> Option<(HBITMAP, i32, i32)> {
+    let mut src = vec![0u8; wide * high * 4];
+    let mut dst = vec![0u8; wide * high * 4];
+    let mut read_info = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: wide as i32,
+            biHeight: -(high as i32), // top-down rows, like the loader's DIBs
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    // SAFETY: `bitmap` is a valid 32bpp DIB owned by the caller, not
+    // selected into `probe_dc`; `src` holds exactly wide*high*4 writable
+    // bytes; `read_info` is a valid stack header (the API may adjust the
+    // format fields back — hence the mutable pointer its signature takes).
+    let got = unsafe {
+        GetDIBits(
+            *probe_dc,
+            bitmap,
+            0,
+            high as u32,
+            Some(src.as_mut_ptr().cast()),
+            &mut read_info,
+            DIB_RGB_COLORS,
+        )
+    };
+    if got == 0 {
+        return None;
+    }
+    if clockwise {
+        crate::pixels::rotate_bgra_90_cw(&src, wide, high, &mut dst);
+    } else {
+        crate::pixels::rotate_bgra_270_cw(&src, wide, high, &mut dst);
+    }
+    let (new_wide, new_high) = (high as i32, wide as i32);
+    let info = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: new_wide,
+            biHeight: -new_high,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut bits: *mut c_void = std::ptr::null_mut();
+    // SAFETY: `info` is a valid stack BITMAPINFO outliving the call; we own
+    // the returned DIB section (no file mapping, no palette with BI_RGB).
+    let created = unsafe { CreateDIBSection(None, &info, DIB_RGB_COLORS, &mut bits, None, 0) };
+    let bitmap = created.ok()?;
+    if bits.is_null() {
+        // SAFETY: bitmap was created above and is owned by us; nothing
+        // references it yet.
+        let _ = unsafe { DeleteObject(HGDIOBJ(bitmap.0)) };
+        return None;
+    }
+    // SAFETY: `bits` points at exactly new_wide*new_high*4 writable bytes
+    // of the freshly created section; `dst` holds the same count.
+    unsafe { std::ptr::copy_nonoverlapping(dst.as_ptr(), bits.cast::<u8>(), dst.len()) };
+    Some((bitmap, new_wide, new_high))
+}
+
 /// A frame selected into a private memory DC, ready for StretchBlt —
 /// built on the UI thread from a worker-produced [`DibFrame`] so the DC
 /// never leaves the thread that created it.
@@ -428,6 +507,67 @@ impl Surface {
 
     pub(crate) fn height(&self) -> i32 {
         self.frame.height
+    }
+
+    /// #43 in-place rotation (upstream `_viv_edit_rotate`'s memory pass,
+    /// viv.c:7729-7749 over `_viv_orientate_hbitmap` viv.c:13671-13850):
+    /// read the frame DIB through a throwaway DC, rotate the BGRA buffer
+    /// with the pure pixels helper, build a fresh DIB section of the
+    /// swapped dimensions, swap it into this surface's memory DC, and drop
+    /// the mips (upstream frees every frame's chain, viv.c:7742-7749 —
+    /// paint lazily regenerates from the new orientation). The frame's
+    /// slot in the animation timeline is untouched. Fail-soft like
+    /// upstream: on any GDI failure the frame stays exactly as it was
+    /// (`_viv_orientate_hbitmap` returns 0 and the caller skips the swap).
+    pub(crate) fn rotate(&mut self, clockwise: bool) -> bool {
+        let wide = self.frame.width as usize;
+        let high = self.frame.height as usize;
+        if wide == 0 || high == 0 {
+            return false;
+        }
+        // GetDIBits must see the bitmap NOT selected into the DC it is
+        // handed (its documented contract) — upstream passes a fresh
+        // memory DC for the same reason (viv.c:13721-13725).
+        // SAFETY: a throwaway DC owned by this thread, selected with
+        // nothing, deleted exactly once at the tail.
+        let probe_dc = unsafe { CreateCompatibleDC(None) };
+        if probe_dc.is_invalid() {
+            return false;
+        }
+        let rotated = rotate_dib(&probe_dc, self.frame.bitmap, wide, high, clockwise);
+        let Some((bitmap, new_wide, new_high)) = rotated else {
+            // SAFETY: the DC was created above and is owned by us.
+            let _ = unsafe { DeleteDC(probe_dc) };
+            return false;
+        };
+        // Swap the new bitmap into the surface's DC BEFORE the old
+        // DibFrame drops — DeleteObject on a still-selected bitmap is
+        // undefined.
+        // SAFETY: self.memdc is this surface's DC (UI thread); the old
+        // selection is self.frame.bitmap, which the drop below reclaims.
+        let swapped = unsafe { SelectObject(self.memdc, HGDIOBJ(bitmap.0)) };
+        if swapped.is_invalid() {
+            // SAFETY: the new bitmap is selected nowhere; owned by us.
+            let _ = unsafe { DeleteObject(HGDIOBJ(bitmap.0)) };
+            // SAFETY: as the tail below.
+            let _ = unsafe { DeleteDC(probe_dc) };
+            return false;
+        }
+        // The old frame (bitmap no longer selected) drops here; its stale
+        // mip chain went with it or with self.mips below.
+        self.frame = DibFrame {
+            bitmap,
+            width: new_wide,
+            height: new_high,
+            mips: Vec::new(),
+        };
+        // SAFETY: RawMip's Drop deletes each stale level's DDB — none is
+        // selected anywhere (they only ever select transiently).
+        self.mips.clear();
+        self.mips_stuck = None; // a fresh chain may succeed now
+        // SAFETY: as above — the throwaway DC leaves scope here.
+        let _ = unsafe { DeleteDC(probe_dc) };
+        true
     }
 
     /// The memory DC the frame DIB is selected into — read-only use (the
