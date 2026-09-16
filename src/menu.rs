@@ -1468,6 +1468,202 @@ pub(crate) fn item_text(label: &str, key: Option<&str>) -> String {
     }
 }
 
+/// The command whose first binding names a row's accelerator: upstream
+/// remaps the visible Delete row onto the recycle-delete key — the visible
+/// row itself carries no default binding (Del belongs to the hidden
+/// recycle row) — in BOTH the menu-bar build (viv.c:12351-12361) and the
+/// context-menu walk (viv.c:3454-3461).
+pub(crate) fn hint_cmd(cmd: Cmd) -> Cmd {
+    if cmd == Cmd::FileDelete {
+        Cmd::FileDeleteRecycle
+    } else {
+        cmd
+    }
+}
+
+/// One entry of the context-menu table (#49; upstream's flat
+/// `_viv_context_menu_items[]`, viv.c:1053-1123 — a WORD array whose three
+/// value kinds encode commands, submenu markers and separators: a fresh
+/// `_VIV_MENU_*` marker pushes a submenu, its repeat pops back).
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ContextEntry {
+    /// A command row (upstream: an id above `_VIV_MENU_COUNT`).
+    Command(Cmd),
+    /// Push a submenu (upstream: a `_VIV_MENU_*` marker seen fresh; the
+    /// label override for the Rate popup lives here, viv.c:3498-3507 —
+    /// Sort falls through to its own command-table string).
+    PushPopup { slot: Slot, label: loc::Id },
+    /// Pop back to the top level (upstream viv.c:3482-3487 — this arm
+    /// switches `curmenu` and touches NOTHING else, not the separator
+    /// dedupe state).
+    PopPopup,
+    /// A separator (upstream: 0).
+    Separator,
+}
+
+/// The context-menu table, a verbatim port of upstream's
+/// `_viv_context_menu_items[]` (viv.c:1053-1123) in table order. Only the
+/// walk ([`context_rows`]) applies gates: Preview (Win8+ baseline,
+/// viv.c:3418-3423) and the Menu recovery row (bar visible, viv.c:3427).
+/// Upstream comments the slideshow row out (viv.c:1090) — absent here too.
+pub(crate) const CONTEXT_TABLE: &[ContextEntry] = &[
+    ContextEntry::Command(Cmd::NavNext),
+    ContextEntry::Command(Cmd::NavPrev),
+    ContextEntry::Separator,
+    ContextEntry::Command(Cmd::ViewFullscreen),
+    ContextEntry::Command(Cmd::SlideshowPause),
+    ContextEntry::PushPopup {
+        slot: Slot::SlideshowRate,
+        label: loc::Id::MenuSlideshowRate,
+    },
+    ContextEntry::Command(Cmd::SlideshowRateDecrease),
+    ContextEntry::Command(Cmd::SlideshowRateIncrease),
+    ContextEntry::Separator,
+    ContextEntry::Command(Cmd::SlideshowRate250),
+    ContextEntry::Command(Cmd::SlideshowRate500),
+    ContextEntry::Command(Cmd::SlideshowRate1000),
+    ContextEntry::Command(Cmd::SlideshowRate2000),
+    ContextEntry::Command(Cmd::SlideshowRate3000),
+    ContextEntry::Command(Cmd::SlideshowRate4000),
+    ContextEntry::Command(Cmd::SlideshowRate5000),
+    ContextEntry::Command(Cmd::SlideshowRate6000),
+    ContextEntry::Command(Cmd::SlideshowRate7000),
+    ContextEntry::Command(Cmd::SlideshowRate8000),
+    ContextEntry::Command(Cmd::SlideshowRate9000),
+    ContextEntry::Command(Cmd::SlideshowRate10000),
+    ContextEntry::Command(Cmd::SlideshowRate20000),
+    ContextEntry::Command(Cmd::SlideshowRate30000),
+    ContextEntry::Command(Cmd::SlideshowRate40000),
+    ContextEntry::Command(Cmd::SlideshowRate50000),
+    ContextEntry::Command(Cmd::SlideshowRate60000),
+    ContextEntry::Command(Cmd::SlideshowRateCustom),
+    ContextEntry::PopPopup,
+    ContextEntry::Separator,
+    ContextEntry::Command(Cmd::ViewMenu),
+    ContextEntry::Separator,
+    ContextEntry::Command(Cmd::ViewAllowShrinking),
+    ContextEntry::Command(Cmd::ViewKeepAspect),
+    ContextEntry::Command(Cmd::ViewFillWindow),
+    ContextEntry::Command(Cmd::ViewOneToOne),
+    ContextEntry::Separator,
+    ContextEntry::PushPopup {
+        slot: Slot::NavigateSort,
+        label: loc::Id::MenuSort,
+    },
+    ContextEntry::Command(Cmd::NavSortName),
+    ContextEntry::Command(Cmd::NavSortFullPath),
+    ContextEntry::Command(Cmd::NavSortSize),
+    ContextEntry::Command(Cmd::NavSortDateModified),
+    ContextEntry::Command(Cmd::NavSortDateCreated),
+    ContextEntry::Separator,
+    ContextEntry::Command(Cmd::NavSortAscending),
+    ContextEntry::Command(Cmd::NavSortDescending),
+    ContextEntry::PopPopup,
+    ContextEntry::Separator,
+    ContextEntry::Command(Cmd::FileOpenFileLocation),
+    ContextEntry::Command(Cmd::FileSetDesktopWallpaper),
+    ContextEntry::Command(Cmd::FileEdit),
+    ContextEntry::Command(Cmd::FilePrint),
+    // No FilePreview row: upstream skips it on Windows 8+ (viv.c:3418-3423
+    // — "this doesn't exist on Windows 8 or later"); riviv's baseline is
+    // Win8+, so the walk drops it unconditionally.
+    ContextEntry::Separator,
+    ContextEntry::Command(Cmd::EditRotate90),
+    ContextEntry::Command(Cmd::EditRotate270),
+    ContextEntry::Separator,
+    ContextEntry::Command(Cmd::EditCut),
+    ContextEntry::Command(Cmd::EditCopy),
+    ContextEntry::Command(Cmd::EditCopyImage),
+    ContextEntry::Separator,
+    ContextEntry::Command(Cmd::FileDelete),
+    ContextEntry::Command(Cmd::FileRename),
+    ContextEntry::Separator,
+    ContextEntry::Command(Cmd::FileProperties),
+    ContextEntry::Command(Cmd::ViewOptions),
+    ContextEntry::Separator,
+    ContextEntry::Command(Cmd::FileExit),
+];
+
+/// One built row of the context menu — the flattened walk of
+/// [`CONTEXT_TABLE`] (the output of upstream's build loop, viv.c:3400-3527;
+/// the window shell replays Push/Pop to switch the append target exactly
+/// like upstream's `curmenu`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ContextRow {
+    Command { cmd: Cmd, label: loc::Id },
+    Popup { slot: Slot, label: loc::Id },
+    Pop,
+    Separator,
+}
+
+/// The caption a context-menu command row carries: upstream copies the
+/// command's own localization string, except the slideshow-pause row takes
+/// the Play/Pause string (viv.c:3442-3452).
+pub(crate) fn context_label(cmd: Cmd) -> loc::Id {
+    if cmd == Cmd::SlideshowPause {
+        return loc::Id::MenuSlideshowPlayPause;
+    }
+    command_loc(cmd)
+}
+
+/// The localization id of a command's table row (upstream's
+/// `_viv_command_index_from_command_id` + the row's localization id — every
+/// command the context table names has exactly one ENTRIES row, the
+/// registration invariant `item_commands_are_unique` pins).
+fn command_loc(cmd: Cmd) -> loc::Id {
+    for entry in ENTRIES {
+        if let Entry::Item { loc, cmd: c, .. } | Entry::HiddenItem { loc, cmd: c, .. } = *entry
+            && c == cmd
+        {
+            return loc;
+        }
+    }
+    unreachable!("every Cmd variant has an ENTRIES row (tested invariant)")
+}
+
+/// Walk [`CONTEXT_TABLE`] into the rows the context menu shows under a
+/// config (upstream's build loop, viv.c:3400-3527): the Menu recovery row
+/// drops while the bar shows (viv.c:3427), the Preview row never ships on
+/// the Win8+ baseline (viv.c:3418-3423), and separators dedupe through one
+/// `was_separator` state — init true (a table-leading separator would be
+/// eaten), cleared by every command/popup append, set by a separator
+/// append, untouched by skipped rows AND by pops; ONE state shared across
+/// submenu levels, exactly upstream. The dropped Menu row's two neighboring
+/// separators therefore merge into one.
+pub(crate) fn context_rows(show_menu: bool) -> Vec<ContextRow> {
+    let mut rows = Vec::new();
+    let mut was_separator = true;
+    for entry in CONTEXT_TABLE {
+        match *entry {
+            ContextEntry::Command(cmd) => {
+                if cmd == Cmd::FilePreview {
+                    continue; // Win8+ never ships the row (viv.c:3418-3423)
+                }
+                if cmd == Cmd::ViewMenu && show_menu {
+                    continue; // bar visible: no recovery row (viv.c:3427)
+                }
+                rows.push(ContextRow::Command {
+                    cmd,
+                    label: context_label(cmd),
+                });
+                was_separator = false;
+            }
+            ContextEntry::PushPopup { slot, label } => {
+                rows.push(ContextRow::Popup { slot, label });
+                was_separator = false;
+            }
+            ContextEntry::PopPopup => rows.push(ContextRow::Pop),
+            ContextEntry::Separator => {
+                if !was_separator {
+                    rows.push(ContextRow::Separator);
+                    was_separator = true;
+                }
+            }
+        }
+    }
+    rows
+}
+
 /// The dynamic menu state read when a menu is about to open (the inputs of
 /// upstream `_viv_check_menus`' CheckMenuItem calls, viv.c:7123-7132 —
 /// upstream's EnableMenuItem list is copy/delete/print-style commands
@@ -2250,5 +2446,232 @@ mod tests {
                 Cmd::AnimationJumpBackwardLong,
             ]
         );
+    }
+
+    /// #49: the context walk pinned against upstream's table order
+    /// (`_viv_context_menu_items`, viv.c:1053-1123) with the bar hidden —
+    /// the verbatim table. Any future insertion into CONTEXT_TABLE shifts
+    /// this and gets caught here.
+    #[test]
+    fn context_rows_pin_the_upstream_table_order() {
+        let c = |cmd| ContextRow::Command {
+            cmd,
+            label: context_label(cmd),
+        };
+        let pp = |slot, label| ContextRow::Popup { slot, label };
+        let expected_full = vec![
+            c(Cmd::NavNext),
+            c(Cmd::NavPrev),
+            ContextRow::Separator,
+            c(Cmd::ViewFullscreen),
+            c(Cmd::SlideshowPause),
+            pp(Slot::SlideshowRate, loc::Id::MenuSlideshowRate),
+            c(Cmd::SlideshowRateDecrease),
+            c(Cmd::SlideshowRateIncrease),
+            ContextRow::Separator,
+            c(Cmd::SlideshowRate250),
+            c(Cmd::SlideshowRate500),
+            c(Cmd::SlideshowRate1000),
+            c(Cmd::SlideshowRate2000),
+            c(Cmd::SlideshowRate3000),
+            c(Cmd::SlideshowRate4000),
+            c(Cmd::SlideshowRate5000),
+            c(Cmd::SlideshowRate6000),
+            c(Cmd::SlideshowRate7000),
+            c(Cmd::SlideshowRate8000),
+            c(Cmd::SlideshowRate9000),
+            c(Cmd::SlideshowRate10000),
+            c(Cmd::SlideshowRate20000),
+            c(Cmd::SlideshowRate30000),
+            c(Cmd::SlideshowRate40000),
+            c(Cmd::SlideshowRate50000),
+            c(Cmd::SlideshowRate60000),
+            c(Cmd::SlideshowRateCustom),
+            ContextRow::Pop,
+            ContextRow::Separator,
+            c(Cmd::ViewMenu),
+            ContextRow::Separator,
+            c(Cmd::ViewAllowShrinking),
+            c(Cmd::ViewKeepAspect),
+            c(Cmd::ViewFillWindow),
+            c(Cmd::ViewOneToOne),
+            ContextRow::Separator,
+            pp(Slot::NavigateSort, loc::Id::MenuSort),
+            c(Cmd::NavSortName),
+            c(Cmd::NavSortFullPath),
+            c(Cmd::NavSortSize),
+            c(Cmd::NavSortDateModified),
+            c(Cmd::NavSortDateCreated),
+            ContextRow::Separator,
+            c(Cmd::NavSortAscending),
+            c(Cmd::NavSortDescending),
+            ContextRow::Pop,
+            ContextRow::Separator,
+            c(Cmd::FileOpenFileLocation),
+            c(Cmd::FileSetDesktopWallpaper),
+            c(Cmd::FileEdit),
+            c(Cmd::FilePrint),
+            ContextRow::Separator,
+            c(Cmd::EditRotate90),
+            c(Cmd::EditRotate270),
+            ContextRow::Separator,
+            c(Cmd::EditCut),
+            c(Cmd::EditCopy),
+            c(Cmd::EditCopyImage),
+            ContextRow::Separator,
+            c(Cmd::FileDelete),
+            c(Cmd::FileRename),
+            ContextRow::Separator,
+            c(Cmd::FileProperties),
+            c(Cmd::ViewOptions),
+            ContextRow::Separator,
+            c(Cmd::FileExit),
+        ];
+        let full = context_rows(false);
+        assert_eq!(full, expected_full);
+        // Bar visible: the recovery row and ONE of its flanking separators
+        // drop (the dedupe eats the second) — splicing those two rows out
+        // of the hidden-bar walk must equal the visible-bar walk exactly.
+        let i = full
+            .iter()
+            .position(|r| {
+                matches!(
+                    r,
+                    ContextRow::Command {
+                        cmd: Cmd::ViewMenu,
+                        ..
+                    }
+                )
+            })
+            .expect("recovery row in the hidden-bar walk");
+        let mut gated = full.clone();
+        gated.drain(i..i + 2);
+        assert_eq!(context_rows(true), gated);
+    }
+
+    /// The Menu recovery row gates on the bar (viv.c:3427) and its removal
+    /// never leaves adjacent separators (the was_separator dedupe).
+    #[test]
+    fn the_menu_recovery_row_gates_on_the_bar_without_leaving_a_double_separator() {
+        let hidden = context_rows(false);
+        let shown = context_rows(true);
+        assert!(hidden.iter().any(|r| matches!(
+            r,
+            ContextRow::Command {
+                cmd: Cmd::ViewMenu,
+                ..
+            }
+        )));
+        assert!(!shown.iter().any(|r| matches!(
+            r,
+            ContextRow::Command {
+                cmd: Cmd::ViewMenu,
+                ..
+            }
+        )));
+        for rows in [&hidden, &shown] {
+            assert!(!matches!(rows.first(), Some(ContextRow::Separator)));
+            for pair in rows.windows(2) {
+                assert!(
+                    !(matches!(pair[0], ContextRow::Separator)
+                        && matches!(pair[1], ContextRow::Separator)),
+                    "adjacent separators at {:?}",
+                    &rows[..2]
+                );
+            }
+        }
+    }
+
+    /// Upstream gates the Preview row off on Windows 8+ (viv.c:3418-3423 —
+    /// the verb "doesn't exist on Windows 8 or later"); riviv's baseline is
+    /// Win8+, so the walk drops it unconditionally. The BAR keeps its row
+    /// (the gate is context-menu-only) — #42 behavior unchanged.
+    #[test]
+    fn the_preview_row_never_ships_in_the_context_menu() {
+        for show_menu in [false, true] {
+            assert!(!context_rows(show_menu).iter().any(|r| matches!(
+                r,
+                ContextRow::Command {
+                    cmd: Cmd::FilePreview,
+                    ..
+                }
+            )));
+        }
+        assert!(ENTRIES.iter().any(|e| matches!(
+            e,
+            Entry::Item {
+                cmd: Cmd::FilePreview,
+                ..
+            }
+        )));
+    }
+
+    /// The slideshow-pause context row takes the Play/Pause caption
+    /// (viv.c:3442-3452); every other row keeps its own command caption.
+    #[test]
+    fn the_slideshow_pause_row_takes_the_play_pause_caption() {
+        assert_eq!(
+            context_label(Cmd::SlideshowPause),
+            loc::Id::MenuSlideshowPlayPause
+        );
+        assert_eq!(context_label(Cmd::NavNext), loc::Id::MenuNext);
+        assert_eq!(context_label(Cmd::FileDelete), loc::Id::MenuDelete);
+    }
+
+    /// The accelerator hint of the visible Delete row reads the
+    /// recycle-delete binding (viv.c:3457-3460 for the context walk,
+    /// viv.c:12356-12361 for the bar build); every other command is
+    /// identity.
+    #[test]
+    fn hint_cmd_remaps_only_the_visible_delete_row() {
+        assert_eq!(hint_cmd(Cmd::FileDelete), Cmd::FileDeleteRecycle);
+        for cmd in [
+            Cmd::FileDeleteRecycle,
+            Cmd::FileDeletePermanently,
+            Cmd::NavNext,
+            Cmd::SlideshowPause,
+            Cmd::FileExit,
+        ] {
+            assert_eq!(hint_cmd(cmd), cmd);
+        }
+    }
+
+    /// Every context row's caption resolves to real text in BOTH language
+    /// tables (an empty caption would append a blank row).
+    #[test]
+    fn context_rows_carry_non_empty_captions_in_both_languages() {
+        for row in context_rows(false) {
+            let id = match row {
+                ContextRow::Command { label, .. } | ContextRow::Popup { label, .. } => label,
+                ContextRow::Pop | ContextRow::Separator => continue,
+            };
+            assert!(!loc::get_for(loc::Language::English, id).is_empty());
+            assert!(!loc::get_for(loc::Language::ChineseSimplified, id).is_empty());
+        }
+    }
+
+    /// The push/pop markers nest exactly one level and the pop arm leaves
+    /// the dedupe state alone (viv.c:3482-3487) — which is why the
+    /// top-level separator right after each pop still lands (the last row
+    /// before the pop is a command, so was_separator is false across it).
+    #[test]
+    fn pushes_and_pops_balance_and_separators_survive_the_pops() {
+        let rows = context_rows(false);
+        let mut depth = 0i32;
+        for (i, row) in rows.iter().enumerate() {
+            match row {
+                ContextRow::Popup { .. } => depth += 1,
+                ContextRow::Pop => {
+                    depth -= 1;
+                    assert_eq!(depth, 0, "unbalanced or nested pop at row {i}");
+                    assert!(
+                        matches!(rows.get(i + 1), Some(ContextRow::Separator)),
+                        "the separator after the pop at {i} was eaten"
+                    );
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(depth, 0, "unclosed push");
     }
 }
