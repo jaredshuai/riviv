@@ -446,12 +446,28 @@ pub(crate) enum Id {
     MenuWhilePlaying,
     /// On Top → "&Never" (en_us.h:114 / zh_cn.h:114).
     MenuNever,
+    /// File → "Open File &Location..." (#42; viv.c:811, en_us.h:41).
+    MenuOpenFileLocation,
+    /// File → "&Edit..." (#42; viv.c:812, en_us.h:42 — the File-menu
+    /// shell row, a DIFFERENT upstream id from the top-level Edit popup).
+    MenuFileEdit,
+    /// File → "Pre&view..." (#42; viv.c:813, en_us.h:43).
+    MenuPreview,
+    /// File → "&Print..." (#42; viv.c:814, en_us.h:44).
+    MenuPrint,
+    /// File → "Set Des&ktop Wallpaper" (#42; viv.c:815, en_us.h:45).
+    MenuSetDesktopWallpaper,
+    /// File → "&Close" (#42; viv.c:816, en_us.h:46 — MF_OWNERDRAW
+    /// upstream, keyboard Ctrl+W only).
+    MenuClose,
+    /// File → "P&roperties" (#42; viv.c:820, en_us.h:51).
+    MenuProperties,
 }
 
 impl Id {
     /// Variant count; array-typing both tables against this keeps them
     /// length-locked to the enum by construction.
-    pub(crate) const COUNT: usize = Self::MenuNever as usize + 1;
+    pub(crate) const COUNT: usize = Self::MenuProperties as usize + 1;
 }
 
 /// Table choice (upstream `LOCALIZATION_LANGUAGE_*`, localization.h:30-32).
@@ -714,6 +730,14 @@ const EN_US: [&str; Id::COUNT] = [
     "&Always",                               // MenuAlways (en_us.h:112)
     "&While Playing Slideshow or Animating", // MenuWhilePlaying (en_us.h:113)
     "&Never",                                // MenuNever (en_us.h:114)
+    // The #42 shell verb block (en_us.h:41-46/51).
+    "Open File &Location...", // MenuOpenFileLocation
+    "&Edit...",               // MenuFileEdit
+    "Pre&view...",            // MenuPreview
+    "&Print...",              // MenuPrint
+    "Set Des&ktop Wallpaper", // MenuSetDesktopWallpaper
+    "&Close",                 // MenuClose
+    "P&roperties",            // MenuProperties
 ];
 
 /// zh-CN table — upstream localization_zh_cn.h:31/197-199/261-263.
@@ -967,6 +991,14 @@ const ZH_CN: [&str; Id::COUNT] = [
     "总是(&A)",               // MenuAlways (zh_cn.h:112)
     "播放幻灯片或动画时(&W)", // MenuWhilePlaying (zh_cn.h:113)
     "从不(&N)",               // MenuNever (zh_cn.h:114)
+    // The #42 shell verb block (zh_cn.h:41-46/51).
+    "打开文件位置(&L)...", // MenuOpenFileLocation
+    "编辑(&E)...",         // MenuFileEdit
+    "预览(&V)...",         // MenuPreview
+    "打印(&P)...",         // MenuPrint
+    "设置为桌面壁纸(&D)",  // MenuSetDesktopWallpaper
+    "关闭(&C)",            // MenuClose
+    "属性(&P)",            // MenuProperties
 ];
 
 /// Map a `GetUserDefaultUILanguage` LANGID onto the table choice

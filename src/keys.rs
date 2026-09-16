@@ -106,6 +106,17 @@ const DEFAULT_KEYS: &[(Cmd, &[KeyDef])] = &[
         Cmd::FileAddEverythingSearch,
         &[key(true, false, true, b'E' as u16)],
     ),
+    // The #42 shell trio (viv.c:978-983, upstream row order between the
+    // Add rows and Exit). Edit and Wallpaper stay keyless upstream —
+    // Ctrl+E belongs to the Everything search (viv.c:979) and wallpaper
+    // "needs a confirmation dialog" (viv.c:982); Preview/Properties
+    // never had rows.
+    (
+        Cmd::FileOpenFileLocation,
+        &[key(true, false, false, VK_RETURN)],
+    ),
+    (Cmd::FilePrint, &[key(true, false, false, b'P' as u16)]),
+    (Cmd::FileClose, &[key(true, false, false, b'W' as u16)]),
     (Cmd::FileExit, &[key(true, false, false, b'Q' as u16)]),
     // The #41 clipboard quartet (viv.c:987-990, right after the exit row
     // and before the view presets — upstream table order).
@@ -612,6 +623,26 @@ mod tests {
             vks(Cmd::FileOpenFile),
             vec![k(true, false, false, b'O' as u16)]
         );
+        // The #42 shell trio (viv.c:978/981/983) and the four keyless
+        // rows — Edit/Wallpaper are commented out upstream (Ctrl+E is the
+        // Everything search's, wallpaper "needs a confirmation dialog"),
+        // Preview/Properties never registered.
+        assert_eq!(
+            vks(Cmd::FileOpenFileLocation),
+            vec![k(true, false, false, VK_RETURN)]
+        );
+        assert_eq!(
+            vks(Cmd::FilePrint),
+            vec![k(true, false, false, b'P' as u16)]
+        );
+        assert_eq!(
+            vks(Cmd::FileClose),
+            vec![k(true, false, false, b'W' as u16)]
+        );
+        assert!(vks(Cmd::FileEdit).is_empty());
+        assert!(vks(Cmd::FilePreview).is_empty());
+        assert!(vks(Cmd::FileSetDesktopWallpaper).is_empty());
+        assert!(vks(Cmd::FileProperties).is_empty());
         // The #46 additions: presets on bare digits, window sizes on
         // Alt+digits, Ctrl+T on-top, F5 refresh (viv.c:991-993/997-1000/
         // 1024/1026).
@@ -903,6 +934,18 @@ mod tests {
                 Cmd::FileAddEverythingSearch,
                 "file_add_everything_search_keys",
             ),
+            // The #42 shell septet ("Open File &Location..." keeps its
+            // inner space, the "..." dots drop like every caption's).
+            (Cmd::FileOpenFileLocation, "file_open_file_location_keys"),
+            (Cmd::FileEdit, "file_edit_keys"),
+            (Cmd::FilePreview, "file_preview_keys"),
+            (Cmd::FilePrint, "file_print_keys"),
+            (
+                Cmd::FileSetDesktopWallpaper,
+                "file_set_desktop_wallpaper_keys",
+            ),
+            (Cmd::FileClose, "file_close_keys"),
+            (Cmd::FileProperties, "file_properties_keys"),
             (Cmd::FileExit, "file_exit_keys"),
             // The #46 View block: the two hidden style toggles ("Caption",
             // "Frame"), Status Bar, the Preset trio, the Window Size
