@@ -65,6 +65,13 @@ pub(crate) fn to_wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(once(0)).collect()
 }
 
+/// A nul-terminated wide copy of an OsStr path — the same lossless
+/// OsStr→UTF-16 conversion shell.rs uses; #43's file operations share it
+/// so exotic names survive to the shell unmangled.
+pub(crate) fn to_wide_os(path: &std::ffi::OsStr) -> Vec<u16> {
+    path.encode_wide().chain(once(0)).collect()
+}
+
 /// File-dialog filter as a double-null-terminated wide string, upstream's
 /// exact shape (viv.c:2363): `<label> (<patterns>)\0<patterns>\0<all>
 /// (*.*)\0*.*\0` with both labels from the loc tables and the nine

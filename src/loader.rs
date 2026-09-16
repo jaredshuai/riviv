@@ -563,6 +563,12 @@ impl<F> LoadedImage<F> {
         &mut self.frames[self.position]
     }
 
+    /// Every loaded frame, mutably — #43's rotate pass touches them all
+    /// (upstream loops the whole `_viv_frames` array, viv.c:7729-7749).
+    pub(crate) fn frames_mut(&mut self) -> &mut [F] {
+        &mut self.frames
+    }
+
     pub(crate) fn is_animated(&self) -> bool {
         self.frames.len() > 1
     }

@@ -60,8 +60,8 @@ use windows::Win32::System::Threading::{
     CreateMutexA, GetCurrentThreadId, GetStartupInfoW, STARTF_USESHOWWINDOW, STARTUPINFOW,
 };
 use windows::Win32::UI::Controls::Dialogs::{
-    CommDlgExtendedError, GetOpenFileNameW, OFN_FILEMUSTEXIST, OFN_HIDEREADONLY, OFN_NOCHANGEDIR,
-    OFN_PATHMUSTEXIST, OPENFILENAMEW,
+    CommDlgExtendedError, GetOpenFileNameW, GetSaveFileNameW, OFN_ENABLESIZING, OFN_FILEMUSTEXIST,
+    OFN_HIDEREADONLY, OFN_NOCHANGEDIR, OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST, OPENFILENAMEW,
 };
 use windows::Win32::UI::Controls::{
     ICC_BAR_CLASSES, ICC_STANDARD_CLASSES, ICC_WIN95_CLASSES, INITCOMMONCONTROLSEX,
@@ -103,7 +103,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WS_EX_ACCEPTFILES, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_SYSMENU, WS_THICKFRAME, WS_VISIBLE,
     WindowFromPoint,
 };
-use windows::core::{HSTRING, PCSTR, PCWSTR, w};
+use windows::core::{HSTRING, PCSTR, PCWSTR, PWSTR, w};
 
 use crate::anim::{ANIMATION_TIMER_ID, RATE_ONE, rate_step};
 use crate::cli;
@@ -853,7 +853,9 @@ fn on_double_click(hwnd: HWND, lparam: LPARAM) {
         // 3/4 = zoom in / next image: the default arm re-runs the click
         // action (upstream viv.c:3313-3326).
         3 => zoom_at(hwnd, false, (pt.x, pt.y)),
-        4 => nav_next(hwnd, false, true, false),
+        4 => {
+            nav_next(hwnd, false, true, false);
+        }
         // 0/1/2/5/6 (scroll, slideshow, animation, 1:1 scroll, move
         // window): the double-click toggles FULLSCREEN — upstream's arm
         // switches on exactly these values and never re-runs the action,
@@ -1959,8 +1961,12 @@ fn on_xbutton(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
             _ => {}
         },
         2 => match button {
-            XBUTTON1 => nav_next(hwnd, true, true, false),
-            XBUTTON2 => nav_next(hwnd, false, true, false),
+            XBUTTON1 => {
+                nav_next(hwnd, true, true, false);
+            }
+            XBUTTON2 => {
+                nav_next(hwnd, false, true, false);
+            }
             _ => {}
         },
         _ => {}
@@ -2811,7 +2817,13 @@ fn home_open_inner(hwnd: HWND, end: bool, preload: bool) {
 /// by non-preload calls only), random mode bails without querying
 /// (viv.c:5825-5828), targets queue as preload jobs, and the home arm
 /// never blanks (viv.c:6247-6252).
-fn nav_next(hwnd: HWND, prev: bool, reset_slideshow: bool, preload: bool) {
+/// Step to the neighbor image (#6's engine). The bool is upstream
+/// `_viv_next`'s return (viv.c:5821 `ret = 1`, `ret = 0` only when no
+/// candidate exists — the deleted-file follow-up blanks on false,
+/// viv.c:7223-7227): true = an open was initiated (or the random search
+/// was sent / the no-current Home arm ran, upstream's ret-stays-1 arms),
+/// false = nothing to show.
+fn nav_next(hwnd: HWND, prev: bool, reset_slideshow: bool, preload: bool) -> bool {
     enum Action {
         Random,
         Home,
@@ -2828,14 +2840,14 @@ fn nav_next(hwnd: HWND, prev: bool, reset_slideshow: bool, preload: bool) {
     let action = {
         // SAFETY: see above; nothing below runs inside this borrow.
         let Some(state) = (unsafe { state_of(hwnd) }) else {
-            return;
+            return false;
         };
         if state.random_search.is_some() {
             if preload {
                 // Preloading is not supported in random mode — request_
                 // preload already bailed, this is the belt to its braces
                 // (viv.c:5825-5828).
-                return;
+                return false;
             }
             Action::Random
         } else {
@@ -2880,6 +2892,7 @@ fn nav_next(hwnd: HWND, prev: bool, reset_slideshow: bool, preload: bool) {
             }
         }
     };
+    let mut opened = true;
     match action {
         Action::Random => everything::send_random(hwnd),
         Action::Home => home_open(hwnd, false, preload),
@@ -2910,6 +2923,8 @@ fn nav_next(hwnd: HWND, prev: bool, reset_slideshow: bool, preload: bool) {
                 } else {
                     request_open(hwnd, &entry.path, OpenOrigin::Nav(&entry));
                 }
+            } else {
+                opened = false;
             }
         }
         Action::Scan => {
@@ -2928,7 +2943,7 @@ fn nav_next(hwnd: HWND, prev: bool, reset_slideshow: bool, preload: bool) {
             // entry is cloned out).
             let current = (unsafe { state_of(hwnd) }).and_then(|s| s.nav_current.clone());
             let Some((sort, ascending)) = sort else {
-                return;
+                return false;
             };
             if let Some(entry) =
                 playlist::next(&entries, current.as_ref(), prev, false, sort, ascending)
@@ -2938,6 +2953,8 @@ fn nav_next(hwnd: HWND, prev: bool, reset_slideshow: bool, preload: bool) {
                 } else {
                     request_open(hwnd, &entry.path, OpenOrigin::Nav(entry));
                 }
+            } else {
+                opened = false;
             }
         }
     }
@@ -2950,6 +2967,7 @@ fn nav_next(hwnd: HWND, prev: bool, reset_slideshow: bool, preload: bool) {
     if reset_slideshow {
         reset_slideshow_timer(hwnd);
     }
+    opened
 }
 
 /// Re-arm a RUNNING slideshow timer at the current rate (upstream's
@@ -3291,6 +3309,147 @@ fn playlist_add_current_if_empty(state: &mut WindowState) {
             current.created,
             current.size,
         );
+    }
+}
+
+/// #43 `_viv_delete` (viv.c:7200-7229): FO_DELETE the current file — the
+/// shell's own confirmation dialog appears (upstream passes no
+/// FOF_NOCONFIRMATION) — then, only on a clean success, converge the
+/// playlist on the deleted node and navigate; a directory with nothing
+/// left blanks the viewer (`_viv_next` returning 0, viv.c:7223-7227).
+/// Aborted (the user answered No) and outright failure keep everything.
+fn delete_current(hwnd: HWND, permanently: bool) {
+    // SAFETY: read-only clone out of the borrow; nothing below holds it.
+    let current = (unsafe { state_of(hwnd) }).and_then(|s| s.nav_current.clone());
+    let Some(current) = current else {
+        return;
+    };
+    if let crate::filemgmt::ShellOutcome::Done =
+        crate::filemgmt::shell_delete(hwnd, &current.path, permanently)
+    {
+        // SAFETY: a short plain-field borrow — the navigation below
+        // runs after it drops.
+        if let Some(state) = unsafe { state_of(hwnd) } {
+            state.playlist.remove_by_id(current.id);
+        }
+        if !nav_next(hwnd, false, true, false) {
+            blank_display(hwnd);
+        }
+    }
+}
+
+/// #43 `_viv_edit_rotate` (viv.c:7715-7768): fire the shell rotate90/
+/// rotate270 verb and WAIT — the OS photo handler rewrites the file on
+/// disk (upstream's own re-encode route; riviv keeps it verbatim, see
+/// README Differences) — then rotate every loaded frame in memory, drop
+/// the mips, re-anchor the view at the swapped dimensions, and refresh
+/// the POS/RGB sample, the status bar and the paint. The decode-complete
+/// gate is upstream's own "wait for the image to load" FIXME
+/// (`_viv_frame_loaded_count == _viv_frame_count`, viv.c:7721-7723); a
+/// failed verb launch skips the memory pass too (fail-soft).
+fn rotate_current(hwnd: HWND, counterclockwise: bool) {
+    // SAFETY: read-only clones; the shell call below must run without a
+    // borrow (its collision/progress dialogs pump messages).
+    let (path, ready) = (unsafe { state_of(hwnd) }).map_or((None, false), |s| {
+        (
+            s.nav_current.as_ref().map(|e| e.path.clone()),
+            s.image.as_ref().is_some_and(|i| i.decode_complete()),
+        )
+    });
+    let Some(path) = ready.then_some(path).flatten() else {
+        return;
+    };
+    // Upstream's verb pair: ROTATE_90 → "rotate90" + orientation 6
+    // (clockwise), ROTATE_270 → "rotate270" + orientation 8 (viv.c:2492-
+    // 2495 / 7736).
+    let verb = if counterclockwise {
+        "rotate270"
+    } else {
+        "rotate90"
+    };
+    if crate::shell::shell_execute(hwnd, &path, Some(verb), None, true).is_err() {
+        return;
+    }
+    {
+        // SAFETY: the borrow spans the frame rotations and the view
+        // re-anchor — plain GDI calls and arithmetic, nothing pumps (the
+        // shell call has returned; the DC work touches no windows).
+        let Some(state) = (unsafe { state_of(hwnd) }) else {
+            return;
+        };
+        if let Some(image) = state.image.as_mut() {
+            // Per-frame fail-soft, like upstream: a frame whose rotation
+            // fails keeps its old bitmap and the loop continues
+            // (viv.c:7736-7749 keeps the old HBITMAP on a 0 return).
+            for frame in image.frames_mut() {
+                frame.rotate(!counterclockwise);
+            }
+        }
+        // `_viv_view_set(_viv_view_x,_viv_view_y,1)` (viv.c:7756): re-run
+        // the size pass at the same view coordinates against the swapped
+        // dimensions.
+        let (vp, src) = viewport_and_src(hwnd, state);
+        let fit = fit_policy(state);
+        let (vx, vy) = (state.view.view_x, state.view.view_y);
+        state.view.set_view(vx, vy, src.0, src.1, vp, fit);
+    }
+    // `_viv_update_src_pixel(1,0)` + `_viv_status_update` +
+    // InvalidateRect (viv.c:7757-7759/7763).
+    update_src_pixel(hwnd, true, false);
+    refresh_status(hwnd);
+    repaint(hwnd);
+}
+
+/// #43 Copy To / Move To (viv.c:2496-2568): GetSaveFileName seeded with
+/// the current file's full path (the "save as" flavor — OFN_OVERWRITE-
+/// PROMPT guards collisions), then FO_COPY/FO_MOVE with FOF_ALLOWUNDO.
+/// Fail-soft both ways, and upstream never touches the playlist, the
+/// current file or the title afterwards — a Move leaves the display and
+/// the navigation reference pointing at the moved-away path until the
+/// next navigation slides off it (kept verbatim).
+fn copy_move_to(hwnd: HWND, copy: bool) {
+    // SAFETY: read-only clone out of the borrow; the save dialog below
+    // runs a message pump of its own.
+    let path =
+        (unsafe { state_of(hwnd) }).and_then(|s| s.nav_current.as_ref().map(|e| e.path.clone()));
+    let Some(path) = path else {
+        return;
+    };
+    // The filter (viv.c:2513): "<All Files> (*.*)\0*.*\0" over the
+    // localized label, double-NUL terminated like every filter list.
+    let label = loc::get(loc::Id::OpenAllFiles);
+    let mut filter: Vec<u16> = Vec::new();
+    filter.extend(label.encode_utf16());
+    filter.extend(" (*.*)".encode_utf16());
+    filter.push(0);
+    filter.extend("*.*".encode_utf16());
+    filter.push(0);
+    filter.push(0);
+    let title = to_wide(loc::get(if copy {
+        loc::Id::CopyToCaption
+    } else {
+        loc::Id::MoveToCaption
+    }));
+    // Upstream seeds a STRING_SIZE buffer with the current name and
+    // hands its full capacity to the dialog (viv.c:2508/2518).
+    let mut file_buf = crate::text::to_wide_os(&path);
+    file_buf.resize(1025, 0);
+    let mut ofn = OPENFILENAMEW {
+        lStructSize: size_of::<OPENFILENAMEW>() as u32,
+        hwndOwner: hwnd,
+        lpstrFilter: PCWSTR(filter.as_ptr()),
+        nFilterIndex: 1,
+        lpstrFile: PWSTR(file_buf.as_mut_ptr()),
+        nMaxFile: file_buf.len() as u32,
+        lpstrTitle: PCWSTR(title.as_ptr()),
+        Flags: OFN_ENABLESIZING | OFN_OVERWRITEPROMPT | OFN_NOCHANGEDIR,
+        ..Default::default()
+    };
+    // SAFETY: `ofn` points only at buffers alive in this frame; the
+    // dialog writes within nMaxFile; the returned path stays
+    // NUL-terminated by the API's contract.
+    if unsafe { GetSaveFileNameW(&mut ofn) }.as_bool() {
+        crate::filemgmt::shell_copy_move(hwnd, &path, &file_buf, copy);
     }
 }
 
@@ -4800,6 +4959,38 @@ fn on_command(hwnd: HWND, cmd: menu::Cmd) {
         // Upstream `_viv_blank` (viv.c:7908): this just clears the image —
         // riviv's blank path IS that port.
         menu::Cmd::FileClose => blank_display(hwnd),
+        // The #43 file-management family. The visible Delete row probes
+        // Shift AT DISPATCH (viv.c:2458-2460) — its menu identity doubles
+        // as both deletes; the two hidden rows are the fixed flavors the
+        // Del / Shift+Del keys land on.
+        menu::Cmd::FileDelete => {
+            // SAFETY: GetKeyState reads this thread's key state (the
+            // command runs on the window's thread; #44's sandbox lesson
+            // is about cross-process reads, not this).
+            let permanently = (unsafe { GetKeyState(VK_SHIFT.0 as i32) } as u16) & 0x8000 != 0;
+            delete_current(hwnd, permanently);
+        }
+        menu::Cmd::FileDeleteRecycle => delete_current(hwnd, false),
+        menu::Cmd::FileDeletePermanently => delete_current(hwnd, true),
+        // `_viv_rename` (viv.c:7365-7371): the bare current-file gate,
+        // then the modal (its OK arm owns the shell call and the state
+        // follow-up).
+        menu::Cmd::FileRename => {
+            // SAFETY: read-only clone; the modal below pumps messages.
+            let path = (unsafe { state_of(hwnd) })
+                .and_then(|s| s.nav_current.as_ref().map(|e| e.path.clone()));
+            if let Some(path) = path {
+                crate::rename_dlg::open(hwnd, &path);
+            }
+        }
+        // `_viv_edit_rotate` pair (viv.c:2490-2495): the waited shell
+        // verb + the in-memory rotation.
+        menu::Cmd::EditRotate90 => rotate_current(hwnd, false),
+        menu::Cmd::EditRotate270 => rotate_current(hwnd, true),
+        // Copy To / Move To (viv.c:2496-2568): the save dialog + the file
+        // operation, no state follow-up.
+        menu::Cmd::EditCopyTo => copy_move_to(hwnd, true),
+        menu::Cmd::EditMoveTo => copy_move_to(hwnd, false),
         menu::Cmd::FileExit => {
             // Upstream `_viv_exit` (viv.c:1883-1888) saves the config and
             // quits the pump; riviv's WM_DESTROY does both on the way out.
@@ -4952,8 +5143,12 @@ fn on_command(hwnd: HWND, cmd: menu::Cmd) {
         menu::Cmd::AnimationRateDecrease => animation_rate_step(hwnd, true),
         menu::Cmd::AnimationRateIncrease => animation_rate_step(hwnd, false),
         menu::Cmd::AnimationRateReset => animation_rate_reset(hwnd),
-        menu::Cmd::NavNext => nav_next(hwnd, false, true, false),
-        menu::Cmd::NavPrev => nav_next(hwnd, true, true, false),
+        menu::Cmd::NavNext => {
+            nav_next(hwnd, false, true, false);
+        }
+        menu::Cmd::NavPrev => {
+            nav_next(hwnd, true, true, false);
+        }
         menu::Cmd::NavHome => home_open(hwnd, false, false),
         menu::Cmd::NavEnd => home_open(hwnd, true, false),
         // The #39 sort family (upstream viv.c:1750-1816): the five mode

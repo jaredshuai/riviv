@@ -462,12 +462,37 @@ pub(crate) enum Id {
     MenuClose,
     /// File → "P&roperties" (#42; viv.c:820, en_us.h:51).
     MenuProperties,
+    /// File → "&Delete" (#43; viv.c:817, en_us.h:47 — the visible row that
+    /// live-probes Shift at dispatch time).
+    MenuDelete,
+    /// File → "Delete (Recycle)" (#43; viv.c:818, en_us.h:48 — MF_OWNERDRAW
+    /// upstream, keyboard Del).
+    MenuDeleteRecycle,
+    /// File → "Delete (Permanently)" (#43; viv.c:819, en_us.h:49 —
+    /// MF_OWNERDRAW upstream, keyboard Shift+Del).
+    MenuDeletePermanently,
+    /// File → "Rena&me" (#43; viv.c:821, en_us.h:50, F2).
+    MenuRename,
+    /// Edit → "Rotate Cloc&kwise" (#43; viv.c:833, en_us.h:61).
+    MenuRotateClockwise,
+    /// Edit → "Rotate Cou&nterclockwise" (#43; viv.c:834, en_us.h:62).
+    MenuRotateCounterclockwise,
+    /// Edit → "Copy to &Folder..." (#43; viv.c:836, en_us.h:63).
+    MenuCopyTo,
+    /// Edit → "Mo&ve to Folder..." (#43; viv.c:837, en_us.h:64).
+    MenuMoveTo,
+    /// The rename dialog caption (#43; en_us.h:254, "Rename").
+    RenameCaption,
+    /// The Copy To save-dialog title (#43; en_us.h:284, "Copy To").
+    CopyToCaption,
+    /// The Move To save-dialog title (#43; en_us.h:285, "Move To").
+    MoveToCaption,
 }
 
 impl Id {
     /// Variant count; array-typing both tables against this keeps them
     /// length-locked to the enum by construction.
-    pub(crate) const COUNT: usize = Self::MenuProperties as usize + 1;
+    pub(crate) const COUNT: usize = Self::MoveToCaption as usize + 1;
 }
 
 /// Table choice (upstream `LOCALIZATION_LANGUAGE_*`, localization.h:30-32).
@@ -731,13 +756,24 @@ const EN_US: [&str; Id::COUNT] = [
     "&While Playing Slideshow or Animating", // MenuWhilePlaying (en_us.h:113)
     "&Never",                                // MenuNever (en_us.h:114)
     // The #42 shell verb block (en_us.h:41-46/51).
-    "Open File &Location...", // MenuOpenFileLocation
-    "&Edit...",               // MenuFileEdit
-    "Pre&view...",            // MenuPreview
-    "&Print...",              // MenuPrint
-    "Set Des&ktop Wallpaper", // MenuSetDesktopWallpaper
-    "&Close",                 // MenuClose
-    "P&roperties",            // MenuProperties
+    "Open File &Location...",   // MenuOpenFileLocation
+    "&Edit...",                 // MenuFileEdit
+    "Pre&view...",              // MenuPreview
+    "&Print...",                // MenuPrint
+    "Set Des&ktop Wallpaper",   // MenuSetDesktopWallpaper
+    "&Close",                   // MenuClose
+    "P&roperties",              // MenuProperties
+    "&Delete",                  // MenuDelete (#43)
+    "Delete (Recycle)",         // MenuDeleteRecycle (#43)
+    "Delete (Permanently)",     // MenuDeletePermanently (#43)
+    "Rena&me",                  // MenuRename (#43)
+    "Rotate Cloc&kwise",        // MenuRotateClockwise (#43)
+    "Rotate Cou&nterclockwise", // MenuRotateCounterclockwise (#43)
+    "Copy to &Folder...",       // MenuCopyTo (#43)
+    "Mo&ve to Folder...",       // MenuMoveTo (#43)
+    "Rename",                   // RenameCaption (#43)
+    "Copy To",                  // CopyToCaption (#43)
+    "Move To",                  // MoveToCaption (#43)
 ];
 
 /// zh-CN table — upstream localization_zh_cn.h:31/197-199/261-263.
@@ -999,6 +1035,17 @@ const ZH_CN: [&str; Id::COUNT] = [
     "设置为桌面壁纸(&D)",  // MenuSetDesktopWallpaper
     "关闭(&C)",            // MenuClose
     "属性(&P)",            // MenuProperties
+    "删除(&D)",            // MenuDelete (#43)
+    "删除（回收站）",      // MenuDeleteRecycle (#43)
+    "删除（永久）",        // MenuDeletePermanently (#43)
+    "重命名(&M)",          // MenuRename (#43)
+    "顺时针旋转(&K)",      // MenuRotateClockwise (#43)
+    "逆时针旋转(&N)",      // MenuRotateCounterclockwise (#43)
+    "复制到文件夹(&F)...", // MenuCopyTo (#43)
+    "移动到文件夹(&V)...", // MenuMoveTo (#43)
+    "重命名",              // RenameCaption (#43)
+    "复制到",              // CopyToCaption (#43)
+    "移动到",              // MoveToCaption (#43)
 ];
 
 /// Map a `GetUserDefaultUILanguage` LANGID onto the table choice
