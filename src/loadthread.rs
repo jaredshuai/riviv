@@ -24,15 +24,17 @@
 
 use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
+use std::io::Read as _;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
 
-use crate::loader::{DecodeEnv, LoadReply, decode_to_sink};
+use crate::loader::{DecodeEnv, LoadReply, decode_bytes_to_sink, decode_to_sink};
 use crate::surface::DibFrame;
 
 /// Kick message, posted whenever the worker queues a reply (upstream
@@ -60,13 +62,28 @@ struct SendHwnd(HWND);
 // `_viv_hwnd` (viv.c:10902).
 unsafe impl Send for SendHwnd {}
 
+/// What a job decodes (#65): a file on disk, or the process's stdin
+/// captured as one in-memory stream (the `stdin:` pseudo-filename). The
+/// display name for a virtual source is the literal `stdin:` — the
+/// session carries it so titles/verdicts read like a file load.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LoadSource {
+    File(OsString),
+    Stdin,
+}
+
+/// The `stdin:` display name, shared by the session and the request
+/// shell so the title/status read one constant (#65; the pseudo-name a
+/// piped launch types on the command line).
+pub(crate) const STDIN_NAME: &str = "stdin:";
+
 /// One queued decode request; crossing the channel requires `Send`
 /// (DibFrame and the Arcs are, HWND via the wrapper above).
 /// `render_viewport` is the request-time render area (client minus the
 /// status bar) driving mip pre-generation — upstream stashes the same pair
 /// in `_viv_load_render_wide/high` at request time (viv.c:1557-1558).
 struct Job {
-    path: OsString,
+    source: LoadSource,
     render_viewport: (i32, i32),
     /// The request-time windowed background the decode composites
     /// transparent pixels against (upstream flattens at decode against
@@ -100,7 +117,7 @@ impl LoadThread {
         })
     }
 
-    /// Queue `path` for decoding and return the session that owns its
+    /// Queue `source` for decoding and return the session that owns its
     /// replies. The old session (if any) must be dropped by the caller —
     /// its Drop flags the job, and the worker skips it at the next check.
     /// `render_viewport` is the request-time render area (client minus the
@@ -108,18 +125,23 @@ impl LoadThread {
     pub(crate) fn request(
         &self,
         hwnd: HWND,
-        path: OsString,
+        source: LoadSource,
         render_viewport: (i32, i32),
         background: [u8; 3],
     ) -> LoadSession {
         let id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
         let terminate = Arc::new(AtomicBool::new(false));
         let queue = Arc::new(Mutex::new(VecDeque::new()));
+        // The display name: the file's path, or the literal `stdin:` for
+        // the virtual source — the UI adopts it as the window title.
+        let path = match &source {
+            LoadSource::File(path) => path.clone(),
+            LoadSource::Stdin => OsString::from(STDIN_NAME),
+        };
         // The worker consumes its own copy; the session keeps the
         // original for the UI (window title / Ctrl+O initial dir).
-        let worker_path = path.clone();
         let job = Job {
-            path: worker_path,
+            source,
             render_viewport,
             background,
             hwnd: SendHwnd(hwnd),
@@ -158,7 +180,7 @@ impl LoadThread {
 fn worker(receiver: Receiver<Job>) {
     while let Ok(job) = receiver.recv() {
         let Job {
-            path,
+            source,
             render_viewport,
             background,
             hwnd: SendHwnd(hwnd),
@@ -166,7 +188,7 @@ fn worker(receiver: Receiver<Job>) {
             queue,
         } = job;
         // Superseded while still queued: nothing was decoded, nothing to
-        // reply — skip before touching the file.
+        // reply — skip before touching the source.
         if terminate.load(Ordering::Relaxed) {
             continue;
         }
@@ -202,15 +224,92 @@ fn worker(receiver: Receiver<Job>) {
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
         };
-        decode_to_sink(
-            &path,
-            DecodeEnv {
-                render_viewport,
-                background,
+        let env = DecodeEnv {
+            render_viewport,
+            background,
+        };
+        match source {
+            LoadSource::File(path) => {
+                decode_to_sink(&path, env, &terminate, &mut sink);
+            }
+            LoadSource::Stdin => match read_stdin_terminated(&terminate) {
+                Some(StdinOutcome::Bytes(bytes)) => {
+                    decode_bytes_to_sink(&bytes, env, &terminate, &mut sink);
+                }
+                Some(StdinOutcome::Failed(msg)) => sink(LoadReply::FailedUser(msg)),
+                None => {} // terminated mid-read: exit silently
             },
-            &terminate,
-            &mut sink,
-        );
+        }
+    }
+}
+
+/// The raw byte cap for the `stdin:` stream (#65): without one a hostile
+/// pipe could push the read into an OOM that kills the viewer — the same
+/// posture as the decoder's own allocation caps (user-level failure, not
+/// a crash; ADR 0001). One byte over is read so the cap edge is
+/// detectable.
+const MAX_STDIN_BYTES: u64 = crate::loader::MAX_TOTAL_FRAME_BYTES as u64;
+
+/// What the stdin read produced (#65): the stream's bytes, or a
+/// user-level failure message (already prefixed `stdin:` like the file
+/// path's shown-name failures).
+enum StdinOutcome {
+    Bytes(Vec<u8>),
+    Failed(String),
+}
+
+/// Read the process's stdin to EOF on a DETACHED helper thread and wait
+/// terminate-aware (#65). The blocking read cannot be interrupted — a
+/// console stdin that never sees EOF would otherwise hang the worker's
+/// join at window teardown ("it's critical we wait for load image to
+/// finish", viv.c:5476) — so the read runs on its own inert thread (no
+/// GDI, no window: nothing the process teardown needs to reclaim) and
+/// the worker polls the channel, abandoning the reader when this job is
+/// superseded or the window dies. The abandoned reader holds only its
+/// growing buffer until the pipe closes (or forever, until process exit
+/// reclaims it — the reader never touches shared state either way).
+/// `None` = the job was terminated while reading: exit silently, exactly
+/// like a file decode between frames.
+fn read_stdin_terminated(terminate: &AtomicBool) -> Option<StdinOutcome> {
+    let (sender, receiver) = channel();
+    std::thread::spawn(move || {
+        // take() bounds the read so the cap edge is detectable; the cap
+        // verdict itself lands in the caller as a user-level failure.
+        let mut bytes = Vec::new();
+        let mut stdin = std::io::stdin();
+        let mut limited = (&mut stdin).take(MAX_STDIN_BYTES + 1);
+        let read = std::io::Read::read_to_end(&mut limited, &mut bytes);
+        // An unreadable stdin (no console/pipe — e.g. an Explorer launch)
+        // arrives as the Err; the sender drops silently if nobody waits.
+        let _ = sender.send(read.map(|_| bytes));
+    });
+    loop {
+        match receiver.recv_timeout(Duration::from_millis(100)) {
+            Ok(Ok(bytes)) => {
+                return Some(if bytes.len() as u64 > MAX_STDIN_BYTES {
+                    StdinOutcome::Failed(format!(
+                        "stdin: exceeds the {MAX_STDIN_BYTES} byte read cap"
+                    ))
+                } else {
+                    StdinOutcome::Bytes(bytes)
+                });
+            }
+            // The stream's read failed (unreadable handle): a user-level
+            // verdict, like an unopenable file.
+            Ok(Err(e)) => return Some(StdinOutcome::Failed(format!("stdin: {e}"))),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if terminate.load(Ordering::Relaxed) {
+                    return None; // abandon the detached reader
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                // Unreachable (the reader always sends or panics); treat as
+                // a failed read so the wait can never spin forever.
+                return Some(StdinOutcome::Failed(
+                    "stdin: the reader vanished".to_string(),
+                ));
+            }
+        }
     }
 }
 
@@ -219,7 +318,8 @@ fn worker(receiver: Receiver<Job>) {
 pub(crate) struct LoadSession {
     id: u64,
     /// The file being loaded — the UI adopts it as the window title/path
-    /// when this session's first frame takes the display.
+    /// when this session's first frame takes the display. The `stdin:`
+    /// virtual source carries the literal pseudo-name (#65).
     path: OsString,
     terminate: Arc<AtomicBool>,
     queue: Arc<Mutex<VecDeque<LoadReply<DibFrame>>>>,
@@ -232,6 +332,13 @@ impl LoadSession {
 
     pub(crate) fn path(&self) -> &OsStr {
         &self.path
+    }
+
+    /// Whether this session decodes the `stdin:` virtual source (#65) —
+    /// the adoption edge reads it to flag the display virtual (the
+    /// navigation/graying semantics that follow; no backing file).
+    pub(crate) fn is_stdin(&self) -> bool {
+        self.path == STDIN_NAME
     }
 
     /// #43 rename follow-up: retitle an in-flight session whose file was

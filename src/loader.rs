@@ -16,6 +16,7 @@
 //! until then (see `anim.rs`).
 
 use std::ffi::OsStr;
+use std::io::{BufRead, Cursor, Seek};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -31,8 +32,9 @@ use crate::surface::{DibFrame, Surface};
 /// (#4) makes the gate per-frame instead of per-load, but the limit stands
 /// (mid-stream overflow fails the load like #3 did; see `apply_reply` for
 /// what the UI does with that failure). Matches the single-image
-/// allocation cap the decoder limits already enforce.
-const MAX_TOTAL_FRAME_BYTES: usize = 512 * 1024 * 1024;
+/// allocation cap the decoder limits already enforce. The `stdin:` read
+/// caps its raw stream at the same bound (#65).
+pub(crate) const MAX_TOTAL_FRAME_BYTES: usize = 512 * 1024 * 1024;
 
 /// Frame-count budget: every frame surface costs two GDI objects (DC + DIB)
 /// and the default per-process GDI limit is 10000, so 4096 frames keeps
@@ -138,6 +140,42 @@ pub(crate) fn decode_to_sink(
     }
 }
 
+/// The `stdin:` virtual display (#65; upstream wishlist viv.c:81): decode
+/// an in-memory byte stream through the SAME pipeline as a file — the
+/// format is sniffed from the contents (`with_guessed_format` semantics
+/// preserved), so the pipe's payload is decoded by magic bytes, not a
+/// filename extension. The caller owns the blocking stdin read (see
+/// `loadthread.rs`'s detached reader); `bytes` is everything the pipe
+/// delivered.
+pub(crate) fn decode_bytes_to_sink(
+    bytes: &[u8],
+    env: DecodeEnv,
+    terminate: &AtomicBool,
+    sink: &mut dyn FnMut(LoadReply),
+) {
+    // Sniff the format from the stream contents exactly like the file
+    // path does (renamed/extensionless pipes still decode); the shown
+    // name prefix flows from here into every user-level failure below.
+    let outcome = (|| -> Result<(), Stop> {
+        let reader = ImageReader::new(Cursor::new(bytes))
+            .with_guessed_format()
+            .map_err(|e| Stop::User(format!("{STDIN_SHOWN_NAME}: {e}")))?;
+        decode_reader(STDIN_SHOWN_NAME, reader, env, terminate, sink)
+    })();
+    match outcome {
+        Ok(()) => sink(LoadReply::Complete),
+        Err(Stop::User(msg)) => sink(LoadReply::FailedUser(msg)),
+        Err(Stop::Fatal(msg)) => sink(LoadReply::FatalSystem(msg)),
+        Err(Stop::Terminated) => {}
+    }
+}
+
+/// The shown name for `stdin:` load failures — the message prefix
+/// template renders it as `stdin: <reason>`, mirroring the file path's
+/// prefix (the DISPLAY name keeps its trailing colon; see
+/// `loadthread::STDIN_NAME`. #65).
+const STDIN_SHOWN_NAME: &str = "stdin";
+
 fn produce(
     path: &OsStr,
     env: DecodeEnv,
@@ -145,18 +183,33 @@ fn produce(
     sink: &mut dyn FnMut(LoadReply),
 ) -> Result<(), Stop> {
     let shown = path.to_string_lossy();
-    let user = |msg: String| Stop::User(format!("{shown}: {msg}"));
     // Sniff the format from file contents (upstream GDI+ behavior): renamed or
     // extensionless files still decode. `with_guessed_format` rewinds the
     // stream, so the concrete decoders below start at byte 0.
-    let reader = ImageReader::open(Path::new(path)).map_err(|e| user(e.to_string()))?;
+    let reader =
+        ImageReader::open(Path::new(path)).map_err(|e| Stop::User(format!("{shown}: {e}")))?;
     let reader = reader
         .with_guessed_format()
-        .map_err(|e| user(e.to_string()))?;
-    // GIF and WebP are the only formats whose animation we honor — APNG stays
-    // static, matching upstream where GDI+ exposes no time dimension for it.
-    // Animated formats go through the frame iterators so transparency
-    // compositing and dispose handling are uniform.
+        .map_err(|e| Stop::User(format!("{shown}: {e}")))?;
+    decode_reader(&shown, reader, env, terminate, sink)
+}
+
+/// The shared decode dispatch once a format-guessing reader exists —
+/// the single pipeline both the file path (#4) and the `stdin:` bytes
+/// (#65) feed. `shown` prefixes the user-level failure messages (the
+/// path asked to open / the `stdin:` pseudo-name). GIF and WebP are the
+/// only formats whose animation we honor — APNG stays static, matching
+/// upstream where GDI+ exposes no time dimension for it. Animated
+/// formats go through the frame iterators so transparency compositing
+/// and dispose handling are uniform.
+fn decode_reader<R: BufRead + Seek>(
+    shown: &str,
+    reader: ImageReader<R>,
+    env: DecodeEnv,
+    terminate: &AtomicBool,
+    sink: &mut dyn FnMut(LoadReply),
+) -> Result<(), Stop> {
+    let user = |msg: String| Stop::User(format!("{shown}: {msg}"));
     match reader.format() {
         Some(ImageFormat::Gif) => {
             let mut decoder = image::codecs::gif::GifDecoder::new(reader.into_inner())
@@ -1642,5 +1695,67 @@ mod mip_budget_tests {
         // Pre-generation math: 4096*2 base + 1000 mip-side < 10000 (a const
         // assert, so the budget constants can never drift past the quota).
         const _: () = assert!(MAX_FRAMES * 2 + crate::surface::MIP_GDI_OBJECT_BUDGET < 10000);
+    }
+}
+
+#[cfg(test)]
+mod stdin_bytes_tests {
+    use super::*;
+
+    fn env() -> DecodeEnv {
+        DecodeEnv {
+            render_viewport: (64, 64),
+            background: [255, 255, 255],
+        }
+    }
+
+    #[test]
+    fn stdin_bytes_decode_through_the_same_pipeline_as_files() {
+        // A 3×2 PNG encoded in-memory, fed through the `stdin:` entry
+        // (#65): the same format-sniffing decode the file path runs —
+        // FirstFrame then Complete, dimensions from the decoded frame
+        // (the GDI-backed DibFrame, exactly what a file load delivers).
+        let mut png = Vec::new();
+        let img = image::RgbaImage::from_pixel(3, 2, image::Rgba([200, 100, 50, 255]));
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
+            .expect("in-memory encode");
+        let terminate = AtomicBool::new(false);
+        let mut replies = Vec::new();
+        decode_bytes_to_sink(&png, env(), &terminate, &mut |r| replies.push(r));
+        assert_eq!(replies.len(), 2);
+        match &replies[0] {
+            LoadReply::FirstFrame { frame, delay_ms } => {
+                assert_eq!(frame.dims(), (3, 2));
+                assert_eq!(*delay_ms, 0, "a static stream has no successor");
+            }
+            LoadReply::AdditionalFrame { .. }
+            | LoadReply::Complete
+            | LoadReply::FailedUser(_)
+            | LoadReply::FatalSystem(_) => panic!("expected FirstFrame"),
+        }
+        assert!(matches!(replies[1], LoadReply::Complete));
+    }
+
+    #[test]
+    fn undecodable_stdin_bytes_fail_user_with_the_pseudo_name_prefix() {
+        // Garbage and empty streams: one FailedUser whose message carries
+        // the shown name `stdin:` — the same prefix the file path builds
+        // from the path it was asked to open.
+        for bytes in [&b"not an image at all"[..], &b""[..]] {
+            let terminate = AtomicBool::new(false);
+            let mut replies = Vec::new();
+            decode_bytes_to_sink(bytes, env(), &terminate, &mut |r| replies.push(r));
+            assert_eq!(replies.len(), 1);
+            match &replies[0] {
+                LoadReply::FailedUser(msg) => {
+                    assert!(msg.starts_with("stdin: "), "{msg}");
+                }
+                LoadReply::FirstFrame { .. }
+                | LoadReply::AdditionalFrame { .. }
+                | LoadReply::Complete
+                | LoadReply::FatalSystem(_) => panic!("expected FailedUser"),
+            }
+        }
     }
 }

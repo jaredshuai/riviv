@@ -86,6 +86,48 @@ pub(crate) fn to_int(s: &[u16]) -> i32 {
     sign.wrapping_mul(acc)
 }
 
+/// The `stdin:` pseudo-filename (#65; upstream wishlist viv.c:81 — "open
+/// a file with the filename stdin: to open stdin"): one word's text,
+/// ASCII case-insensitive, exactly `stdin:`. Quoting is irrelevant (the
+/// tokenizer strips it into the word — a quoted `"stdin:"` is still the
+/// filename); the switch form `/stdin:` keeps its slash and never
+/// matches. NTFS reserves ':' as the alternate-data-stream separator, so
+/// no on-disk file can collide with the pseudo-name.
+pub(crate) fn is_stdin_word(word: &[u16]) -> bool {
+    word.len() == 6
+        && word.iter().zip("stdin:".as_bytes()).all(|(c, b)| {
+            // eq_switch's manual lowercase (u16 has no to_ascii_lowercase).
+            let lower = if (b'A' as u16..=b'Z' as u16).contains(c) {
+                *c + 32
+            } else {
+                *c
+            };
+            lower == u16::from(*b)
+        })
+}
+
+/// Whether a raw command line contains the `stdin:` pseudo-filename as
+/// any word (#65): the single-instance gate reads this BEFORE forwarding
+/// — a piped launch must keep its own stdin (the pipe belongs to this
+/// process; see the run() handoff block) — and nothing else may resolve
+/// the word to a path.
+pub(crate) fn has_stdin_word(cl: &[u16]) -> bool {
+    let mut i = 0usize;
+    while i < cl.len() && is_ws(cl[i]) {
+        i += 1;
+    }
+    let _exe = next_word(cl, &mut i);
+    loop {
+        if i >= cl.len() {
+            return false;
+        }
+        let word = next_word(cl, &mut i);
+        if is_stdin_word(&word.text) {
+            return true;
+        }
+    }
+}
+
 /// ASCII case-insensitive compare against a switch name (upstream
 /// `string_icompare_lowercase_ascii`).
 fn eq_switch(word: &[u16], name: &str) -> bool {
@@ -607,5 +649,36 @@ mod tests {
         assert_eq!(to_int(&w("1x2")), 12);
         assert_eq!(to_int(&w("")), 0);
         assert_eq!(to_int(&w("abc")), 0);
+    }
+
+    // ---- the stdin: pseudo-filename (#65) ----
+
+    #[test]
+    fn stdin_word_matches_case_insensitively_and_exactly() {
+        assert!(is_stdin_word(&w("stdin:")));
+        assert!(is_stdin_word(&w("STDIN:")));
+        assert!(is_stdin_word(&w("StdIn:")));
+        // Not the word: longer, shorter, prefix, switch form, suffixed.
+        assert!(!is_stdin_word(&w("stdin")));
+        assert!(!is_stdin_word(&w("stdin:x")));
+        assert!(!is_stdin_word(&w("xstdin:")));
+        assert!(!is_stdin_word(&w("/stdin:")));
+        assert!(!is_stdin_word(&w("-stdin:")));
+        assert!(!is_stdin_word(&w("stdin.png")));
+    }
+
+    #[test]
+    fn stdin_word_scan_walks_the_raw_command_line() {
+        // Any word position counts, quoted or not (the tokenizer strips
+        // quoting); the exe word and switches do not false-positive.
+        assert!(has_stdin_word(&w("riviv stdin:")));
+        assert!(has_stdin_word(&w("riviv /fullscreen stdin:")));
+        assert!(has_stdin_word(&w("riviv \"stdin:\"")));
+        assert!(has_stdin_word(&w("riviv a.png stdin:")));
+        assert!(has_stdin_word(&w("riviv /x 100 stdin:")));
+        assert!(!has_stdin_word(&w("riviv a.png")));
+        assert!(!has_stdin_word(&w("riviv /stdin:")));
+        assert!(!has_stdin_word(&w("riviv stdin.png")));
+        assert!(!has_stdin_word(&w("riviv")));
     }
 }

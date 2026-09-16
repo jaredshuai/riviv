@@ -155,7 +155,19 @@ impl DibFrame {
             mips: Vec::new(),
         })
     }
+}
 
+#[cfg(test)]
+impl DibFrame {
+    /// The frame's pixel dimensions — the test surface for the load
+    /// protocol's frame payloads (production reads them through the
+    /// `Surface` wrapper).
+    pub(crate) fn dims(&self) -> (i32, i32) {
+        (self.width, self.height)
+    }
+}
+
+impl DibFrame {
     /// Pre-generate mip levels 1..=`target` for this frame on the calling
     /// (worker) thread — upstream `_viv_get_mipmap` with the request-time
     /// viewport halved, called per frame before the reply is queued
