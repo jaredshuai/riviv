@@ -4,7 +4,7 @@ Unofficial Rust rewrite of [voidtools/voidImageViewer](https://github.com/voidto
 
 Based on voidImageViewer by David Carpenter / voidtools. See [LICENSE](LICENSE). The original C implementation is preserved under [`c-original/`](c-original/) as a read-only behavioral reference.
 
-> **Status: early development (M4 planned).** Current scope: Win32 window + GDI rendering, animated GIF/WebP playback at author timing, alpha-composited transparency for every supported format (PNG, JPEG, BMP, ICO, TIFF, GIF and WebP), drag & drop, a keyboard-navigable playlist, zoom/pan over the upstream 16-level preset curve, the settings foundation (the window rect is remembered across runs in a `[riviv]` ini with upstream's 60% first-run auto-fit), en/zh-CN localization driven by the system UI language, single-instance command-line forwarding (a second launch hands its image to the running viewer and exits), a menu bar over a command table (File/View/Navigate/Help carrying the implemented commands, toggled by `show_menu`), the Options dialog (General/View/Controls pages over the same ini — filters, fit/fill, auto-size, background colors, frame-minus, mouse actions, multiple instances, appdata location, start-menu shortcuts and file associations; OK applies live and saves), custom keyboard shortcuts (per-command bindings over the same ini — upstream's `*_keys` lines — editable on the Controls page; the keyboard route and the menu accelerator labels follow the live table), and the install family (the `/install`-family CLI, an embedded app icon, and an NSIS installer), and the Everything IPC search (Ctrl+E / Ctrl+Shift+E open a hand-built Search Everything dialog; the query goes out as a QUERY2 WM_COPYDATA to a running Everything, the LIST2 results fill the playlist — Open replaces, Add appends — and the Randomize checkbox arms an endless one-image-at-a-time mode bound to next/prev/home), and the slideshow (#37: F11 or View→Slideshow auto-enters fullscreen and advances the playlist on a timer; the Slideshow menu carries Play/Pause, the 17 rate presets and a Custom dialog; Space/↑/↓ and Esc follow upstream), and the view-frame family (#46: the Minimal/Compact/Normal presets, window sizing at 50/100/200%/Auto Fit, the always-on-top trio, F5 refresh and the View fit/shrink rows over the same frame rebuild). M3 is feature-complete; M4 (the remaining upstream features) is ticketed as #37–#50; see [Roadmap](#roadmap).
+> **Status: early development (M5 planned).** Current scope: Win32 window + GDI rendering, animated GIF/WebP playback at author timing, alpha-composited transparency for every supported format (PNG, JPEG, BMP, ICO, TIFF, GIF and WebP), drag & drop, a keyboard-navigable playlist, zoom/pan over the upstream 16-level preset curve, the settings foundation (the window rect is remembered across runs in a `[riviv]` ini with upstream's 60% first-run auto-fit), en/zh-CN localization driven by the system UI language, single-instance command-line forwarding (a second launch hands its image to the running viewer and exits), a menu bar over a command table (File/View/Navigate/Help carrying the implemented commands, toggled by `show_menu`), the Options dialog (General/View/Controls pages over the same ini — filters, fit/fill, auto-size, background colors, frame-minus, mouse actions, multiple instances, appdata location, start-menu shortcuts and file associations; OK applies live and saves), custom keyboard shortcuts (per-command bindings over the same ini — upstream's `*_keys` lines — editable on the Controls page; the keyboard route and the menu accelerator labels follow the live table), and the install family (the `/install`-family CLI, an embedded app icon, and an NSIS installer), and the Everything IPC search (Ctrl+E / Ctrl+Shift+E open a hand-built Search Everything dialog; the query goes out as a QUERY2 WM_COPYDATA to a running Everything, the LIST2 results fill the playlist — Open replaces, Add appends — and the Randomize checkbox arms an endless one-image-at-a-time mode bound to next/prev/home), and the slideshow (#37: F11 or View→Slideshow auto-enters fullscreen and advances the playlist on a timer; the Slideshow menu carries Play/Pause, the 17 rate presets and a Custom dialog; Space/↑/↓ and Esc follow upstream), and the view-frame family (#46: the Minimal/Compact/Normal presets, window sizing at 50/100/200%/Auto Fit, the always-on-top trio, F5 refresh and the View fit/shrink rows over the same frame rebuild). M3 and M4 are feature-complete (M4 landed as #37–#50); M5 (the upstream-wishlist pass — virtual displays & input completion) is ticketed as #65–#69; see [Roadmap](#roadmap).
 
 ## Build
 
@@ -59,7 +59,7 @@ File management (upstream semantics, #43): F2 (File→Rename) opens a rename dia
   - [x] zoom & pan: 16-level presets + wheel + drag + temporary 1:1
   - [x] fullscreen: double-click / Alt+Enter / Esc + idle cursor hide
   - [x] ≥32768-px giant images: stitched mip generation + per-zoom-level mipmap cache
-- [ ] M3 — settings & custom shortcuts, Everything IPC, file associations, localization, installer
+- [x] M3 — settings & custom shortcuts, Everything IPC, file associations, localization, installer
   - [x] config foundation: `[riviv]` ini read/write + remembered window rect + 60% first-run auto-fit (#19)
   - [x] localization: en/zh-CN string tables + system language detection (#20)
   - [x] single-instance command-line forwarding (#21)
@@ -68,7 +68,7 @@ File management (upstream semantics, #43): F2 (File→Rename) opens a rename dia
   - [x] options dialog (General/View/Controls) (#24)
   - [x] custom shortcuts (#25)
   - [x] file associations + NSIS installer (#26: `/install`-family CLI, General-page association checkboxes, app icon, `installer/` NSIS port)
-- [ ] M4 — the remaining upstream features (interaction & shell completion)
+- [x] M4 — the remaining upstream features (interaction & shell completion)
   - [x] slideshow: View→Slideshow + Slideshow menu + rate presets (#37)
   - [x] animation controls: Animation menu + pause/jumps/frame step/rate + loop-once checkbox (#38)
   - [x] navigation sort + shuffle + Jump To (#39: Navigate→Sort radios, shuffle order, the J dialog)
@@ -83,6 +83,13 @@ File management (upstream semantics, #43): F2 (File→Rename) opens a rename dia
   - [x] config CLI second pass + usage dialog (#48)
   - [x] full context menu (#49: the upstream table — Rate/Sort submenus, shell verbs, clipboard, file-management rows)
   - [x] ICM evaluation (#50: wontfix for the GDI phase — decision record under Differences; `icm` key ships as a persisted no-op)
+- [ ] M5 — beyond-upstream wishlist pass: virtual displays & input completion
+  - [ ] virtual display foundation + `stdin:` pseudo-file (#65)
+  - [ ] clipboard image family: CF_DIB read + `clipboard:` + bitmap paste (#66, blocked by #65)
+  - [ ] `/close` CLI switch — exit after slideshow (#67)
+  - [ ] keep-zoom-on-change option `keep_zoom` (#68)
+  - [ ] chore: `shell_execute` dual-definition convergence (#69)
+- Unscheduled candidates (upstream wishlist & #50 record): D2D/WCS renderer (needs an ADR — the #50 reopen trigger), playlist pane/tool window, I18N beyond en/zh-CN, SVG/AVIF/APNG decoders, undo-delete restore, About credits.
 
 ## Differences from upstream (intentional)
 
