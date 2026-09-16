@@ -108,6 +108,7 @@ mod panscan;
 mod pixels;
 mod playlist;
 mod preload;
+mod shell;
 mod slideshow;
 mod status;
 mod stitch;

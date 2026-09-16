@@ -120,6 +120,7 @@ use crate::menu;
 use crate::paint::paint;
 use crate::playlist::{self, Playlist, PlaylistEntry};
 use crate::preload::{self, AdoptDecision, LastCache, PreloadSlot, PreloadState};
+use crate::shell;
 use crate::slideshow;
 use crate::status;
 use crate::surface::{DibFrame, Surface};
@@ -4786,6 +4787,19 @@ fn on_command(hwnd: HWND, cmd: menu::Cmd) {
         menu::Cmd::FileOpenEverythingSearch => everything::open_search_dialog(hwnd, false),
         menu::Cmd::FileAddEverythingSearch => everything::open_search_dialog(hwnd, true),
         menu::Cmd::FileAddFile => open_image_via_dialog(hwnd, true),
+        // The #42 shell family (upstream viv.c:2477-2519: Preview/Print/
+        // Wallpaper/Close then Edit/Location/Properties) — every handler
+        // is the bare current-file gate plus one shell call, all
+        // fail-soft.
+        cmd @ (menu::Cmd::FileEdit
+        | menu::Cmd::FilePreview
+        | menu::Cmd::FilePrint
+        | menu::Cmd::FileProperties) => shell::run_verb(hwnd, cmd),
+        menu::Cmd::FileOpenFileLocation => shell::open_file_location(hwnd),
+        menu::Cmd::FileSetDesktopWallpaper => shell::set_desktop_wallpaper(hwnd),
+        // Upstream `_viv_blank` (viv.c:7908): this just clears the image —
+        // riviv's blank path IS that port.
+        menu::Cmd::FileClose => blank_display(hwnd),
         menu::Cmd::FileExit => {
             // Upstream `_viv_exit` (viv.c:1883-1888) saves the config and
             // quits the pump; riviv's WM_DESTROY does both on the way out.

@@ -35,6 +35,35 @@ pub(crate) enum Cmd {
     /// File → Add Everything Search... (`VIV_ID_FILE_ADD_EVERYTHING_
     /// SEARCH`, viv.c:807) — the #22 search dialog's Add flavor.
     FileAddEverythingSearch,
+    /// File → Open File &Location... (#42; `VIV_ID_FILE_OPEN_FILE_
+    /// LOCATION`, viv.c:811) — Ctrl+Return: select the current file in
+    /// Explorer (SHOpenFolderAndSelectItems; the fallback opens the
+    /// parent folder).
+    FileOpenFileLocation,
+    /// File → &Edit... (#42; `VIV_ID_FILE_EDIT`, viv.c:812) — the shell
+    /// "edit" verb; no default key (upstream comments Ctrl+E out — the
+    /// Everything search owns it, viv.c:979).
+    FileEdit,
+    /// File → Pre&view... (#42; `VIV_ID_FILE_PREVIEW`, viv.c:813) — the
+    /// shell "preview" verb; no default key upstream.
+    FilePreview,
+    /// File → &Print... (#42; `VIV_ID_FILE_PRINT`, viv.c:814) — the shell
+    /// "print" verb, Ctrl+P.
+    FilePrint,
+    /// File → Set Des&ktop Wallpaper (#42; `VIV_ID_FILE_SET_DESKTOP_
+    /// WALLPAPER`, viv.c:815) — the "setdesktopwallpaper" verb behind a
+    /// one-shot stobject.dll load; no default key (upstream comments it
+    /// out — "needs a confirmation dialog", viv.c:982).
+    FileSetDesktopWallpaper,
+    /// File → &Close (#42; `VIV_ID_FILE_CLOSE`, viv.c:816 — MF_OWNERDRAW
+    /// upstream, keyboard-only Ctrl+W like the #41 hidden rows). This
+    /// just clears the image (upstream `_viv_blank`, viv.c:7908).
+    FileClose,
+    /// File → P&roperties (#42; `VIV_ID_FILE_PROPERTIES`, viv.c:820) —
+    /// the shell "properties" verb; no default key upstream. Upstream
+    /// menu order puts it past the delete block, so #43's Delete/Rename
+    /// rows land between Close and this row.
+    FileProperties,
     /// File → Exit (`VIV_ID_FILE_EXIT`).
     FileExit,
     /// Edit → Cu&t (#41; `VIV_ID_EDIT_CUT`, viv.c:826).
@@ -378,6 +407,13 @@ impl Cmd {
         Self::FileOpenEverythingSearch,
         Self::FileAddFile,
         Self::FileAddEverythingSearch,
+        Self::FileOpenFileLocation,
+        Self::FileEdit,
+        Self::FilePreview,
+        Self::FilePrint,
+        Self::FileSetDesktopWallpaper,
+        Self::FileClose,
+        Self::FileProperties,
         Self::FileExit,
         Self::EditCut,
         Self::EditCopy,
@@ -616,6 +652,50 @@ pub(crate) const ENTRIES: &[Entry] = &[
         loc: loc::Id::MenuAddEverythingSearch,
         parent: Slot::File,
         cmd: Cmd::FileAddEverythingSearch,
+    },
+    Entry::Separator { parent: Slot::File },
+    // The #42 shell verb block (viv.c:811-816): Location/Edit/Preview/
+    // Print/Wallpaper visible; Close hidden (MF_OWNERDRAW upstream —
+    // keyboard Ctrl+W only, the Copy Filename precedent).
+    Entry::Item {
+        loc: loc::Id::MenuOpenFileLocation,
+        parent: Slot::File,
+        cmd: Cmd::FileOpenFileLocation,
+    },
+    Entry::Item {
+        loc: loc::Id::MenuFileEdit,
+        parent: Slot::File,
+        cmd: Cmd::FileEdit,
+    },
+    Entry::Item {
+        loc: loc::Id::MenuPreview,
+        parent: Slot::File,
+        cmd: Cmd::FilePreview,
+    },
+    Entry::Item {
+        loc: loc::Id::MenuPrint,
+        parent: Slot::File,
+        cmd: Cmd::FilePrint,
+    },
+    Entry::Item {
+        loc: loc::Id::MenuSetDesktopWallpaper,
+        parent: Slot::File,
+        cmd: Cmd::FileSetDesktopWallpaper,
+    },
+    Entry::HiddenItem {
+        loc: loc::Id::MenuClose,
+        parent: Slot::File,
+        cmd: Cmd::FileClose,
+    },
+    // Upstream separates Close from the delete/rename block (viv.c:816-
+    // 820); #43's rows land here, with Properties past the block — the
+    // separators survive the pruned middle (the Add tail's precedent in
+    // reverse).
+    Entry::Separator { parent: Slot::File },
+    Entry::Item {
+        loc: loc::Id::MenuProperties,
+        parent: Slot::File,
+        cmd: Cmd::FileProperties,
     },
     Entry::Separator { parent: Slot::File },
     Entry::Item {
@@ -1422,15 +1502,24 @@ pub(crate) fn radio(cmd: Cmd) -> bool {
 /// Whether `cmd`'s menu item is selectable. Everything riviv registers is
 /// always available (upstream never gates zoom/navigation on image state
 /// either — its EnableMenuItem list, viv.c:7103-7121, covers clipboard/
-/// delete/print commands riviv does not register).
+/// delete/print/shell commands).
 pub(crate) fn enabled(cmd: Cmd, state: &MenuState) -> bool {
     match cmd {
-        // The clipboard quartet (#41): upstream grays all four through the
-        // same `is_image_enabled` gate (viv.c:7104-7108). Paste is not in
-        // that list — an empty clipboard just makes the handler a no-op.
-        Cmd::EditCut | Cmd::EditCopy | Cmd::EditCopyFilename | Cmd::EditCopyImage => {
-            state.image_enabled
-        }
+        // The clipboard quartet (#41) and the #42 shell septet: upstream
+        // grays them all through the same `is_image_enabled` gate (viv.c:
+        // 7104-7108 + 7114-7116). Paste is not in that list — an empty
+        // clipboard just makes the handler a no-op.
+        Cmd::EditCut
+        | Cmd::EditCopy
+        | Cmd::EditCopyFilename
+        | Cmd::EditCopyImage
+        | Cmd::FileOpenFileLocation
+        | Cmd::FileEdit
+        | Cmd::FilePreview
+        | Cmd::FilePrint
+        | Cmd::FileSetDesktopWallpaper
+        | Cmd::FileClose
+        | Cmd::FileProperties => state.image_enabled,
         _ => true,
     }
 }
@@ -1503,102 +1592,113 @@ mod tests {
     fn slideshow_and_animation_command_ids_are_pinned_for_the_wire() {
         // smoke37/smoke38 post these as raw WM_COMMAND wparams; inserting a
         // command ahead of the block would silently shift every wire id.
-        // The #41 Edit block runs 7-11 (viv.c:826-830 table order).
-        assert_eq!(Cmd::EditCut.id(), 7);
-        assert_eq!(Cmd::EditCopy.id(), 8);
-        assert_eq!(Cmd::EditCopyFilename.id(), 9);
-        assert_eq!(Cmd::EditCopyImage.id(), 10);
-        assert_eq!(Cmd::EditPaste.id(), 11);
+        // The #42 shell septet runs 6-12 between the Add rows and Exit
+        // (viv.c:811-820 table order), pushing every later id +7.
+        assert_eq!(Cmd::FileOpenFileLocation.id(), 6);
+        assert_eq!(Cmd::FileEdit.id(), 7);
+        assert_eq!(Cmd::FilePreview.id(), 8);
+        assert_eq!(Cmd::FilePrint.id(), 9);
+        assert_eq!(Cmd::FileSetDesktopWallpaper.id(), 10);
+        assert_eq!(Cmd::FileClose.id(), 11);
+        assert_eq!(Cmd::FileProperties.id(), 12);
+        assert_eq!(Cmd::FileExit.id(), 13);
+        // The #41 Edit block runs 14-18 (viv.c:826-830 table order).
+        assert_eq!(Cmd::EditCut.id(), 14);
+        assert_eq!(Cmd::EditCopy.id(), 15);
+        assert_eq!(Cmd::EditCopyFilename.id(), 16);
+        assert_eq!(Cmd::EditCopyImage.id(), 17);
+        assert_eq!(Cmd::EditPaste.id(), 18);
         // The #46 View head grows to upstream's full order (viv.c:843-864):
-        // hidden Caption/ThickFrame (12/13), Menu 14, Status 15, Controls
-        // 16, the Preset trio 17-19, Fullscreen 20, Slideshow 21, the
-        // Window Size quartet 22-25, Refresh 26, the fit trio 27-29,
-        // 1:1 30 and Best Fit 31.
-        assert_eq!(Cmd::ViewCaption.id(), 12);
-        assert_eq!(Cmd::ViewThickFrame.id(), 13);
-        assert_eq!(Cmd::ViewMenu.id(), 14);
-        assert_eq!(Cmd::ViewStatus.id(), 15);
-        assert_eq!(Cmd::ViewControls.id(), 16);
-        assert_eq!(Cmd::ViewPreset1.id(), 17);
-        assert_eq!(Cmd::ViewPreset2.id(), 18);
-        assert_eq!(Cmd::ViewPreset3.id(), 19);
-        assert_eq!(Cmd::ViewFullscreen.id(), 20);
-        assert_eq!(Cmd::ViewSlideshow.id(), 21);
-        assert_eq!(Cmd::ViewWindowSize50.id(), 22);
-        assert_eq!(Cmd::ViewWindowSize100.id(), 23);
-        assert_eq!(Cmd::ViewWindowSize200.id(), 24);
-        assert_eq!(Cmd::ViewWindowSizeAutoFit.id(), 25);
-        assert_eq!(Cmd::ViewRefresh.id(), 26);
-        assert_eq!(Cmd::ViewAllowShrinking.id(), 27);
-        assert_eq!(Cmd::ViewKeepAspect.id(), 28);
-        assert_eq!(Cmd::ViewFillWindow.id(), 29);
-        assert_eq!(Cmd::ViewOneToOne.id(), 30);
-        assert_eq!(Cmd::ViewBestFit.id(), 31);
-        // The #44 Pan/Scan block runs 32-47 (viv.h:110-125 order).
-        assert_eq!(Cmd::ViewPanScanIncreaseSize.id(), 32);
-        assert_eq!(Cmd::ViewPanScanDecreaseSize.id(), 33);
-        assert_eq!(Cmd::ViewPanScanIncreaseWidth.id(), 34);
-        assert_eq!(Cmd::ViewPanScanDecreaseWidth.id(), 35);
-        assert_eq!(Cmd::ViewPanScanIncreaseHeight.id(), 36);
-        assert_eq!(Cmd::ViewPanScanDecreaseHeight.id(), 37);
-        assert_eq!(Cmd::ViewPanScanMoveUp.id(), 38);
-        assert_eq!(Cmd::ViewPanScanMoveDown.id(), 39);
-        assert_eq!(Cmd::ViewPanScanMoveLeft.id(), 40);
-        assert_eq!(Cmd::ViewPanScanMoveRight.id(), 41);
-        assert_eq!(Cmd::ViewPanScanMoveUpLeft.id(), 42);
-        assert_eq!(Cmd::ViewPanScanMoveUpRight.id(), 43);
-        assert_eq!(Cmd::ViewPanScanMoveDownLeft.id(), 44);
-        assert_eq!(Cmd::ViewPanScanMoveDownRight.id(), 45);
-        assert_eq!(Cmd::ViewPanScanMoveCenter.id(), 46);
-        assert_eq!(Cmd::ViewPanScanReset.id(), 47);
-        // Zoom trio 48-50, the #46 on-top trio 51-53, Options 54.
-        assert_eq!(Cmd::ViewZoomIn.id(), 48);
-        assert_eq!(Cmd::ViewZoomOut.id(), 49);
-        assert_eq!(Cmd::ViewZoomReset.id(), 50);
-        assert_eq!(Cmd::ViewOntopAlways.id(), 51);
-        assert_eq!(Cmd::ViewOntopWhilePlaying.id(), 52);
-        assert_eq!(Cmd::ViewOntopNever.id(), 53);
-        assert_eq!(Cmd::ViewOptions.id(), 54);
-        // The #45 toolbar-only pair: 56/57.
-        assert_eq!(Cmd::SlideshowPause.id(), 55);
-        assert_eq!(Cmd::SlideshowPlayOnly.id(), 56);
-        assert_eq!(Cmd::SlideshowPauseOnly.id(), 57);
-        assert_eq!(Cmd::SlideshowRateDecrease.id(), 58);
-        assert_eq!(Cmd::SlideshowRateIncrease.id(), 59);
-        assert_eq!(Cmd::SlideshowRate250.id(), 60);
-        assert_eq!(Cmd::SlideshowRate500.id(), 61);
-        assert_eq!(Cmd::SlideshowRateCustom.id(), 77);
-        // The #38 Animation block lands 78-91 with the #41/#44/#45/#46
-        // shifts.
-        assert_eq!(Cmd::AnimationPlayPause.id(), 78);
-        assert_eq!(Cmd::AnimationJumpForwardMedium.id(), 79);
-        assert_eq!(Cmd::AnimationJumpBackwardMedium.id(), 80);
-        assert_eq!(Cmd::AnimationJumpForwardShort.id(), 81);
-        assert_eq!(Cmd::AnimationJumpBackwardShort.id(), 82);
-        assert_eq!(Cmd::AnimationJumpForwardLong.id(), 83);
-        assert_eq!(Cmd::AnimationJumpBackwardLong.id(), 84);
-        assert_eq!(Cmd::AnimationFrameStep.id(), 85);
-        assert_eq!(Cmd::AnimationFramePrev.id(), 86);
-        assert_eq!(Cmd::AnimationFirstFrame.id(), 87);
-        assert_eq!(Cmd::AnimationLastFrame.id(), 88);
-        assert_eq!(Cmd::AnimationRateDecrease.id(), 89);
-        assert_eq!(Cmd::AnimationRateIncrease.id(), 90);
-        assert_eq!(Cmd::AnimationRateReset.id(), 91);
-        assert_eq!(Cmd::NavNext.id(), 92);
+        // hidden Caption/ThickFrame (19/20), Menu 21, Status 22, Controls
+        // 23, the Preset trio 24-26, Fullscreen 27, Slideshow 28, the
+        // Window Size quartet 29-32, Refresh 33, the fit trio 34-36,
+        // 1:1 37 and Best Fit 38.
+        assert_eq!(Cmd::ViewCaption.id(), 19);
+        assert_eq!(Cmd::ViewThickFrame.id(), 20);
+        assert_eq!(Cmd::ViewMenu.id(), 21);
+        assert_eq!(Cmd::ViewStatus.id(), 22);
+        assert_eq!(Cmd::ViewControls.id(), 23);
+        assert_eq!(Cmd::ViewPreset1.id(), 24);
+        assert_eq!(Cmd::ViewPreset2.id(), 25);
+        assert_eq!(Cmd::ViewPreset3.id(), 26);
+        assert_eq!(Cmd::ViewFullscreen.id(), 27);
+        assert_eq!(Cmd::ViewSlideshow.id(), 28);
+        assert_eq!(Cmd::ViewWindowSize50.id(), 29);
+        assert_eq!(Cmd::ViewWindowSize100.id(), 30);
+        assert_eq!(Cmd::ViewWindowSize200.id(), 31);
+        assert_eq!(Cmd::ViewWindowSizeAutoFit.id(), 32);
+        assert_eq!(Cmd::ViewRefresh.id(), 33);
+        assert_eq!(Cmd::ViewAllowShrinking.id(), 34);
+        assert_eq!(Cmd::ViewKeepAspect.id(), 35);
+        assert_eq!(Cmd::ViewFillWindow.id(), 36);
+        assert_eq!(Cmd::ViewOneToOne.id(), 37);
+        assert_eq!(Cmd::ViewBestFit.id(), 38);
+        // The #44 Pan/Scan block runs 39-54 (viv.h:110-125 order).
+        assert_eq!(Cmd::ViewPanScanIncreaseSize.id(), 39);
+        assert_eq!(Cmd::ViewPanScanDecreaseSize.id(), 40);
+        assert_eq!(Cmd::ViewPanScanIncreaseWidth.id(), 41);
+        assert_eq!(Cmd::ViewPanScanDecreaseWidth.id(), 42);
+        assert_eq!(Cmd::ViewPanScanIncreaseHeight.id(), 43);
+        assert_eq!(Cmd::ViewPanScanDecreaseHeight.id(), 44);
+        assert_eq!(Cmd::ViewPanScanMoveUp.id(), 45);
+        assert_eq!(Cmd::ViewPanScanMoveDown.id(), 46);
+        assert_eq!(Cmd::ViewPanScanMoveLeft.id(), 47);
+        assert_eq!(Cmd::ViewPanScanMoveRight.id(), 48);
+        assert_eq!(Cmd::ViewPanScanMoveUpLeft.id(), 49);
+        assert_eq!(Cmd::ViewPanScanMoveUpRight.id(), 50);
+        assert_eq!(Cmd::ViewPanScanMoveDownLeft.id(), 51);
+        assert_eq!(Cmd::ViewPanScanMoveDownRight.id(), 52);
+        assert_eq!(Cmd::ViewPanScanMoveCenter.id(), 53);
+        assert_eq!(Cmd::ViewPanScanReset.id(), 54);
+        // Zoom trio 55-57, the #46 on-top trio 58-60, Options 61.
+        assert_eq!(Cmd::ViewZoomIn.id(), 55);
+        assert_eq!(Cmd::ViewZoomOut.id(), 56);
+        assert_eq!(Cmd::ViewZoomReset.id(), 57);
+        assert_eq!(Cmd::ViewOntopAlways.id(), 58);
+        assert_eq!(Cmd::ViewOntopWhilePlaying.id(), 59);
+        assert_eq!(Cmd::ViewOntopNever.id(), 60);
+        assert_eq!(Cmd::ViewOptions.id(), 61);
+        // The #45 toolbar-only pair: 63/64.
+        assert_eq!(Cmd::SlideshowPause.id(), 62);
+        assert_eq!(Cmd::SlideshowPlayOnly.id(), 63);
+        assert_eq!(Cmd::SlideshowPauseOnly.id(), 64);
+        assert_eq!(Cmd::SlideshowRateDecrease.id(), 65);
+        assert_eq!(Cmd::SlideshowRateIncrease.id(), 66);
+        assert_eq!(Cmd::SlideshowRate250.id(), 67);
+        assert_eq!(Cmd::SlideshowRate500.id(), 68);
+        assert_eq!(Cmd::SlideshowRateCustom.id(), 84);
+        // The #38 Animation block lands 85-98 with the #41/#44/#45/#46/
+        // #42 shifts.
+        assert_eq!(Cmd::AnimationPlayPause.id(), 85);
+        assert_eq!(Cmd::AnimationJumpForwardMedium.id(), 86);
+        assert_eq!(Cmd::AnimationJumpBackwardMedium.id(), 87);
+        assert_eq!(Cmd::AnimationJumpForwardShort.id(), 88);
+        assert_eq!(Cmd::AnimationJumpBackwardShort.id(), 89);
+        assert_eq!(Cmd::AnimationJumpForwardLong.id(), 90);
+        assert_eq!(Cmd::AnimationJumpBackwardLong.id(), 91);
+        assert_eq!(Cmd::AnimationFrameStep.id(), 92);
+        assert_eq!(Cmd::AnimationFramePrev.id(), 93);
+        assert_eq!(Cmd::AnimationFirstFrame.id(), 94);
+        assert_eq!(Cmd::AnimationLastFrame.id(), 95);
+        assert_eq!(Cmd::AnimationRateDecrease.id(), 96);
+        assert_eq!(Cmd::AnimationRateIncrease.id(), 97);
+        assert_eq!(Cmd::AnimationRateReset.id(), 98);
+        assert_eq!(Cmd::NavNext.id(), 99);
         // The #39 sort/shuffle/jumpto block (menu-table order,
-        // viv.c:946-956); HelpCommandLineOptions lands 105, HelpAbout 106.
-        assert_eq!(Cmd::NavSortName.id(), 96);
-        assert_eq!(Cmd::NavSortFullPath.id(), 97);
-        assert_eq!(Cmd::NavSortSize.id(), 98);
-        assert_eq!(Cmd::NavSortDateModified.id(), 99);
-        assert_eq!(Cmd::NavSortDateCreated.id(), 100);
-        assert_eq!(Cmd::NavSortAscending.id(), 101);
-        assert_eq!(Cmd::NavSortDescending.id(), 102);
-        assert_eq!(Cmd::NavShuffle.id(), 103);
-        assert_eq!(Cmd::NavJumpTo.id(), 104);
-        // The #48 Help→Command Line Options row: 105, HelpAbout 106.
-        assert_eq!(Cmd::HelpCommandLineOptions.id(), 105);
-        assert_eq!(Cmd::HelpAbout.id(), 106);
+        // viv.c:946-956); HelpCommandLineOptions lands 112, HelpAbout
+        // 113.
+        assert_eq!(Cmd::NavSortName.id(), 103);
+        assert_eq!(Cmd::NavSortFullPath.id(), 104);
+        assert_eq!(Cmd::NavSortSize.id(), 105);
+        assert_eq!(Cmd::NavSortDateModified.id(), 106);
+        assert_eq!(Cmd::NavSortDateCreated.id(), 107);
+        assert_eq!(Cmd::NavSortAscending.id(), 108);
+        assert_eq!(Cmd::NavSortDescending.id(), 109);
+        assert_eq!(Cmd::NavShuffle.id(), 110);
+        assert_eq!(Cmd::NavJumpTo.id(), 111);
+        // The #48 Help→Command Line Options row: 112, HelpAbout 113.
+        assert_eq!(Cmd::HelpCommandLineOptions.id(), 112);
+        assert_eq!(Cmd::HelpAbout.id(), 113);
     }
 
     #[test]
@@ -1929,34 +2029,37 @@ mod tests {
     }
 
     #[test]
-    fn only_the_clipboard_quartet_gates_and_only_on_the_image_flag() {
-        // #41: upstream grays exactly Cut/Copy/Copy Filename/Copy Image
-        // through `is_image_enabled` (viv.c:7104-7108) — Paste has NO
-        // EnableMenuItem row (an empty clipboard is just a no-op). Every
-        // other riviv command stays always-selectable.
+    fn the_image_gated_commands_gate_and_only_on_the_image_flag() {
+        // #41 + #42: upstream grays exactly Cut/Copy/Copy Filename/Copy
+        // Image (viv.c:7104-7108) plus the shell septet Close/Edit/
+        // Location/Preview/Print/Properties/Wallpaper (viv.c:7114-7116)
+        // through `is_image_enabled` — Paste has NO EnableMenuItem row (an
+        // empty clipboard is just a no-op). Every other riviv command
+        // stays always-selectable.
+        let gated_cmds = [
+            Cmd::EditCut,
+            Cmd::EditCopy,
+            Cmd::EditCopyFilename,
+            Cmd::EditCopyImage,
+            Cmd::FileOpenFileLocation,
+            Cmd::FileEdit,
+            Cmd::FilePreview,
+            Cmd::FilePrint,
+            Cmd::FileSetDesktopWallpaper,
+            Cmd::FileClose,
+            Cmd::FileProperties,
+        ];
         for cmd in Cmd::ALL {
-            if matches!(
-                cmd,
-                Cmd::EditCut | Cmd::EditCopy | Cmd::EditCopyFilename | Cmd::EditCopyImage
-            ) {
+            if gated_cmds.contains(&cmd) {
                 continue;
             }
             assert!(enabled(cmd, &plain_state()), "{cmd:?}");
         }
         let mut gated = plain_state();
         gated.image_enabled = false;
-        assert!(!enabled(Cmd::EditCut, &gated), "{:?}", Cmd::EditCut);
-        assert!(!enabled(Cmd::EditCopy, &gated), "{:?}", Cmd::EditCopy);
-        assert!(
-            !enabled(Cmd::EditCopyFilename, &gated),
-            "{:?}",
-            Cmd::EditCopyFilename
-        );
-        assert!(
-            !enabled(Cmd::EditCopyImage, &gated),
-            "{:?}",
-            Cmd::EditCopyImage
-        );
+        for cmd in gated_cmds {
+            assert!(!enabled(cmd, &gated), "{cmd:?}");
+        }
         assert!(enabled(Cmd::EditPaste, &gated), "{:?}", Cmd::EditPaste);
     }
 
@@ -1980,28 +2083,34 @@ mod tests {
     fn command_ids_stay_pinned_for_the_smoke_scripts() {
         // The cross-process smokes post WM_COMMAND by raw id; inserting a
         // Cmd variant shifts everything after it. This pins the load-bearing
-        // anchors (the #46 baseline; #47 reads panscan/rate/1:1/Options).
-        assert_eq!(Cmd::ViewOneToOne.id(), 30);
-        assert_eq!(Cmd::ViewPanScanIncreaseSize.id(), 32);
-        assert_eq!(Cmd::ViewOptions.id(), 54);
-        assert_eq!(Cmd::SlideshowRate1000.id(), 62);
-        assert_eq!(Cmd::AnimationRateDecrease.id(), 89);
-        assert_eq!(Cmd::HelpAbout.id(), 106);
-        assert_eq!(Cmd::COUNT, 106);
+        // anchors (the #46 baseline; #47 reads panscan/rate/1:1/Options;
+        // #42 reads the shell septet 6-12). The #42 insertion pushed every
+        // id from Exit on +7 and COUNT to 113.
+        assert_eq!(Cmd::FileOpenFileLocation.id(), 6);
+        assert_eq!(Cmd::FileClose.id(), 11);
+        assert_eq!(Cmd::FileProperties.id(), 12);
+        assert_eq!(Cmd::ViewOneToOne.id(), 37);
+        assert_eq!(Cmd::ViewPanScanIncreaseSize.id(), 39);
+        assert_eq!(Cmd::ViewOptions.id(), 61);
+        assert_eq!(Cmd::SlideshowRate1000.id(), 69);
+        assert_eq!(Cmd::AnimationRateDecrease.id(), 96);
+        assert_eq!(Cmd::HelpAbout.id(), 113);
+        assert_eq!(Cmd::COUNT, 113);
     }
 
     #[test]
     fn the_owner_draw_rows_hide_from_the_menu_bar_only() {
         // Upstream's MF_OWNERDRAW rows: present in the command table
         // (Controls list + WM_COMMAND + ini names), absent from the menu
-        // bar build (viv.c:12328). The animation quartet (viv.c:925-928),
-        // the #41 clipboard pair — Copy Filename (viv.c:828) and Paste
-        // (viv.c:830), keyboard Ctrl+Shift+C / Ctrl+V upstream — #44's
-        // four diagonal Pan/Scan moves (viv.c:881-884, Ctrl+NUMPAD
-        // corners), and #45's toolbar-only slideshow pair (upstream keeps
-        // them out of the table entirely; riviv's hidden-row superset,
-        // README Differences). The table marks them HiddenItem; the
-        // visible rows stay Item.
+        // bar build (viv.c:12328). The #42 Close row (viv.c:816), the
+        // animation quartet (viv.c:925-928), the #41 clipboard pair —
+        // Copy Filename (viv.c:828) and Paste (viv.c:830, keyboard
+        // Ctrl+Shift+C / Ctrl+V upstream) — #44's four diagonal Pan/Scan
+        // moves (viv.c:881-884, Ctrl+NUMPAD corners), and #45's
+        // toolbar-only slideshow pair (upstream keeps them out of the
+        // table entirely; riviv's hidden-row superset, README
+        // Differences). The table marks them HiddenItem; the visible
+        // rows stay Item.
         let hidden: Vec<Cmd> = ENTRIES
             .iter()
             .filter_map(|e| match e {
@@ -2012,6 +2121,7 @@ mod tests {
         assert_eq!(
             hidden,
             vec![
+                Cmd::FileClose,
                 Cmd::EditCopyFilename,
                 Cmd::EditPaste,
                 Cmd::ViewCaption,
