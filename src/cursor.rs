@@ -22,11 +22,14 @@ pub(crate) const HIDE_CURSOR_DELAY_MS: u32 = 2000;
 /// riviv's animation timer is 1).
 pub(crate) const HIDE_CURSOR_TIMER_ID: usize = 2;
 
-/// The live inputs of `_viv_should_show_cursor` (viv.c:14593-14619).
-/// `_viv_in_popup_menu` is always false in riviv (no context menu yet), so
-/// it is omitted.
+/// The live inputs of `_viv_should_show_cursor` (viv.c:14593-14619): the
+/// popup flag wraps the whole gate block — while a context menu tracks,
+/// the cursor never hides no matter what the other conditions say.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CursorConditions {
+    /// A context menu is tracking (`_viv_in_popup_menu`, set around
+    /// TrackPopupMenu, viv.c:3534-3539).
+    pub(crate) in_popup_menu: bool,
     /// A current file is open and neither failure flag is set (upstream:
     /// `*fd->cFileName && !file_not_found && !load_failed`).
     pub(crate) has_viewable_image: bool,
@@ -94,13 +97,15 @@ impl CursorVisibility {
     }
 
     /// `_viv_should_show_cursor` (viv.c:14593-14619): show UNLESS every hide
-    /// condition holds at once.
+    /// condition holds at once — and always show while a popup menu tracks
+    /// (the flag short-circuits the whole gate block, viv.c:14595).
     pub(crate) fn should_show(&self, c: &CursorConditions) -> bool {
-        !(c.has_viewable_image
-            && c.foreground
-            && c.mouseover
-            && !c.captured
-            && (c.fullscreen || c.hide_when_windowed))
+        c.in_popup_menu
+            || !(c.has_viewable_image
+                && c.foreground
+                && c.mouseover
+                && !c.captured
+                && (c.fullscreen || c.hide_when_windowed))
     }
 
     /// `_viv_show_cursor` (viv.c:14559-14571): kill the timer, show if hidden.
@@ -185,6 +190,7 @@ mod tests {
 
     /// The conditions that let the cursor hide (upstream's every-gate-at-once).
     const HIDING: CursorConditions = CursorConditions {
+        in_popup_menu: false,
         has_viewable_image: true,
         foreground: true,
         mouseover: true,
@@ -231,9 +237,40 @@ mod tests {
                 fullscreen: false,
                 ..HIDING
             },
+            CursorConditions {
+                in_popup_menu: true,
+                ..HIDING
+            },
         ] {
             assert!(v.should_show(&mutate), "should show with {mutate:?}");
         }
+    }
+
+    /// While a popup menu tracks, the cursor shows regardless of every other
+    /// condition (the flag wraps upstream's whole gate block, viv.c:14595) —
+    /// so the idle timer firing mid-menu can never hide it.
+    #[test]
+    fn popup_menu_tracking_forces_the_cursor_visible() {
+        let mut v = CursorVisibility::new();
+        v.update(&HIDING); // armed
+        v.timer_fired(&HIDING); // hidden, timer dead
+        let menu_up = CursorConditions {
+            in_popup_menu: true,
+            ..HIDING
+        };
+        assert!(v.should_show(&menu_up));
+        // The armed-timer fire during the menu is a no-op (conditions say
+        // show), matching upstream's _viv_should_show_cursor short-circuit.
+        assert_eq!(v.timer_fired(&menu_up), CursorEffects::default());
+        // After the menu closes the flag drops and the normal cycle resumes.
+        assert!(!v.should_show(&HIDING));
+        assert_eq!(
+            v.update(&HIDING),
+            CursorEffects {
+                start_timer: true,
+                ..Default::default()
+            }
+        );
     }
 
     #[test]

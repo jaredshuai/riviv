@@ -231,6 +231,10 @@ pub(crate) struct WindowState {
     /// Cursor visibility state machine (#8; upstream `_viv_is_cursor_shown`
     /// + `_viv_is_hide_cursor_timer`, viv.c:709/713) — see `cursor.rs`.
     pub(crate) cursor: CursorVisibility,
+    /// A context menu is tracking (upstream `_viv_in_popup_menu`,
+    /// viv.c:716/3534-3539): set across TrackPopupMenu so the WM_TIMER
+    /// hide-cursor path sees it (the cursor never hides mid-menu).
+    pub(crate) in_popup_menu: bool,
     /// Mouse-leave tracking is armed (upstream `_viv_is_tracking_mouse`,
     /// viv.c:781) and the mouse is currently over the window
     /// (`_viv_is_mouseover`, viv.c:782) — the hide-cursor conditions read
@@ -702,6 +706,7 @@ pub(crate) fn fit_policy(state: &WindowState) -> FitPolicy {
 /// config, default 1 — #24 wired it to the ini).
 fn cursor_conditions(hwnd: HWND, state: &WindowState) -> cursor::CursorConditions {
     cursor::CursorConditions {
+        in_popup_menu: state.in_popup_menu,
         has_viewable_image: state.nav_current.is_some()
             && !state.status_file_not_found
             && !state.status_load_failed,
@@ -4639,12 +4644,15 @@ fn create_menu_bar(keys: &crate::keys::KeyMap) -> HMENU {
                 };
             }
             menu::Entry::Item { loc, parent, cmd } => {
-                // The accelerator label: the first binding's display name
-                // via GetKeyNameTextW (layout-localized like upstream,
+                // The accelerator label: the hint command's first binding
+                // (the visible Delete row reads the RECYCLE-delete key,
+                // upstream's own remap, viv.c:12356-12361) via
+                // GetKeyNameTextW (layout-localized like upstream,
                 // `_viv_vk_to_text` viv.c:12221-12261), composed by the
                 // pure `menu::key_label`.
+                let hint = menu::hint_cmd(cmd);
                 let label = keys
-                    .first(cmd)
+                    .first(hint)
                     .and_then(|k| vk_text(k.vk).map(|t| menu::key_label(k, &t)));
                 let text = to_wide(&menu::item_text(loc::get(loc), label.as_deref()));
                 // SAFETY: text outlives the append.
@@ -4754,8 +4762,25 @@ pub(crate) fn vk_text(vk: u16) -> Option<String> {
 
 /// WM_INITMENU (upstream viv.c:3063-3072: `_viv_check_menus` over
 /// `GetMenu(hwnd)` just before the bar opens) — apply the check marks and
-/// grays for the state right now.
+/// grays for the state right now. The bar comes from GetMenu, NOT the
+/// wParam menu: TrackPopupMenu delivers its own WM_INITMENU with the
+/// popup's handle, and both upstream and the cross-process probes address
+/// the bar.
 fn on_initmenu(hwnd: HWND) {
+    // SAFETY: read-only query of the window's own menu.
+    let bar = unsafe { GetMenu(hwnd) };
+    refresh_menu_state(hwnd, bar);
+}
+
+/// The shared menu-state application (upstream `_viv_check_menus`,
+/// viv.c:7071-7198 — ONE function serves the bar's WM_INITMENU and the
+/// context menu's build, viv.c:3071/3530): snapshot the live state, run
+/// the fullscreen-slideshow side refreshes (viv.c:7081-7090 — BEFORE any
+/// menu-validity concern; upstream never validates the HMENU, and the
+/// side effects must survive a missing bar), then apply every command's
+/// check/gray to `target` by command id — the MF_BYCOMMAND operations walk
+/// the whole menu tree, submenus included.
+fn refresh_menu_state(hwnd: HWND, target: HMENU) {
     // The 1:1 check is upstream's render-size == image-size compare
     // (viv.c:7131); blank displays carry no 1:1 state (upstream's raw
     // 0 == 0 compare would check the item on an empty window — riviv
@@ -4808,15 +4833,15 @@ fn on_initmenu(hwnd: HWND) {
     // Upstream refreshes the status bar, the strip and the on-top state
     // right here when a slideshow runs fullscreen (viv.c:7081-7090) — a
     // slideshow started while fullscreen never passes through the normal
-    // refresh points' windowed paths before the menu opens.
+    // refresh points' windowed paths before the menu opens. This runs
+    // BEFORE the target-validity guard: a detached bar (fullscreen) must
+    // not skip the side effects.
     if state.fullscreen && state.slideshow {
         refresh_status(hwnd);
         refresh_toolbar(hwnd);
         update_ontop(hwnd);
     }
-    // SAFETY: read-only query of the window's own menu.
-    let bar = unsafe { GetMenu(hwnd) };
-    if bar.is_invalid() {
+    if target.is_invalid() {
         return;
     }
     for cmd in menu::Cmd::ALL {
@@ -4832,8 +4857,9 @@ fn on_initmenu(hwnd: HWND) {
         } else {
             (MF_UNCHECKED | MF_BYCOMMAND).0 | radio
         };
-        // SAFETY: bar is the window's own live menu.
-        let _ = unsafe { CheckMenuItem(bar, u32::from(cmd.id()), flags) };
+        // SAFETY: target is the caller's live menu (the bar or the context
+        // popup) — a by-command op on an id the menu lacks just fails.
+        let _ = unsafe { CheckMenuItem(target, u32::from(cmd.id()), flags) };
         let enable: MENU_ITEM_FLAGS = if menu::enabled(cmd, &state) {
             MF_ENABLED | MF_BYCOMMAND
         } else {
@@ -4845,23 +4871,20 @@ fn on_initmenu(hwnd: HWND) {
             // leaves a clickable-looking no-op (cubic round 1).
             MF_GRAYED | MF_BYCOMMAND
         };
-        // SAFETY: bar is the window's own live menu.
-        let _ = unsafe { EnableMenuItem(bar, u32::from(cmd.id()), enable) };
+        // SAFETY: target is the caller's live menu.
+        let _ = unsafe { EnableMenuItem(target, u32::from(cmd.id()), enable) };
     }
 }
 
-/// WM_CONTEXTMENU's recovery slice (upstream builds its full context menu
-/// here, viv.c:3376-3550 — navigation, slideshow rate, sort modes…; riviv
-/// ships only the one row whose feature exists): upstream puts "Menu" in
-/// the context menu GATED to appear only while the bar is hidden
-/// (viv.c:3427 + `_viv_context_menu_items`, viv.c:1084) — the in-app way
-/// back from View→Menu OFF. Without it the bar could only return by
-/// hand-editing the ini (cubic round 1).
+/// WM_CONTEXTMENU (upstream viv.c:3376-3545, #49): the FULL context menu
+/// from `menu::CONTEXT_TABLE` — navigation, the Rate submenu, the fit
+/// rows, the Sort submenu, the shell verbs, rotations, clipboard, file
+/// management, Properties/Options/Exit — with NO fullscreen or bar gate
+/// (upstream has none); the only gated row is the Menu recovery entry,
+/// which appears while the bar hides (viv.c:3427). The keyboard invocation
+/// (-1/-1, Shift+F10 / Menu key) centers the popup on the window
+/// (viv.c:3386-3398) — keyboard-only users get the same menu.
 fn on_contextmenu(hwnd: HWND, lparam: LPARAM) {
-    // The keyboard invocation (-1/-1, Shift+F10 / Menu key) centers the
-    // popup on the window instead of skipping (upstream viv.c:3386-3398:
-    // GetWindowRect → center → TPM_CENTERALIGN|TPM_VCENTERALIGN) —
-    // keyboard-only users get the same recovery row (Codex round 2).
     let (x, y, flags) = if lparam.0 == -1 {
         let mut r = RECT::default();
         // SAFETY: read-only rect query on the live window; a failure reads
@@ -4880,56 +4903,117 @@ fn on_contextmenu(hwnd: HWND, lparam: LPARAM) {
             TPM_LEFTBUTTON, // TRACK_POPUP_MENU_FLAGS(0)
         )
     };
-    // SAFETY: the borrow spans only the three reads — nothing pumps.
-    let next = (unsafe { state_of(hwnd) }).and_then(|state| {
-        if state.fullscreen || state.config.show_menu != 0 {
-            return None; // bar visible (or fullscreen): nothing to recover
-        }
-        Some(state.menu)
-    });
-    let Some(menu_bar) = next else {
+    // SAFETY: the borrow spans only the two reads — nothing pumps (the
+    // rebuild_menu_bar pattern for the KeyMap clone).
+    let setup = (unsafe { state_of(hwnd) })
+        .map(|state| (state.config.show_menu != 0, state.config.keys.clone()));
+    let Some((show_menu, keys)) = setup else {
         return;
     };
-    if menu_bar.is_invalid() {
+    let popup = create_context_menu(show_menu, &keys);
+    if popup.is_invalid() {
         return;
     }
-    // SAFETY: fresh popup creation.
-    let Ok(popup) = (unsafe { CreatePopupMenu() }) else {
-        return;
-    };
-    let text = to_wide(loc::get(loc::Id::MenuMenu));
-    // SAFETY: text outlives the append; the command id routes back through
-    // the shared WM_COMMAND dispatch when picked.
-    let _ = unsafe {
-        AppendMenuW(
-            popup,
-            MF_STRING,
-            usize::from(menu::Cmd::ViewMenu.id()),
-            PCWSTR(text.as_ptr()),
-        )
-    };
-    // The check state the row would carry (unchecked — the bar is hidden;
-    // upstream runs `_viv_check_menus` over the popup, viv.c:3530).
-    // SAFETY: our fresh popup.
-    let _ = unsafe {
-        CheckMenuItem(
-            popup,
-            u32::from(menu::Cmd::ViewMenu.id()),
-            (MF_UNCHECKED | MF_BYCOMMAND).0,
-        )
-    };
+    // The check/gray state the rows carry (upstream runs `_viv_check_menus`
+    // over the popup BEFORE tracking, viv.c:3530 — same shared walk as the
+    // bar, side effects included).
+    refresh_menu_state(hwnd, popup);
+    // The cursor shows for the menu and the popup flag keeps the idle
+    // timer from hiding it mid-tracking (viv.c:3532-3534 + 14595). The
+    // effects run outside the borrow (the apply_cursor pattern).
+    // SAFETY: short borrow — the flag write and the pure cursor step.
+    let show = (unsafe { state_of(hwnd) }).map(|state| {
+        state.in_popup_menu = true;
+        state.cursor.show()
+    });
+    if let Some(effects) = show {
+        apply_cursor(hwnd, effects);
+    }
     // The MSDN menu-dismissal pattern: foreground the owner before
     // TrackPopupMenu and nudge it with WM_NULL after, so the menu closes
-    // when focus leaves (a denial is ignored — the menu still works).
+    // when focus leaves (a denial is ignored — the menu still works; a
+    // riviv recovery-slice behavior kept — upstream tracks bare,
+    // viv.c:3536).
     // SAFETY: our own live window.
     let _ = unsafe { SetForegroundWindow(hwnd) };
     // SAFETY: our popup shown at the message's screen point over our
-    // window; blocks until dismissed and posts WM_COMMAND on pick.
+    // window; blocks until dismissed and posts WM_COMMAND on pick. The
+    // pick's handler runs INSIDE this modal loop — including Exit, which
+    // destroys the window and frees the state — so nothing below may
+    // assume either lives.
     let _ = unsafe { TrackPopupMenu(popup, flags, x, y, None, hwnd, None) };
-    // SAFETY: our popup, whose tracking ended above.
+    // viv.c:3539-3540: drop the flag and reconcile the cursor — every
+    // access None-tolerant (an Exit pick leaves state_of reading None).
+    // SAFETY: short borrow on a window that may already be gone.
+    let after = (unsafe { state_of(hwnd) }).map(|state| {
+        state.in_popup_menu = false;
+        let conditions = cursor_conditions(hwnd, state);
+        state.cursor.update(&conditions)
+    });
+    if let Some(effects) = after {
+        apply_cursor(hwnd, effects);
+    }
+    // SAFETY: our popup, whose tracking ended above — standalone menus
+    // stay destroyable after the owner window is gone.
     let _ = unsafe { DestroyMenu(popup) };
-    // SAFETY: our own window; the empty nudge just wakes the pump.
+    // SAFETY: empty nudge on our own window; a dead window just fails it.
     let _ = unsafe { PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0)) };
+}
+
+/// Build the right-click popup from the context table (upstream's build
+/// loop, viv.c:3400-3527): replay `menu::context_rows` appending into the
+/// root popup, switching to a fresh popup on Push rows and back on Pop
+/// rows (upstream's curmenu — the nesting is one level deep, so Pop lands
+/// on the root). The accelerator on each command row is the HINT command's
+/// first binding (the visible Delete row reads the recycle-delete key,
+/// viv.c:3454-3472). Returns an invalid HMENU on failure (the caller
+/// skips the popup, like a failed bar).
+fn create_context_menu(show_menu: bool, keys: &crate::keys::KeyMap) -> HMENU {
+    // SAFETY: pure menu-object construction; no window involvement.
+    let Ok(root) = (unsafe { CreatePopupMenu() }) else {
+        return HMENU::default();
+    };
+    let mut cur = root;
+    for row in menu::context_rows(show_menu) {
+        match row {
+            menu::ContextRow::Command { cmd, label } => {
+                let hint = menu::hint_cmd(cmd);
+                let key = keys
+                    .first(hint)
+                    .and_then(|k| vk_text(k.vk).map(|t| menu::key_label(k, &t)));
+                let text = to_wide(&menu::item_text(loc::get(label), key.as_deref()));
+                // SAFETY: text outlives the append.
+                let _ = unsafe {
+                    AppendMenuW(cur, MF_STRING, usize::from(cmd.id()), PCWSTR(text.as_ptr()))
+                };
+            }
+            menu::ContextRow::Popup { label, .. } => {
+                // SAFETY: fresh popup creation; a failure stores an invalid
+                // handle whose rows append nowhere (degraded, like the bar
+                // build's failed popups).
+                let popup = unsafe { CreatePopupMenu() }.unwrap_or_default();
+                let text = to_wide(loc::get(label));
+                // SAFETY: text outlives the append; the popup handle moves
+                // into its parent menu here.
+                let _ = unsafe {
+                    AppendMenuW(
+                        cur,
+                        MF_STRING | MF_POPUP,
+                        popup.0 as usize,
+                        PCWSTR(text.as_ptr()),
+                    )
+                };
+                cur = popup;
+            }
+            // Upstream's pop arm (viv.c:3482-3487): back to the top level.
+            menu::ContextRow::Pop => cur = root,
+            menu::ContextRow::Separator => {
+                // SAFETY: a separator append carries no text.
+                let _ = unsafe { AppendMenuW(cur, MF_SEPARATOR, 0, PCWSTR::null()) };
+            }
+        }
+    }
+    root
 }
 
 /// WM_COMMAND dispatch (upstream `_viv_command`, viv.c:1658-2580: the
@@ -6169,10 +6253,9 @@ unsafe extern "system" fn wnd_proc(
             // default procedure owns the menu-open default handling.
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
-        // Right-click: the bar-recovery slice of upstream's context menu
-        // (viv.c:3376-3550 — only its "Menu" row, gated to the hidden
-        // state per viv.c:3427); the full context menu lands with its
-        // features. Breaks to the default procedure like upstream.
+        // Right-click: the full context menu (#49; upstream viv.c:3376-3545
+        // — the Menu recovery row gates on the hidden bar, everything else
+        // always shows). Breaks to the default procedure like upstream.
         WM_CONTEXTMENU => {
             on_contextmenu(hwnd, lparam);
             // SAFETY: hwnd/msg are exactly what this callback received; the
@@ -6914,6 +6997,7 @@ pub(crate) fn run() -> Result<(), String> {
         fullscreen_restore_rect: RECT::default(),
         fullscreen_zoom_offset: 0,
         cursor: CursorVisibility::new(),
+        in_popup_menu: false,
         tracking_mouse: false,
         is_mouseover: false,
         last_cursor_pt: POINT { x: -1, y: -1 },
