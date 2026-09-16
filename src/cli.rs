@@ -94,16 +94,17 @@ pub(crate) fn to_int(s: &[u16]) -> i32 {
 /// matches. NTFS reserves ':' as the alternate-data-stream separator, so
 /// no on-disk file can collide with the pseudo-name.
 pub(crate) fn is_stdin_word(word: &[u16]) -> bool {
-    word.len() == 6
-        && word.iter().zip("stdin:".as_bytes()).all(|(c, b)| {
-            // eq_switch's manual lowercase (u16 has no to_ascii_lowercase).
-            let lower = if (b'A' as u16..=b'Z' as u16).contains(c) {
-                *c + 32
-            } else {
-                *c
-            };
-            lower == u16::from(*b)
-        })
+    eq_switch(word, "stdin:")
+}
+
+/// The `clipboard:` pseudo-filename (#66; upstream wishlist viv.c:80 —
+/// "open a file with the filename clipboard: to open the clipboard"):
+/// the same whole-word ASCII case-insensitive match and the same
+/// lone-file-word ladder in window.rs. Unlike `stdin:` the clipboard is
+/// GLOBAL — a `clipboard:` launch still forwards to the first instance
+/// (no single-instance exemption; issue #66 decision record).
+pub(crate) fn is_clipboard_word(word: &[u16]) -> bool {
+    eq_switch(word, "clipboard:")
 }
 
 /// Whether this raw command line, parsed as a STARTUP line (add-mode
@@ -689,6 +690,39 @@ mod tests {
             "riviv stdin.png",
         ];
         for cl in no {
+            assert!(!stdin_launch_keeps_own_window(&w(cl)), "{cl}");
+        }
+    }
+
+    // ---- the clipboard: pseudo-filename (#66) ----
+
+    #[test]
+    fn clipboard_word_matches_case_insensitively_and_exactly() {
+        assert!(is_clipboard_word(&w("clipboard:")));
+        assert!(is_clipboard_word(&w("CLIPBOARD:")));
+        assert!(is_clipboard_word(&w("ClipBoard:")));
+        // Not the word: longer, shorter, prefix, switch form, suffixed.
+        assert!(!is_clipboard_word(&w("clipboard")));
+        assert!(!is_clipboard_word(&w("clipboard:x")));
+        assert!(!is_clipboard_word(&w("xclipboard:")));
+        assert!(!is_clipboard_word(&w("/clipboard:")));
+        assert!(!is_clipboard_word(&w("clipboard.png")));
+        // Not the OTHER pseudo-name either.
+        assert!(!is_clipboard_word(&w("stdin:")));
+        assert!(!is_stdin_word(&w("clipboard:")));
+    }
+
+    #[test]
+    fn a_clipboard_launch_still_forwards_to_the_first_instance() {
+        // The clipboard is global (#66): unlike `stdin:`, the pseudo-name
+        // launch hands off — the owning instance reads the SAME clipboard.
+        let w = |s: &str| s.encode_utf16().collect::<Vec<u16>>();
+        for cl in [
+            "riviv clipboard:",
+            "riviv CLIPBOARD:",
+            "riviv \"clipboard:\"",
+            "riviv /fullscreen clipboard:",
+        ] {
             assert!(!stdin_launch_keeps_own_window(&w(cl)), "{cl}");
         }
     }

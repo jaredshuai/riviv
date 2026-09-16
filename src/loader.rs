@@ -176,6 +176,44 @@ pub(crate) fn decode_bytes_to_sink(
 /// `loadthread::STDIN_NAME`. #65).
 const STDIN_SHOWN_NAME: &str = "stdin";
 
+/// The shown name for `clipboard:` load failures (#66) — same shape as
+/// STDIN_SHOWN_NAME (the DISPLAY name is `clipboard:`, see
+/// `clipboard::CLIPBOARD_NAME`).
+const CLIPBOARD_SHOWN_NAME: &str = "clipboard";
+
+/// The `clipboard:` virtual display's decode (#66; upstream wishlist
+/// viv.c:80/105): one clipboard DIB payload — the raw CF_DIB/CF_DIBV5
+/// bytes, or the DIB the CF_BITMAP reader synthesizes — parsed by the
+/// pure `dib` module into a final top-down BGRA frame. A one-frame
+/// stream exactly like a still decode: first frame, then Complete; no
+/// interruption points (the parse is a single pass). Every payload
+/// problem is user-level (keep old image, no dialog, no exit — ADR
+/// 0001); only the GDI frame allocation stays system-level.
+pub(crate) fn decode_dib_to_sink(payload: &[u8], env: DecodeEnv, sink: &mut dyn FnMut(LoadReply)) {
+    let outcome = (|| -> Result<(), Stop> {
+        let mut dib = crate::dib::parse_dib(payload, env.background, MAX_TOTAL_FRAME_BYTES)
+            .map_err(|e| Stop::User(format!("{CLIPBOARD_SHOWN_NAME}: {e}")))?;
+        let mut frame =
+            DibFrame::from_bgra(dib.width, dib.height, &mut dib.bgra).map_err(Stop::Fatal)?;
+        // Un-gated like a still: one frame's mip chain is nowhere near
+        // the animation budget (see sink_static).
+        frame.pregenerate_mips(crate::mip::select_mip_level(
+            dib.width as i32,
+            dib.height as i32,
+            env.render_viewport.0 / 2,
+            env.render_viewport.1 / 2,
+        ));
+        sink(LoadReply::FirstFrame { frame, delay_ms: 0 });
+        Ok(())
+    })();
+    match outcome {
+        Ok(()) => sink(LoadReply::Complete),
+        Err(Stop::User(msg)) => sink(LoadReply::FailedUser(msg)),
+        Err(Stop::Fatal(msg)) => sink(LoadReply::FatalSystem(msg)),
+        Err(Stop::Terminated) => {}
+    }
+}
+
 fn produce(
     path: &OsStr,
     env: DecodeEnv,

@@ -90,6 +90,7 @@ mod config;
 mod copydata;
 mod cursor;
 mod custom_rate_dlg;
+mod dib;
 mod everything;
 mod filemgmt;
 mod fit;

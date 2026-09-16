@@ -33,7 +33,9 @@ use std::time::Duration;
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
 
-use crate::loader::{DecodeEnv, LoadReply, decode_bytes_to_sink, decode_to_sink};
+use crate::loader::{
+    DecodeEnv, LoadReply, decode_bytes_to_sink, decode_dib_to_sink, decode_to_sink,
+};
 use crate::surface::DibFrame;
 
 /// Kick message, posted whenever the worker queues a reply (upstream
@@ -61,19 +63,24 @@ struct SendHwnd(HWND);
 // `_viv_hwnd` (viv.c:10902).
 unsafe impl Send for SendHwnd {}
 
-/// What a job decodes (#65): a file on disk, or the process's stdin
-/// captured as one in-memory stream (the `stdin:` pseudo-filename). The
-/// display name for a virtual source is the literal `stdin:` — the
+/// What a job decodes (#65/#66): a file on disk, the process's stdin
+/// captured as one in-memory stream (the `stdin:` pseudo-filename), or
+/// the clipboard's image read as one DIB payload (the `clipboard:`
+/// pseudo-filename — the clipboard is global, so unlike stdin this
+/// source reads the same bytes whichever window requested it). The
+/// display name for a virtual source is the literal pseudo-name — the
 /// session carries it so titles/verdicts read like a file load.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum LoadSource {
     File(OsString),
     Stdin,
+    Clipboard,
 }
 
 /// The `stdin:` display name, shared by the session and the request
 /// shell so the title/status read one constant (#65; the pseudo-name a
-/// piped launch types on the command line).
+/// piped launch types on the command line). The clipboard family's
+/// counterpart is `clipboard::CLIPBOARD_NAME`.
 pub(crate) const STDIN_NAME: &str = "stdin:";
 
 /// One queued decode request; crossing the channel requires `Send`
@@ -131,11 +138,12 @@ impl LoadThread {
         let id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
         let terminate = Arc::new(AtomicBool::new(false));
         let queue = Arc::new(Mutex::new(VecDeque::new()));
-        // The display name: the file's path, or the literal `stdin:` for
-        // the virtual source — the UI adopts it as the window title.
+        // The display name: the file's path, or the literal pseudo-name
+        // for a virtual source — the UI adopts it as the window title.
         let path = match &source {
             LoadSource::File(path) => path.clone(),
             LoadSource::Stdin => OsString::from(STDIN_NAME),
+            LoadSource::Clipboard => OsString::from(crate::clipboard::CLIPBOARD_NAME),
         };
         // The worker consumes its own copy; the session keeps the
         // original for the UI (window title / Ctrl+O initial dir).
@@ -237,6 +245,21 @@ fn worker(receiver: Receiver<Job>) {
                 }
                 Some(StdinOutcome::Failed(msg)) => sink(LoadReply::FailedUser(msg)),
                 None => {} // terminated mid-read: exit silently
+            },
+            // The clipboard read is a short open-copy-close session on
+            // this thread (#66); every read problem is user-level (keep
+            // old image, no dialog, no exit — ADR 0001), exactly like a
+            // foreign pipe's bytes.
+            LoadSource::Clipboard => match crate::clipboard::read_clipboard_dib() {
+                Ok(Some(payload)) => decode_dib_to_sink(&payload, env, &mut sink),
+                Ok(None) => sink(LoadReply::FailedUser(format!(
+                    "{} no image on the clipboard",
+                    crate::clipboard::CLIPBOARD_NAME
+                ))),
+                Err(msg) => sink(LoadReply::FailedUser(format!(
+                    "{} {msg}",
+                    crate::clipboard::CLIPBOARD_NAME
+                ))),
             },
         }
     }
@@ -346,8 +369,9 @@ fn read_stdin_once() -> StdinOutcome {
 pub(crate) struct LoadSession {
     id: u64,
     /// The file being loaded — the UI adopts it as the window title/path
-    /// when this session's first frame takes the display. The `stdin:`
-    /// virtual source carries the literal pseudo-name (#65).
+    /// when this session's first frame takes the display. A virtual
+    /// source (`stdin:` #65, `clipboard:` #66) carries the literal
+    /// pseudo-name.
     path: OsString,
     terminate: Arc<AtomicBool>,
     queue: Arc<Mutex<VecDeque<LoadReply<DibFrame>>>>,
@@ -362,11 +386,12 @@ impl LoadSession {
         &self.path
     }
 
-    /// Whether this session decodes the `stdin:` virtual source (#65) —
-    /// the adoption edge reads it to flag the display virtual (the
-    /// navigation/graying semantics that follow; no backing file).
-    pub(crate) fn is_stdin(&self) -> bool {
-        self.path == STDIN_NAME
+    /// Whether this session decodes a VIRTUAL source (#65 `stdin:`,
+    /// #66 `clipboard:`) — the adoption edge reads it to flag the
+    /// display virtual (the navigation/graying semantics that follow; no
+    /// backing file).
+    pub(crate) fn is_virtual(&self) -> bool {
+        self.path == STDIN_NAME || self.path == crate::clipboard::CLIPBOARD_NAME
     }
 
     /// #43 rename follow-up: retitle an in-flight session whose file was

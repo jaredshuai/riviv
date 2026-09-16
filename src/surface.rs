@@ -119,6 +119,14 @@ impl DibFrame {
     /// in place). Errors are plain system-level messages (GDI allocation
     /// failures only); the loader maps them into its two-layer taxonomy.
     pub(crate) fn from_rgba(width: u32, height: u32, rgba: &mut [u8]) -> Result<Self, String> {
+        rgba8_to_bgra_in_place(rgba);
+        Self::from_bgra(width, height, rgba)
+    }
+
+    /// The BGRA-native entry (#66): `bgra` holds exactly
+    /// `width * height * 4` bytes of top-down 32bpp BGRA — the clipboard
+    /// DIB parser already emits that layout, so no swizzle pass runs.
+    pub(crate) fn from_bgra(width: u32, height: u32, bgra: &mut [u8]) -> Result<Self, String> {
         let info = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
                 biSize: size_of::<BITMAPINFOHEADER>() as u32,
@@ -142,12 +150,11 @@ impl DibFrame {
             let _ = unsafe { DeleteObject(HGDIOBJ(bitmap.0)) };
             return Err("CreateDIBSection returned NULL bits".into());
         }
-        rgba8_to_bgra_in_place(rgba);
         let byte_len = width as usize * height as usize * 4;
-        debug_assert_eq!(rgba.len(), byte_len);
+        debug_assert_eq!(bgra.len(), byte_len);
         // SAFETY: `bits` points to exactly width*height*4 writable bytes of the
-        // freshly created section; `rgba` holds the same count (asserted above).
-        unsafe { std::ptr::copy_nonoverlapping(rgba.as_ptr(), bits.cast::<u8>(), byte_len) };
+        // freshly created section; `bgra` holds the same count (asserted above).
+        unsafe { std::ptr::copy_nonoverlapping(bgra.as_ptr(), bits.cast::<u8>(), byte_len) };
         Ok(DibFrame {
             bitmap,
             width: width as i32,
