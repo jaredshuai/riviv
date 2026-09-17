@@ -208,6 +208,11 @@ pub(crate) struct Parsed {
     pub single: Option<Vec<u16>>,
     pub is_add: bool,
     pub start_slideshow: bool,
+    /// `/close` (#67; upstream wishlist viv.c:37 — "needs to work with
+    /// /slideshow"): arms the close-after-slideshow intent. NOT an ordered
+    /// action — it is a sticky runtime intent applied in the show tail,
+    /// never cleared by a later parse and never persisted.
+    pub close_after_slideshow: bool,
     pub start_fullscreen: bool,
     pub start_window: bool,
     pub start_maximized: bool,
@@ -253,6 +258,10 @@ pub(crate) fn parse(cl: &[u16], is_add: bool, has_current: bool) -> Parsed {
             let param = |i: &mut usize| next_word(cl, i).text;
             if eq_switch(arm, "slideshow") {
                 out.start_slideshow = true;
+            } else if eq_switch(arm, "close") {
+                // #67 (upstream wishlist viv.c:37): no parameter word —
+                // like /slideshow, it takes nothing and consumes nothing.
+                out.close_after_slideshow = true;
             } else if eq_switch(arm, "fullscreen") {
                 out.start_fullscreen = true;
                 out.start_window = false;
@@ -692,6 +701,37 @@ mod tests {
         for cl in no {
             assert!(!stdin_launch_keeps_own_window(&w(cl)), "{cl}");
         }
+    }
+
+    // ---- the /close switch (#67; upstream wishlist viv.c:37) ----
+
+    #[test]
+    fn close_switch_arms_without_consuming_a_parameter() {
+        // Like /slideshow the switch takes no value: the next word stays a
+        // file word.
+        let p = parse(&w("exe /close a.png"), false, false);
+        assert!(p.close_after_slideshow);
+        assert_eq!(p.file_count, 1);
+        assert_eq!(s(p.single.as_ref().unwrap()), "a.png");
+        assert!(p.unknown.is_empty());
+    }
+
+    #[test]
+    fn close_switch_recognizes_case_and_dash_and_pairs_with_slideshow() {
+        assert!(parse(&w("exe /CLOSE"), false, false).close_after_slideshow);
+        assert!(parse(&w("exe -close"), false, false).close_after_slideshow);
+        let p = parse(&w("exe a.png /slideshow /close"), false, false);
+        assert!(p.start_slideshow);
+        assert!(p.close_after_slideshow);
+        // The pairing order is irrelevant — both are walk-position-free
+        // start flags.
+        let p = parse(&w("exe /close /slideshow a.png"), false, false);
+        assert!(p.start_slideshow && p.close_after_slideshow);
+        // Absent by default, and a quoted "/close" is a FILE word.
+        assert!(!parse(&w("exe a.png"), false, false).close_after_slideshow);
+        let p = parse(&w("exe \"/close\""), false, false);
+        assert!(!p.close_after_slideshow);
+        assert_eq!(p.file_count, 1);
     }
 
     // ---- the clipboard: pseudo-filename (#66) ----
