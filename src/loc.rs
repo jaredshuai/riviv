@@ -487,12 +487,16 @@ pub(crate) enum Id {
     CopyToCaption,
     /// The Move To save-dialog title (#43; en_us.h:285, "Move To").
     MoveToCaption,
+    /// ---- #68: keep-zoom on image change ----
+    /// Options View page: keep-zoom checkbox (riviv-authored — upstream's
+    /// viv.c:41 wishlist note has no string).
+    OptionsKeepZoom,
 }
 
 impl Id {
     /// Variant count; array-typing both tables against this keeps them
     /// length-locked to the enum by construction.
-    pub(crate) const COUNT: usize = Self::MoveToCaption as usize + 1;
+    pub(crate) const COUNT: usize = Self::OptionsKeepZoom as usize + 1;
 }
 
 /// Table choice (upstream `LOCALIZATION_LANGUAGE_*`, localization.h:30-32).
@@ -757,24 +761,25 @@ const EN_US: [&str; Id::COUNT] = [
     "&While Playing Slideshow or Animating", // MenuWhilePlaying (en_us.h:113)
     "&Never",                                // MenuNever (en_us.h:114)
     // The #42 shell verb block (en_us.h:41-46/51).
-    "Open File &Location...",   // MenuOpenFileLocation
-    "&Edit...",                 // MenuFileEdit
-    "Pre&view...",              // MenuPreview
-    "&Print...",                // MenuPrint
-    "Set Des&ktop Wallpaper",   // MenuSetDesktopWallpaper
-    "&Close",                   // MenuClose
-    "P&roperties",              // MenuProperties
-    "&Delete",                  // MenuDelete (#43)
-    "Delete (Recycle)",         // MenuDeleteRecycle (#43)
-    "Delete (Permanently)",     // MenuDeletePermanently (#43)
-    "Rena&me",                  // MenuRename (#43)
-    "Rotate Cloc&kwise",        // MenuRotateClockwise (#43)
-    "Rotate Cou&nterclockwise", // MenuRotateCounterclockwise (#43)
-    "Copy to &Folder...",       // MenuCopyTo (#43)
-    "Mo&ve to Folder...",       // MenuMoveTo (#43)
-    "Rename",                   // RenameCaption (#43)
-    "Copy To",                  // CopyToCaption (#43)
-    "Move To",                  // MoveToCaption (#43)
+    "Open File &Location...",                  // MenuOpenFileLocation
+    "&Edit...",                                // MenuFileEdit
+    "Pre&view...",                             // MenuPreview
+    "&Print...",                               // MenuPrint
+    "Set Des&ktop Wallpaper",                  // MenuSetDesktopWallpaper
+    "&Close",                                  // MenuClose
+    "P&roperties",                             // MenuProperties
+    "&Delete",                                 // MenuDelete (#43)
+    "Delete (Recycle)",                        // MenuDeleteRecycle (#43)
+    "Delete (Permanently)",                    // MenuDeletePermanently (#43)
+    "Rena&me",                                 // MenuRename (#43)
+    "Rotate Cloc&kwise",                       // MenuRotateClockwise (#43)
+    "Rotate Cou&nterclockwise",                // MenuRotateCounterclockwise (#43)
+    "Copy to &Folder...",                      // MenuCopyTo (#43)
+    "Mo&ve to Folder...",                      // MenuMoveTo (#43)
+    "Rename",                                  // RenameCaption (#43)
+    "Copy To",                                 // CopyToCaption (#43)
+    "Move To",                                 // MoveToCaption (#43)
+    "Keep &zoom and pan when changing images", // OptionsKeepZoom (#68, riviv)
 ];
 
 /// zh-CN table — upstream localization_zh_cn.h:31/197-199/261-263.
@@ -1030,24 +1035,25 @@ const ZH_CN: [&str; Id::COUNT] = [
     "播放幻灯片或动画时(&W)", // MenuWhilePlaying (zh_cn.h:113)
     "从不(&N)",               // MenuNever (zh_cn.h:114)
     // The #42 shell verb block (zh_cn.h:41-46/51).
-    "打开文件位置(&L)...", // MenuOpenFileLocation
-    "编辑(&E)...",         // MenuFileEdit
-    "预览(&V)...",         // MenuPreview
-    "打印(&P)...",         // MenuPrint
-    "设置为桌面壁纸(&D)",  // MenuSetDesktopWallpaper
-    "关闭(&C)",            // MenuClose
-    "属性(&P)",            // MenuProperties
-    "删除(&D)",            // MenuDelete (#43)
-    "删除（回收站）",      // MenuDeleteRecycle (#43)
-    "删除（永久）",        // MenuDeletePermanently (#43)
-    "重命名(&M)",          // MenuRename (#43)
-    "顺时针旋转(&K)",      // MenuRotateClockwise (#43)
-    "逆时针旋转(&N)",      // MenuRotateCounterclockwise (#43)
-    "复制到文件夹(&F)...", // MenuCopyTo (#43)
-    "移动到文件夹(&V)...", // MenuMoveTo (#43)
-    "重命名",              // RenameCaption (#43)
-    "复制到",              // CopyToCaption (#43)
-    "移动到",              // MoveToCaption (#43)
+    "打开文件位置(&L)...",      // MenuOpenFileLocation
+    "编辑(&E)...",              // MenuFileEdit
+    "预览(&V)...",              // MenuPreview
+    "打印(&P)...",              // MenuPrint
+    "设置为桌面壁纸(&D)",       // MenuSetDesktopWallpaper
+    "关闭(&C)",                 // MenuClose
+    "属性(&P)",                 // MenuProperties
+    "删除(&D)",                 // MenuDelete (#43)
+    "删除（回收站）",           // MenuDeleteRecycle (#43)
+    "删除（永久）",             // MenuDeletePermanently (#43)
+    "重命名(&M)",               // MenuRename (#43)
+    "顺时针旋转(&K)",           // MenuRotateClockwise (#43)
+    "逆时针旋转(&N)",           // MenuRotateCounterclockwise (#43)
+    "复制到文件夹(&F)...",      // MenuCopyTo (#43)
+    "移动到文件夹(&V)...",      // MenuMoveTo (#43)
+    "重命名",                   // RenameCaption (#43)
+    "复制到",                   // CopyToCaption (#43)
+    "移动到",                   // MoveToCaption (#43)
+    "换图时保持缩放与平移(&Z)", // OptionsKeepZoom (#68, riviv)
 ];
 
 /// Map a `GetUserDefaultUILanguage` LANGID onto the table choice

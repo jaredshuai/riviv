@@ -101,6 +101,11 @@ pub(crate) struct Config {
     pub(crate) orientation: i32,
     pub(crate) title_bar_format: i32,
     pub(crate) add_command_line_timeout: i32,
+    /// riviv-authored key (#68; upstream has no such setting — its
+    /// wishlist notes the idea at viv.c:41): 0 = reset the zoom/pan state
+    /// at every image change like upstream's `_viv_clear`, 1 = carry the
+    /// level/1:1/pan onto the next image.
+    pub(crate) keep_zoom: i32,
     /// The per-command keyboard bindings (#25; upstream keeps these OUTSIDE
     /// the `config_*` int globals in `_viv_key_list`, but loads/saves them
     /// through the same ini pass — riding inside `Config` gives them the
@@ -172,6 +177,7 @@ impl Default for Config {
             orientation: 1,
             title_bar_format: 1,
             add_command_line_timeout: 500,
+            keep_zoom: 0,
             keys: KeyMap::default(),
         }
     }
@@ -347,6 +353,7 @@ impl Config {
         apply_byte!(toolbar_move_window = "toolbar_move_window");
         apply_byte!(title_bar_format = "title_bar_format");
         apply_int!(add_command_line_timeout = "add_command_line_timeout");
+        apply_byte!(keep_zoom = "keep_zoom");
         if root {
             apply_byte!(appdata = "appdata");
         }
@@ -373,7 +380,7 @@ impl Config {
         if root && self.appdata != 0 {
             return vec![("appdata".to_string(), i(self.appdata))];
         }
-        let int_pairs: [(&str, String); 60] = [
+        let int_pairs: [(&str, String); 61] = [
             ("x", i(self.x)),
             ("y", i(self.y)),
             ("wide", i(self.wide)),
@@ -455,6 +462,9 @@ impl Config {
             ("toolbar_move_window", i(self.toolbar_move_window)),
             ("title_bar_format", i(self.title_bar_format)),
             ("add_command_line_timeout", i(self.add_command_line_timeout)),
+            // riviv-authored keys sit at the table's tail (#68) — the
+            // upstream block above keeps its exact key-for-key order.
+            ("keep_zoom", i(self.keep_zoom)),
         ];
         let mut pairs: Vec<(String, String)> = int_pairs
             .iter()
@@ -579,16 +589,18 @@ mod tests {
             nav_sort: 0,
             pixel_info: 1,
             shuffle: 1,
+            keep_zoom: 1,
             ..Config::default()
         };
         let text = ini::serialize(SECTION, &c.to_pairs(false));
         let back = parse_apply(&text, true);
         assert_eq!(back, c, "every save key must be a load key");
-        // 60 int keys + one *_keys line per command in Cmd::ALL order —
+        // 61 int keys + one *_keys line per command in Cmd::ALL order —
         // 92 bound, the rest empty (#42 adds the shell septet: three
         // bound, four empty; #43 adds the file-management octet: Del /
-        // Shift+Del / F2 bound, five empty).
-        assert_eq!(c.to_pairs(false).len(), 181, "the upstream save table");
+        // Shift+Del / F2 bound, five empty; #68 appends the riviv-authored
+        // keep_zoom int key).
+        assert_eq!(c.to_pairs(false).len(), 182, "the save table + keep_zoom");
     }
 
     #[test]
@@ -638,7 +650,7 @@ mod tests {
         let c = Config::default();
         assert_eq!(
             c.to_pairs(true).len(),
-            181,
+            182,
             "active store writes the full table"
         );
         let c = Config {

@@ -196,6 +196,9 @@ pub(crate) enum Field {
     /// The cache-last checkbox (#40; upstream
     /// IDC_CACHE_LAST_IMAGE_STATIC, viv.c:8394-8395/8776).
     CacheLast,
+    /// The keep-zoom-on-image-change checkbox (#68; a riviv-authored row —
+    /// upstream's viv.c:41 wishlist note has no Options UI).
+    KeepZoom,
     WindowedBg,
     FullscreenBg,
     LeftClickAction,
@@ -353,27 +356,29 @@ pub(crate) const VIEW: &[Ctrl] = &[
         w: 60,
         h: 100,
     },
-    // Loop animations once (rc:81-82: (0,70) 192x10 — right after the
-    // auto-size pair, upstream IDD_VIEW's own order; #38).
+    // Loop animations once (upstream IDD_VIEW's own order right after the
+    // auto-size pair; #38). The tail rows below the auto-size pair run a
+    // 16-du pitch (#68 squeezed the old 17/18-du tail to fit the keep-zoom
+    // row inside the page host's 233-du height).
     Ctrl {
         kind: Kind::Checkbox,
         label: loc::Id::OptionsLoopAnimationsOnce,
         field: Field::LoopAnimationsOnce,
         label_w: 0,
         x: 0,
-        y: 121,
+        y: 120,
         w: 186,
         h: 10,
     },
-    // Preload / cache-last pair (rc:84-86: (0,87)/(0,103) 192x10 — the
-    // same relative order after the loop-once row; #40).
+    // Preload / cache-last pair (#40, the same relative order after the
+    // loop-once row).
     Ctrl {
         kind: Kind::Checkbox,
         label: loc::Id::OptionsPreloadNext,
         field: Field::PreloadNext,
         label_w: 0,
         x: 0,
-        y: 138,
+        y: 136,
         w: 186,
         h: 10,
     },
@@ -383,7 +388,7 @@ pub(crate) const VIEW: &[Ctrl] = &[
         field: Field::CacheLast,
         label_w: 0,
         x: 0,
-        y: 155,
+        y: 152,
         w: 186,
         h: 10,
     },
@@ -393,7 +398,19 @@ pub(crate) const VIEW: &[Ctrl] = &[
         field: Field::FrameMinus,
         label_w: 0,
         x: 0,
-        y: 172,
+        y: 168,
+        w: 186,
+        h: 10,
+    },
+    // Keep zoom on image change (#68; a riviv-authored row — upstream has
+    // no Options UI for its viv.c:41 wishlist note).
+    Ctrl {
+        kind: Kind::Checkbox,
+        label: loc::Id::OptionsKeepZoom,
+        field: Field::KeepZoom,
+        label_w: 0,
+        x: 0,
+        y: 184,
         w: 186,
         h: 10,
     },
@@ -403,7 +420,7 @@ pub(crate) const VIEW: &[Ctrl] = &[
         field: Field::WindowedBg,
         label_w: 96,
         x: 0,
-        y: 190,
+        y: 200,
         w: 50,
         h: 14,
     },
@@ -413,7 +430,7 @@ pub(crate) const VIEW: &[Ctrl] = &[
         field: Field::FullscreenBg,
         label_w: 96,
         x: 0,
-        y: 208,
+        y: 216,
         w: 50,
         h: 14,
     },
@@ -503,6 +520,7 @@ pub(crate) struct OptionsModel {
     pub(crate) loop_animations_once: bool,
     pub(crate) preload_next: bool,
     pub(crate) cache_last: bool,
+    pub(crate) keep_zoom: bool,
     pub(crate) windowed_bg: [u8; 3],
     pub(crate) fullscreen_bg: [u8; 3],
     pub(crate) left_click_action: Option<i32>,
@@ -529,6 +547,7 @@ impl OptionsModel {
             Field::LoopAnimationsOnce => self.loop_animations_once,
             Field::PreloadNext => self.preload_next,
             Field::CacheLast => self.cache_last,
+            Field::KeepZoom => self.keep_zoom,
             _ => return None,
         })
     }
@@ -545,6 +564,7 @@ impl OptionsModel {
             Field::LoopAnimationsOnce => self.loop_animations_once = value,
             Field::PreloadNext => self.preload_next = value,
             Field::CacheLast => self.cache_last = value,
+            Field::KeepZoom => self.keep_zoom = value,
             _ => {}
         }
     }
@@ -614,6 +634,7 @@ impl OptionsModel {
             loop_animations_once: to_bool(config.loop_animations_once),
             preload_next: to_bool(config.preload_next),
             cache_last: to_bool(config.cache_last),
+            keep_zoom: to_bool(config.keep_zoom),
             windowed_bg: config.windowed_bg(),
             fullscreen_bg: config.fullscreen_bg(),
             left_click_action: Some(config.left_click_action),
@@ -672,6 +693,9 @@ impl OptionsModel {
         // navigation; no runtime invalidation is owed.
         config.preload_next = i32::from(self.preload_next);
         config.cache_last = i32::from(self.cache_last);
+        // #68: keep_zoom only changes the NEXT image change's view edge;
+        // the current display owes nothing.
+        config.keep_zoom = i32::from(self.keep_zoom);
         config.windowed_background_color_r = i32::from(self.windowed_bg[0]);
         config.windowed_background_color_g = i32::from(self.windowed_bg[1]);
         config.windowed_background_color_b = i32::from(self.windowed_bg[2]);
@@ -751,7 +775,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!((bools, values, colors), (10, 8, 2));
+        assert_eq!((bools, values, colors), (11, 8, 2));
     }
 
     #[test]
@@ -799,7 +823,7 @@ mod tests {
                 );
             }
         }
-        assert_eq!(seen.len(), 20);
+        assert_eq!(seen.len(), 21);
     }
 
     #[test]
@@ -833,16 +857,17 @@ mod tests {
     #[test]
     fn every_row_sits_on_its_own_line_in_dialog_units() {
         // The shell stacks controls straight from these y values: no two
-        // rows share a line, and nothing exceeds the 214-dlu page height
-        // (upstream's IDC_PAGEPLACEHOLDER, rc:67). A combo's `h` is its
-        // OPEN dropdown extent (like the rc's 30/100), not its row height,
-        // so only `y` participates here.
+        // rows share a line, and nothing exceeds the page container's
+        // 233-du height (options_dlg's PAGE host — wider than upstream's
+        // 214-du rc page because riviv's View page carries more rows, #68).
+        // A combo's `h` is its OPEN dropdown extent (like the rc's 30/100),
+        // not its row height, so only `y` participates here.
         for page in &PAGES {
             let mut ys: Vec<i32> = page.controls.iter().map(|c| c.y).collect();
             ys.sort_unstable();
             ys.dedup();
             assert_eq!(ys.len(), page.controls.len(), "two rows share a y");
-            assert!(*ys.last().unwrap() < 214, "row below the page area");
+            assert!(*ys.last().unwrap() < 233, "row below the page area");
         }
     }
 
@@ -864,6 +889,7 @@ mod tests {
             loop_animations_once: false,
             preload_next: false,
             cache_last: true,
+            keep_zoom: true,
             windowed_bg: [10, 20, 30],
             fullscreen_bg: [1, 2, 3],
             left_click_action: Some(3),
@@ -887,6 +913,7 @@ mod tests {
         assert_eq!(config.loop_animations_once, 0);
         assert_eq!(config.preload_next, 0);
         assert_eq!(config.cache_last, 1);
+        assert_eq!(config.keep_zoom, 1);
         assert_eq!(config.windowed_background_color_r, 10);
         assert_eq!(config.fullscreen_background_color_b, 3);
         assert_eq!(config.left_click_action, 3);

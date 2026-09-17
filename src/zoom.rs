@@ -39,6 +39,12 @@
 //! (viv.c:6530-6547) and the resize restore (viv.c:1646-1648) besides
 //! paint. The panscan state survives `reset` — upstream's `_viv_clear`
 //! never touches it (viv.c:1270-1291).
+//!
+//! #68 adds the keep-zoom image change ([`View::carry`], upstream wishlist
+//! viv.c:41): with the `keep_zoom` setting on, a display swap runs the
+//! carry instead of the reset — the level/1:1 state stands and the pan
+//! re-derives from the center anchor scaled by the old→new source ratio
+//! (the same re-projection a window resize performs).
 
 use crate::fit::fit_shrink;
 use crate::panscan::{self, Panscan};
@@ -116,6 +122,11 @@ pub(crate) struct View {
     /// the anchor that survives a window resize.
     center_src_x: f64,
     center_src_y: f64,
+    /// The last non-degenerate source size the anchor was computed against
+    /// (#68). The carry-over path scales the anchor from THIS size onto the
+    /// new image's; `(0, 0)` means no image has anchored yet (a fresh view
+    /// or one only ever blanked), where a carry has nothing to migrate.
+    src_seen: (i32, i32),
 }
 
 impl Default for View {
@@ -135,6 +146,7 @@ impl View {
             panscan: Panscan::default(),
             center_src_x: 0.0,
             center_src_y: 0.0,
+            src_seen: (0, 0),
         }
     }
 
@@ -149,6 +161,34 @@ impl View {
         let panscan = self.panscan;
         *self = View::new();
         self.panscan = panscan;
+    }
+
+    /// The keep-zoom counterpart of [`View::reset`] (#68; upstream
+    /// wishlist viv.c:41): a new image took the display, but the zoom
+    /// state CARRIES instead of clearing. What that means per field:
+    /// - the preset level and the 1:1 mode (plus its restore level) are
+    ///   kept as-is — the render size at the same level re-derives from
+    ///   the NEW image's fit size automatically (and 1:1 stays the new
+    ///   source verbatim);
+    /// - the pan position is re-derived from the center anchor: the
+    ///   source pixel under the viewport center is scaled by the
+    ///   old→new source ratio (a normalized position on the old image
+    ///   stays the same relative spot), then re-projected and re-clamped
+    ///   against the new render size exactly like a window resize
+    ///   ([`View::on_resize`]) — an anchor outside a smaller image
+    ///   clamps inside, an image that fits re-pins to the center.
+    ///
+    /// The panscan layer is untouched: it already survives every path
+    /// (#44, upstream's `_viv_clear` never resets it).
+    pub(crate) fn carry(&mut self, src_w: i32, src_h: i32, vp: Viewport, fit: FitPolicy) {
+        let (old_w, old_h) = self.src_seen;
+        if old_w > 0 && old_h > 0 && src_w > 0 && src_h > 0 && (old_w, old_h) != (src_w, src_h) {
+            self.center_src_x = self.center_src_x * f64::from(src_w) / f64::from(old_w);
+            self.center_src_y = self.center_src_y * f64::from(src_h) / f64::from(old_h);
+        }
+        // The re-projection refreshes the pan AND (through set_view)
+        // re-anchors against the new source, keeping `src_seen` current.
+        self.on_resize(src_w, src_h, vp, fit);
     }
 
     /// The rendered size at the current level, in viewport pixels (upstream
@@ -260,6 +300,13 @@ impl View {
         if rh != 0 {
             self.center_src_y =
                 (i64::from(vp.high / 2 - ry) * i64::from(src_h)) as f64 / f64::from(rh);
+        }
+        // The carry-over's migration source (#68): remember the latest
+        // non-degenerate size the anchor was computed against. A blanked
+        // display (0x0) never overwrites it, so the anchor chain across a
+        // blank → next-image sequence stays unbroken.
+        if src_w > 0 && src_h > 0 {
+            self.src_seen = (src_w, src_h);
         }
     }
 
@@ -961,6 +1008,222 @@ mod tests {
         assert_eq!(v.panscan.pos_y, 600);
         assert_eq!(v.panscan.zoom_x, DST_ZOOM_ONE + 9);
         assert_eq!(v.panscan.zoom_y, DST_ZOOM_ONE - 9);
+    }
+
+    // ---- #68: the keep-zoom carry (the reset's counterpart) ----
+
+    #[test]
+    fn carry_keeps_the_level_and_migrates_the_center_anchor() {
+        // A zoomed view of a 2000x1500 image carries onto an 800x800 one:
+        // the level stands, the render size re-derives from the NEW fit
+        // (2000x1500 fits to 400x300; 800x800 fits to 300x300 — the same
+        // level renders differently), and the center anchor scales to
+        // the same RELATIVE spot (the dead center stays the center, give
+        // or take the path's integer truncations).
+        let mut v = View::new();
+        for _ in 0..8 {
+            v.zoom_step(false, (200, 150), 2000, 1500, VP, FIT);
+        }
+        let level = v.pos;
+        assert_eq!(level, 8);
+        let (old_rw, old_rh) = v.render_size(2000, 1500, VP, FIT);
+        // The center anchor's RELATIVE position (the invariant the carry
+        // migrates; the cursor-anchored zoom path accumulates a few
+        // pixels of integer truncation on its way up the ladder).
+        let norm_before = (v.center_src_x / 2000.0, v.center_src_y / 1500.0);
+        v.carry(800, 800, VP, FIT);
+        assert_eq!(v.pos, level, "the preset level carries");
+        assert_eq!(
+            v.render_size(800, 800, VP, FIT),
+            render_size_at(level, false, 800, 800, VP, FIT),
+            "the size re-derives from the new image's fit"
+        );
+        assert_ne!(v.render_size(800, 800, VP, FIT), (old_rw, old_rh));
+        assert!(
+            (v.center_src_x / 800.0 - norm_before.0).abs() < 3.0 / 800.0,
+            "the normalized anchor carries over ({})",
+            v.center_src_x
+        );
+        assert!(
+            (v.center_src_y / 800.0 - norm_before.1).abs() < 3.0 / 800.0,
+            "the normalized anchor carries over ({})",
+            v.center_src_y
+        );
+    }
+
+    #[test]
+    fn carry_clamps_the_pan_into_the_new_render_bounds() {
+        let mut v = View::new();
+        for _ in 0..15 {
+            v.zoom_step(false, (200, 150), 2000, 1500, VP, FIT);
+        }
+        assert_eq!(v.pos, 15);
+        // Pan towards the far corner of the max-zoomed image (a NEGATIVE
+        // drag: the image follows the cursor left/up, so the viewport
+        // slides towards its bottom-right).
+        v.scroll_by(-16_000, -12_000, 2000, 1500, VP, FIT);
+        let (old_anchor_x, old_anchor_y) = (v.center_src_x, v.center_src_y);
+        assert!(
+            old_anchor_x > 1900.0 && old_anchor_y > 1400.0,
+            "panned near the far corner ({old_anchor_x}, {old_anchor_y})"
+        );
+        // Carry onto a half-size image: the anchor halves with it and the
+        // re-projection clamps the pan into the new render's legal range.
+        v.carry(1000, 750, VP, FIT);
+        assert_eq!(v.pos, 15);
+        let (rw, rh) = v.render_size(1000, 750, VP, FIT);
+        assert!(
+            v.center_src_x > 950.0,
+            "the anchor scales toward {}/1000",
+            v.center_src_x
+        );
+        assert!(
+            v.center_src_y > 700.0,
+            "the anchor scales toward {}/750",
+            v.center_src_y
+        );
+        assert!(v.view_x.abs() <= (rw - VP.wide) / 2 + 1, "pan clamped");
+        assert!(v.view_y.abs() <= (rh - VP.high) / 2 + 1, "pan clamped");
+    }
+
+    #[test]
+    fn carry_recenters_a_render_that_now_fits() {
+        // keep_centered's re-pin rides the carry's re-projection: a
+        // panned view carried onto an image whose render at the KEPT
+        // level fits the viewport re-pins to the center exactly like the
+        // plain set_view path.
+        let mut v = View::new();
+        for _ in 0..8 {
+            v.zoom_step(false, (200, 150), 4000, 3000, VP, FIT);
+        }
+        v.scroll_by(9000, 7000, 4000, 3000, VP, FIT);
+        assert_ne!((v.view_x, v.view_y), (0, 0));
+        // A 50x40 source at level 8 renders below the viewport.
+        v.carry(50, 40, VP, FIT);
+        assert_eq!(v.pos, 8);
+        let (rw, rh) = v.render_size(50, 40, VP, FIT);
+        assert!(rw < VP.wide && rh < VP.high);
+        assert_eq!((v.view_x, v.view_y), (0, 0), "a fitting render re-pins");
+    }
+
+    #[test]
+    fn carry_preserves_one_to_one_and_its_restore_level() {
+        // 1:1 carries as a MODE: the new image renders at its own source
+        // size verbatim, and leaving 1:1 afterwards restores the carried
+        // level (saved_pos rides along).
+        let mut v = View::new();
+        for _ in 0..6 {
+            v.zoom_step(false, (200, 150), 2000, 1500, VP, FIT);
+        }
+        let level = v.pos;
+        v.toggle_one_to_one(2000, 1500, VP, FIT);
+        assert!(v.is_one_to_one());
+        v.carry(800, 600, VP, FIT);
+        assert!(v.is_one_to_one(), "the 1:1 mode carries");
+        assert_eq!(v.render_size(800, 600, VP, FIT), (800, 600));
+        v.toggle_one_to_one(800, 600, VP, FIT);
+        assert_eq!(v.pos, level, "the saved level restores after the carry");
+    }
+
+    #[test]
+    fn carry_of_a_same_size_image_leaves_the_view_bit_exact() {
+        // The refresh path (F5) carries onto the SAME image: the migration
+        // ratio is one and the re-projection re-derives the very same pan.
+        let mut v = View::new();
+        for _ in 0..10 {
+            v.zoom_step(false, (200, 150), 2000, 1500, VP, FIT);
+        }
+        v.scroll_by(1234, 567, 2000, 1500, VP, FIT);
+        let before = (v.pos, v.view_x, v.view_y, v.center_src_x, v.center_src_y);
+        v.carry(2000, 1500, VP, FIT);
+        assert_eq!((v.pos, v.view_x, v.view_y), (before.0, before.1, before.2));
+        assert_eq!((v.center_src_x, v.center_src_y), (before.3, before.4));
+    }
+
+    #[test]
+    fn carry_from_a_never_anchored_view_is_a_clean_center() {
+        // A fresh view (no image ever anchored) has nothing to migrate:
+        // the carry degrades to a centered re-projection with no NaNs.
+        let mut v = View::new();
+        v.carry(1000, 750, VP, FIT);
+        assert_eq!(v.pos, 0);
+        assert!((v.view_x, v.view_y) == (0, 0));
+        assert!(v.center_src_x.is_finite() && v.center_src_y.is_finite());
+    }
+
+    #[test]
+    fn carry_survives_a_blank_stretch_between_images() {
+        // The blanked display re-anchors with a degenerate (0, 0) source;
+        // the anchor chain must not break: `src_seen` keeps the last real
+        // image, so the next carry migrates exactly as it would have
+        // without the blank stretch in between.
+        let panned = |v: &mut View| {
+            for _ in 0..10 {
+                v.zoom_step(false, (200, 150), 2000, 1500, VP, FIT);
+            }
+            v.scroll_by(9000, 7000, 2000, 1500, VP, FIT);
+        };
+        let mut straight = View::new();
+        panned(&mut straight);
+        let mut through_blank = View::new();
+        panned(&mut through_blank);
+        // The blank's (0, 0) re-anchor must not touch the anchor chain.
+        through_blank.on_resize(0, 0, VP, FIT);
+        through_blank.carry(1000, 750, VP, FIT);
+        straight.carry(1000, 750, VP, FIT);
+        assert_eq!(
+            (through_blank.center_src_x, through_blank.center_src_y),
+            (straight.center_src_x, straight.center_src_y)
+        );
+        assert_eq!(
+            (through_blank.view_x, through_blank.view_y),
+            (straight.view_x, straight.view_y)
+        );
+    }
+
+    #[test]
+    fn carry_then_a_window_resize_keeps_the_anchor_normalized() {
+        // The auto_zoom orthogonality pin (#68): auto_zoom only changes
+        // the WINDOW (a viewport resize after the adoption); the carry
+        // only changes the view state at the swap. Stacking them must
+        // leave the normalized anchor where the carry put it — the two
+        // re-projections are idempotent on the anchor. The anchor parks
+        // at mid-image on purpose: an edge-parked anchor CLAMPS on the
+        // resize (the bounds shrink relative to the render), which is the
+        // carry's own clamping contract, not a stacking artifact.
+        let mut v = View::new();
+        for _ in 0..8 {
+            v.zoom_step(false, (200, 150), 2000, 1500, VP, FIT);
+        }
+        v.scroll_by(-2500, -1900, 2000, 1500, VP, FIT);
+        v.carry(1000, 750, VP, FIT);
+        let norm = |v: &View| (v.center_src_x / 1000.0, v.center_src_y / 750.0);
+        let after_carry = norm(&v);
+        assert!(
+            after_carry.0 > 0.5
+                && after_carry.0 < 0.9
+                && after_carry.1 > 0.5
+                && after_carry.1 < 0.9,
+            "a mid-image anchor away from both edges ({after_carry:?})"
+        );
+        // auto_zoom's window change (the size the image asks for) and a
+        // further manual resize both re-anchor through the same path.
+        let vp2 = Viewport {
+            wide: 640,
+            high: 480,
+        };
+        v.on_resize(1000, 750, vp2, FIT);
+        let after_window = norm(&v);
+        let vp3 = Viewport {
+            wide: 200,
+            high: 150,
+        };
+        v.on_resize(1000, 750, vp3, FIT);
+        let after_manual = norm(&v);
+        assert!((after_carry.0 - after_window.0).abs() < 2.0 / 1000.0);
+        assert!((after_carry.1 - after_window.1).abs() < 2.0 / 750.0);
+        assert!((after_carry.0 - after_manual.0).abs() < 2.0 / 1000.0);
+        assert!((after_carry.1 - after_manual.1).abs() < 2.0 / 750.0);
     }
 
     #[test]
