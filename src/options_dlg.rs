@@ -1406,10 +1406,15 @@ fn on_ok(dlg: HWND) {
     // state borrow is live here, and the child exits before this process
     // reaches DestroyWindow (the wait is upstream's `wait=1`).
     if !admin_params.is_empty() {
-        let exe = std::env::current_exe()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        if let Err(e) = crate::assoc::shell_execute(&exe, Some(&admin_params), None, true) {
+        let exe = std::env::current_exe().unwrap_or_default();
+        // The single seam (#69): upstream viv.c:8808, os_shell_execute(0,...).
+        if let Err(e) = crate::shell::shell_execute(
+            HWND::default(),
+            exe.as_os_str(),
+            None,
+            Some(&admin_params),
+            true,
+        ) {
             eprintln!("riviv: {e}");
         }
     }
