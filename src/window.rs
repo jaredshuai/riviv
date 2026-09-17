@@ -300,6 +300,13 @@ pub(crate) struct WindowState {
     /// looped once yet (upstream `_viv_is_slideshow_timeup`, viv.c:694) —
     /// the held advance fires from the animation's wrap (viv.c:3243-3248).
     pub(crate) slideshow_timeup: bool,
+    /// The `/close` intent (#67; upstream wishlist viv.c:37): the next
+    /// slideshow self-advance that reaches the walk's END (the wrap or
+    /// dead-end step) exits the process instead of wrapping. Armed by any
+    /// command-line parse — startup or single-instance handoff — and never
+    /// cleared; NOT config (a per-launch runtime intent, never persisted).
+    /// Manual navigation and the random mode never fire it.
+    pub(crate) close_after_slideshow: bool,
     /// The displayed animation has completed at least one full loop
     /// (upstream `_viv_frame_looped`, viv.c:693 — reset with every new
     /// image like `_viv_clear`, viv.c:1278).
@@ -865,7 +872,7 @@ fn on_double_click(hwnd: HWND, lparam: LPARAM) {
         // action (upstream viv.c:3313-3326).
         3 => zoom_at(hwnd, false, (pt.x, pt.y)),
         4 => {
-            nav_next(hwnd, false, true, false);
+            nav_next(hwnd, false, true, false, false);
         }
         // 0/1/2/5/6 (scroll, slideshow, animation, 1:1 scroll, move
         // window): the double-click toggles FULLSCREEN — upstream's arm
@@ -902,7 +909,7 @@ fn on_right_button(hwnd: HWND, msg: u32, lparam: LPARAM) -> bool {
         }
         2 => {
             if press {
-                nav_next(hwnd, true, true, false);
+                nav_next(hwnd, true, true, false, false);
             }
             true
         }
@@ -1332,17 +1339,17 @@ fn on_mousewheel(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
         // Action 1: wheel up = previous, down = next (viv.c:14063-14074).
         1 => {
             if delta > 0 {
-                nav_next(hwnd, true, true, false);
+                nav_next(hwnd, true, true, false, false);
             } else if delta < 0 {
-                nav_next(hwnd, false, true, false);
+                nav_next(hwnd, false, true, false, false);
             }
         }
         // Action 2: wheel up = next, down = previous (viv.c:14075-14086).
         2 => {
             if delta > 0 {
-                nav_next(hwnd, false, true, false);
+                nav_next(hwnd, false, true, false, false);
             } else if delta < 0 {
-                nav_next(hwnd, true, true, false);
+                nav_next(hwnd, true, true, false, false);
             }
         }
         // Action 0 (and any hand-edited unknown value, which upstream's
@@ -1740,7 +1747,7 @@ fn on_left_button_down(hwnd: HWND, lparam: LPARAM) {
             return;
         }
         4 => {
-            nav_next(hwnd, false, true, false);
+            nav_next(hwnd, false, true, false, false);
             return;
         }
         // 1 = play/pause slideshow (upstream's action-1 arm is
@@ -1973,10 +1980,10 @@ fn on_xbutton(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
         },
         2 => match button {
             XBUTTON1 => {
-                nav_next(hwnd, true, true, false);
+                nav_next(hwnd, true, true, false, false);
             }
             XBUTTON2 => {
-                nav_next(hwnd, false, true, false);
+                nav_next(hwnd, false, true, false, false);
             }
             _ => {}
         },
@@ -2308,7 +2315,7 @@ fn request_preload(hwnd: HWND) {
         return;
     }
     let prev = state.last_nav_prev;
-    nav_next(hwnd, prev, false, true);
+    nav_next(hwnd, prev, false, true, false);
 }
 
 /// Queue one entry as a preload job (upstream `_viv_open(fd, 1)`'s
@@ -2941,7 +2948,13 @@ fn home_fallback(virtual_display: bool, preload: bool) -> HomeFallback {
 /// viv.c:7223-7227): true = an open was initiated (or the random search
 /// was sent / the no-current Home arm ran, upstream's ret-stays-1 arms),
 /// false = nothing to show.
-fn nav_next(hwnd: HWND, prev: bool, reset_slideshow: bool, preload: bool) -> bool {
+fn nav_next(
+    hwnd: HWND,
+    prev: bool,
+    reset_slideshow: bool,
+    preload: bool,
+    stop_at_end: bool,
+) -> bool {
     enum Action {
         Random,
         Home,
@@ -2951,6 +2964,10 @@ fn nav_next(hwnd: HWND, prev: bool, reset_slideshow: bool, preload: bool) -> boo
         PlaylistSorted,
         /// The fd_compare scan over the current file's directory.
         Scan,
+        /// #67: the walk hit its END (the wrap or dead-end step) with
+        /// `stop_at_end` armed — open nothing, report failure so the
+        /// caller (the slideshow's own tick) can exit the process.
+        Blocked,
     }
     // One borrow for classification AND the shuffle bookkeeping: the FS
     // scans inside `ensure_shuffle_ready` never pump messages, and only
@@ -2990,15 +3007,32 @@ fn nav_next(hwnd: HWND, prev: bool, reset_slideshow: bool, preload: bool) -> boo
                     // upstream's lookup returns -1 and the front/back row
                     // serves (viv.c:5908-5918) — `shuffle_edge(!prev)` is the
                     // same read.
-                    let target = match state.nav_current.as_ref() {
-                        Some(current) => state.playlist.shuffle_target(current, prev),
-                        None => state.playlist.shuffle_edge(!prev),
-                    };
-                    match target {
-                        Some(entry) => Action::Open(entry.clone()),
-                        // Unreachable with a non-empty playlist (ensure built
-                        // the order); the sorted scan keeps it total.
-                        None => Action::PlaylistSorted,
+                    match state.nav_current.as_ref() {
+                        Some(current) => match state.playlist.shuffle_step(current, prev) {
+                            playlist::WalkStep {
+                                target: Some(entry),
+                                at_end: false,
+                            } => Action::Open(entry.clone()),
+                            // #67: the armed self-advance stops at the order's
+                            // wrap instead of re-entering it.
+                            playlist::WalkStep { at_end: true, .. } if stop_at_end => {
+                                Action::Blocked
+                            }
+                            playlist::WalkStep {
+                                target: Some(entry),
+                                ..
+                            } => Action::Open(entry.clone()),
+                            // Unreachable with a non-empty playlist (ensure
+                            // built the order); the sorted scan keeps it
+                            // total.
+                            playlist::WalkStep { target: None, .. } => Action::PlaylistSorted,
+                        },
+                        None => match state.playlist.shuffle_edge(!prev) {
+                            // The walk's START entering the order — never an
+                            // end step.
+                            Some(entry) => Action::Open(entry.clone()),
+                            None => Action::PlaylistSorted,
+                        },
                     }
                 }
             } else {
@@ -3014,6 +3048,8 @@ fn nav_next(hwnd: HWND, prev: bool, reset_slideshow: bool, preload: bool) -> boo
     match action {
         Action::Random => everything::send_random(hwnd),
         Action::Home => home_open(hwnd, false, preload),
+        // #67: the end step opened nothing on purpose — the caller exits.
+        Action::Blocked => opened = false,
         Action::Open(entry) => {
             if preload {
                 queue_preload(hwnd, &entry);
@@ -3022,20 +3058,24 @@ fn nav_next(hwnd: HWND, prev: bool, reset_slideshow: bool, preload: bool) -> boo
             }
         }
         Action::PlaylistSorted => {
-            // SAFETY: the borrow ends at the end of the statement (the
-            // entry is cloned out); nothing below pumps.
-            let target = (unsafe { state_of(hwnd) }).and_then(|s| {
-                playlist::next(
+            // SAFETY: the borrow ends at the end of the statement (the step
+            // is cloned out); nothing below pumps.
+            let step = (unsafe { state_of(hwnd) }).map(|s| {
+                let step = playlist::walk_step(
                     s.playlist.entries(),
                     s.nav_current.as_ref(),
                     prev,
                     true,
                     playlist::SortMode::from_config(s.config.nav_sort),
                     s.config.nav_sort_ascending != 0,
-                )
-                .cloned()
+                );
+                (step.target.cloned(), step.at_end)
             });
-            if let Some(entry) = target {
+            // A `stop_at_end` walk does not open the wrap target — it
+            // reports the end for the caller to act on (#67).
+            if let Some((target, at_end)) = step
+                && let Some(entry) = target.filter(|_| !(stop_at_end && at_end))
+            {
                 if preload {
                     queue_preload(hwnd, &entry);
                 } else {
@@ -3063,9 +3103,10 @@ fn nav_next(hwnd: HWND, prev: bool, reset_slideshow: bool, preload: bool) -> boo
             let Some((sort, ascending)) = sort else {
                 return false;
             };
-            if let Some(entry) =
-                playlist::next(&entries, current.as_ref(), prev, false, sort, ascending)
-            {
+            let step =
+                playlist::walk_step(&entries, current.as_ref(), prev, false, sort, ascending);
+            // A `stop_at_end` walk does not open the wrap target (#67).
+            if let Some(entry) = step.target.filter(|_| !(stop_at_end && step.at_end)) {
                 if preload {
                     queue_preload(hwnd, entry);
                 } else {
@@ -3273,7 +3314,23 @@ fn on_slideshow_timer(hwnd: HWND) {
         }
     });
     if advance.is_some() {
-        nav_next(hwnd, false, false, false);
+        // #67: an armed `/close` exits at the walk's end instead of
+        // wrapping — this self-advance is the ONLY `stop_at_end` caller
+        // (manual navigation keeps today's wrap).
+        // SAFETY: the borrow spans the one flag read.
+        let close_armed =
+            (unsafe { state_of(hwnd) }).is_some_and(|state| state.close_after_slideshow);
+        if close_armed && !nav_next(hwnd, false, false, false, true) {
+            // The walk reached the list end. Exit exactly like File→Exit
+            // (WM_DESTROY saves the config and quits the pump); the
+            // WM_TIMER dispatch touches no state after this handler
+            // returns.
+            // SAFETY: legal on the owning thread; synchronously runs
+            // WM_DESTROY/WM_NCDESTROY with no borrow live.
+            let _ = unsafe { DestroyWindow(hwnd) };
+        } else if !close_armed {
+            nav_next(hwnd, false, false, false, false);
+        }
     }
 }
 
@@ -3452,7 +3509,7 @@ fn delete_current(hwnd: HWND, permanently: bool) {
         if let Some(state) = unsafe { state_of(hwnd) } {
             state.playlist.remove_by_id(current.id);
         }
-        if !nav_next(hwnd, false, true, false) {
+        if !nav_next(hwnd, false, true, false, false) {
             blank_display(hwnd);
         }
     }
@@ -3717,6 +3774,14 @@ fn process_parsed_cl(hwnd: HWND, parsed: &cli::Parsed) {
         show_usage(hwnd);
     }
     // The show tail (viv.c:5102-5141).
+    // #67: `/close` arms the sticky close-after-slideshow intent — never
+    // cleared by a later parse, never persisted to the ini.
+    if parsed.close_after_slideshow {
+        // SAFETY: the borrow spans one field store.
+        if let Some(state) = unsafe { state_of(hwnd) } {
+            state.close_after_slideshow = true;
+        }
+    }
     if parsed.start_slideshow {
         slideshow_start(hwnd);
     }
@@ -4377,7 +4442,7 @@ fn on_animation_timer(hwnd: HWND) {
         // The gate held the slideshow's advance until this animation
         // looped once — fire it now, as a MANUAL advance (the timer
         // re-arms, viv.c:3245's `_viv_next(0,1,0,0)`).
-        nav_next(hwnd, false, true, false);
+        nav_next(hwnd, false, true, false, false);
     }
     if repaint {
         // The frame counter part ("n / m") tracks the displayed frame,
@@ -5398,10 +5463,10 @@ fn on_command(hwnd: HWND, cmd: menu::Cmd) {
         menu::Cmd::AnimationRateIncrease => animation_rate_step(hwnd, false),
         menu::Cmd::AnimationRateReset => animation_rate_reset(hwnd),
         menu::Cmd::NavNext => {
-            nav_next(hwnd, false, true, false);
+            nav_next(hwnd, false, true, false, false);
         }
         menu::Cmd::NavPrev => {
-            nav_next(hwnd, true, true, false);
+            nav_next(hwnd, true, true, false, false);
         }
         menu::Cmd::NavHome => home_open(hwnd, false, false),
         menu::Cmd::NavEnd => home_open(hwnd, true, false),
@@ -7185,6 +7250,7 @@ pub(crate) fn run() -> Result<(), String> {
         random_rand_state: 0,
         slideshow: false,
         slideshow_timeup: false,
+        close_after_slideshow: false,
         animation_looped: false,
         animation_playing: true,
         animation_rate_pos: crate::anim::RATE_ONE,

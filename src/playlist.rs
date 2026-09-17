@@ -232,44 +232,53 @@ impl Playlist {
         self.rng_state = 0;
     }
 
-    /// The shuffle-order neighbor of `current` (upstream `_viv_next`'s
-    /// shuffle arm, viv.c:5881-5923): the FIRST order slot whose entry id
-    /// equals the current's (`_viv_playlist_shuffle_index_from_fd`,
-    /// viv.c:13527-13546 — the id-0 collision picks the first match, an
-    /// upstream quirk), stepped and wrapped; a current matching nothing
-    /// starts at the order's front (back for `prev`). The array wrap needs
-    /// no same-path guard — every slot is a distinct entry.
-    pub(crate) fn shuffle_target(
-        &self,
-        current: &PlaylistEntry,
-        prev: bool,
-    ) -> Option<&PlaylistEntry> {
-        let order = self.shuffle_order.as_ref()?;
+    /// The shuffle-order walk step (#67's `WalkStep` shape over the order
+    /// array): the neighbor of `current`, and whether stepping to it
+    /// wrapped past the order's end (the walk's END for `/close` — the
+    /// array wrap needs no same-path guard, every slot is a distinct
+    /// entry). A current matching nothing ENTERS the order at the front
+    /// (back for `prev`) — the walk's start, not its end.
+    pub(crate) fn shuffle_step(&self, current: &PlaylistEntry, prev: bool) -> WalkStep<'_> {
+        let Some(order) = self.shuffle_order.as_ref() else {
+            return WalkStep {
+                target: None,
+                at_end: false,
+            };
+        };
         let count = order.len();
         if count == 0 {
-            return None;
+            return WalkStep {
+                target: None,
+                at_end: false,
+            };
         }
         let found = order
             .iter()
             .position(|&i| self.entries[i as usize].id == current.id);
-        let index = match found {
+        let (index, at_end) = match found {
             Some(i) => {
                 if prev {
-                    (i + count - 1) % count
+                    // Stepping before slot 0 wraps to the back — the end
+                    // for a backwards walk.
+                    ((i + count - 1) % count, i == 0)
                 } else {
-                    (i + 1) % count
+                    // Stepping past the last slot wraps to the front.
+                    ((i + 1) % count, i + 1 == count)
                 }
             }
             // Not in the order: front for next, back for prev (viv.c:5908-5918).
             None => {
                 if prev {
-                    count - 1
+                    (count - 1, false)
                 } else {
-                    0
+                    (0, false)
                 }
             }
         };
-        self.entries.get(order[index] as usize)
+        WalkStep {
+            target: self.entries.get(order[index] as usize),
+            at_end,
+        }
     }
 
     /// The shuffle-order edge for Home/End (upstream `_viv_home`'s shuffle
@@ -503,15 +512,36 @@ pub(crate) fn fd_compare(
 /// (viv.c:6013-6069), so the same-file case is left to the compare and
 /// same-path checks. The compare itself is the caller's sort config
 /// (`mode`/`ascending`, #39).
-pub(crate) fn next<'a>(
+/// One navigation step's shape (#67): the entry to open, and whether the
+/// step landed on the WRAP fallback (`best` was `None`, so `start` served
+/// or nothing did) — the "list walked to its end" point the `/close`
+/// switch exits at instead of wrapping. `at_end` with a `target` is the
+/// wrap re-entry; `at_end` without one is the dead end (a lone image:
+/// the wrap extreme is the current path itself, filtered).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct WalkStep<'a> {
+    pub(crate) target: Option<&'a PlaylistEntry>,
+    pub(crate) at_end: bool,
+}
+
+/// The navigation core: `best` (the strict successor), else `start` (the
+/// wrap extreme), else nothing.
+pub(crate) fn walk_step<'a>(
     entries: &'a [PlaylistEntry],
     current: Option<&PlaylistEntry>,
     prev: bool,
     from_playlist: bool,
     mode: SortMode,
     ascending: bool,
-) -> Option<&'a PlaylistEntry> {
-    let current = current?;
+) -> WalkStep<'a> {
+    let Some(current) = current else {
+        // No navigation reference: no step exists (the Home arm serves the
+        // walk's START, a different action).
+        return WalkStep {
+            target: None,
+            at_end: false,
+        };
+    };
     let mut best: Option<&PlaylistEntry> = None;
     let mut start: Option<&PlaylistEntry> = None;
     for entry in entries {
@@ -555,11 +585,17 @@ pub(crate) fn next<'a>(
             start = Some(entry);
         }
     }
-    if best.is_some() {
-        return best;
+    if let Some(best) = best {
+        return WalkStep {
+            target: Some(best),
+            at_end: false,
+        };
     }
     // Wrap — but never "open" the very same path again (upstream viv.c:6086-6092).
-    start.filter(|s| s.path != current.path)
+    WalkStep {
+        target: start.filter(|s| s.path != current.path),
+        at_end: true,
+    }
 }
 
 /// The home/end entry — the global minimum (or maximum for `end`) under
@@ -753,7 +789,7 @@ mod tests {
         prev: bool,
         from_playlist: bool,
     ) -> Option<&'a PlaylistEntry> {
-        next(
+        walk_step(
             entries,
             current,
             prev,
@@ -761,6 +797,7 @@ mod tests {
             SortMode::DateModified,
             false,
         )
+        .target
     }
 
     fn hm(entries: &[PlaylistEntry], end: bool) -> Option<&PlaylistEntry> {
@@ -1192,13 +1229,17 @@ mod tests {
         let b = entry("b.png", 200, 1);
         let entries = [a.clone(), b.clone()];
         assert_eq!(
-            next(&entries, Some(&b), false, true, SortMode::Unknown, false).map(|e| e.path.clone()),
+            walk_step(&entries, Some(&b), false, true, SortMode::Unknown, false)
+                .target
+                .map(|e| e.path.clone()),
             Some(a.path.clone())
         );
         // From the first entry the wrap target is the second — the
         // ping-pong (only a same-path target no-ops, viv.c:6086-6092).
         assert_eq!(
-            next(&entries, Some(&a), false, true, SortMode::Unknown, false).map(|e| e.path.clone()),
+            walk_step(&entries, Some(&a), false, true, SortMode::Unknown, false)
+                .target
+                .map(|e| e.path.clone()),
             Some(b.path.clone())
         );
         assert_eq!(
@@ -1408,7 +1449,111 @@ mod tests {
         assert!(pl.shuffle_order.is_some());
     }
 
-    // shuffle_target: found current steps and wraps; a foreign current
+    // #67: the walk's END detection `/close` exits on — at_end marks the
+    // wrap step (best was None) and the dead end alike; a strict successor
+    // and a missing current are never the end.
+    #[test]
+    fn walk_step_flags_the_wrap_and_dead_ends_as_the_walks_end() {
+        let a = entry("a.png", 300, 0);
+        let b = entry("b.png", 200, 1);
+        let c = entry("c.png", 100, 2);
+        let entries = [a.clone(), b.clone(), c.clone()];
+        // DateModified descending: a (newest) first, c (oldest) last.
+        // Mid-list strict successor: not the end.
+        let step = walk_step(
+            &entries,
+            Some(&b),
+            false,
+            true,
+            SortMode::DateModified,
+            false,
+        );
+        assert_eq!(step.target.map(|e| e.path.clone()), Some(c.path.clone()));
+        assert!(!step.at_end);
+        // The list's last entry: the wrap re-entry IS the end.
+        let step = walk_step(
+            &entries,
+            Some(&c),
+            false,
+            true,
+            SortMode::DateModified,
+            false,
+        );
+        assert_eq!(step.target.map(|e| e.path.clone()), Some(a.path.clone()));
+        assert!(step.at_end);
+        // A lone image: the dead end — the end with nothing to open (the
+        // wrap extreme is the current path itself, filtered).
+        let only = entry("only.png", 100, 0);
+        let lone = [only.clone()];
+        let step = walk_step(
+            &lone,
+            Some(&only),
+            false,
+            true,
+            SortMode::DateModified,
+            false,
+        );
+        assert!(step.target.is_none());
+        assert!(step.at_end);
+        // No navigation reference: no step, and NOT the end (the Home arm
+        // serves the walk's start).
+        let step = walk_step(&entries, None, false, true, SortMode::DateModified, false);
+        assert!(step.target.is_none());
+        assert!(!step.at_end);
+        // The backwards walk ends at the OTHER extreme.
+        let step = walk_step(
+            &entries,
+            Some(&a),
+            true,
+            true,
+            SortMode::DateModified,
+            false,
+        );
+        assert!(step.at_end);
+    }
+
+    // #67: the shuffle walk's end — stepping past the order's last slot
+    // (before its first, backwards) wraps; entering the order from a
+    // foreign current is the walk's start, not its end.
+    #[test]
+    fn shuffle_step_flags_the_order_wrap_as_the_walks_end() {
+        let mut pl = Playlist::new();
+        for name in ["a", "b", "c"] {
+            pl.add(OsString::from(format!("{name}.png")), 1, 0, 0);
+        }
+        pl.ensure_shuffle(1234);
+        let order = pl.shuffle_order.clone().unwrap();
+        let at = |i: usize| pl.entries[order[i] as usize].clone();
+        // Mid-order: a plain step.
+        let step = pl.shuffle_step(&at(1), false);
+        assert_eq!(step.target.map(|e| e.id), Some(at(2).id));
+        assert!(!step.at_end);
+        // Past the last slot: the wrap is the end.
+        let step = pl.shuffle_step(&at(2), false);
+        assert_eq!(step.target.map(|e| e.id), Some(at(0).id));
+        assert!(step.at_end);
+        // Before the first slot, backwards: the end too.
+        let step = pl.shuffle_step(&at(0), true);
+        assert_eq!(step.target.map(|e| e.id), Some(at(2).id));
+        assert!(step.at_end);
+        // Backwards mid-order: not the end.
+        assert!(!pl.shuffle_step(&at(2), true).at_end);
+        // A foreign current enters at the order's front: the start.
+        let foreign = entry("zz.png", 0, 999);
+        let step = pl.shuffle_step(&foreign, false);
+        assert_eq!(step.target.map(|e| e.id), Some(at(0).id));
+        assert!(!step.at_end);
+        // A single-entry order: every step is the wrap/end.
+        let mut pl1 = Playlist::new();
+        pl1.add(OsString::from("only.png"), 1, 0, 0);
+        pl1.ensure_shuffle(5);
+        let only = pl1.entries[0].clone();
+        let step = pl1.shuffle_step(&only, false);
+        assert_eq!(step.target.map(|e| e.path.clone()), Some(only.path.clone()));
+        assert!(step.at_end);
+    }
+
+    // shuffle_step: found current steps and wraps; a foreign current
     // starts at the order's edge (viv.c:5881-5923).
     #[test]
     fn shuffle_target_steps_wraps_and_defaults_for_foreign_currents() {
@@ -1421,27 +1566,33 @@ mod tests {
         let at = |i: usize| pl.entries[order[i] as usize].clone();
         // found: step forward/back with wrap
         let cur = at(1);
-        assert_eq!(pl.shuffle_target(&cur, false).map(|e| e.id), Some(at(2).id));
-        assert_eq!(pl.shuffle_target(&cur, true).map(|e| e.id), Some(at(0).id));
+        assert_eq!(
+            pl.shuffle_step(&cur, false).target.map(|e| e.id),
+            Some(at(2).id)
+        );
+        assert_eq!(
+            pl.shuffle_step(&cur, true).target.map(|e| e.id),
+            Some(at(0).id)
+        );
         // wrap at both ends
         let last = at(3);
         assert_eq!(
-            pl.shuffle_target(&last, false).map(|e| e.id),
+            pl.shuffle_step(&last, false).target.map(|e| e.id),
             Some(at(0).id)
         );
         let first = at(0);
         assert_eq!(
-            pl.shuffle_target(&first, true).map(|e| e.id),
+            pl.shuffle_step(&first, true).target.map(|e| e.id),
             Some(at(3).id)
         );
         // foreign current (id not in the playlist): front for next, back for prev
         let foreign = entry("zz.png", 0, 999);
         assert_eq!(
-            pl.shuffle_target(&foreign, false).map(|e| e.id),
+            pl.shuffle_step(&foreign, false).target.map(|e| e.id),
             Some(at(0).id)
         );
         assert_eq!(
-            pl.shuffle_target(&foreign, true).map(|e| e.id),
+            pl.shuffle_step(&foreign, true).target.map(|e| e.id),
             Some(at(3).id)
         );
         // id-0 collision: a direct-open current (id 0) matches the FIRST
@@ -1452,7 +1603,7 @@ mod tests {
             .position(|&i| pl.entries[i as usize].id == 0)
             .unwrap();
         assert_eq!(
-            pl.shuffle_target(&direct, false).map(|e| e.id),
+            pl.shuffle_step(&direct, false).target.map(|e| e.id),
             Some(at((first_zero + 1) % 4).id)
         );
     }
@@ -1489,11 +1640,11 @@ mod tests {
         pl.ensure_shuffle(5);
         let only = pl.entries[0].clone();
         assert_eq!(
-            pl.shuffle_target(&only, false).map(|e| e.path.clone()),
+            pl.shuffle_step(&only, false).target.map(|e| e.path.clone()),
             Some(OsString::from("only.png"))
         );
         assert_eq!(
-            pl.shuffle_target(&only, true).map(|e| e.path.clone()),
+            pl.shuffle_step(&only, true).target.map(|e| e.path.clone()),
             Some(OsString::from("only.png"))
         );
     }

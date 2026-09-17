@@ -699,6 +699,7 @@ const EN_US: [&str; Id::COUNT] = [
      \n\
      Switches:\n\
      /slideshow\tStart a slideshow.\n\
+     /close\t\tClose after the slideshow finishes.\n\
      /fullscreen\tStart fullscreen.\n\
      /maximized\tStart maximized.\n\
      /window\t\tStart windowed.\n\
@@ -971,6 +972,7 @@ const ZH_CN: [&str; Id::COUNT] = [
      \n\
      开关:\n\
      /slideshow\t开始幻灯片播放。\n\
+     /close\t\t幻灯片播放完毕后退出。\n\
      /fullscreen\t全屏启动。\n\
      /maximized\t最大化启动。\n\
      /window\t\t窗口化启动。\n\
@@ -1138,6 +1140,17 @@ mod tests {
             assert!(!EN_US[i].is_empty(), "en table empty at index {i}");
             assert!(!ZH_CN[i].is_empty(), "zh table empty at index {i}");
         }
+    }
+
+    #[test]
+    fn usage_text_lists_the_close_switch_in_both_languages() {
+        // #67: the /close row rides in the usage body (the row after
+        // /slideshow), in English and the zh translation alike.
+        let en = get_for(Language::English, Id::UsageText);
+        assert!(en.contains("/slideshow\tStart a slideshow."));
+        assert!(en.contains("/close\t\tClose after the slideshow finishes."));
+        let zh = get_for(Language::ChineseSimplified, Id::UsageText);
+        assert!(zh.contains("/close\t\t幻灯片播放完毕后退出。"));
     }
 
     #[test]
