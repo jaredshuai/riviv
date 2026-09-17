@@ -361,7 +361,7 @@ pub(crate) fn parse_install_options(words: &[Word]) -> InstallPlan {
 
 use std::path::{Path, PathBuf};
 
-use windows::Win32::Foundation::{CloseHandle, ERROR_FILE_NOT_FOUND};
+use windows::Win32::Foundation::{CloseHandle, ERROR_FILE_NOT_FOUND, HWND};
 use windows::Win32::Storage::FileSystem::{
     CopyFileW, DeleteFileW, GetFileAttributesW, INVALID_FILE_ATTRIBUTES, RemoveDirectoryW,
 };
@@ -376,11 +376,10 @@ use windows::Win32::System::Threading::{
     INFINITE, OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
 };
 use windows::Win32::UI::Shell::{
-    CSIDL_COMMON_PROGRAMS, IShellLinkW, IsUserAnAdmin, SEE_MASK_INVOKEIDLIST,
-    SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, SHGetFolderPathW, ShellExecuteExW, ShellLink,
+    CSIDL_COMMON_PROGRAMS, IShellLinkW, IsUserAnAdmin, SHGetFolderPathW, ShellLink,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    FindWindowA, GetWindowThreadProcessId, SW_SHOWNORMAL, SendMessageW, WM_CLOSE,
+    FindWindowA, GetWindowThreadProcessId, SendMessageW, WM_CLOSE,
 };
 use windows::core::{Interface, PCSTR, PCWSTR, s};
 
@@ -765,48 +764,6 @@ pub(crate) fn is_admin() -> bool {
     unsafe { IsUserAnAdmin() }.as_bool()
 }
 
-/// ShellExecuteEx wrapper (upstream `os_shell_execute`, os.c:1094+):
-/// INVOKEIDLIST mask like upstream, NOCLOSEPROCESS + a wait when asked.
-/// Returns Err on a failed launch (the callers decide fail-soft vs loud).
-pub(crate) fn shell_execute(
-    file: &str,
-    params: Option<&str>,
-    verb: Option<&str>,
-    wait: bool,
-) -> Result<(), String> {
-    let file_w = to_wide(file);
-    let params_w = params.map(to_wide);
-    let verb_w = verb.map(to_wide);
-    let mut sei = SHELLEXECUTEINFOW {
-        cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
-        fMask: SEE_MASK_INVOKEIDLIST | if wait { SEE_MASK_NOCLOSEPROCESS } else { 0 },
-        lpFile: PCWSTR(file_w.as_ptr()),
-        lpParameters: match &params_w {
-            Some(p) => PCWSTR(p.as_ptr()),
-            None => PCWSTR::null(),
-        },
-        lpVerb: match &verb_w {
-            Some(v) => PCWSTR(v.as_ptr()),
-            None => PCWSTR::null(),
-        },
-        nShow: SW_SHOWNORMAL.0,
-        ..Default::default()
-    };
-    // SAFETY: sei outlives the call and every string it points at is alive
-    // in this frame; the struct is written only by the API.
-    unsafe { ShellExecuteExW(&mut sei) }
-        .map_err(|e| format!("ShellExecuteExW({file}) failed: {e}"))?;
-    if wait && !sei.hProcess.is_invalid() {
-        // SAFETY: hProcess came from this successful execute; the wait is
-        // bounded by the child's exit and the handle is closed exactly once.
-        unsafe {
-            let _ = WaitForSingleObject(sei.hProcess, INFINITE);
-            let _ = CloseHandle(sei.hProcess);
-        }
-    }
-    Ok(())
-}
-
 /// Close every running viewer instance (viv.c:12666-12704): find each
 /// riviv window, WM_CLOSE it, and wait for its process to exit before
 /// looking again — install/uninstall must not race a live exe.
@@ -914,10 +871,16 @@ pub(crate) fn process_install_command_line(config: &mut Config) -> bool {
     if plan.needs_admin() && !is_admin() && !plan.is_runas {
         let rest = String::from_utf16_lossy(&cl[split.rest_after_first..]);
         let params = isrunas_params(&rest);
-        let exe = std::env::current_exe()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        if let Err(e) = shell_execute(&exe, Some(&params), Some("runas"), true) {
+        let exe = std::env::current_exe().unwrap_or_default();
+        // The single seam (#69): upstream's elevated re-exec rides the same
+        // PIDL os_shell_execute (viv.c:4653) — hwnd 0 like upstream.
+        if let Err(e) = crate::shell::shell_execute(
+            HWND::default(),
+            exe.as_os_str(),
+            Some("runas"),
+            Some(&params),
+            true,
+        ) {
             eprintln!("riviv: {e}"); // user-level: a refused elevation is not fatal
         }
         return true;
@@ -954,7 +917,15 @@ pub(crate) fn process_install_command_line(config: &mut Config) -> bool {
 
         if let Some(options) = &plan.install_options {
             let new_exe = Path::new(install_path).join("riviv.exe");
-            if let Err(e) = shell_execute(&new_exe.to_string_lossy(), Some(options), None, true) {
+            // Upstream viv.c:4709: the staged exe runs with the options and
+            // is waited on, through the same PIDL os_shell_execute.
+            if let Err(e) = crate::shell::shell_execute(
+                HWND::default(),
+                new_exe.as_os_str(),
+                None,
+                Some(options),
+                true,
+            ) {
                 eprintln!("riviv: {e}");
             }
         }

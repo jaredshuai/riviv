@@ -2,6 +2,10 @@
 //! Edit/Preview/Print/Properties through ShellExecuteEx verbs, Open File
 //! Location through SHOpenFolderAndSelectItems, Set Desktop Wallpaper
 //! behind its stobject.dll load — all riding one PIDL-based execute.
+//! Since #69 this is the viewer's only shell-exec seam: the installer's
+//! re-exec family (the runas elevate, the staged exe and the Options
+//! admin re-exec — upstream viv.c:4653/4709/8808) rides it too, exactly
+//! upstream's single `os_shell_execute`.
 //!
 //! Upstream: `_viv_file_preview`/`_viv_file_print`/
 //! `_viv_file_set_desktop_wallpaper` (viv.c:7679-7712), `_viv_file_edit`/
@@ -82,9 +86,10 @@ fn current_path(hwnd: HWND) -> Option<std::ffi::OsString> {
 
 /// `os_shell_execute` (os.c:1094-1140): resolve the file to an item id
 /// list, then invoke through SEE_MASK_INVOKEIDLIST (+ NOCLOSEPROCESS and
-/// an infinite wait when asked — no #42 caller asks). Err on a null pidl
-/// or a failed launch; upstream returns 0 and its callers ignore it —
-/// riviv threads the Err for diagnostics, the handlers stay fail-soft.
+/// an infinite wait when asked — the #43 rotate and the #69 install-family
+/// re-execs wait; the #42 verb family does not). Err on a null pidl or a
+/// failed launch; upstream returns 0 and its callers ignore it — riviv
+/// threads the Err for diagnostics, the handlers stay fail-soft.
 pub(crate) fn shell_execute(
     hwnd: HWND,
     path: &OsStr,
@@ -120,10 +125,12 @@ pub(crate) fn shell_execute(
     };
     // SAFETY: sei and every string it points at are alive in this frame;
     // the struct is written only by the API.
-    let launched = unsafe { ShellExecuteExW(&mut sei) }.is_ok();
+    let launched = unsafe { ShellExecuteExW(&mut sei) };
     let mut result = Ok(());
-    if !launched {
-        result = Err(format!("ShellExecuteExW({path:?}, verb {verb:?}) failed"));
+    if let Err(e) = launched {
+        result = Err(format!(
+            "ShellExecuteExW({path:?}, verb {verb:?}) failed: {e}"
+        ));
     } else if wait && !sei.hProcess.is_invalid() {
         // SAFETY: hProcess came from this successful execute; upstream
         // waits INFINITE then closes the handle (os.c:1140-1143).
