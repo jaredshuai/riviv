@@ -1673,7 +1673,10 @@ fn refresh_current(hwnd: HWND) {
         state.displayed_file_bytes = None;
         state.pending_file_bytes = None;
         state.session = None;
-        state.view.reset();
+        // The `_viv_clear` view edge (#68): with keep_zoom the state stands
+        // here — the re-open's adoption edge re-derives it moments later
+        // (same file, so the carry migrates by a ratio of one).
+        view_edge(hwnd, state, DisplayEdge::Cleared);
         state.animation_looped = false;
         state.animation_playing = true;
         state.slideshow_timeup = false;
@@ -2045,7 +2048,7 @@ fn activate_last_flow(hwnd: HWND) {
         image.reanchor_at(now);
         state.image = Some(image);
         state.displayed_from = None;
-        reset_display_marks(state);
+        reset_display_marks(hwnd, state, DisplayEdge::NewImage);
         // current_fd = last_fd + title (viv.c:14499-14501).
         state.nav_current = Some(cache.entry.clone());
         state.path = Some(cache.entry.path.clone());
@@ -2127,7 +2130,7 @@ fn adopt_preload_flow(hwnd: HWND) {
                 // viv.c:15176-15182: cache the display, swap the whole
                 // parked image in, chain-preload the next neighbor. The
                 // finished session drops (nothing replies anymore).
-                if let Err(e) = adopt_parked_image(state, now, false) {
+                if let Err(e) = adopt_parked_image(hwnd, state, now, false) {
                     fatal_msg = Some(e);
                 } else {
                     invalidate = true;
@@ -2142,7 +2145,7 @@ fn adopt_preload_flow(hwnd: HWND) {
                 // viv.c:15166-15175: switch now — the parked first frame
                 // takes the display and the still-running stream finishes
                 // as the foreground load.
-                if let Err(e) = adopt_parked_image(state, now, true) {
+                if let Err(e) = adopt_parked_image(hwnd, state, now, true) {
                     fatal_msg = Some(e);
                 } else {
                     invalidate = true;
@@ -2165,7 +2168,7 @@ fn adopt_preload_flow(hwnd: HWND) {
                 state.image = None;
                 state.displayed_from = None;
                 state.status_load_failed = true;
-                reset_display_marks(state);
+                reset_display_marks(hwnd, state, DisplayEdge::Cleared);
                 state.nav_current = Some(slot.entry.clone());
                 state.path = Some(slot.entry.path.clone());
                 state.displayed_entry = None;
@@ -2201,7 +2204,12 @@ fn adopt_preload_flow(hwnd: HWND) {
 /// still-running stream into the foreground slot (AdoptPartial, upstream
 /// flips `_viv_load_is_preload` to 0, viv.c:15172); dropping it retires a
 /// finished stream (AdoptComplete).
-fn adopt_parked_image(state: &mut WindowState, now: u64, keep_session: bool) -> Result<(), String> {
+fn adopt_parked_image(
+    hwnd: HWND,
+    state: &mut WindowState,
+    now: u64,
+    keep_session: bool,
+) -> Result<(), String> {
     let Some(slot) = state.preload.take() else {
         return Ok(());
     };
@@ -2215,7 +2223,7 @@ fn adopt_parked_image(state: &mut WindowState, now: u64, keep_session: bool) -> 
     image.reanchor_at(now);
     state.image = Some(image);
     state.displayed_from = Some(session.id());
-    reset_display_marks(state);
+    reset_display_marks(hwnd, state, DisplayEdge::NewImage);
     if keep_session {
         state.session = Some(session);
     }
@@ -2256,9 +2264,37 @@ fn move_displaced_to_last(state: &mut WindowState, displaced: Option<LoadedImage
 
 /// The frame-freeing half of upstream `_viv_clear` is the LoadedImage
 /// replacement itself; this is the rest — view and animation marks reset,
-/// playback restarted (viv.c:1278-1291).
-fn reset_display_marks(state: &mut WindowState) {
-    state.view.reset();
+/// playback restarted (viv.c:1278-1291). `NewImage` marks a swap where a
+/// fresh image took the display (the view edge then depends on
+/// `keep_zoom`); `Cleared` marks the display going blank.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DisplayEdge {
+    NewImage,
+    Cleared,
+}
+
+/// The view half of a display edge (#68). Upstream's `_viv_clear` resets
+/// the zoom/pan state at EVERY edge (viv.c:1282-1288); with `keep_zoom` on,
+/// riviv instead CARRIES onto a new image (level/1:1 kept, the pan
+/// re-derived from the migrated center anchor — `View::carry`) and KEEPS
+/// the state standing through a cleared display (a blank renders nothing,
+/// and the surviving anchor lets the next image continue the carry chain).
+/// The option off reproduces upstream bit-for-bit: reset at every edge.
+fn view_edge(hwnd: HWND, state: &mut WindowState, edge: DisplayEdge) {
+    if state.config.keep_zoom == 0 {
+        state.view.reset();
+    } else if edge == DisplayEdge::NewImage {
+        let (vp, src) = viewport_and_src(hwnd, state);
+        let fit = fit_policy(state);
+        state.view.carry(src.0, src.1, vp, fit);
+    }
+}
+
+/// See [`DisplayEdge`] — the shared marks tail of every `_viv_clear` edge:
+/// the view edge above, then the per-image animation marks (frame_looped/
+/// timeup, viv.c:1278/1279) and the playback restart (viv.c:1291).
+fn reset_display_marks(hwnd: HWND, state: &mut WindowState, edge: DisplayEdge) {
+    view_edge(hwnd, state, edge);
     state.animation_looped = false;
     state.slideshow_timeup = false;
     state.animation_playing = true;
@@ -3402,7 +3438,9 @@ fn blank_display(hwnd: HWND) {
         // `_viv_clear`, viv.c:7910 + 1282-1288) — and so do the per-image
         // animation marks (frame_looped/timeup, viv.c:1278/1279). The
         // slideshow itself keeps running (upstream never stops it here).
-        state.view.reset();
+        // keep_zoom keeps the view standing through the blank (#68): the
+        // next image's adoption edge continues the carry chain.
+        view_edge(hwnd, state, DisplayEdge::Cleared);
         state.animation_looped = false;
         state.animation_playing = true;
         state.slideshow_timeup = false;
@@ -4162,11 +4200,23 @@ fn on_load_replies(hwnd: HWND) {
                         }
                         UiAction::SetWindowTitle => {
                             // The display adopted this session's image (or
-                            // cleared it): the zoom/pan view resets with it
-                            // (upstream `_viv_clear` runs at exactly these
-                            // points, viv.c:2804/2835/7910) and the status
-                            // bar's "(N KB)" follows the same commit/clear.
-                            state.view.reset();
+                            // cleared it): the zoom/pan view takes the same
+                            // display edge (upstream `_viv_clear` runs at
+                            // exactly these points, viv.c:2804/2835/7910)
+                            // and the status bar's "(N KB)" follows the same
+                            // commit/clear. `displayed_from` already tells
+                            // the edge: Some = this session's first frame is
+                            // on screen, None = the FAILED clear — the view
+                            // edge (#68) picks carry vs. keep from it.
+                            view_edge(
+                                hwnd,
+                                state,
+                                if state.displayed_from == Some(session_id) {
+                                    DisplayEdge::NewImage
+                                } else {
+                                    DisplayEdge::Cleared
+                                },
+                            );
                             if state.displayed_from == Some(session_id) && !displayed_before_reply {
                                 adopted_new_image = true;
                                 state.path = Some(session_path.clone());
@@ -4277,7 +4327,7 @@ fn on_load_replies(hwnd: HWND) {
                 state.image = None;
                 state.displayed_from = None;
                 state.status_load_failed = true;
-                reset_display_marks(state);
+                reset_display_marks(hwnd, state, DisplayEdge::Cleared);
                 state.displayed_entry = None;
                 // The cleared display is blank: never virtual (#65).
                 state.virtual_display = false;
@@ -4287,7 +4337,7 @@ fn on_load_replies(hwnd: HWND) {
                 kick_preload = true;
             }
             preload::DrainAdoption::Promote { keep_session } => {
-                match adopt_parked_image(state, now, keep_session) {
+                match adopt_parked_image(hwnd, state, now, keep_session) {
                     Ok(()) => {
                         invalidate = true;
                         adopted_new_image = true;
