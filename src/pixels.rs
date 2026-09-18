@@ -59,8 +59,10 @@ pub(crate) fn composite_over_background_in_place(rgba: &mut [u8], bg: [u8; 3]) {
 /// The BGRA-order sibling of [`composite_over_background_in_place`]: the
 /// ICM path's transform already emits the master's BGRA layout (#77 —
 /// the swizzle is folded into `TranslateBitmapBits`' output format), so
-/// the composite runs directly on it with the background triple passed
-/// in matching `[B, G, R]` order.
+/// the composite runs directly on it. The caller's background triple
+/// stays `[R, G, B]` (DecodeEnv's shape, like the RGBA sibling); it is
+/// reversed HERE to match the `[B, G, R]` byte order the BGRA chunks
+/// iterate.
 pub(crate) fn composite_over_background_bgra_in_place(bgra: &mut [u8], bg: [u8; 3]) {
     composite_over_background_in_place(bgra, [bg[2], bg[1], bg[0]]);
 }

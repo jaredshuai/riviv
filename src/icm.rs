@@ -37,9 +37,9 @@ use windows::Win32::Foundation::GetLastError;
 use windows::Win32::Storage::FileSystem::OPEN_EXISTING;
 use windows::Win32::UI::ColorSystem::{
     BEST_MODE, BM_xBGRQUADS, BM_xRGBQUADS, CloseColorProfile, CreateMultiProfileTransform,
-    DeleteColorTransform, GetStandardColorSpaceProfileW, INDEX_DONT_CARE, INTENT_PERCEPTUAL,
-    LCS_sRGB, OpenColorProfileW, PROFILE, PROFILE_MEMBUFFER, PROFILE_READ, TranslateBitmapBits,
-    USE_RELATIVE_COLORIMETRIC,
+    DeleteColorTransform, GetStandardColorSpaceProfileW, INDEX_DONT_CARE,
+    INTENT_RELATIVE_COLORIMETRIC, LCS_sRGB, OpenColorProfileW, PROFILE, PROFILE_MEMBUFFER,
+    PROFILE_READ, TranslateBitmapBits, USE_RELATIVE_COLORIMETRIC,
 };
 use windows::core::{PCWSTR, PWSTR};
 
@@ -122,18 +122,21 @@ fn system_srgb() -> Option<&'static [u8]> {
     .as_deref()
 }
 
-/// The two-call `GetStandardColorSpaceProfileW` pattern: the first call
-/// fails reporting the required path-buffer byte count, the second
-/// fills it (the API resolves the localized sRGB filename itself — no
-/// hardcoded color-directory path).
+/// The two-call `GetStandardColorSpaceProfileW` pattern: the size query
+/// with a null buffer reports the required path-buffer byte count, the
+/// second call fills it (the API resolves the localized sRGB filename
+/// itself — no hardcoded color-directory path). The query's BOOL result
+/// is NOT a verdict here (MSDN Parameters documents a TRUE return for
+/// the null-buffer call too): only an unusable size — zero, or not a
+/// wide-char multiple — makes the query failed.
 fn load_system_srgb() -> Result<Vec<u8>, String> {
     let mut size = 0u32;
     // SAFETY: null machine name and null buffer — `size` is a valid out
     // pointer the failed size query writes the required byte count to.
-    let ok = unsafe {
+    let _ = unsafe {
         GetStandardColorSpaceProfileW(PCWSTR::null(), LCS_sRGB.0 as u32, None, &mut size)
     };
-    if ok.as_bool() || size == 0 || !size.is_multiple_of(2) {
+    if size == 0 || !size.is_multiple_of(2) {
         return Err(format!(
             "GetStandardColorSpaceProfileW size query returned an unusable size {size}"
         ));
@@ -199,13 +202,15 @@ impl Drop for ProfileHandle {
 
 /// The two-profile transform the frames flow through — source first,
 /// the system sRGB profile second. Relative colorimetric intent (the
-/// `USE_RELATIVE_COLORIMETRIC` flag overrides `padwIntent`): in-gamut
-/// colors land byte-accurate, matching how browsers treat tagged
-/// images, and keeping the identity probe meaningful — perceptual
-/// rescales the gamut and would blur the equivalence line.
-fn create_transform(src: &ProfileHandle, dst: &ProfileHandle) -> Option<isize> {
+/// `USE_RELATIVE_COLORIMETRIC` flag forces it, and the intents array
+/// now says the same thing): in-gamut colors land byte-accurate,
+/// matching how browsers treat tagged images, and keeping the identity
+/// probe meaningful — perceptual rescales the gamut and would blur the
+/// equivalence line. Failure carries the thread error slot's GLE up to
+/// the caller's breadcrumb.
+fn create_transform(src: &ProfileHandle, dst: &ProfileHandle) -> Result<isize, u32> {
     let profiles = [src.h, dst.h];
-    let intents = [INTENT_PERCEPTUAL; 2];
+    let intents = [INTENT_RELATIVE_COLORIMETRIC; 2];
     // SAFETY: both handles are live and owned for the call's duration;
     // the returned transform keeps its own references.
     let xform = unsafe {
@@ -216,7 +221,12 @@ fn create_transform(src: &ProfileHandle, dst: &ProfileHandle) -> Option<isize> {
             INDEX_DONT_CARE,
         )
     };
-    (xform != 0).then_some(xform)
+    if xform != 0 {
+        Ok(xform)
+    } else {
+        // SAFETY: thread error slot read immediately after the failed call.
+        Err(unsafe { GetLastError() }.0)
+    }
 }
 
 /// A prepared ICC->sRGB transform: one per decode job, applied to every
@@ -224,15 +234,19 @@ fn create_transform(src: &ProfileHandle, dst: &ProfileHandle) -> Option<isize> {
 /// the same way — `GdipLoadImageFromStreamICM`). Created, used, and
 /// dropped on the decode worker; nothing crosses a thread boundary.
 ///
-/// Field order matters for drop: `Transform`'s own `Drop` deletes the
-/// transform BEFORE the profile handles close (a transform may still
-/// reference its profiles while alive).
+/// `Transform`'s own `Drop` deletes the transform handle BEFORE the
+/// profile handles close — Rust guarantees the `Drop` impl runs ahead
+/// of field destruction, and the CMM may keep referencing its profiles
+/// while the transform is alive.
 pub(crate) struct Transform {
     xform: isize,
     shown: Box<str>,
     apply_failed: Cell<bool>,
-    _src: ProfileHandle,
-    _dst: ProfileHandle,
+    /// Held only so the profile outlives `xform` (RAII); the leading
+    /// underscore marks the drop-only field.
+    _src_profile: ProfileHandle,
+    /// Same hold for the destination (system sRGB) profile.
+    _dst_profile: ProfileHandle,
 }
 
 impl Drop for Transform {
@@ -246,16 +260,26 @@ impl Drop for Transform {
 
 impl Transform {
     /// `TranslateBitmapBits` over one full frame: RGBA source rows in,
-    /// BGRA master rows out (the folded swizzle). No logging — callers
-    /// decide what a failure means.
-    fn translate(&self, width: u32, height: u32, src_rgba: &[u8], dst_bgra: &mut [u8]) -> bool {
+    /// BGRA master rows out (the folded swizzle). `Err` carries the
+    /// GLE for the caller's breadcrumb. No logging — callers decide
+    /// what a failure means.
+    fn translate(
+        &self,
+        width: u32,
+        height: u32,
+        src_rgba: &[u8],
+        dst_bgra: &mut [u8],
+    ) -> Result<(), u32> {
         debug_assert_eq!(src_rgba.len(), width as usize * height as usize * 4);
         debug_assert_eq!(dst_bgra.len(), src_rgba.len());
         let stride = width * 4;
-        // SAFETY: both buffers are `width*height*4` bytes (asserted) and
-        // distinct allocations, matching the API's non-in-place contract;
-        // the transform handle is borrowed live via &self.
-        unsafe {
+        // SAFETY: both buffers span `width*height*4` bytes — debug
+        // builds assert it, release builds rely on the callers' own
+        // construction (the decode pipeline allocates `dst` from the
+        // source buffer's exact length) — and are distinct allocations,
+        // matching the API's non-in-place contract; the transform
+        // handle is borrowed live via &self.
+        let ok = unsafe {
             TranslateBitmapBits(
                 self.xform,
                 src_rgba.as_ptr().cast(),
@@ -270,12 +294,25 @@ impl Transform {
                 None,
             )
         }
-        .as_bool()
+        .as_bool();
+        if ok {
+            Ok(())
+        } else {
+            // SAFETY: thread error slot read immediately after the failed call.
+            Err(unsafe { GetLastError() }.0)
+        }
     }
 
     /// One decoded frame: RGBA in, BGRA out. `false` = the CMM refused
     /// the pass — the caller falls back to the untransformed RGBA path
     /// for the frame (breadcrumb once per transform, not per frame).
+    ///
+    /// The `x` byte of `BM_x*QUADS` is documented *unused*, so the CMM
+    /// makes no promise about it — mscms happens to pass it through
+    /// byte-for-byte (probe-verified), but the composite downstream
+    /// needs the decoder's alpha, so it is restored from the source
+    /// here regardless: correctness must not ride on undocumented
+    /// behavior.
     pub(crate) fn apply(
         &self,
         width: u32,
@@ -283,14 +320,24 @@ impl Transform {
         src_rgba: &[u8],
         dst_bgra: &mut [u8],
     ) -> bool {
-        let ok = self.translate(width, height, src_rgba, dst_bgra);
-        if !ok && !self.apply_failed.replace(true) {
-            eprintln!(
-                "riviv: icm: {}: TranslateBitmapBits failed — remaining frames decode untransformed",
-                self.shown
-            );
+        if let Err(gle) = self.translate(width, height, src_rgba, dst_bgra) {
+            if !self.apply_failed.replace(true) {
+                eprintln!(
+                    "riviv: icm: {}: TranslateBitmapBits failed (GLE={gle}) — remaining frames decode untransformed",
+                    self.shown
+                );
+            }
+            return false;
         }
-        ok
+        for (dst, src) in dst_bgra
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(src_rgba.as_chunks::<4>().0)
+        {
+            dst[3] = src[3];
+        }
+        true
     }
 }
 
@@ -332,16 +379,21 @@ pub(crate) fn prepare(enabled: bool, icc: Option<Vec<u8>>, shown: &str) -> Optio
             return None;
         }
     };
-    let Some(xform) = create_transform(&src, &dst) else {
-        eprintln!("riviv: icm: {shown}: CreateMultiProfileTransform failed — decoding untagged");
-        return None;
+    let xform = match create_transform(&src, &dst) {
+        Ok(xform) => xform,
+        Err(gle) => {
+            eprintln!(
+                "riviv: icm: {shown}: CreateMultiProfileTransform failed (GLE={gle}) — decoding untagged"
+            );
+            return None;
+        }
     };
     let transform = Transform {
         xform,
         shown: shown.into(),
         apply_failed: Cell::new(false),
-        _src: src,
-        _dst: dst,
+        _src_profile: src,
+        _dst_profile: dst,
     };
     // A different blob can still encode the sRGB space (the byte
     // compare above only catches the identical one). Probe the built
@@ -351,8 +403,8 @@ pub(crate) fn prepare(enabled: bool, icc: Option<Vec<u8>>, shown: &str) -> Optio
     // trip (Microsoft's same-profile precision-error caveat).
     let probe = probe_pixels();
     let mut out = vec![0u8; probe.len()];
-    if !transform.translate((probe.len() / 4) as u32, 1, &probe, &mut out) {
-        eprintln!("riviv: icm: {shown}: probe transform failed — decoding untagged");
+    if let Err(gle) = transform.translate((probe.len() / 4) as u32, 1, &probe, &mut out) {
+        eprintln!("riviv: icm: {shown}: probe transform failed (GLE={gle}) — decoding untagged");
         return None;
     }
     if probe_max_channel_diff(&probe, &out) <= SRGB_EQUIVALENT_TOLERANCE {
@@ -506,6 +558,11 @@ pub(crate) mod test_fixtures {
         [0.1882, 0.6407, 0.0307],
         [0.1456, 0.0407, 0.7454],
     ];
+    const P3_D65_PRIMARIES: [[f64; 3]; 3] = [
+        [0.4866, 0.2290, 0.0000],
+        [0.2657, 0.6918, 0.0451],
+        [0.1982, 0.0792, 1.0439],
+    ];
 
     /// sRGB primaries + sRGB tone curve: a DIFFERENT blob encoding the
     /// same space (the L2 probe's job to detect).
@@ -516,6 +573,19 @@ pub(crate) mod test_fixtures {
     /// AdobeRGB primaries + gamma 2.2: a real foreign profile.
     pub(crate) fn adobe_like_icc() -> Vec<u8> {
         synthetic_icc(ADOBE_PRIMARIES, tag_curv_table(|x| x.powf(2.2)))
+    }
+
+    /// Display P3 (D65) primaries + the sRGB tone curve: the second
+    /// real foreign space the #77 acceptance names.
+    pub(crate) fn p3_like_icc() -> Vec<u8> {
+        synthetic_icc(P3_D65_PRIMARIES, srgb_trc())
+    }
+
+    /// sRGB primaries + a linear tone curve: same gamut, wildly
+    /// different transfer function — the midtone-mover of the suite
+    /// (design pin: `linLike` must prepare a transform).
+    pub(crate) fn lin_like_icc() -> Vec<u8> {
+        synthetic_icc(SRGB_PRIMARIES, tag_curv_table(|x| x))
     }
 
     /// Require a working system sRGB profile (the same dependency the
@@ -599,16 +669,63 @@ mod tests {
         let _ = require_srgb();
         let t = prepare(true, Some(adobe_like_icc()), "t")
             .expect("an AdobeRGB-like profile transforms");
-        // Asymmetric color + a midtone gray, RGBA in / BGRA out.
-        let src = [200u8, 60, 10, 255, 128, 128, 128, 255];
-        let mut dst = [0u8; 8];
-        assert!(t.apply(2, 1, &src, &mut dst));
-        // The transform moved the color (foreign profile), R stayed in
-        // the BGRA slot's byte 2, and alpha is forced opaque.
-        assert_ne!(dst[2], 200, "the CMM moved the source red");
+        // Pure red, an asymmetric color, a midtone gray and a
+        // semi-transparent pixel, RGBA in / BGRA out. The first two pin
+        // the channel placement: red lands in the BGRA slot's byte 2
+        // with B/G near zero (a swapped format would move it), and the
+        // CMM moves the source color off its input value.
+        let src = [
+            255u8, 0, 0, 255, //
+            200, 60, 10, 255, //
+            128, 128, 128, 255, //
+            200, 60, 10, 128,
+        ];
+        let mut dst = [0u8; 16];
+        assert!(t.apply(4, 1, &src, &mut dst));
+        // Pure red under a wider gamut maps to a more saturated red:
+        // byte 2 (R) stays pinned at full, B (byte 0) stays near zero,
+        // and G (byte 1) sits far below its midtone value.
+        assert_eq!(dst[2], 255, "pure red keeps a full R channel");
+        assert!(dst[0] <= 2, "pure red keeps B near zero, got {}", dst[0]);
+        assert!(dst[1] <= 2, "pure red keeps G near zero, got {}", dst[1]);
+        assert_ne!(dst[6], 200, "the CMM moved the source red");
+        assert!((dst[5] as i32 - 60).abs() <= 8, "green stays near-gamut");
+        // Alpha: opaque stays opaque, and the semi-transparent source
+        // pixel's alpha is carried through byte-for-byte (design pin —
+        // the composite downstream keys on it).
         assert_eq!(dst[3], 255);
         assert_eq!(dst[7], 255);
-        assert!((dst[1] as i32 - 60).abs() <= 8, "green stays near-gamut");
+        assert_eq!(dst[11], 255);
+        assert_eq!(dst[15], 128, "alpha passes through the transform");
+    }
+
+    #[test]
+    fn display_p3_and_linear_gamma_profiles_also_prepare_transforms() {
+        // The #77 acceptance names AdobeRGB and Display P3 as the two
+        // real foreign spaces, and the design pin adds a linear-gamma
+        // variant: every one of them must prepare (none is sRGB).
+        let _ = require_srgb();
+        for blob in [p3_like_icc(), lin_like_icc()] {
+            assert!(
+                prepare(true, Some(blob), "t").is_some(),
+                "a genuinely foreign profile must transform"
+            );
+        }
+    }
+
+    #[test]
+    fn a_linear_gamma_profile_moves_midtones_hard() {
+        // The linLike discriminator: same primaries as sRGB but a
+        // linear transfer function, so the [128,128,128] midtone must
+        // land far from where it started (identity would leave it at
+        // 128; the sRGB encode of linear 0.5 sits near 188).
+        let _ = require_srgb();
+        let t = prepare(true, Some(lin_like_icc()), "t").expect("linLike transforms");
+        let src = [128u8, 128, 128, 255];
+        let mut dst = [0u8; 4];
+        assert!(t.apply(1, 1, &src, &mut dst));
+        let moved = (dst[2] as i32 - 128).abs();
+        assert!(moved >= 30, "midtone must move nontrivially, got {moved}");
     }
 
     #[test]

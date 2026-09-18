@@ -48,6 +48,11 @@ windows = { version = "0.62", features = [
 # 嵌入 res/riviv.ico + 版本信息(#26);自带资源对象写出,无外部 rc.exe
 winresource = "0.1.31"
 
+[dev-dependencies]
+# 测试内合成带 ICC 应用扩展(ICCRGBG1012)的动画 GIF(#77 动画验收);
+# 经 image 的 gif feature 已在依赖树里,零新增下载
+gif = "0.14"
+
 [lints.clippy]
 # unsafe 密集 FFI:每个 unsafe 块必须带 SAFETY 注释(AGENTS.md 技术栈约定)
 undocumented_unsafe_blocks = "deny"
