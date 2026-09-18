@@ -27,7 +27,7 @@ use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL, HWND};
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAP, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CreateCompatibleBitmap,
     CreateCompatibleDC, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, GetDIBits, GetObjectW,
-    HBITMAP, HDC, HGDIOBJ, ReleaseDC, SRCCOPY, SelectObject,
+    HBITMAP, HGDIOBJ, ReleaseDC, SRCCOPY, SelectObject,
 };
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
@@ -40,6 +40,7 @@ use windows::Win32::System::Ole::{CF_BITMAP, CF_DIB, CF_DIBV5, CF_HDROP, CF_UNIC
 use windows::Win32::UI::Shell::HDROP;
 use windows::core::w;
 
+use crate::surface::create_bgra_dib;
 use crate::window::{apply_drop_files, request_open_clipboard, state_of};
 
 /// The `clipboard:` display name (#66; upstream wishlist viv.c:80 — "open
@@ -125,17 +126,19 @@ fn preferred_drop_effect() -> u32 {
 /// (the FAILED handler never touches current_fd, viv.c:2832-2840), so the
 /// keyboard path still copies it; the menu gray is display-only.
 pub(crate) fn copy_current(hwnd: HWND, cut: bool) {
-    // SAFETY: read-only state reads, all values copied out before the
-    // clipboard session (which pumps nothing but must not hold a borrow).
+    // SAFETY: read-only state reads; the frame's master bytes are CLONED
+    // out so the borrow ends before the clipboard session (which must
+    // not hold one).
     let (path, frame) = match unsafe { state_of(hwnd) } {
         Some(state) => match state.nav_current.clone() {
             Some(entry) => (
                 entry.path,
                 state.image.as_ref().map(|i| {
+                    let master = i.surface().master();
                     (
-                        i.surface().mem_dc(),
-                        i.surface().width(),
-                        i.surface().height(),
+                        master.pixels.to_vec(),
+                        master.width as i32,
+                        master.height as i32,
                     )
                 }),
             ),
@@ -153,8 +156,8 @@ pub(crate) fn copy_current(hwnd: HWND, cut: bool) {
         }
         let _ = EmptyClipboard();
         // CF_BITMAP first (upstream 7380): Copy/Cut also carry the pixels.
-        if let Some((src, w, h)) = frame {
-            set_clipboard_image(src, w, h);
+        if let Some((pixels, w, h)) = frame {
+            set_clipboard_image(&pixels, w, h);
         }
         set_hglobal(CF_HDROP.0 as u32, &hdrop_bytes(&[path.as_os_str()]));
         let fmt = preferred_drop_effect();
@@ -211,14 +214,15 @@ pub(crate) fn copy_image(hwnd: HWND) {
             return;
         }
         state.image.as_ref().map(|i| {
+            let master = i.surface().master();
             (
-                i.surface().mem_dc(),
-                i.surface().width(),
-                i.surface().height(),
+                master.pixels.to_vec(),
+                master.width as i32,
+                master.height as i32,
             )
         })
     };
-    let Some((src, w, h)) = frame else {
+    let Some((pixels, w, h)) = frame else {
         return;
     };
     // SAFETY: the clipboard session, as in copy_current.
@@ -227,21 +231,25 @@ pub(crate) fn copy_image(hwnd: HWND) {
             return;
         }
         let _ = EmptyClipboard();
-        set_clipboard_image(src, w, h);
+        set_clipboard_image(&pixels, w, h);
         let _ = CloseClipboard();
     }
 }
 
 /// The blit half of upstream `_viv_set_clipboard_image` (viv.c:7485-7530):
 /// copy the displayed frame's pixels into a fresh SCREEN-compatible
-/// bitmap and hand it to the clipboard. The frame's own DIB is never
-/// surrendered — the clipboard takes the copy, the display keeps the
-/// original. The clipboard session must already be open (upstream calls
-/// this both from _viv_copy, which opened it, and from _viv_copy_image).
+/// bitmap and hand it to the clipboard. The frame's master is the
+/// source (#76): a throwaway DIB derived from these bytes feeds the
+/// blit — the same 1:1 SRCCOPY from the same pixel values the display's
+/// own GDI face would have served, so the DDB out is byte-identical.
+/// The master itself is never surrendered — the clipboard takes the
+/// copy, the display keeps the original. The clipboard session must
+/// already be open (upstream calls this both from _viv_copy, which
+/// opened it, and from _viv_copy_image).
 ///
-/// SAFETY (callers): `src` is a live memory DC with the frame DIB
-/// selected, owned by the display's Surface; the clipboard is open.
-unsafe fn set_clipboard_image(src: HDC, wide: i32, high: i32) {
+/// SAFETY (callers): `pixels` holds exactly `wide * high * 4` top-down
+/// BGRA bytes (the master); the clipboard is open.
+unsafe fn set_clipboard_image(pixels: &[u8], wide: i32, high: i32) {
     // SAFETY: blanket for the edition-2024 block — every call below is the
     // GDI primitive its comment names; the per-path teardown the comments
     // describe is what the body itself encodes.
@@ -251,9 +259,38 @@ unsafe fn set_clipboard_image(src: HDC, wide: i32, high: i32) {
         if screen.is_invalid() {
             return;
         }
+        // SAFETY: the throwaway source face — a DIB memcpy of the master,
+        // selected into its own temp DC for the blit (upstream blits the
+        // frame's mem DC, same bytes; deleted on every path below).
+        let Ok(dib) = create_bgra_dib(wide, high, pixels) else {
+            let _ = ReleaseDC(None, screen);
+            return;
+        };
+        // SAFETY: plain DC creation/teardown; DeleteDC on every path.
+        let src = CreateCompatibleDC(Some(screen));
+        if src.is_invalid() {
+            let _ = DeleteObject(HGDIOBJ(dib.0));
+            let _ = ReleaseDC(None, screen);
+            return;
+        }
+        // SAFETY: `dib` is valid and unselected; the old object is restored
+        // before the DC is deleted. A failed selection would leave the DC's
+        // 1x1 stock bitmap as the blit source — bail with the symmetric
+        // teardown instead of copying garbage to the clipboard (review
+        // PR #84 F6).
+        let src_old = SelectObject(src, HGDIOBJ(dib.0));
+        if src_old.is_invalid() {
+            let _ = DeleteDC(src);
+            let _ = DeleteObject(HGDIOBJ(dib.0));
+            let _ = ReleaseDC(None, screen);
+            return;
+        }
         // SAFETY: plain DC creation/teardown; DeleteDC on every path.
         let mem = CreateCompatibleDC(Some(screen));
         if mem.is_invalid() {
+            let _ = SelectObject(src, src_old);
+            let _ = DeleteDC(src);
+            let _ = DeleteObject(HGDIOBJ(dib.0));
             let _ = ReleaseDC(None, screen);
             return;
         }
@@ -262,12 +299,26 @@ unsafe fn set_clipboard_image(src: HDC, wide: i32, high: i32) {
         let bitmap = CreateCompatibleBitmap(screen, wide, high);
         if bitmap.is_invalid() {
             let _ = DeleteDC(mem);
+            let _ = SelectObject(src, src_old);
+            let _ = DeleteDC(src);
+            let _ = DeleteObject(HGDIOBJ(dib.0));
             let _ = ReleaseDC(None, screen);
             return;
         }
         // SAFETY: `bitmap` is valid and unselected; the old object is
-        // restored before the DC is deleted.
+        // restored before the DC is deleted. Same failed-selection guard
+        // as above: blitting from the stock bitmap would hand the
+        // clipboard a 1x1 garbage DDB (review PR #84 F6).
         let old = SelectObject(mem, HGDIOBJ(bitmap.0));
+        if old.is_invalid() {
+            let _ = DeleteObject(HGDIOBJ(bitmap.0));
+            let _ = DeleteDC(mem);
+            let _ = SelectObject(src, src_old);
+            let _ = DeleteDC(src);
+            let _ = DeleteObject(HGDIOBJ(dib.0));
+            let _ = ReleaseDC(None, screen);
+            return;
+        }
         // SAFETY: both DCs are live; src holds exactly a wide x high frame.
         let _ = BitBlt(mem, 0, 0, wide, high, Some(src), 0, 0, SRCCOPY);
         SelectObject(mem, old);
@@ -282,8 +333,12 @@ unsafe fn set_clipboard_image(src: HDC, wide: i32, high: i32) {
                 let _ = DeleteObject(HGDIOBJ(bitmap.0));
             }
         }
-        // SAFETY: the bitmap is deselected; the DC is ours to delete.
+        // SAFETY: the bitmap is deselected; the DCs are ours to delete; the
+        // temp DIB is deselected before its deletion.
         let _ = DeleteDC(mem);
+        let _ = SelectObject(src, src_old);
+        let _ = DeleteDC(src);
+        let _ = DeleteObject(HGDIOBJ(dib.0));
         let _ = ReleaseDC(None, screen);
     }
 }

@@ -11,8 +11,9 @@
 //! `_viv_last_frames` so navigating back skips the decode.
 
 use crate::loader::LoadedImage;
+use crate::pixels::PixelFrame;
 use crate::playlist::PlaylistEntry;
-use crate::surface::{DibFrame, Surface};
+use crate::surface::Surface;
 
 /// Decode progress of a preload load (upstream `_viv_preload_state`,
 /// viv.c:756 — 0 loading, 1 complete, 2 failed).
@@ -38,10 +39,11 @@ pub(crate) struct PreloadSlot {
     /// The file being preloaded with its navigation facts (upstream
     /// `_viv_preload_fd`; the entry becomes `nav_current` on adoption).
     pub(crate) entry: PlaylistEntry,
-    /// Frames decoded so far (upstream `_viv_preload_frames`) — bare DIBs;
-    /// the DC-carrying `Surface` is built only when the image actually
-    /// takes the display, like the drain does for replies.
-    pub(crate) image: Option<LoadedImage<DibFrame>>,
+    /// Frames decoded so far (upstream `_viv_preload_frames`) — pure
+    /// memory masters (#76); the GDI-deriving `Surface` is built only
+    /// when the image actually takes the display, like the drain does
+    /// for replies.
+    pub(crate) image: Option<LoadedImage<PixelFrame>>,
     /// Which session's first frame the parked image holds (the slot-local
     /// `displayed_from` that `apply_reply` mutates).
     pub(crate) adopted_from: Option<u64>,
