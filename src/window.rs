@@ -949,6 +949,13 @@ unsafe extern "system" fn view_proc(
             on_double_click(owner, lparam);
             LRESULT(0)
         }
+        WM_MOUSELEAVE => {
+            // The TME_LEAVE tracking rides this child (#78 — see
+            // on_mouse_move's arm block): the leave means the cursor moved
+            // off the viewport (onto the chrome or out of the window).
+            on_mouse_leave(owner);
+            LRESULT(0)
+        }
         WM_LBUTTONUP => {
             on_left_button_up(owner);
             LRESULT(0)
@@ -1974,17 +1981,34 @@ fn on_mouse_move(hwnd: HWND, lparam: LPARAM) {
     //SIDE any borrow: TrackMouseEvent can deliver WM_MOUSELEAVE
     // SYNCHRONOUSLY (upstream's "ui must come first" comment, viv.c:3593),
     // and that handler takes its own state borrow — ours must be gone.
+    // #78: the tracking rides the window the mouse is actually OVER — the
+    // viewport child when it exists. Tracking the owner while the cursor
+    // rides the child makes every mouse input fire a trailing WM_MOUSELEAVE
+    // on the owner (the window-under-the-cursor is never it), and the
+    // queued leave lands AFTER the forwarded move that re-set
+    // `is_mouseover` — net effect: mouseover flips off for good and the
+    // idle cursor never hides (smoke8 F7/F8 caught exactly that). The
+    // child's leave boundary IS the viewport, which matches the owner's
+    // effective boundary before the split (a move onto any chrome child
+    // fired the owner's leave there too).
     // SAFETY: the borrow spans only the flag read.
     let arm_tracking = (unsafe { state_of(hwnd) }).is_some_and(|state| !state.tracking_mouse);
     if arm_tracking {
-        // SAFETY: the borrow spans only the flag store.
-        if let Some(state) = unsafe { state_of(hwnd) } {
-            state.tracking_mouse = true;
-        }
+        // SAFETY: the borrow spans the flag store and the track-target copy.
+        let track_on = (unsafe { state_of(hwnd) })
+            .map(|state| {
+                state.tracking_mouse = true;
+                if state.viewport.is_invalid() {
+                    hwnd
+                } else {
+                    state.viewport
+                }
+            })
+            .unwrap_or(hwnd);
         let mut tme = TRACKMOUSEEVENT {
             cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
             dwFlags: TME_LEAVE,
-            hwndTrack: hwnd,
+            hwndTrack: track_on,
             dwHoverTime: 0,
         };
         // SAFETY: tme outlives the call; a failed track only costs the
