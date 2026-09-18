@@ -92,7 +92,7 @@ File management (upstream semantics, #43): F2 (File→Rename) opens a rename dia
 - [ ] M6 — rendering stack & color management (D2D viewport + WCS ICM; [ADR 0002](docs/adr/0002-d2d-wcs-render-stack.md))
   - [x] M6a: `PixelFrame` CPU frame source of truth — worker ships plain memory, GDI surfaces become derived, the three GDI seams read the master (#76)
   - [x] M6a: ICM Stage 1 — embedded ICC → sRGB via WCS at decode time (before compositing), `icm` key live (#77)
-  - [ ] M6b: dedicated viewport child HWND `riviv_view` (pure GDI phase, zero pixel delta — the flip-integration groundwork) (#78)
+  - [x] M6b: dedicated viewport child HWND `riviv_view` (pure GDI phase, zero pixel delta — the flip-integration groundwork) (#78)
   - [ ] M6b: PerMonitorV2 DPI manifest + WM_DPICHANGED handling (fixes 1:1 on mixed-DPI multi-monitor; intentional deviation) (#79, after #78)
   - [ ] M6b: D2D minimal path — `renderer=auto|d2d|warp|gdi`, GpuStack with device-loss recovery, pixel-exact 1:1, `--dump-viewport` readback (#80)
   - [ ] M6b: filter-mode mapping (2×2 ini matrix) + mip retirement for regular sizes, default renderer → `auto` (#81)
