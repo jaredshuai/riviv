@@ -4,6 +4,14 @@
 //! conversion and the alpha compositing (#3, landed — the composite
 //! background itself is a runtime parameter since #24, snapshot from
 //! the config at request time).
+//!
+//! #76 makes the CPU frame the source of truth: [`PixelFrame`] is what
+//! the decode worker produces (plain memory, naturally `Send` — the
+//! cross-thread boundary carries no GDI objects) and what every
+//! consumer reads directly (the RGB status readout, the clipboard image
+//! blit's source, the rotate pass, the future D2D upload). The GDI face
+//! (DIB section + memory DC + mips) is a UI-thread derivation owned by
+//! `surface::Surface`.
 
 /// image crate yields RGBA rows (top-down); GDI 32bpp DIBs want BGRA.
 pub(crate) fn rgba8_to_bgra_in_place(buf: &mut [u8]) {
@@ -81,6 +89,84 @@ pub(crate) fn rotate_bgra_270_cw(src: &[u8], wide: usize, high: usize, dst: &mut
             dst[dst_idx..dst_idx + 4].copy_from_slice(&src[src_idx..src_idx + 4]);
         }
     }
+}
+
+/// The decoded frame as pure memory (#76, ADR 0002 D3): top-down 32bpp
+/// BGRA, exactly `width * height * 4` bytes, alpha forced opaque (the
+/// invariant `composite_over_background_in_place` and the clipboard DIB
+/// parser's three copy paths pin). This is the source of truth — the
+/// GDI face is derived from it on the UI thread; device-loss recovery
+/// and the D2D upload (#80) will re-derive from these bytes without
+/// re-decoding.
+///
+/// `mip_target` is the decode-side mip pre-generation decision (the
+/// pure `select_mip_level` + budget-gate math, kept verbatim in the
+/// loader): how many levels the UI thread pre-generates when it builds
+/// the frame's GDI face. Zero means "no pre-generation" (the gate spent
+/// the animation's budget, or the viewport asked for none).
+#[derive(Debug)]
+pub(crate) struct PixelFrame {
+    pub(crate) pixels: Box<[u8]>,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) mip_target: u32,
+}
+
+impl PixelFrame {
+    /// Row stride in bytes — the invariant `width * 4` (top-down,
+    /// tightly packed), expressed as a method rather than a stored field
+    /// so it can never drift from `width`. Test-only until the D2D
+    /// upload path (#80) consumes it.
+    #[cfg(test)]
+    pub(crate) fn stride(&self) -> usize {
+        self.width as usize * 4
+    }
+
+    /// `rgba` holds exactly `width * height * 4` bytes; converted to
+    /// BGRA in place and boxed. Pure memory — infallible (a Rust
+    /// allocation failure is a process-level abort, not a load failure;
+    /// the worker-side GDI allocation errors this replaces were the
+    /// system-level failures that could still happen at decode).
+    pub(crate) fn from_rgba(width: u32, height: u32, mut rgba: Vec<u8>) -> Self {
+        debug_assert_eq!(rgba.len(), width as usize * height as usize * 4);
+        rgba8_to_bgra_in_place(&mut rgba);
+        Self::from_bgra(width, height, rgba)
+    }
+
+    /// The BGRA-native entry (the clipboard DIB parser already emits
+    /// this layout, #66): boxed as-is, no swizzle pass.
+    pub(crate) fn from_bgra(width: u32, height: u32, bgra: Vec<u8>) -> Self {
+        debug_assert_eq!(bgra.len(), width as usize * height as usize * 4);
+        PixelFrame {
+            pixels: bgra.into_boxed_slice(),
+            width,
+            height,
+            mip_target: 0,
+        }
+    }
+
+    /// The pixel dimensions (the load protocol's test surface for frame
+    /// payloads; production reads them through the `Surface` wrapper).
+    #[cfg(test)]
+    pub(crate) fn dims(&self) -> (i32, i32) {
+        (self.width as i32, self.height as i32)
+    }
+}
+
+/// Read one pixel of a top-down tightly-packed BGRA buffer as an
+/// (R, G, B) triple (#76; replaces the #47 status readout's `GetPixel`
+/// on the frame's memory DC). `width` is the buffer's pixel width (the
+/// row stride); `None` for any out-of-bounds coordinate — the caller
+/// maps that to the `CLR_INVALID` read-through (255, 255, 255) the
+/// unchecked GDI path produced, preserving the failure arm byte for
+/// byte.
+pub(crate) fn sample_bgra(pixels: &[u8], width: i32, x: i32, y: i32) -> Option<(u8, u8, u8)> {
+    if x < 0 || y < 0 || x >= width {
+        return None;
+    }
+    let idx = (y as usize * width as usize + x as usize) * 4;
+    let px = pixels.get(idx..idx + 4)?;
+    Some((px[2], px[1], px[0]))
 }
 
 #[cfg(test)]
@@ -196,5 +282,77 @@ mod tests {
         let mut back = vec![0u8; src.len()];
         rotate_bgra_270_cw(&cw, 3, 2, &mut back);
         assert_eq!(back, src);
+    }
+
+    // ---- PixelFrame (#76) ----
+
+    #[test]
+    fn pixelframe_from_rgba_swizzles_and_boxes() {
+        // RGBA [10,20,30,255 | 1,2,3,255] becomes BGRA [30,20,10,255 |
+        // 3,2,1,255], owned as a boxed slice.
+        let frame = PixelFrame::from_rgba(2, 1, vec![10, 20, 30, 255, 1, 2, 3, 255]);
+        assert_eq!(&frame.pixels[..], &[30, 20, 10, 255, 3, 2, 1, 255]);
+    }
+
+    #[test]
+    fn pixelframe_from_bgra_keeps_bytes_and_defaults_to_no_pregen() {
+        let frame = PixelFrame::from_bgra(1, 2, vec![1, 2, 3, 255, 4, 5, 6, 255]);
+        assert_eq!(&frame.pixels[..], &[1, 2, 3, 255, 4, 5, 6, 255]);
+        assert_eq!(frame.mip_target, 0, "the decode side sets it explicitly");
+        assert_eq!(frame.dims(), (1, 2));
+    }
+
+    #[test]
+    fn pixelframe_stride_is_width_times_four() {
+        let frame = PixelFrame::from_bgra(7, 3, vec![0u8; 7 * 3 * 4]);
+        assert_eq!(frame.stride(), 28);
+        assert_eq!(frame.pixels.len(), frame.stride() * 3);
+    }
+
+    #[test]
+    fn pixelframe_is_send() {
+        // The whole point of the CPU frame (#76): the worker -> UI
+        // boundary carries plain memory, no `unsafe impl Send` needed —
+        // pinned so a future GDI-typed field cannot sneak in silently.
+        fn assert_send<T: Send>() {}
+        assert_send::<PixelFrame>();
+    }
+
+    // ---- sample_bgra (#76) ----
+
+    /// A 3x2 BGRA canvas: pixel (x, y) tagged with its coordinates so
+    /// the channel order reads directly off the assertion values.
+    fn canvas_3x2() -> Vec<u8> {
+        let mut v = vec![0u8; 3 * 2 * 4];
+        for (i, px) in v.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            let (x, y) = (i % 3, i / 3);
+            *px = [x as u8, y as u8, (x * 10 + y) as u8, 255];
+        }
+        v
+    }
+
+    #[test]
+    fn sample_bgra_reads_rgb_from_the_addressed_pixel() {
+        // Pixel (1, 1) is stored as [B=1, G=1, R=11, 255] — the triple
+        // comes back ordered (R, G, B), exactly what the COLORREF
+        // unpacking of the old GetPixel produced.
+        let px = canvas_3x2();
+        assert_eq!(sample_bgra(&px, 3, 1, 1), Some((11, 1, 1)));
+        assert_eq!(sample_bgra(&px, 3, 2, 0), Some((20, 0, 2)));
+        assert_eq!(sample_bgra(&px, 3, 0, 0), Some((0, 0, 0)));
+        // The last pixel in the buffer.
+        assert_eq!(sample_bgra(&px, 3, 2, 1), Some((21, 1, 2)));
+    }
+
+    #[test]
+    fn sample_bgra_rejects_every_out_of_bounds_shape() {
+        let px = canvas_3x2();
+        // x past the width must NOT wrap into the next row.
+        assert_eq!(sample_bgra(&px, 3, 3, 0), None);
+        // y past the height (the buffer's end guards it).
+        assert_eq!(sample_bgra(&px, 3, 0, 2), None);
+        // Negative coordinates.
+        assert_eq!(sample_bgra(&px, 3, -1, 0), None);
+        assert_eq!(sample_bgra(&px, 3, 0, -1), None);
     }
 }

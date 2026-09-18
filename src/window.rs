@@ -41,9 +41,8 @@ use windows::Win32::Foundation::{
     RECT, SetLastError, WIN32_ERROR, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
-    COLOR_BTNFACE, GetMonitorInfoW, GetPixel, HBRUSH, InvalidateRect, MONITOR_DEFAULTTOPRIMARY,
-    MONITORINFO, MonitorFromPoint, MonitorFromRect, MonitorFromWindow, PtInRect, ScreenToClient,
-    UpdateWindow,
+    COLOR_BTNFACE, GetMonitorInfoW, HBRUSH, InvalidateRect, MONITOR_DEFAULTTOPRIMARY, MONITORINFO,
+    MonitorFromPoint, MonitorFromRect, MonitorFromWindow, PtInRect, ScreenToClient, UpdateWindow,
 };
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoCreateInstance,
@@ -112,16 +111,20 @@ use crate::cursor::{self, CursorEffects, CursorVisibility};
 use crate::custom_rate_dlg;
 use crate::everything;
 use crate::loader::{LoadReply, LoadedImage, UiAction, apply_reply, map_reply_frame};
-use crate::loadthread::{LoadSession, LoadSource, LoadThread, REPLY_KICK_MESSAGE, STDIN_NAME};
+use crate::loadthread::{
+    FirstFramePainted as LoadThreadSignal, LoadSession, LoadSource, LoadThread, REPLY_KICK_MESSAGE,
+    STDIN_NAME,
+};
 use crate::loc;
 use crate::menu;
 use crate::paint::paint;
+use crate::pixels::{PixelFrame, sample_bgra};
 use crate::playlist::{self, Playlist, PlaylistEntry};
 use crate::preload::{self, AdoptDecision, LastCache, PreloadSlot, PreloadState};
 use crate::shell;
 use crate::slideshow;
 use crate::status;
-use crate::surface::{DibFrame, Surface};
+use crate::surface::Surface;
 use crate::text::{
     TitleFormat, dialog_filter, temp_animation_rate_text, temp_pos_zoom_text,
     temp_slideshow_rate_text, title_wide, to_wide,
@@ -151,6 +154,12 @@ pub(crate) struct WindowState {
     /// Which load session produced the currently displayed image (`None`
     /// when blank) — the staleness guard for replies and failure handling.
     pub(crate) displayed_from: Option<u64>,
+    /// The animation first-frame paint handshake armed at a foreground
+    /// first-frame adoption (#76) and fired by the paint that renders it
+    /// — the decode worker holds the FOLLOWING frames' decode until then
+    /// (master's worker-side GDI serialization, translated). See
+    /// `loadthread::Job::first_frame_painted`.
+    pub(crate) paint_signal: Option<LoadThreadSignal>,
     /// The persisted settings (#19): loaded before the window exists,
     /// updated by the position tracking in WM_SIZE/WM_MOVE, saved in
     /// WM_DESTROY on the way out.
@@ -473,9 +482,9 @@ pub(crate) fn refresh_title(hwnd: HWND) {
 /// 9277-9278/14325-14326). With pixel-info off the coordinate resets and
 /// no refresh is owed (the parts sit empty either way).
 fn update_src_pixel(hwnd: HWND, force: bool, update_statusbar: bool) -> bool {
-    // SAFETY: the borrow spans the coordinate math and the read-only
-    // GetPixel on the displayed frame's DC — neither pumps messages, so no
-    // reentrant state_of borrow can interleave.
+    // SAFETY: the borrow spans the coordinate math and the pure master
+    // read of the displayed frame's pixels — no GDI, no message pump, so
+    // no reentrant state_of borrow can interleave.
     (unsafe { state_of(hwnd) }).is_some_and(|state| {
         if state.config.pixel_info == 0 {
             // Upstream's else-arm resets the coordinate only; the stale rgb
@@ -537,22 +546,18 @@ fn update_src_pixel(hwnd: HWND, force: bool, update_statusbar: bool) -> bool {
             && new_pt.1 >= 0
             && let Some(image) = state.image.as_ref()
         {
-            // The displayed frame's own DC, read-only (upstream builds a
-            // scratch DC for the same GetPixel, viv.c:15063-15109; riviv's
-            // persistent mem DC serves the identical read — the #41
-            // clipboard blit set the precedent).
-            let dc = image.surface().mem_dc();
-            // SAFETY: read-only GetPixel on the surface's selected frame;
-            // no selection change, no messages. A failed read returns
-            // CLR_INVALID (0xFFFFFFFF → 255,255,255) unchecked, like
-            // upstream's GetRValue chain (viv.c:9212-9214).
-            let cref = unsafe { GetPixel(dc, new_pt.0, new_pt.1) };
-            // COLORREF is 0x00BBGGRR (the GetRValue/GValue/BValue macros).
-            state.src_rgb = (
-                (cref.0 & 0xFF) as u8,
-                ((cref.0 >> 8) & 0xFF) as u8,
-                ((cref.0 >> 16) & 0xFF) as u8,
-            );
+            // The displayed frame's master, read directly (#76; upstream
+            // builds a scratch DC and GetPixels the displayed frame,
+            // viv.c:15063-15109 — the master holds the very bytes the GDI
+            // face derives from, so the pure read is the same value
+            // without the GDI roundtrip, device-independent).
+            let master = image.surface().master();
+            // Out-of-bounds maps to the CLR_INVALID read-through the
+            // unchecked GetRValue chain produced (255, 255, 255) — the
+            // coordinate math keeps new_pt in-frame by construction, so
+            // this arm is defensive parity, same as upstream's.
+            state.src_rgb = sample_bgra(&master.pixels, master.width as i32, new_pt.0, new_pt.1)
+                .unwrap_or((255, 255, 255));
         }
         update_statusbar
     })
@@ -2195,9 +2200,9 @@ fn adopt_preload_flow(hwnd: HWND) {
 }
 
 /// The shared body of the two adopt arms: the current display parks in
-/// last, the parked image takes the display (DC-carrying Surfaces built
-/// here on the UI thread — a wrap failure is GDI exhaustion, fatal like
-/// the drain's reply mapping, ADR 0001), re-anchored like upstream's
+/// last, the parked image takes the display (Surfaces wrapped here on
+/// the UI thread — pure ownership moves, #76; the GDI faces derive
+/// lazily at paint), re-anchored like upstream's
 /// `_viv_start_first_frame` (viv.c:14313-14319), and the preload file
 /// commits as the display's entry (upstream copies preload_fd into
 /// current_fd/frame_fd, viv.c:14415/15134). `keep_session` moves the
@@ -2219,7 +2224,7 @@ fn adopt_parked_image(
         .image
         .expect("adopt with no parked image is unreachable: adopt_decision gates on it");
     move_display_to_last(state);
-    let mut image = image.map_frames(Surface::from_frame)?;
+    let mut image = image.map_frames(|f| Ok::<Surface, String>(Surface::from_master(f)))?;
     image.reanchor_at(now);
     state.image = Some(image);
     state.displayed_from = Some(session.id());
@@ -2408,6 +2413,7 @@ fn queue_preload(hwnd: HWND, entry: &PlaylistEntry) {
         LoadSource::File(entry.path.clone()),
         render_viewport,
         background,
+        false, // a preload's parked first frame paints at adoption — no handshake
     );
     state.preload = Some(PreloadSlot {
         session,
@@ -2581,6 +2587,7 @@ pub(crate) fn request_open(hwnd: HWND, path: &OsStr, origin: OpenOrigin<'_>) {
             LoadSource::File(path.to_os_string()),
             render_viewport,
             background,
+            true, // the foreground's first frame gets the paint handshake (#76)
         );
         state.session = Some(session);
     }
@@ -2673,9 +2680,13 @@ fn request_open_virtual(hwnd: HWND, name: &str, source: LoadSource) {
         state.preload = None;
         let render_viewport = request_render_viewport(hwnd, state);
         let background = state.config.windowed_bg();
-        let session = state
-            .load_thread
-            .request(hwnd, source, render_viewport, background);
+        let session = state.load_thread.request(
+            hwnd,
+            source,
+            render_viewport,
+            background,
+            true, // the foreground's first frame gets the paint handshake (#76)
+        );
         state.session = Some(session);
     }
     refresh_title(hwnd);
@@ -4130,12 +4141,16 @@ fn on_load_replies(hwnd: HWND) {
             let session_id = session.id();
             let session_path = session.path().to_os_string();
             let session_is_virtual = session.is_virtual();
+            // The foreground session's first-frame paint handshake (#76) —
+            // armed below at the adoption edge, fired by the paint.
+            let session_paint_signal = session.paint_signal().cloned();
             for reply in replies {
-                // Frames cross the thread boundary as bare DIBs; the DC-carrying
-                // Surface is built here, on the UI thread that renders with it
-                // (memory DCs belong to their creating thread). A wrap failure
-                // is GDI exhaustion — system-level, fail loud (ADR 0001).
-                let reply = map_reply_frame(reply, Surface::from_frame);
+                // Frames cross the thread boundary as pure memory (#76); the
+                // wrap is a plain ownership move — the GDI face derives
+                // lazily at the first paint, after this drain has adopted the
+                // image (see surface.rs's Face docs).
+                let reply =
+                    map_reply_frame(reply, |f| Ok::<Surface, String>(Surface::from_master(f)));
                 // Whether THIS session already owned the display before the
                 // reply — the auto-size hook must fire on the adoption EDGE
                 // only (upstream's `_viv_start_first_frame` runs at the first
@@ -4220,6 +4235,11 @@ fn on_load_replies(hwnd: HWND) {
                             if state.displayed_from == Some(session_id) && !displayed_before_reply {
                                 adopted_new_image = true;
                                 state.path = Some(session_path.clone());
+                                // Arm the animation first-frame paint
+                                // handshake (#76): the paint that renders
+                                // this adoption fires it, unblocking the
+                                // decode of the frames that follow.
+                                state.paint_signal = session_paint_signal.clone();
                                 // The display-kind flag follows the same
                                 // edge as the path (#65/#66): a virtual
                                 // session (stdin:/clipboard:) adopts a
@@ -4275,10 +4295,11 @@ fn on_load_replies(hwnd: HWND) {
             let slot_id = slot.session.id();
             let replies = slot.session.drain();
             for reply in replies {
-                // DIBs stay bare — the DC wrap happens only if/when the
-                // image takes the display (the same split upstream makes
-                // between _viv_preload_frames and _viv_frames).
-                let reply = map_reply_frame(reply, Ok::<DibFrame, String>);
+                // Frames stay pure memory — the GDI derivation happens
+                // only if/when the image takes the display (the same
+                // split upstream makes between _viv_preload_frames and
+                // _viv_frames).
+                let reply = map_reply_frame(reply, Ok::<PixelFrame, String>);
                 let outcome = apply_reply(
                     &mut slot.image,
                     &mut slot.adopted_from,
@@ -7263,6 +7284,7 @@ pub(crate) fn run() -> Result<(), String> {
         load_thread,
         session: None,
         displayed_from: None,
+        paint_signal: None,
         config,
         animation_timer_running: false,
         // The status bar is created in WM_NCCREATE (the window handle must

@@ -24,8 +24,8 @@ use image::metadata::Orientation;
 use image::{AnimationDecoder, Frames, GenericImageView, ImageDecoder, ImageFormat, ImageReader};
 
 use crate::anim::{self, FrameScheduler, gif_delay_ms};
-use crate::pixels::composite_over_background_in_place;
-use crate::surface::{DibFrame, Surface};
+use crate::pixels::{PixelFrame, composite_over_background_in_place};
+use crate::surface::Surface;
 
 /// Cumulative decoded-frame budget. Without a total cap a hostile file
 /// could declare an unbounded frame stream and exhaust memory — streaming
@@ -33,33 +33,38 @@ use crate::surface::{DibFrame, Surface};
 /// (mid-stream overflow fails the load like #3 did; see `apply_reply` for
 /// what the UI does with that failure). Matches the single-image
 /// allocation cap the decoder limits already enforce. The `stdin:` read
-/// caps its raw stream at the same bound (#65).
+/// caps its raw stream at the same bound (#65). Counts the decoded
+/// (master) bytes — unchanged by #76, whose GDI derivations sit outside
+/// this budget.
 pub(crate) const MAX_TOTAL_FRAME_BYTES: usize = 512 * 1024 * 1024;
 
-/// Frame-count budget: every frame surface costs two GDI objects (DC + DIB)
-/// and the default per-process GDI limit is 10000, so 4096 frames keeps
-/// roughly 1800 objects of headroom for the window itself.
+/// Frame-count budget: every displayed frame's GDI face costs two GDI
+/// objects (DC + DIB, built on the UI thread at reply time) and the
+/// default per-process GDI limit is 10000, so 4096 frames keeps roughly
+/// 1800 objects of headroom for the window itself.
 const MAX_FRAMES: usize = 4096;
 
-/// GDI-object budget for mipmap pre-generation on the worker (the DDB per
-/// level plus the paint-time scratch DC per mip-carrying frame). This is
-/// the worker-side early-out that avoids generating levels the process
-/// cannot afford; the REAL shared bound — also covering the UI thread's
-/// lazy fills in `Surface::ensure_mips` — is the process-level counter in
-/// `surface.rs` (`MIP_GDI_OBJECT_BUDGET` there, checked inside
-/// `generate_mip` itself, review PR #18 F1). Long small-frame animations
-/// skip mips past the budget (they re-HALFTONE from the original at deep
-/// zoom-out — the pre-#9 behavior).
+/// GDI-object cost charged against [`crate::surface::MIP_GDI_OBJECT_BUDGET`]
+/// for the mip levels a frame's `mip_target` asks the UI thread to
+/// pre-generate (the DDB per level plus the paint-time scratch DC a
+/// mip-carrying frame creates). Since #76 the decode side only does this
+/// pure accounting — it decides WHICH frames carry how many pre-generated
+/// levels (the waste-avoidance early-out); the actual GDI generation runs
+/// on the UI thread at `Surface::from_master`, still bounded by the
+/// process-level counter in `surface.rs` (checked inside `generate_mip`
+/// itself, review PR #18 F1). Long small-frame animations skip mips past
+/// the budget (they re-HALFTONE from the original at deep zoom-out — the
+/// pre-#9 behavior).
 ///
-/// GDI objects a frame's pre-generated mip chain will hold: one DDB per
-/// level plus the paint-time scratch DC (created lazily once a frame has
-/// any level). A zero-level frame generates nothing and needs no DC.
+/// GDI objects a target's mip chain will hold: one DDB per level plus the
+/// paint-time scratch DC (created lazily once a frame has any level). A
+/// zero-level target generates nothing and needs no DC.
 fn mip_pregen_cost(target: u32) -> usize {
     if target == 0 { 0 } else { target as usize + 1 }
 }
 
-/// Whether a frame may pre-generate `target` mips given `used` objects
-/// already committed to earlier frames of this animation.
+/// Whether a frame may carry `target` pre-generation levels given `used`
+/// objects already committed to earlier frames of this animation.
 fn mip_pregen_allows(used: usize, target: u32) -> bool {
     used + mip_pregen_cost(target) <= crate::surface::MIP_GDI_OBJECT_BUDGET
 }
@@ -70,11 +75,12 @@ fn mip_pregen_allows(used: usize, target: u32) -> bool {
 
 /// One step of the load protocol, in delivery order (upstream
 /// `_VIV_REPLY_LOAD_IMAGE_*`, viv.c:310-313). Generic over the frame
-/// payload: the worker sends bare DIBs (`DibFrame`, the default); the UI
-/// maps them to DC-wrapping `Surface`s before applying, so the state
+/// payload: the worker sends pure memory frames (`PixelFrame`, the
+/// default — #76: no GDI object crosses the thread boundary); the UI
+/// maps them to GDI-deriving `Surface`s before applying, so the state
 /// machine is unit-testable without GDI.
 #[derive(Debug, PartialEq)]
-pub(crate) enum LoadReply<F = DibFrame> {
+pub(crate) enum LoadReply<F = PixelFrame> {
     /// The first decoded frame — the UI swaps the display to it (old image
     /// visible until this arrives). `delay_ms` is the frame's own delay,
     /// relevant only if more frames follow.
@@ -100,8 +106,6 @@ pub(crate) enum LoadReply<F = DibFrame> {
 enum Stop {
     /// User-level: keep the message for the FailedUser reply.
     User(String),
-    /// System-level: fail loud via FatalSystem.
-    Fatal(String),
     /// The load was superseded — exit silently; the UI already stopped
     /// reading this session's queue (upstream's thread just returns,
     /// viv.c:10331 exit paths).
@@ -130,12 +134,12 @@ pub(crate) fn decode_to_sink(
     path: &OsStr,
     env: DecodeEnv,
     terminate: &AtomicBool,
+    first_frame_painted: Option<&crate::loadthread::FirstFramePainted>,
     sink: &mut dyn FnMut(LoadReply),
 ) {
-    match produce(path, env, terminate, sink) {
+    match produce(path, env, terminate, first_frame_painted, sink) {
         Ok(()) => sink(LoadReply::Complete),
         Err(Stop::User(msg)) => sink(LoadReply::FailedUser(msg)),
-        Err(Stop::Fatal(msg)) => sink(LoadReply::FatalSystem(msg)),
         Err(Stop::Terminated) => {}
     }
 }
@@ -151,6 +155,7 @@ pub(crate) fn decode_bytes_to_sink(
     bytes: &[u8],
     env: DecodeEnv,
     terminate: &AtomicBool,
+    first_frame_painted: Option<&crate::loadthread::FirstFramePainted>,
     sink: &mut dyn FnMut(LoadReply),
 ) {
     // Sniff the format from the stream contents exactly like the file
@@ -160,12 +165,18 @@ pub(crate) fn decode_bytes_to_sink(
         let reader = ImageReader::new(Cursor::new(bytes))
             .with_guessed_format()
             .map_err(|e| Stop::User(format!("{STDIN_SHOWN_NAME}: {e}")))?;
-        decode_reader(STDIN_SHOWN_NAME, reader, env, terminate, sink)
+        decode_reader(
+            STDIN_SHOWN_NAME,
+            reader,
+            env,
+            terminate,
+            first_frame_painted,
+            sink,
+        )
     })();
     match outcome {
         Ok(()) => sink(LoadReply::Complete),
         Err(Stop::User(msg)) => sink(LoadReply::FailedUser(msg)),
-        Err(Stop::Fatal(msg)) => sink(LoadReply::FatalSystem(msg)),
         Err(Stop::Terminated) => {}
     }
 }
@@ -188,28 +199,28 @@ const CLIPBOARD_SHOWN_NAME: &str = "clipboard";
 /// stream exactly like a still decode: first frame, then Complete; no
 /// interruption points (the parse is a single pass). Every payload
 /// problem is user-level (keep old image, no dialog, no exit — ADR
-/// 0001); only the GDI frame allocation stays system-level.
+/// 0001); since #76 the frame itself is pure memory, so the decode side
+/// has no system-level failure class left (the UI's GDI derivation
+/// still fails loud through `map_reply_frame`).
 pub(crate) fn decode_dib_to_sink(payload: &[u8], env: DecodeEnv, sink: &mut dyn FnMut(LoadReply)) {
     let outcome = (|| -> Result<(), Stop> {
-        let mut dib = crate::dib::parse_dib(payload, env.background, MAX_TOTAL_FRAME_BYTES)
+        let dib = crate::dib::parse_dib(payload, env.background, MAX_TOTAL_FRAME_BYTES)
             .map_err(|e| Stop::User(format!("{CLIPBOARD_SHOWN_NAME}: {e}")))?;
-        let mut frame =
-            DibFrame::from_bgra(dib.width, dib.height, &mut dib.bgra).map_err(Stop::Fatal)?;
+        let mut frame = PixelFrame::from_bgra(dib.width, dib.height, dib.bgra);
         // Un-gated like a still: one frame's mip chain is nowhere near
         // the animation budget (see sink_static).
-        frame.pregenerate_mips(crate::mip::select_mip_level(
+        frame.mip_target = crate::mip::select_mip_level(
             dib.width as i32,
             dib.height as i32,
             env.render_viewport.0 / 2,
             env.render_viewport.1 / 2,
-        ));
+        );
         sink(LoadReply::FirstFrame { frame, delay_ms: 0 });
         Ok(())
     })();
     match outcome {
         Ok(()) => sink(LoadReply::Complete),
         Err(Stop::User(msg)) => sink(LoadReply::FailedUser(msg)),
-        Err(Stop::Fatal(msg)) => sink(LoadReply::FatalSystem(msg)),
         Err(Stop::Terminated) => {}
     }
 }
@@ -218,6 +229,7 @@ fn produce(
     path: &OsStr,
     env: DecodeEnv,
     terminate: &AtomicBool,
+    first_frame_painted: Option<&crate::loadthread::FirstFramePainted>,
     sink: &mut dyn FnMut(LoadReply),
 ) -> Result<(), Stop> {
     let shown = path.to_string_lossy();
@@ -229,7 +241,7 @@ fn produce(
     let reader = reader
         .with_guessed_format()
         .map_err(|e| Stop::User(format!("{shown}: {e}")))?;
-    decode_reader(&shown, reader, env, terminate, sink)
+    decode_reader(&shown, reader, env, terminate, first_frame_painted, sink)
 }
 
 /// The shared decode dispatch once a format-guessing reader exists —
@@ -245,6 +257,7 @@ fn decode_reader<R: BufRead + Seek>(
     reader: ImageReader<R>,
     env: DecodeEnv,
     terminate: &AtomicBool,
+    first_frame_painted: Option<&crate::loadthread::FirstFramePainted>,
     sink: &mut dyn FnMut(LoadReply),
 ) -> Result<(), Stop> {
     let user = |msg: String| Stop::User(format!("{shown}: {msg}"));
@@ -271,6 +284,7 @@ fn decode_reader<R: BufRead + Seek>(
                 per_frame_bytes,
                 env,
                 terminate,
+                first_frame_painted,
                 sink,
             )
         }
@@ -299,6 +313,7 @@ fn decode_reader<R: BufRead + Seek>(
                 per_frame_bytes,
                 env,
                 terminate,
+                first_frame_painted,
                 sink,
             )
         }
@@ -321,6 +336,7 @@ fn decode_reader<R: BufRead + Seek>(
 /// `render_viewport` drives per-frame mip pre-generation (halved, like
 /// upstream's `_viv_load_render_wide/2` at viv.c:10302/10316), gated by
 /// the animation-wide GDI object budget (see loader.rs's mip gate docs).
+#[allow(clippy::too_many_arguments)]
 fn stream_animation(
     mut frames: Frames<'_>,
     normalize_delay: fn(u32) -> u32,
@@ -328,6 +344,7 @@ fn stream_animation(
     per_frame_bytes: usize,
     env: DecodeEnv,
     terminate: &AtomicBool,
+    first_frame_painted: Option<&crate::loadthread::FirstFramePainted>,
     sink: &mut dyn FnMut(LoadReply),
 ) -> Result<(), Stop> {
     let user = |msg: String| Stop::User(msg);
@@ -379,15 +396,15 @@ fn stream_animation(
             Some(_) => {}
         }
         total_frame_bytes += buffer.len();
-        // Resolve transparency against the windowed background before the
-        // DIB copy — the render path has no alpha channel of its own.
+        // Resolve transparency against the windowed background — the
+        // render path has no alpha channel of its own. The frame itself
+        // is pure memory since #76; GDI derivations (and their failure
+        // class) live on the UI thread.
         composite_over_background_in_place(&mut buffer, env.background);
-        // DIB failures are purely system-level (GDI allocation); fail
-        // loud (ADR 0001) through the FatalSystem reply.
-        let mut frame = DibFrame::from_rgba(w, h, &mut buffer.into_raw()).map_err(Stop::Fatal)?;
-        // Pre-generate the frame's mips against the halved request-time
-        // viewport (upstream viv.c:10302/10316), bounded by the object
-        // budget: once spent, later frames skip mips entirely.
+        let mut frame = PixelFrame::from_rgba(w, h, buffer.into_raw());
+        // The frame's mip pre-generation decision, against the halved
+        // request-time viewport (upstream viv.c:10302/10316), bounded by
+        // the object budget: once spent, later frames skip mips entirely.
         let target = crate::mip::select_mip_level(
             w as i32,
             h as i32,
@@ -395,11 +412,20 @@ fn stream_animation(
             env.render_viewport.1 / 2,
         );
         if mip_pregen_allows(mip_objects_used, target) {
-            frame.pregenerate_mips(target);
+            frame.mip_target = target;
             mip_objects_used += mip_pregen_cost(target);
         }
         if emitted == 0 {
             sink(LoadReply::FirstFrame { frame, delay_ms });
+            // The first-frame paint handshake (#76): hold frame 1's decode
+            // until the UI has painted frame 0 — the worker-side GDI
+            // serialization master had between replies (without it, the
+            // posted reply kicks preempt WM_PAINT and a mid-stream
+            // failure can clear the partial display before its first
+            // frame ever renders).
+            if let Some(signal) = first_frame_painted {
+                crate::loadthread::wait_first_frame_painted(signal, terminate);
+            }
         } else {
             sink(LoadReply::AdditionalFrame { frame, delay_ms });
         }
@@ -439,28 +465,28 @@ fn sink_static<D: ImageDecoder>(
     // RGB under the alpha channel (upstream composites over
     // config_windowed_background_color; identity for opaque images).
     composite_over_background_in_place(&mut rgba, env.background);
-    let mut frame = DibFrame::from_rgba(w, h, &mut rgba).map_err(Stop::Fatal)?;
-    // A static frame pre-generates un-gated: one frame's chain is at most
-    // ~log2(128M px) ≈ 27 levels + the scratch DC, nowhere near the
+    let mut frame = PixelFrame::from_rgba(w, h, rgba);
+    // A static frame's mip decision is un-gated: one frame's chain is at
+    // most ~log2(128M px) ≈ 27 levels + the scratch DC, nowhere near the
     // budget (upstream pre-generates stills the same way, viv.c:10749 —
     // GdipImageGetFrameCount reports 1 and the frame loop's i==0 arm
     // runs the same _viv_get_mipmap call).
-    frame.pregenerate_mips(crate::mip::select_mip_level(
+    frame.mip_target = crate::mip::select_mip_level(
         w as i32,
         h as i32,
         env.render_viewport.0 / 2,
         env.render_viewport.1 / 2,
-    ));
+    );
     // A static image is a one-frame stream: first frame, then Complete from
     // decode_to_sink. delay_ms is unused (no second frame ever follows).
     sink(LoadReply::FirstFrame { frame, delay_ms: 0 });
     Ok(())
 }
 
-/// Convert a reply's frame payload — the UI thread maps worker DIBs into
-/// DC-carrying Surfaces (memory DCs belong to their creating thread), with
-/// a conversion failure surfacing as the system-level FatalSystem reply
-/// (GDI exhaustion, ADR 0001).
+/// Convert a reply's frame payload — the UI thread maps worker memory
+/// frames into GDI-deriving Surfaces (memory DCs belong to their
+/// creating thread), with a conversion failure surfacing as the
+/// system-level FatalSystem reply (GDI exhaustion, ADR 0001).
 pub(crate) fn map_reply_frame<E, F>(
     reply: LoadReply<E>,
     convert: impl Fn(E) -> Result<F, String>,
@@ -1760,7 +1786,7 @@ mod stdin_bytes_tests {
             .expect("in-memory encode");
         let terminate = AtomicBool::new(false);
         let mut replies = Vec::new();
-        decode_bytes_to_sink(&png, env(), &terminate, &mut |r| replies.push(r));
+        decode_bytes_to_sink(&png, env(), &terminate, None, &mut |r| replies.push(r));
         assert_eq!(replies.len(), 2);
         match &replies[0] {
             LoadReply::FirstFrame { frame, delay_ms } => {
@@ -1783,7 +1809,7 @@ mod stdin_bytes_tests {
         for bytes in [&b"not an image at all"[..], &b""[..]] {
             let terminate = AtomicBool::new(false);
             let mut replies = Vec::new();
-            decode_bytes_to_sink(bytes, env(), &terminate, &mut |r| replies.push(r));
+            decode_bytes_to_sink(bytes, env(), &terminate, None, &mut |r| replies.push(r));
             assert_eq!(replies.len(), 1);
             match &replies[0] {
                 LoadReply::FailedUser(msg) => {

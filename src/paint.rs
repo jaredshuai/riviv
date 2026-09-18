@@ -307,6 +307,18 @@ pub(crate) fn paint(hwnd: HWND) {
             // DeleteObject is the documented teardown.
             let _ = DeleteObject(HGDIOBJ(brush.0));
         }
+        // The animation first-frame paint handshake (#76): this paint has
+        // rendered (or blanked) the adoption the decode worker is holding
+        // frame 1 for — signal it before the handler returns. A fresh
+        // short borrow: none of the draws above hold one. (Inside this
+        // function's outer unsafe block already.)
+        if let Some(signal) = state_of(hwnd).and_then(|s| s.paint_signal.take()) {
+            let (lock, cvar) = &*signal;
+            // unwrap on poisoning: a panicked UI thread would be dead
+            // anyway; the worker's wait cap covers it regardless.
+            *lock.lock().unwrap() = true;
+            cvar.notify_all();
+        }
         let _ = EndPaint(hwnd, &ps);
     }
 }

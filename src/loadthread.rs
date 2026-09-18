@@ -19,14 +19,15 @@
 //! frames if decoding — a still image's single decode cannot be
 //! interrupted, the same granularity upstream has). The queue — not the
 //! posted message — owns the replies, so a kick lost to window teardown
-//! cannot leak. Frames cross the boundary as bare DIBs (`DibFrame`); the
-//! UI thread wraps them in DC-carrying Surfaces (see `surface.rs`).
+//! cannot leak. Frames cross the boundary as pure memory (`PixelFrame`,
+//! #76 — no GDI object leaves the worker); the UI thread derives the
+//! GDI-carrying Surfaces from them (see `surface.rs`).
 
 use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -36,7 +37,7 @@ use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
 use crate::loader::{
     DecodeEnv, LoadReply, decode_bytes_to_sink, decode_dib_to_sink, decode_to_sink,
 };
-use crate::surface::DibFrame;
+use crate::pixels::PixelFrame;
 
 /// Kick message, posted whenever the worker queues a reply (upstream
 /// `_VIV_WM_REPLY`; `WM_APP + n` is the reserved range for private
@@ -84,7 +85,7 @@ pub(crate) enum LoadSource {
 pub(crate) const STDIN_NAME: &str = "stdin:";
 
 /// One queued decode request; crossing the channel requires `Send`
-/// (DibFrame and the Arcs are, HWND via the wrapper above).
+/// (PixelFrame and the Arcs are, HWND via the wrapper above).
 /// `render_viewport` is the request-time render area (client minus the
 /// status bar) driving mip pre-generation — upstream stashes the same pair
 /// in `_viv_load_render_wide/high` at request time (viv.c:1557-1558).
@@ -97,8 +98,58 @@ struct Job {
     background: [u8; 3],
     hwnd: SendHwnd,
     terminate: Arc<AtomicBool>,
-    queue: Arc<Mutex<VecDeque<LoadReply<DibFrame>>>>,
+    queue: Arc<Mutex<VecDeque<LoadReply<PixelFrame>>>>,
+    /// The animation first-frame paint handshake (#76). Master built each
+    /// frame's GDI face on the worker BETWEEN replies — frame 1's decode
+    /// could never overtake frame 0's display, so a mid-stream failure
+    /// (the decode budget's clear) always found frame 0 already on
+    /// screen. With pure-memory frames the worker has no such work, and
+    /// posted reply kicks preempt WM_PAINT — without a wait the failure
+    /// reply can clear the partial display before its first frame ever
+    /// paints. The decode of the frames AFTER an animation's first frame
+    /// therefore waits until the UI signals "painted". Foreground opens
+    /// only: a preload's parked first frame paints at adoption (much
+    /// later), and stalling the single worker on it would defeat
+    /// preloading. Stills need nothing — their terminal reply changes
+    /// nothing about the display.
+    first_frame_painted: Option<FirstFramePainted>,
 }
+
+/// The handshake signal: set by the UI thread's first paint after an
+/// animation first-frame adoption, awaited by the worker's decode loop.
+/// Plain data (Mutex/Condvar/Arc) — `Send` by construction.
+pub(crate) type FirstFramePainted = Arc<(Mutex<bool>, Condvar)>;
+
+/// Block until the first frame paints, the job is terminated, or the
+/// wait cap expires (a minimized window never paints; the cap keeps the
+/// decode moving — master had no stall to begin with there).
+pub(crate) fn wait_first_frame_painted(signal: &FirstFramePainted, terminate: &AtomicBool) {
+    let (lock, cvar) = &**signal;
+    let mut painted = lock.lock().unwrap();
+    let deadline = std::time::Instant::now() + FIRST_FRAME_PAINT_CAP;
+    while !*painted {
+        if terminate.load(Ordering::Relaxed) {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return;
+        }
+        let (guard, _timeout) = cvar
+            .wait_timeout(
+                painted,
+                std::cmp::min(FIRST_FRAME_WAIT_TICK, deadline - now),
+            )
+            .unwrap();
+        painted = guard;
+    }
+}
+
+/// How long the worker waits for the first-frame paint before moving on
+/// (see [`wait_first_frame_painted`]).
+const FIRST_FRAME_PAINT_CAP: std::time::Duration = std::time::Duration::from_secs(5);
+/// The polling granularity while waiting (terminate responsiveness).
+const FIRST_FRAME_WAIT_TICK: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// The process-wide decode worker handle. Jobs are processed strictly in
 /// order (upstream chains the same way, viv.c:1520-1572), so at most one
@@ -127,17 +178,22 @@ impl LoadThread {
     /// replies. The old session (if any) must be dropped by the caller —
     /// its Drop flags the job, and the worker skips it at the next check.
     /// `render_viewport` is the request-time render area (client minus the
-    /// status bar, upstream viv.c:1557-1558).
+    /// status bar, upstream viv.c:1557-1558). `wait_first_paint` arms the
+    /// animation first-frame handshake (see `Job::first_frame_painted`)
+    /// — true for foreground opens, false for preloads.
     pub(crate) fn request(
         &self,
         hwnd: HWND,
         source: LoadSource,
         render_viewport: (i32, i32),
         background: [u8; 3],
+        wait_first_paint: bool,
     ) -> LoadSession {
         let id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
         let terminate = Arc::new(AtomicBool::new(false));
         let queue = Arc::new(Mutex::new(VecDeque::new()));
+        let first_frame_painted = wait_first_paint
+            .then(|| Arc::new((Mutex::new(false), Condvar::new())) as FirstFramePainted);
         // The display name: the file's path, or the literal pseudo-name
         // for a virtual source — the UI adopts it as the window title.
         let path = match &source {
@@ -154,6 +210,7 @@ impl LoadThread {
             hwnd: SendHwnd(hwnd),
             terminate: Arc::clone(&terminate),
             queue: Arc::clone(&queue),
+            first_frame_painted: first_frame_painted.clone(),
         };
         // Unbounded channel: never blocks the UI thread. A send can only
         // fail if the worker already exited — impossible short of the
@@ -164,6 +221,7 @@ impl LoadThread {
             path,
             terminate,
             queue,
+            paint_signal: first_frame_painted,
         }
     }
 
@@ -193,6 +251,7 @@ fn worker(receiver: Receiver<Job>) {
             hwnd: SendHwnd(hwnd),
             terminate,
             queue,
+            first_frame_painted,
         } = job;
         // Superseded while still queued: nothing was decoded, nothing to
         // reply — skip before touching the source.
@@ -202,7 +261,7 @@ fn worker(receiver: Receiver<Job>) {
         // The sink gets its own handle for its retry loop; the original
         // stays with the decode call's terminate parameter.
         let sink_terminate = Arc::clone(&terminate);
-        let mut sink = move |reply: LoadReply<DibFrame>| {
+        let mut sink = move |reply: LoadReply<PixelFrame>| {
             // unwrap: a poisoned lock means some thread panicked while
             // holding the queue — an undefined state we fail loud on
             // (ADR 0001) rather than limp past.
@@ -237,11 +296,23 @@ fn worker(receiver: Receiver<Job>) {
         };
         match source {
             LoadSource::File(path) => {
-                decode_to_sink(&path, env, &terminate, &mut sink);
+                decode_to_sink(
+                    &path,
+                    env,
+                    &terminate,
+                    first_frame_painted.as_ref(),
+                    &mut sink,
+                );
             }
             LoadSource::Stdin => match read_stdin_terminated(&terminate) {
                 Some(StdinOutcome::Bytes(bytes)) => {
-                    decode_bytes_to_sink(&bytes, env, &terminate, &mut sink);
+                    decode_bytes_to_sink(
+                        &bytes,
+                        env,
+                        &terminate,
+                        first_frame_painted.as_ref(),
+                        &mut sink,
+                    );
                 }
                 Some(StdinOutcome::Failed(msg)) => sink(LoadReply::FailedUser(msg)),
                 None => {} // terminated mid-read: exit silently
@@ -381,7 +452,11 @@ pub(crate) struct LoadSession {
     /// pseudo-name.
     path: OsString,
     terminate: Arc<AtomicBool>,
-    queue: Arc<Mutex<VecDeque<LoadReply<DibFrame>>>>,
+    queue: Arc<Mutex<VecDeque<LoadReply<PixelFrame>>>>,
+    /// The first-frame paint handshake the UI arms at an animation's
+    /// first-frame adoption and fires at the paint that renders it (see
+    /// `Job::first_frame_painted`). `None` for preloads and stills.
+    paint_signal: Option<FirstFramePainted>,
 }
 
 impl LoadSession {
@@ -391,6 +466,12 @@ impl LoadSession {
 
     pub(crate) fn path(&self) -> &OsStr {
         &self.path
+    }
+
+    /// The first-frame paint handshake, for the UI to arm at the
+    /// first-frame adoption edge (#76).
+    pub(crate) fn paint_signal(&self) -> Option<&FirstFramePainted> {
+        self.paint_signal.as_ref()
     }
 
     /// Whether this session decodes a VIRTUAL source (#65 `stdin:`,
@@ -418,7 +499,7 @@ impl LoadSession {
 
     /// Take every queued reply, in delivery order (upstream's handler
     /// drains the whole list per kick, viv.c:2770).
-    pub(crate) fn drain(&self) -> Vec<LoadReply<DibFrame>> {
+    pub(crate) fn drain(&self) -> Vec<LoadReply<PixelFrame>> {
         // unwrap on poisoning, as in the sink.
         let mut q = self.queue.lock().unwrap();
         q.drain(..).collect()
@@ -436,5 +517,31 @@ impl Drop for LoadSession {
         self.terminate();
         // unwrap on poisoning, as in the sink.
         self.queue.lock().unwrap().clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_painted_signal_releases_the_wait_immediately() {
+        let signal: FirstFramePainted = Arc::new((Mutex::new(true), Condvar::new()));
+        let terminate = AtomicBool::new(false);
+        let t0 = std::time::Instant::now();
+        wait_first_frame_painted(&signal, &terminate);
+        assert!(t0.elapsed() < FIRST_FRAME_WAIT_TICK, "no waiting once set");
+    }
+
+    #[test]
+    fn a_terminated_job_does_not_wait_for_the_paint() {
+        let signal: FirstFramePainted = Arc::new((Mutex::new(false), Condvar::new()));
+        let terminate = AtomicBool::new(true);
+        let t0 = std::time::Instant::now();
+        wait_first_frame_painted(&signal, &terminate);
+        assert!(
+            t0.elapsed() < FIRST_FRAME_WAIT_TICK,
+            "terminate short-circuits"
+        );
     }
 }

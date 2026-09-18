@@ -1,25 +1,27 @@
-//! Image frames: decoded pixels held in a top-down 32bpp DIB section.
+//! Image frames: the CPU master ([`crate::pixels::PixelFrame`]) plus its
+//! UI-thread GDI derivation.
 //!
-//! Two types split by thread boundary (#4): [`DibFrame`] is what the
-//! background decode produces — the DIB section alone, exactly the payload
-//! upstream's replies carry (frame HBITMAPs, viv.c:2900/2989); it owns no
-//! DC, so handing it to the UI thread is plain GDI-object transfer.
-//! [`Surface`] is the UI-thread wrap that selects the DIB into a private
-//! memory DC for StretchBlt (the render path of upstream
-//! CreateCompatibleBitmap + SetDIBits -> mem DC -> StretchBlt,
-//! viv.c:10263-10271, 4273). Memory DCs stay on the thread that created
-//! them; the animation work (#3) holds one surface per displayed frame —
-//! each costs a DC + a DIB, which is why the loader caps the frame count.
+//! #76 (ADR 0002 D3) inverts the old ownership: the decode worker
+//! produces pure memory — a top-down BGRA `PixelFrame`, no GDI objects
+//! cross the thread boundary — and [`Surface`] is the UI-thread wrap
+//! that derives the GDI face from it: a DIB section (a memcpy of the
+//! master) selected into a private memory DC for StretchBlt (the render
+//! path of upstream CreateCompatibleBitmap + SetDIBits -> mem DC ->
+//! StretchBlt, viv.c:10263-10271, 4273). Memory DCs stay on the thread
+//! that created them; the animation work (#3) holds one surface per
+//! displayed frame — each costs a DC + a DIB, which is why the loader
+//! caps the frame count.
 //!
 //! #9 adds the mipmap chain: each frame carries downsampled DDB levels
 //! ([`RawMip`], upstream `_viv_mipmap_t`, viv.c:365-384) sized by
-//! [`crate::mip::mip_size`]. Levels are bare bitmaps — selected into a DC
-//! only transiently (generation source, or the paint-time scratch DC) —
-//! which mirrors upstream, where only the paint DC ever holds a mip, and
-//! keeps every bitmap selected by at most one DC at a time. The chain is
-//! pre-generated on the decode worker (`DibFrame::pregenerate_mips`,
-//! upstream viv.c:10302/10316/10717/10749) and can be extended lazily on
-//! the UI thread (`Surface::ensure_mips`, upstream's paint-time fill inside
+//! [`crate::mip::mip_size`]. Levels are bare bitmaps — selected into a
+//! DC only transiently (generation source, or the paint-time scratch
+//! DC) — which mirrors upstream, where only the paint DC ever holds a
+//! mip, and keeps every bitmap selected by at most one DC at a time.
+//! Since #76 the chain lives wholly on the UI thread: pre-generated at
+//! `Surface::from_master` (from the decode-side `mip_target` decision,
+//! upstream viv.c:10302/10316/10717/10749) and extended lazily at paint
+//! (`Surface::ensure_mips`, upstream's paint-time fill inside
 //! `_viv_get_mipmap`); failures truncate the chain — a shallower level
 //! still renders, where upstream's NULL propagates into not drawing the
 //! image at all (viv.c:14226→14262→4167-4169; deliberate gentler
@@ -32,28 +34,30 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use windows::Win32::Foundation::GetLastError;
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleBitmap, CreateCompatibleDC,
-    CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetCurrentObject, GetDC, GetDIBits,
-    HALFTONE, HBITMAP, HDC, HGDIOBJ, OBJ_BITMAP, ReleaseDC, SRCCOPY, STRETCH_BLT_MODE,
-    SelectObject, SetStretchBltMode, StretchBlt,
+    CreateDIBSection, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetCurrentObject, GetDC, HALFTONE,
+    HBITMAP, HDC, HGDIOBJ, OBJ_BITMAP, ReleaseDC, SRCCOPY, STRETCH_BLT_MODE, SelectObject,
+    SetStretchBltMode, StretchBlt,
 };
 
 use crate::mip;
-use crate::pixels::rgba8_to_bgra_in_place;
+use crate::pixels::{PixelFrame, rotate_bgra_90_cw, rotate_bgra_270_cw};
 use crate::stitch::stitch_tiles;
 use crate::zoom::BlitRect;
 
 /// Process-wide cap on live mip GDI objects (one DDB per level, plus each
-/// mip-carrying surface's paint-time scratch DC), shared by the worker's
-/// pre-generation AND the UI thread's lazy fills. Without a shared cap the
-/// lazy path would bypass the loader's worker-side gate: every displayed
+/// mip-carrying surface's paint-time scratch DC), shared by the UI
+/// thread's pre-generation at `from_master` AND its lazy paint fills
+/// (both on the same thread since #76; the counter stays atomic for the
+/// day it is queried cross-thread). Without a shared cap every displayed
 /// animation frame extends its own resident chain and a long big-frame
 /// animation could push the process past the default 10000-object GDI
 /// quota, after which even `CreateDIBSection` fails and the next open dies
 /// through FatalSystem (review PR #18, engineering F1). The loader's
-/// worker-side gate stays as a waste-avoidance early-out; THIS counter is
-/// the real bound. Transient generation DCs (created and deleted within
-/// one call) are not counted — the overshoot is at most a couple of
-/// short-lived objects and their creation failure degrades, never crashes.
+/// decode-side gate (the `mip_target` each frame carries) stays as a
+/// waste-avoidance early-out; THIS counter is the real bound. Transient
+/// generation DCs (created and deleted within one call) are not counted —
+/// the overshoot is at most a couple of short-lived objects and their
+/// creation failure degrades, never crashes.
 pub(crate) const MIP_GDI_OBJECT_BUDGET: usize = 1000;
 
 static LIVE_MIP_GDI_OBJECTS: AtomicUsize = AtomicUsize::new(0);
@@ -66,21 +70,17 @@ fn mip_budget_allows(needed: usize) -> bool {
 /// One mipmap level: a screen-compatible DDB plus its dimensions
 /// (upstream `_viv_mipmap_t`, viv.c:365-373 — upstream derives sizes from
 /// the frame each time instead of storing them; storing avoids re-deriving
-/// at every paint and keeps the level self-describing across threads).
+/// at every paint and keeps the level self-describing).
 ///
-/// Like the frame DIB, a DDB is a process-global GDI object with no thread
-/// affinity, so worker -> UI handoff and teardown on either side are sound.
+/// Since #76 the chain is UI-thread-only (generated at `from_master` and
+/// by lazy paint fills, never crossing a thread boundary), so no
+/// `unsafe impl Send` is needed — the compiler now rejects any accidental
+/// cross-thread move.
 pub(crate) struct RawMip {
     bitmap: HBITMAP,
     wide: i32,
     high: i32,
 }
-
-// SAFETY: the struct is a GDI bitmap handle plus plain dimensions; DDBs are
-// process-global with no thread affinity (the same handoff the frame DIB
-// makes, upstream viv.c:10304/10318), so the raw pointer inside HBITMAP
-// only makes std conservative about the move.
-unsafe impl Send for RawMip {}
 
 impl Drop for RawMip {
     fn drop(&mut self) {
@@ -94,165 +94,47 @@ impl Drop for RawMip {
     }
 }
 
-/// One decoded frame as a top-down 32bpp DIB section — the unit that
-/// crosses the decode-worker -> UI thread boundary. GDI bitmaps are
-/// process-global with no thread affinity, so creating it on the worker,
-/// displaying it on the UI thread, and deleting it on either is sound.
-pub(crate) struct DibFrame {
-    bitmap: HBITMAP,
-    width: i32,
-    height: i32,
-    /// Pre-generated mipmap levels 1..=k, attached by the worker after the
-    /// frame decodes (upstream hangs the chain off each `_viv_frame_t`,
-    /// viv.c:380-384). Ownership moves with the frame into its `Surface`.
-    pub(crate) mips: Vec<RawMip>,
-}
-
-// SAFETY: the struct is a GDI bitmap handle plus plain dimensions. Bitmap
-// handles are process-global (upstream ships them across threads the same
-// way, viv.c:2900/2989); the raw pointer inside HBITMAP only makes std
-// conservative about the move.
-unsafe impl Send for DibFrame {}
-
-impl DibFrame {
-    /// `rgba` holds exactly `width * height * 4` bytes (converted to BGRA
-    /// in place). Errors are plain system-level messages (GDI allocation
-    /// failures only); the loader maps them into its two-layer taxonomy.
-    pub(crate) fn from_rgba(width: u32, height: u32, rgba: &mut [u8]) -> Result<Self, String> {
-        rgba8_to_bgra_in_place(rgba);
-        Self::from_bgra(width, height, rgba)
-    }
-
-    /// The BGRA-native entry (#66): `bgra` holds exactly
-    /// `width * height * 4` bytes of top-down 32bpp BGRA — the clipboard
-    /// DIB parser already emits that layout, so no swizzle pass runs.
-    pub(crate) fn from_bgra(width: u32, height: u32, bgra: &mut [u8]) -> Result<Self, String> {
-        let info = BITMAPINFO {
-            bmiHeader: BITMAPINFOHEADER {
-                biSize: size_of::<BITMAPINFOHEADER>() as u32,
-                biWidth: width as i32,
-                biHeight: -(height as i32), // negative = top-down rows
-                biPlanes: 1,
-                biBitCount: 32,
-                biCompression: BI_RGB.0,
-                ..Default::default()
-            },
+/// Build a top-down 32bpp DIB section holding a memcpy of `pixels`
+/// (`width * height * 4` BGRA bytes) — the GDI derivation of the CPU
+/// master (#76). Errors are plain system-level messages (GDI allocation
+/// failures only); `from_master` maps them into the fail-loud reply and
+/// `rotate` keeps its fail-soft contract. The returned bitmap is bare
+/// (selected into no DC); the caller owns it.
+pub(crate) fn create_bgra_dib(width: i32, height: i32, pixels: &[u8]) -> Result<HBITMAP, String> {
+    let info = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: width,
+            biHeight: -height, // negative = top-down rows
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
             ..Default::default()
-        };
-        let mut bits: *mut c_void = std::ptr::null_mut();
-        // SAFETY: `info` is a valid stack BITMAPINFO outliving the call; we own the
-        // returned DIB section (no file mapping, no palette with BI_RGB).
-        let bitmap = unsafe { CreateDIBSection(None, &info, DIB_RGB_COLORS, &mut bits, None, 0) }
-            .map_err(|e| format!("CreateDIBSection failed: {e}"))?;
-        if bits.is_null() {
-            // SAFETY: bitmap was created above and is owned by us; nothing
-            // references it yet, so plain DeleteObject is the correct teardown.
-            let _ = unsafe { DeleteObject(HGDIOBJ(bitmap.0)) };
-            return Err("CreateDIBSection returned NULL bits".into());
-        }
-        let byte_len = width as usize * height as usize * 4;
-        debug_assert_eq!(bgra.len(), byte_len);
-        // SAFETY: `bits` points to exactly width*height*4 writable bytes of the
-        // freshly created section; `bgra` holds the same count (asserted above).
-        unsafe { std::ptr::copy_nonoverlapping(bgra.as_ptr(), bits.cast::<u8>(), byte_len) };
-        Ok(DibFrame {
-            bitmap,
-            width: width as i32,
-            height: height as i32,
-            mips: Vec::new(),
-        })
+        },
+        ..Default::default()
+    };
+    let mut bits: *mut c_void = std::ptr::null_mut();
+    // SAFETY: `info` is a valid stack BITMAPINFO outliving the call; we own the
+    // returned DIB section (no file mapping, no palette with BI_RGB).
+    let bitmap = unsafe { CreateDIBSection(None, &info, DIB_RGB_COLORS, &mut bits, None, 0) }
+        .map_err(|e| format!("CreateDIBSection failed: {e}"))?;
+    if bits.is_null() {
+        // SAFETY: bitmap was created above and is owned by us; nothing
+        // references it yet, so plain DeleteObject is the correct teardown.
+        let _ = unsafe { DeleteObject(HGDIOBJ(bitmap.0)) };
+        return Err("CreateDIBSection returned NULL bits".into());
     }
-}
-
-#[cfg(test)]
-impl DibFrame {
-    /// The frame's pixel dimensions — the test surface for the load
-    /// protocol's frame payloads (production reads them through the
-    /// `Surface` wrapper).
-    pub(crate) fn dims(&self) -> (i32, i32) {
-        (self.width, self.height)
-    }
-}
-
-impl DibFrame {
-    /// Pre-generate mip levels 1..=`target` for this frame on the calling
-    /// (worker) thread — upstream `_viv_get_mipmap` with the request-time
-    /// viewport halved, called per frame before the reply is queued
-    /// (viv.c:10302/10316/10717/10749). Each level is stitched down from
-    /// the PREVIOUS level (viv.c:14229-14236), keeping chain sizes exactly
-    /// `mip_size` at every step. A generation failure truncates the chain
-    /// instead of failing the frame: the frame itself already decodes
-    /// fine, and paint can still extend the chain lazily or render a
-    /// shallower level (README deviation; upstream lets a NULL propagate
-    /// into not drawing the image, viv.c:4167-4169).
-    ///
-    /// Thread contract: DCs are created and destroyed on the calling
-    /// thread; the frame's bitmap is bare (selected nowhere) until this
-    /// returns.
-    pub(crate) fn pregenerate_mips(&mut self, target: u32) {
-        if target == 0 {
-            return;
-        }
-        // SAFETY: no DC needs to be selected here; None gives a
-        // screen-compatible DC, created and destroyed on this thread.
-        let src_dc = unsafe { CreateCompatibleDC(None) };
-        if src_dc.is_invalid() {
-            return;
-        }
-        // SAFETY: `self.bitmap` is a valid GDI bitmap owned by us and
-        // selected nowhere else (the frame is bare on the worker).
-        let src_stock = unsafe { SelectObject(src_dc, HGDIOBJ(self.bitmap.0)) };
-        if src_stock.is_invalid() {
-            // SAFETY: selection failed, so the DC still holds its stock
-            // bitmap — plain DeleteDC is the correct teardown.
-            unsafe {
-                let _ = DeleteDC(src_dc);
-            };
-            return;
-        }
-        let (mut src_w, mut src_h) = (self.width, self.height);
-        for level in 1..=target {
-            let (dst_w, dst_h) = mip::mip_size(self.width, self.height, level);
-            match generate_mip(src_dc, src_w, src_h, dst_w, dst_h) {
-                Ok(mip_level) => {
-                    src_w = dst_w;
-                    src_h = dst_h;
-                    // SAFETY: the just-created level bitmap is owned by us
-                    // and selected nowhere; re-selecting it as the source
-                    // for the next level replaces the previous selection.
-                    // A failed re-selection must stop the chain: the next
-                    // iteration would stretch against the DC's stale
-                    // (larger) bitmap using this level's source rect
-                    // (review PR #18 F3).
-                    // SAFETY (the SelectObject itself): src_dc is valid.
-                    let reselected = unsafe { SelectObject(src_dc, HGDIOBJ(mip_level.bitmap.0)) };
-                    if reselected.is_invalid() {
-                        self.mips.push(mip_level);
-                        break;
-                    }
-                    self.mips.push(mip_level);
-                }
-                Err(_) => break,
-            }
-        }
-        // SAFETY: restore the stock bitmap before deleting the DC (GDI
-        // will not delete a bitmap still selected into a DC — the frame's
-        // own DIB must survive this teardown).
-        unsafe {
-            let _ = SelectObject(src_dc, src_stock);
-            let _ = DeleteDC(src_dc);
-        }
-    }
-}
-
-impl Drop for DibFrame {
-    fn drop(&mut self) {
-        // SAFETY: we exclusively own the bitmap; no DC has selected it while
-        // it is a bare DibFrame (Surfaces unselect before dropping their DIB).
-        unsafe {
-            let _ = DeleteObject(HGDIOBJ(self.bitmap.0));
-        };
-    }
+    debug_assert_eq!(pixels.len(), width as usize * height as usize * 4);
+    // SAFETY: `bits` points to exactly width*height*4 writable bytes of the
+    // freshly created section; `pixels` holds the same count (asserted above).
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            pixels.as_ptr(),
+            bits.cast::<u8>(),
+            width as usize * height as usize * 4,
+        )
+    };
+    Ok(bitmap)
 }
 
 /// Stretch one mip level down from `src_dc` (previous level, already
@@ -379,93 +261,55 @@ fn generate_mip(
     })
 }
 
-/// The GDI half of #43's rotation: GetDIBits the source bitmap into a
-/// BGRA buffer, run the pure rotation, and CreateDIBSection the result —
-/// returning the new bitmap with its swapped dimensions, or `None` on any
-/// GDI failure (the caller keeps the old frame then, upstream's
-/// fail-soft).
-fn rotate_dib(
-    probe_dc: &HDC,
+/// The derived GDI half of a frame: the DIB section (a memcpy of the
+/// master) selected into a private memory DC, ready for StretchBlt.
+/// Built lazily ON DEMAND (#76: "GDI 面降级为按需派生") — the first
+/// paint asks for it — so a huge frame's build cost (a 32 MiB-per-
+/// megapixel memcpy plus the mip pre-generation) lands inside the paint
+/// that consumes it, AFTER the reply drain has adopted the image and
+/// run the window auto-size. Building it eagerly at reply time instead
+/// would stall the drain handler for hundreds of milliseconds, wedging
+/// every cross-thread window probe (PrintWindow) that lands there
+/// between its pre-drain rect read and its post-drain content capture.
+struct Face {
     bitmap: HBITMAP,
-    wide: usize,
-    high: usize,
-    clockwise: bool,
-) -> Option<(HBITMAP, i32, i32)> {
-    let mut src = vec![0u8; wide * high * 4];
-    let mut dst = vec![0u8; wide * high * 4];
-    let mut read_info = BITMAPINFO {
-        bmiHeader: BITMAPINFOHEADER {
-            biSize: size_of::<BITMAPINFOHEADER>() as u32,
-            biWidth: wide as i32,
-            biHeight: -(high as i32), // top-down rows, like the loader's DIBs
-            biPlanes: 1,
-            biBitCount: 32,
-            biCompression: BI_RGB.0,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    // SAFETY: `bitmap` is a valid 32bpp DIB owned by the caller, not
-    // selected into `probe_dc`; `src` holds exactly wide*high*4 writable
-    // bytes; `read_info` is a valid stack header (the API may adjust the
-    // format fields back — hence the mutable pointer its signature takes).
-    let got = unsafe {
-        GetDIBits(
-            *probe_dc,
-            bitmap,
-            0,
-            high as u32,
-            Some(src.as_mut_ptr().cast()),
-            &mut read_info,
-            DIB_RGB_COLORS,
-        )
-    };
-    if got == 0 {
-        return None;
-    }
-    if clockwise {
-        crate::pixels::rotate_bgra_90_cw(&src, wide, high, &mut dst);
-    } else {
-        crate::pixels::rotate_bgra_270_cw(&src, wide, high, &mut dst);
-    }
-    let (new_wide, new_high) = (high as i32, wide as i32);
-    let info = BITMAPINFO {
-        bmiHeader: BITMAPINFOHEADER {
-            biSize: size_of::<BITMAPINFOHEADER>() as u32,
-            biWidth: new_wide,
-            biHeight: -new_high,
-            biPlanes: 1,
-            biBitCount: 32,
-            biCompression: BI_RGB.0,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    let mut bits: *mut c_void = std::ptr::null_mut();
-    // SAFETY: `info` is a valid stack BITMAPINFO outliving the call; we own
-    // the returned DIB section (no file mapping, no palette with BI_RGB).
-    let created = unsafe { CreateDIBSection(None, &info, DIB_RGB_COLORS, &mut bits, None, 0) };
-    let bitmap = created.ok()?;
-    if bits.is_null() {
-        // SAFETY: bitmap was created above and is owned by us; nothing
-        // references it yet.
-        let _ = unsafe { DeleteObject(HGDIOBJ(bitmap.0)) };
-        return None;
-    }
-    // SAFETY: `bits` points at exactly new_wide*new_high*4 writable bytes
-    // of the freshly created section; `dst` holds the same count.
-    unsafe { std::ptr::copy_nonoverlapping(dst.as_ptr(), bits.cast::<u8>(), dst.len()) };
-    Some((bitmap, new_wide, new_high))
-}
-
-/// A frame selected into a private memory DC, ready for StretchBlt —
-/// built on the UI thread from a worker-produced [`DibFrame`] so the DC
-/// never leaves the thread that created it.
-pub(crate) struct Surface {
-    frame: DibFrame,
     memdc: HDC,
     old_bitmap: HGDIOBJ,
-    /// Mipmap levels 1..=k (moved from the frame at wrap time). Bare DDBs:
+}
+
+impl Drop for Face {
+    fn drop(&mut self) {
+        // SAFETY: we exclusively own the face; restoring the DC's stock
+        // bitmap before deleting it and then deleting the deselected DIB
+        // is the documented GDI teardown order.
+        unsafe {
+            let _ = SelectObject(self.memdc, self.old_bitmap);
+            let _ = DeleteDC(self.memdc);
+            let _ = DeleteObject(HGDIOBJ(self.bitmap.0));
+        }
+    }
+}
+
+/// A frame's GDI face: the CPU master ([`PixelFrame`], the source of
+/// truth since #76) plus its lazily derived UI-thread face. The master
+/// inside is what the RGB readout, the clipboard image blit and the
+/// rotate pass read directly; only the paint path ever pays for the
+/// DIB/DC derivation.
+pub(crate) struct Surface {
+    master: PixelFrame,
+    /// The derived DIB + DC, built by the first paint (see [`Face`]).
+    face: Option<Face>,
+    /// Set when a face build failed: never retried for this surface's
+    /// lifetime (the same doctrine as `mips_stuck` — a paint-path
+    /// failure degrades to a blank frame, it must not fail loud inside
+    /// the window-state borrow, PR #10 P1).
+    face_stuck: bool,
+    /// The decode-side mip pre-generation decision, consumed by the
+    /// first `ensure_mips` call (the chain builds to at least this depth
+    /// — the worker-side pre-generation's old contract, upstream
+    /// viv.c:10302/10316/10717/10749).
+    pregen_target: u32,
+    /// Mipmap levels 1..=k, generated on this thread. Bare DDBs:
     /// selected only transiently — into a temp DC while extending the
     /// chain, or into `mip_scratch` for painting.
     mips: Vec<RawMip>,
@@ -484,120 +328,141 @@ pub(crate) struct Surface {
 }
 
 impl Surface {
-    /// Take ownership of `frame`, select it into a fresh memory DC. Must
-    /// run on the thread that will render (the UI thread): memory DCs
-    /// belong to their creating thread.
-    pub(crate) fn from_frame(mut frame: DibFrame) -> Result<Self, String> {
-        // SAFETY: no DC needs to be selected here; None gives a screen-compatible DC.
-        let memdc = unsafe { CreateCompatibleDC(None) };
-        if memdc.is_invalid() {
-            // SAFETY: reading the thread's last error immediately after the failed call.
-            let gle = unsafe { GetLastError().0 };
-            return Err(format!("CreateCompatibleDC failed (GLE={gle})"));
-        }
-        // SAFETY: `frame.bitmap` is a valid GDI bitmap handle owned by us.
-        let old_bitmap = unsafe { SelectObject(memdc, HGDIOBJ(frame.bitmap.0)) };
-        if old_bitmap.is_invalid() {
-            // SAFETY: selection failed, so the DC still holds its stock 1x1
-            // bitmap — plain DeleteDC is the correct teardown; the DibFrame
-            // drops itself.
-            unsafe {
-                let _ = DeleteDC(memdc);
-            };
-            return Err("SelectObject failed to select the DIB".into());
-        }
-        // The chain moves with the frame (mem::take: DibFrame implements
-        // Drop, so its fields cannot move out directly).
-        let mips = std::mem::take(&mut frame.mips);
-        Ok(Surface {
-            frame,
-            memdc,
-            old_bitmap,
-            mips,
+    /// Wrap the decode's `master` frame — pure ownership move, no GDI:
+    /// the reply drain adopts the image (and runs the window auto-size)
+    /// without waiting on any derivation, and the GDI face builds at the
+    /// first paint. Infallible by construction.
+    pub(crate) fn from_master(mut master: PixelFrame) -> Self {
+        let pregen_target = master.mip_target;
+        master.mip_target = 0; // consumed by the first ensure_mips
+        Surface {
+            master,
+            face: None,
+            face_stuck: false,
+            pregen_target,
+            mips: Vec::new(),
             mip_scratch: HDC::default(),
             mip_stock: HGDIOBJ::default(),
             mips_stuck: None,
-        })
+        }
+    }
+
+    /// The CPU master this surface derives from — the direct read source
+    /// for the RGB status sample (#47), the clipboard image blit (#41)
+    /// and anything else that must not pay a GDI roundtrip (#76).
+    pub(crate) fn master(&self) -> &PixelFrame {
+        &self.master
     }
 
     pub(crate) fn width(&self) -> i32 {
-        self.frame.width
+        self.master.width as i32
     }
 
     pub(crate) fn height(&self) -> i32 {
-        self.frame.height
+        self.master.height as i32
+    }
+
+    /// Build the GDI face if it does not exist yet (the on-demand
+    /// derivation, #76). Runs on the UI thread — memory DCs belong to
+    /// their creating thread. `false` = the build failed (or failed
+    /// before and is stuck): the caller degrades (paint skips the blit),
+    /// never fails loud (this runs under the paint borrow).
+    fn ensure_face(&mut self) -> bool {
+        if self.face.is_some() {
+            return true;
+        }
+        if self.face_stuck {
+            return false;
+        }
+        let face = (|| {
+            let bitmap = create_bgra_dib(
+                self.master.width as i32,
+                self.master.height as i32,
+                &self.master.pixels,
+            )?;
+            // SAFETY: no DC needs to be selected here; None gives a
+            // screen-compatible DC.
+            let memdc = unsafe { CreateCompatibleDC(None) };
+            if memdc.is_invalid() {
+                // SAFETY: reading the thread's last error immediately
+                // after the failed call.
+                let gle = unsafe { GetLastError().0 };
+                // SAFETY: the DIB is owned by us and selected nowhere —
+                // plain DeleteObject is the correct teardown.
+                unsafe {
+                    let _ = DeleteObject(HGDIOBJ(bitmap.0));
+                }
+                return Err(format!("CreateCompatibleDC failed (GLE={gle})"));
+            }
+            // SAFETY: `bitmap` is a valid GDI bitmap handle owned by us.
+            let old_bitmap = unsafe { SelectObject(memdc, HGDIOBJ(bitmap.0)) };
+            if old_bitmap.is_invalid() {
+                // SAFETY: selection failed, so the DC still holds its
+                // stock 1x1 bitmap — plain DeleteDC is the correct
+                // teardown; the DIB drops with this block's scope.
+                unsafe {
+                    let _ = DeleteDC(memdc);
+                    let _ = DeleteObject(HGDIOBJ(bitmap.0));
+                };
+                return Err("SelectObject failed to select the DIB".into());
+            }
+            Ok(Face {
+                bitmap,
+                memdc,
+                old_bitmap,
+            })
+        })();
+        match face {
+            Ok(face) => {
+                self.face = Some(face);
+                true
+            }
+            Err(_) => {
+                self.face_stuck = true;
+                false
+            }
+        }
     }
 
     /// #43 in-place rotation (upstream `_viv_edit_rotate`'s memory pass,
     /// viv.c:7729-7749 over `_viv_orientate_hbitmap` viv.c:13671-13850):
-    /// read the frame DIB through a throwaway DC, rotate the BGRA buffer
-    /// with the pure pixels helper, build a fresh DIB section of the
-    /// swapped dimensions, swap it into this surface's memory DC, and drop
-    /// the mips (upstream frees every frame's chain, viv.c:7742-7749 —
-    /// paint lazily regenerates from the new orientation). The frame's
-    /// slot in the animation timeline is untouched. Fail-soft like
-    /// upstream: on any GDI failure the frame stays exactly as it was
-    /// (`_viv_orientate_hbitmap` returns 0 and the caller skips the swap).
+    /// rotate the CPU master with the pure pixels helper (the old
+    /// GetDIBits roundtrip is gone — the master IS the pixels, #76) and
+    /// invalidate every derivation: the GDI face (rebuilt from the new
+    /// master at the next paint) and the mips (upstream frees every
+    /// frame's chain, viv.c:7742-7749 — paint lazily regenerates from
+    /// the new orientation). The frame's slot in the animation timeline
+    /// is untouched. Fail-soft like upstream: a GDI failure leaves the
+    /// frame exactly as it was (`_viv_orientate_hbitmap` returns 0 and
+    /// the caller skips the swap) — which for the pure pass means only
+    /// the allocation class, a process-level abort either way.
     pub(crate) fn rotate(&mut self, clockwise: bool) -> bool {
-        let wide = self.frame.width as usize;
-        let high = self.frame.height as usize;
+        let wide = self.master.width as usize;
+        let high = self.master.height as usize;
         if wide == 0 || high == 0 {
             return false;
         }
-        // GetDIBits must see the bitmap NOT selected into the DC it is
-        // handed (its documented contract) — upstream passes a fresh
-        // memory DC for the same reason (viv.c:13721-13725).
-        // SAFETY: a throwaway DC owned by this thread, selected with
-        // nothing, deleted exactly once at the tail.
-        let probe_dc = unsafe { CreateCompatibleDC(None) };
-        if probe_dc.is_invalid() {
-            return false;
+        let mut rotated = vec![0u8; wide * high * 4];
+        if clockwise {
+            rotate_bgra_90_cw(&self.master.pixels, wide, high, &mut rotated);
+        } else {
+            rotate_bgra_270_cw(&self.master.pixels, wide, high, &mut rotated);
         }
-        let rotated = rotate_dib(&probe_dc, self.frame.bitmap, wide, high, clockwise);
-        let Some((bitmap, new_wide, new_high)) = rotated else {
-            // SAFETY: the DC was created above and is owned by us.
-            let _ = unsafe { DeleteDC(probe_dc) };
-            return false;
+        self.master = PixelFrame {
+            pixels: rotated.into_boxed_slice(),
+            width: high as u32,
+            height: wide as u32,
+            mip_target: 0,
         };
-        // Swap the new bitmap into the surface's DC BEFORE the old
-        // DibFrame drops — DeleteObject on a still-selected bitmap is
-        // undefined.
-        // SAFETY: self.memdc is this surface's DC (UI thread); the old
-        // selection is self.frame.bitmap, which the drop below reclaims.
-        let swapped = unsafe { SelectObject(self.memdc, HGDIOBJ(bitmap.0)) };
-        if swapped.is_invalid() {
-            // SAFETY: the new bitmap is selected nowhere; owned by us.
-            let _ = unsafe { DeleteObject(HGDIOBJ(bitmap.0)) };
-            // SAFETY: as the tail below.
-            let _ = unsafe { DeleteDC(probe_dc) };
-            return false;
-        }
-        // The old frame (bitmap no longer selected) drops here; its stale
-        // mip chain went with it or with self.mips below.
-        self.frame = DibFrame {
-            bitmap,
-            width: new_wide,
-            height: new_high,
-            mips: Vec::new(),
-        };
+        // The old face's DIB/DC die with their Drop (deselect-then-delete);
+        // a fresh face may succeed even if the old one had failed.
+        self.face = None;
+        self.face_stuck = false;
         // SAFETY: RawMip's Drop deletes each stale level's DDB — none is
         // selected anywhere (they only ever select transiently).
         self.mips.clear();
         self.mips_stuck = None; // a fresh chain may succeed now
-        // SAFETY: as above — the throwaway DC leaves scope here.
-        let _ = unsafe { DeleteDC(probe_dc) };
         true
-    }
-
-    /// The memory DC the frame DIB is selected into — read-only use (the
-    /// clipboard image blit sources from it, #41). Never select into or
-    /// delete: the Surface owns both the DC and the selection. The raw
-    /// handle outlives the `&self` borrow: it stays valid only until this
-    /// Surface is dropped (a window-state image swap retires it) and is
-    /// UI-thread-affine — callers must consume it within the same message
-    /// handler, without pumping, while the Surface is alive.
-    pub(crate) fn mem_dc(&self) -> HDC {
-        self.memdc
     }
 
     /// Extend the mip chain to `target` levels if needed, on the calling
@@ -621,9 +486,21 @@ impl Surface {
     /// full-chain pass on the UI thread — same as upstream, which also
     /// generates inside `_viv_get_mipmap` during paint (viv.c:14200-14258).
     pub(crate) fn ensure_mips(&mut self, image_w: i32, image_h: i32, target: u32) -> u32 {
+        // 0. The on-demand GDI face (#76): level 0 paints from it and
+        //    level 1 generates from it — a frame that cannot build its
+        //    face degrades to a blank render (the stuck flag prevents a
+        //    per-paint retry storm).
+        if !self.ensure_face() {
+            return 0;
+        }
         // 1. Extend the chain if short (and not already failed) — the
         //    early returns below must never skip step 2: a pre-generated
-        //    chain skips extension but still needs the scratch DC.
+        //    chain skips extension but still needs the scratch DC. The
+        //    FIRST call also honors the decode-side pre-generation
+        //    decision (`pregen_target`, the worker's old contract: the
+        //    chain always reaches the request-time depth) — consumed
+        //    once, later paints extend by render size alone.
+        let target = target.max(std::mem::take(&mut self.pregen_target));
         if self.mips_stuck.is_none() && (self.mips.len() as u32) < target {
             self.extend_mips(image_w, image_h, target);
         }
@@ -662,15 +539,21 @@ impl Surface {
 
     /// The extension loop proper: generate levels len+1..=target from the
     /// chain's current tail, marking `mips_stuck` on the first failure.
+    /// Only callable with a face built (level 1 sources its DC).
     fn extend_mips(&mut self, image_w: i32, image_h: i32, target: u32) {
         // Transient source DC for levels ≥ 2 (bare DDBs must be selected
-        // to blit; the frame's own level-1 source is already `memdc`).
+        // to blit; the frame's own level-1 source is the face's DC).
         let mut temp_src: Option<(HDC, HGDIOBJ)> = None;
+        let face_dc = self
+            .face
+            .as_ref()
+            .expect("extend_mips requires the face (ensure_mips built it)")
+            .memdc;
         while (self.mips.len() as u32) < target {
             let level = self.mips.len() as u32 + 1;
             let (dst_w, dst_h) = mip::mip_size(image_w, image_h, level);
             let (src_dc, src_w, src_h) = if level == 1 {
-                (self.memdc, self.frame.width, self.frame.height)
+                (face_dc, self.master.width as i32, self.master.height as i32)
             } else {
                 let prev = &self.mips[(level - 2) as usize];
                 if temp_src.is_none() {
@@ -730,13 +613,17 @@ impl Surface {
     /// (0 = the frame itself). Mip bitmaps are selected into the scratch
     /// DC for the call and deselected after — upstream selects the chosen
     /// mip into its paint mem DC the same transient way (viv.c:4173).
+    /// A face-less (build-failed) level 0 hands `f` a null DC: the
+    /// caller's blit fails and is swallowed, degrading to the letterbox
+    /// only — never a crash, never a fatal (paint-path doctrine).
     pub(crate) fn with_mip_source<R>(
         &mut self,
         level: u32,
         f: impl FnOnce(HDC, i32, i32) -> R,
     ) -> R {
         if level == 0 {
-            return f(self.memdc, self.frame.width, self.frame.height);
+            let dc = self.face.as_ref().map_or(HDC::default(), |face| face.memdc);
+            return f(dc, self.master.width as i32, self.master.height as i32);
         }
         let mip = &self.mips[(level - 1) as usize];
         // SAFETY: the scratch DC exists whenever mips do (ensure_mips
@@ -758,20 +645,19 @@ impl Surface {
 
 impl Drop for Surface {
     fn drop(&mut self) {
-        // SAFETY: we exclusively own memdc/bitmap; restoring the old bitmap before
-        // deleting the DC and letting the DibFrame delete the bitmap is the
-        // documented GDI teardown order. The scratch DC (if created) is
-        // restored to its captured stock bitmap first for the same reason;
-        // the mip DDBs drop themselves afterwards, selected into nothing
-        // (each also releasing its slot in the shared object budget).
+        // SAFETY: the scratch DC (if created) is restored to its captured
+        // stock bitmap before deletion so the last-selected level's DDB
+        // stays deletable by its owner; the mip DDBs drop themselves
+        // afterwards, selected into nothing (each also releasing its slot
+        // in the shared object budget). The face and the master drop as
+        // plain fields (the face's own Drop does the GDI teardown; the
+        // master is plain memory).
         unsafe {
             if !self.mip_scratch.is_invalid() {
                 let _ = SelectObject(self.mip_scratch, self.mip_stock);
                 let _ = DeleteDC(self.mip_scratch);
                 LIVE_MIP_GDI_OBJECTS.fetch_sub(1, Ordering::Relaxed);
             }
-            let _ = SelectObject(self.memdc, self.old_bitmap);
-            let _ = DeleteDC(self.memdc);
         }
     }
 }
