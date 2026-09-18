@@ -110,7 +110,7 @@ use crate::copydata;
 use crate::cursor::{self, CursorEffects, CursorVisibility};
 use crate::custom_rate_dlg;
 use crate::everything;
-use crate::loader::{LoadReply, LoadedImage, UiAction, apply_reply, map_reply_frame};
+use crate::loader::{DecodeEnv, LoadReply, LoadedImage, UiAction, apply_reply, map_reply_frame};
 use crate::loadthread::{
     FirstFramePainted as LoadThreadSignal, LoadSession, LoadSource, LoadThread, REPLY_KICK_MESSAGE,
     STDIN_NAME,
@@ -2407,12 +2407,15 @@ fn queue_preload(hwnd: HWND, entry: &PlaylistEntry) {
         client.right - client.left,
         (client.bottom - client.top - bar_h).max(0),
     );
-    let background = state.config.windowed_bg();
+    let env = DecodeEnv {
+        render_viewport,
+        background: state.config.windowed_bg(),
+        icm: state.config.icm != 0,
+    };
     let session = state.load_thread.request(
         hwnd,
         LoadSource::File(entry.path.clone()),
-        render_viewport,
-        background,
+        env,
         false, // a preload's parked first frame paints at adoption — no handshake
     );
     state.preload = Some(PreloadSlot {
@@ -2573,9 +2576,14 @@ pub(crate) fn request_open(hwnd: HWND, path: &OsStr, origin: OpenOrigin<'_>) {
         // session's first frame takes the display.
         state.pending_file_bytes = file_bytes;
         let render_viewport = request_render_viewport(hwnd, state);
-        // The composite background snapshots at request time — a color
-        // change mid-load must not flip frames already in flight.
-        let background = state.config.windowed_bg();
+        // The request-time decode inputs snapshot together — a
+        // color/icm change mid-load must not flip frames already in
+        // flight.
+        let env = DecodeEnv {
+            render_viewport,
+            background: state.config.windowed_bg(),
+            icm: state.config.icm != 0,
+        };
         // Clear any existing preload and start fresh (upstream
         // `_viv_clear_preload` inside `_viv_open`'s fresh-start arm,
         // viv.c:1512-1513) — placed after the not-found verdict, which
@@ -2585,8 +2593,7 @@ pub(crate) fn request_open(hwnd: HWND, path: &OsStr, origin: OpenOrigin<'_>) {
         let session = state.load_thread.request(
             hwnd,
             LoadSource::File(path.to_os_string()),
-            render_viewport,
-            background,
+            env,
             true, // the foreground's first frame gets the paint handshake (#76)
         );
         state.session = Some(session);
@@ -2679,17 +2686,20 @@ fn request_open_virtual(hwnd: HWND, name: &str, source: LoadSource) {
         // A fresh start drops any parked preload (viv.c:1512-1513).
         state.preload = None;
         let render_viewport = request_render_viewport(hwnd, state);
-        let background = state.config.windowed_bg();
+        let env = DecodeEnv {
+            render_viewport,
+            background: state.config.windowed_bg(),
+            icm: state.config.icm != 0,
+        };
         // The foreground's first frame gets the paint handshake (#76) —
         // except `clipboard:`, whose stream is always a single frame
         // built by `decode_dib_to_sink` (the wait helper is never
         // consulted there; skip arming a dead signal — review PR #84
         // N3). A piped `stdin:` stream CAN be an animation.
         let wait_first_paint = !matches!(source, LoadSource::Clipboard);
-        let session =
-            state
-                .load_thread
-                .request(hwnd, source, render_viewport, background, wait_first_paint);
+        let session = state
+            .load_thread
+            .request(hwnd, source, env, wait_first_paint);
         state.session = Some(session);
     }
     refresh_title(hwnd);

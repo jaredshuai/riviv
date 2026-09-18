@@ -85,17 +85,14 @@ pub(crate) enum LoadSource {
 pub(crate) const STDIN_NAME: &str = "stdin:";
 
 /// One queued decode request; crossing the channel requires `Send`
-/// (PixelFrame and the Arcs are, HWND via the wrapper above).
-/// `render_viewport` is the request-time render area (client minus the
-/// status bar) driving mip pre-generation — upstream stashes the same pair
-/// in `_viv_load_render_wide/high` at request time (viv.c:1557-1558).
+/// (PixelFrame and the Arcs are, HWND via the wrapper above). `env`
+/// carries the request-time decode inputs (`DecodeEnv` — the render
+/// viewport, composite background, and the icm snapshot; upstream
+/// stashes the same values at request time, viv.c:1557-1558 + the
+/// decode-time composite).
 struct Job {
     source: LoadSource,
-    render_viewport: (i32, i32),
-    /// The request-time windowed background the decode composites
-    /// transparent pixels against (upstream flattens at decode against
-    /// `config_windowed_background_color_*`, viv.c:1076+).
-    background: [u8; 3],
+    env: DecodeEnv,
     hwnd: SendHwnd,
     terminate: Arc<AtomicBool>,
     queue: Arc<Mutex<VecDeque<LoadReply<PixelFrame>>>>,
@@ -188,16 +185,15 @@ impl LoadThread {
     /// Queue `source` for decoding and return the session that owns its
     /// replies. The old session (if any) must be dropped by the caller —
     /// its Drop flags the job, and the worker skips it at the next check.
-    /// `render_viewport` is the request-time render area (client minus the
-    /// status bar, upstream viv.c:1557-1558). `wait_first_paint` arms the
-    /// animation first-frame handshake (see `Job::first_frame_painted`)
-    /// — true for foreground opens, false for preloads.
+    /// `env` snapshots the request-time decode inputs (see `DecodeEnv`).
+    /// `wait_first_paint` arms the animation first-frame handshake (see
+    /// `Job::first_frame_painted`) — true for foreground opens, false
+    /// for preloads.
     pub(crate) fn request(
         &self,
         hwnd: HWND,
         source: LoadSource,
-        render_viewport: (i32, i32),
-        background: [u8; 3],
+        env: DecodeEnv,
         wait_first_paint: bool,
     ) -> LoadSession {
         let id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
@@ -216,8 +212,7 @@ impl LoadThread {
         // original for the UI (window title / Ctrl+O initial dir).
         let job = Job {
             source,
-            render_viewport,
-            background,
+            env,
             hwnd: SendHwnd(hwnd),
             terminate: Arc::clone(&terminate),
             queue: Arc::clone(&queue),
@@ -257,8 +252,7 @@ fn worker(receiver: Receiver<Job>) {
     while let Ok(job) = receiver.recv() {
         let Job {
             source,
-            render_viewport,
-            background,
+            env,
             hwnd: SendHwnd(hwnd),
             terminate,
             queue,
@@ -300,10 +294,6 @@ fn worker(receiver: Receiver<Job>) {
                 }
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
-        };
-        let env = DecodeEnv {
-            render_viewport,
-            background,
         };
         match source {
             LoadSource::File(path) => {
