@@ -1,7 +1,14 @@
-//! WM_PAINT rendering: draw the current frame's view (zoom level + pan
-//! offset) from `zoom::View`'s render-size math, THEN fill the letterbox
-//! strips around it — blit first, background second, the image never
-//! covered (upstream order, viv.c:4164+ blit → 4396-4407 fill).
+//! WM_PAINT rendering for the `riviv_view` viewport child (#78): draw the
+//! current frame's view (zoom level + pan offset) from `zoom::View`'s
+//! render-size math, THEN fill the letterbox strips around it — blit first,
+//! background second, the image never covered (upstream order, viv.c:4164+
+//! blit → 4396-4407 fill).
+//!
+//! The paint runs on the viewport CHILD's DC: its client rect IS the render
+//! viewport (the parent docks the chrome below it and sizes the child to
+//! client-minus-chrome in `on_size`) — the old subtract-chrome arithmetic is
+//! gone, the child rect is the single source of truth. The state still
+//! lives on the owner (main) window; `paint` takes both HWNDs.
 //!
 //! The blit path follows upstream's paint (viv.c:4133-4236): destination
 //! size == source size → BitBlt (the pixel-exact 1:1 path); shrinking →
@@ -33,12 +40,14 @@ use crate::stitch::STRETCH_EXTENT_LIMIT;
 use crate::window::{fatal, state_of};
 use crate::zoom::{FitPolicy, Viewport};
 
-pub(crate) fn paint(hwnd: HWND) {
-    // SAFETY: all GDI calls are bracketed by BeginPaint/EndPaint on the WM_PAINT
-    // DC; handles are valid for the duration of the message.
+pub(crate) fn paint(view: HWND, owner: HWND) {
+    // SAFETY: all GDI calls are bracketed by BeginPaint/EndPaint on the
+    // WM_PAINT DC of the viewport child; handles are valid for the duration
+    // of the message. The state reads run against the owner window's slot —
+    // the child stores nothing in GWLP_USERDATA.
     unsafe {
         let mut ps = PAINTSTRUCT::default();
-        let hdc = BeginPaint(hwnd, &mut ps);
+        let hdc = BeginPaint(view, &mut ps);
         if hdc.is_invalid() {
             // Already inside this function's outer unsafe block.
             let gle = GetLastError().0;
@@ -51,15 +60,10 @@ pub(crate) fn paint(hwnd: HWND) {
         // GetClientRect's return and reads the (zeroed) rect — a failed query
         // yields a degenerate paint, not a dead window (ADR 0001 leaves
         // paint-path diagnostics to the debug-log channel landing in M2).
-        let _ = GetClientRect(hwnd, &mut client);
-        // The render area excludes the status bar AND the controls strip
-        // (#5/#45 — upstream subtracts both at paint time, viv.c:4072;
-        // the strip docked above the bar owned its pixels from #45 on,
-        // and paint had kept centering into them).
-        let chrome = state_of(hwnd).map(|s| crate::status::height(s.status) + s.controls.height());
-        if let Some(h) = chrome {
-            client.bottom = (client.bottom - h).max(client.top);
-        }
+        // The child's client rect IS the viewport (#78) — no chrome
+        // subtraction: the parent sizes this window to client-minus-chrome
+        // after docking the chrome children.
+        let _ = GetClientRect(view, &mut client);
         let cw = (client.right - client.left).max(1);
         let ch = (client.bottom - client.top).max(1);
         // The image blit runs BEFORE the background fill, and the fill
@@ -86,17 +90,17 @@ pub(crate) fn paint(hwnd: HWND) {
         // Gather the fit inputs and the background under one immutable
         // borrow FIRST — the image borrow below is mutable.
         // SAFETY: the borrow spans only the two Copy reads.
-        let fit = state_of(hwnd)
+        let fit = state_of(owner)
             .map(|state| crate::window::fit_policy(state))
             .unwrap_or(FitPolicy::WITHOUT_FILL);
-        if let Some(state) = state_of(hwnd) {
+        if let Some(state) = state_of(owner) {
             bg = if state.fullscreen {
                 state.config.fullscreen_bg()
             } else {
                 state.config.windowed_bg()
             };
         }
-        if let Some(state) = state_of(hwnd)
+        if let Some(state) = state_of(owner)
             && let Some(image) = state.image.as_mut()
         {
             let surface = image.surface_mut();
@@ -312,14 +316,14 @@ pub(crate) fn paint(hwnd: HWND) {
         // frame 1 for — signal it before the handler returns. A fresh
         // short borrow: none of the draws above hold one. (Inside this
         // function's outer unsafe block already.)
-        if let Some(signal) = state_of(hwnd).and_then(|s| s.paint_signal.take()) {
+        if let Some(signal) = state_of(owner).and_then(|s| s.paint_signal.take()) {
             let (lock, cvar) = &*signal;
             // unwrap on poisoning: a panicked UI thread would be dead
             // anyway; the worker's wait cap covers it regardless.
             *lock.lock().unwrap() = true;
             cvar.notify_all();
         }
-        let _ = EndPaint(hwnd, &ps);
+        let _ = EndPaint(view, &ps);
     }
 }
 

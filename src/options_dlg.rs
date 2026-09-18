@@ -1364,7 +1364,11 @@ fn on_ok(dlg: HWND) {
                 owner_state.view.set_view(vx, vy, src.0, src.1, vp, fit);
             }
             if effects.repaint || effects.refit {
-                let _ = InvalidateRect(Some(owner), None, false);
+                // The viewport pixels live on the riviv_view child (#78):
+                // repaint's FindWindowEx lookup takes no state borrow, so
+                // it is safe under this live owner_state borrow (unlike a
+                // helper that re-entered state_of).
+                crate::window::repaint(owner);
             }
             effects
         })
