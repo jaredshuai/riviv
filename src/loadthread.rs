@@ -124,9 +124,20 @@ pub(crate) type FirstFramePainted = Arc<(Mutex<bool>, Condvar)>;
 /// wait cap expires (a minimized window never paints; the cap keeps the
 /// decode moving — master had no stall to begin with there).
 pub(crate) fn wait_first_frame_painted(signal: &FirstFramePainted, terminate: &AtomicBool) {
+    wait_first_frame_painted_capped(signal, terminate, FIRST_FRAME_PAINT_CAP);
+}
+
+/// The cap-parameterized core (the tests drive the cap expiry arm with a
+/// short deadline instead of sleeping the production 5 s — review
+/// PR #84 F8).
+fn wait_first_frame_painted_capped(
+    signal: &FirstFramePainted,
+    terminate: &AtomicBool,
+    cap: std::time::Duration,
+) {
     let (lock, cvar) = &**signal;
     let mut painted = lock.lock().unwrap();
-    let deadline = std::time::Instant::now() + FIRST_FRAME_PAINT_CAP;
+    let deadline = std::time::Instant::now() + cap;
     while !*painted {
         if terminate.load(Ordering::Relaxed) {
             return;
@@ -543,5 +554,19 @@ mod tests {
             t0.elapsed() < FIRST_FRAME_WAIT_TICK,
             "terminate short-circuits"
         );
+    }
+
+    #[test]
+    fn an_unpainted_unterminated_wait_gives_up_at_the_cap() {
+        // The minimized-window arm: nothing paints, nobody terminates —
+        // the decode must move on when the cap expires (short cap here;
+        // production runs 5 s, review PR #84 F8).
+        let signal: FirstFramePainted = Arc::new((Mutex::new(false), Condvar::new()));
+        let terminate = AtomicBool::new(false);
+        let cap = std::time::Duration::from_millis(60);
+        let t0 = std::time::Instant::now();
+        wait_first_frame_painted_capped(&signal, &terminate, cap);
+        assert!(t0.elapsed() >= cap, "the cap is honored");
+        assert!(t0.elapsed() < cap + FIRST_FRAME_WAIT_TICK, "no overrun");
     }
 }

@@ -39,7 +39,8 @@ use crate::surface::Surface;
 pub(crate) const MAX_TOTAL_FRAME_BYTES: usize = 512 * 1024 * 1024;
 
 /// Frame-count budget: every displayed frame's GDI face costs two GDI
-/// objects (DC + DIB, built on the UI thread at reply time) and the
+/// objects (DC + DIB, built on the UI thread at the frame's FIRST
+/// paint since #76 — only displayed frames ever materialize one) and the
 /// default per-process GDI limit is 10000, so 4096 frames keeps roughly
 /// 1800 objects of headroom for the window itself.
 const MAX_FRAMES: usize = 4096;
@@ -50,7 +51,8 @@ const MAX_FRAMES: usize = 4096;
 /// mip-carrying frame creates). Since #76 the decode side only does this
 /// pure accounting — it decides WHICH frames carry how many pre-generated
 /// levels (the waste-avoidance early-out); the actual GDI generation runs
-/// on the UI thread at `Surface::from_master`, still bounded by the
+/// on the UI thread at the frame's first paint (`ensure_mips` consuming
+/// the `pregen_target` share), still bounded by the
 /// process-level counter in `surface.rs` (checked inside `generate_mip`
 /// itself, review PR #18 F1). Long small-frame animations skip mips past
 /// the budget (they re-HALFTONE from the original at deep zoom-out — the
@@ -629,10 +631,10 @@ impl<F> LoadedImage<F> {
         self.scheduler = FrameScheduler::new(now);
     }
 
-    /// Convert every frame through `convert` (DibFrame -> Surface on the
-    /// UI thread when a parked image takes the display — the same
-    /// worker-to-UI handoff the drain does per reply, batched here for the
-    /// adoption path). The first failure aborts, dropping the remaining
+    /// Convert every frame through `convert` (pure-memory master ->
+    /// Surface wrap on the UI thread when a parked image takes the display
+    /// — the same worker-to-UI handoff the drain does per reply, batched
+    /// here for the adoption path; infallible since #76's lazy faces). The first failure aborts, dropping the remaining
     /// frames; position and completeness survive the mapping.
     pub(crate) fn map_frames<G, E>(
         self,
@@ -1696,10 +1698,12 @@ mod tests {
     }
 
     #[test]
-    fn reply_frame_mapping_wraps_worker_dibs_and_surfaces_wrap_failures() {
-        // DibFrame -> Surface conversion is the UI-side job; the pure
-        // mapping keeps protocol replies intact and turns conversion
-        // failures into the fail-loud reply.
+    fn reply_frame_mapping_preserves_replies_and_wraps_conversion_failures() {
+        // The generic mapping keeps protocol replies intact and turns a
+        // conversion Err into the fail-loud reply — a protocol SHAPE kept
+        // for future callers; since #76's lazy faces the production convert
+        // (master -> Surface) is infallible, so this arm is unexercised in
+        // production (review PR #84 F2/F7).
         let convert = |n: u32| -> Result<u32, String> {
             if n == 13 {
                 Err("CreateCompatibleDC failed".into())
@@ -1778,7 +1782,7 @@ mod stdin_bytes_tests {
         // A 3×2 PNG encoded in-memory, fed through the `stdin:` entry
         // (#65): the same format-sniffing decode the file path runs —
         // FirstFrame then Complete, dimensions from the decoded frame
-        // (the GDI-backed DibFrame, exactly what a file load delivers).
+        // (the pure-memory PixelFrame, exactly what a file load delivers).
         let mut png = Vec::new();
         let img = image::RgbaImage::from_pixel(3, 2, image::Rgba([200, 100, 50, 255]));
         image::DynamicImage::ImageRgba8(img)

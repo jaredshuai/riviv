@@ -18,11 +18,13 @@
 //! DC only transiently (generation source, or the paint-time scratch
 //! DC) — which mirrors upstream, where only the paint DC ever holds a
 //! mip, and keeps every bitmap selected by at most one DC at a time.
-//! Since #76 the chain lives wholly on the UI thread: pre-generated at
-//! `Surface::from_master` (from the decode-side `mip_target` decision,
-//! upstream viv.c:10302/10316/10717/10749) and extended lazily at paint
-//! (`Surface::ensure_mips`, upstream's paint-time fill inside
-//! `_viv_get_mipmap`); failures truncate the chain — a shallower level
+//! Since #76 the chain lives wholly on the UI thread: the decode-side
+//! `mip_target` decision (upstream viv.c:10302/10316/10717/10749) rides
+//! the frame to the first `ensure_mips` call, which materializes the
+//! pre-generation share AT PAINT (the reply drain stays GDI-free) and
+//! extends lazily from there
+//! (upstream is itself a paint-time fill inside `_viv_get_mipmap`);
+//! failures truncate the chain — a shallower level
 //! still renders, where upstream's NULL propagates into not drawing the
 //! image at all (viv.c:14226→14262→4167-4169; deliberate gentler
 //! deviation, ADR 0001, README Differences).
@@ -46,13 +48,16 @@ use crate::zoom::BlitRect;
 
 /// Process-wide cap on live mip GDI objects (one DDB per level, plus each
 /// mip-carrying surface's paint-time scratch DC), shared by the UI
-/// thread's pre-generation at `from_master` AND its lazy paint fills
-/// (both on the same thread since #76; the counter stays atomic for the
-/// day it is queried cross-thread). Without a shared cap every displayed
+/// thread's pre-generation share of the FIRST paint (`ensure_mips`) AND
+/// later lazy paint fills (both on the UI thread since #76; the counter
+/// stays atomic for the day it is queried cross-thread). Without a shared
+/// cap every displayed
 /// animation frame extends its own resident chain and a long big-frame
 /// animation could push the process past the default 10000-object GDI
-/// quota, after which even `CreateDIBSection` fails and the next open dies
-/// through FatalSystem (review PR #18, engineering F1). The loader's
+/// quota, after which even the frame face's `CreateDIBSection` fails and
+/// every image degrades to blank (review PR #18, engineering F1; the
+/// failure shape itself went from fail-loud to paint-degrade with #76's
+/// lazy faces). The loader's
 /// decode-side gate (the `mip_target` each frame carries) stays as a
 /// waste-avoidance early-out; THIS counter is the real bound. Transient
 /// generation DCs (created and deleted within one call) are not counted —
@@ -72,8 +77,8 @@ fn mip_budget_allows(needed: usize) -> bool {
 /// the frame each time instead of storing them; storing avoids re-deriving
 /// at every paint and keeps the level self-describing).
 ///
-/// Since #76 the chain is UI-thread-only (generated at `from_master` and
-/// by lazy paint fills, never crossing a thread boundary), so no
+/// Since #76 the chain is UI-thread-only (materialized at the first
+/// paint and by lazy fills, never crossing a thread boundary), so no
 /// `unsafe impl Send` is needed — the compiler now rejects any accidental
 /// cross-thread move.
 pub(crate) struct RawMip {
@@ -97,8 +102,10 @@ impl Drop for RawMip {
 /// Build a top-down 32bpp DIB section holding a memcpy of `pixels`
 /// (`width * height * 4` BGRA bytes) — the GDI derivation of the CPU
 /// master (#76). Errors are plain system-level messages (GDI allocation
-/// failures only); `from_master` maps them into the fail-loud reply and
-/// `rotate` keeps its fail-soft contract. The returned bitmap is bare
+/// failures only); callers DEGRADE — `ensure_face` blanks the frame at
+/// paint (never a fatal; ADR 0002 D5) and the clipboard copy bails — the
+/// fail-loud reply mapping died with the worker-side GDI it described.
+/// The returned bitmap is bare
 /// (selected into no DC); the caller owns it.
 pub(crate) fn create_bgra_dib(width: i32, height: i32, pixels: &[u8]) -> Result<HBITMAP, String> {
     let info = BITMAPINFO {
@@ -417,7 +424,12 @@ impl Surface {
                 self.face = Some(face);
                 true
             }
-            Err(_) => {
+            Err(msg) => {
+                // A degraded blank frame with zero on-screen trace would be
+                // undiagnosable from a user report — leave a stderr
+                // breadcrumb (the repo's established degrade-diagnostics
+                // channel; review PR #84 N2).
+                eprintln!("frame face build failed, degrading to blank: {msg}");
                 self.face_stuck = true;
                 false
             }
@@ -458,6 +470,12 @@ impl Surface {
         // a fresh face may succeed even if the old one had failed.
         self.face = None;
         self.face_stuck = false;
+        // The stale chain and the decode-side pre-generation depth die with
+        // the orientation — the new master's first paint builds the chain
+        // from the NEW dimensions (an unconsumed pregen_target would feed
+        // the OLD orientation's decode-time depth into the new chain;
+        // review PR #84 F3).
+        self.pregen_target = 0;
         // SAFETY: RawMip's Drop deletes each stale level's DDB — none is
         // selected anywhere (they only ever select transiently).
         self.mips.clear();
@@ -497,13 +515,24 @@ impl Surface {
         //    early returns below must never skip step 2: a pre-generated
         //    chain skips extension but still needs the scratch DC. The
         //    FIRST call also honors the decode-side pre-generation
-        //    decision (`pregen_target`, the worker's old contract: the
-        //    chain always reaches the request-time depth) — consumed
-        //    once, later paints extend by render size alone.
-        let target = target.max(std::mem::take(&mut self.pregen_target));
+        //    decision (`pregen_target`) in TWO shares with different
+        //    retry contracts (review PR #84 N1):
+        //    - the pregen share: truncation does NOT mark stuck — the
+        //      worker-side pre-generation's old contract (a truncated
+        //      pregen stays retryable at later paints, where eased GDI
+        //      pressure may let a fresh pass fill deeper);
+        //    - the render share (the current paint's selected depth):
+        //      truncation marks stuck (review PR #18 — no per-paint
+        //      retry storm).
+        let pregen = std::mem::take(&mut self.pregen_target);
+        if pregen > 0 && self.mips_stuck.is_none() && (self.mips.len() as u32) < pregen {
+            self.extend_mips(image_w, image_h, pregen);
+            self.mips_stuck = None;
+        }
         if self.mips_stuck.is_none() && (self.mips.len() as u32) < target {
             self.extend_mips(image_w, image_h, target);
         }
+        let target = target.max(pregen);
         // 2. Any level > 0 is only paintable through the scratch DC —
         //    create it lazily here, once mips are actually in play
         //    (mip-less frames never pay for it), under the shared object

@@ -1,6 +1,6 @@
 //! CF_DIB / CF_DIBV5 payload parsing (#66; upstream wishlist viv.c:105 —
 //! "paste dib from clipboard CF_DIB"): one clipboard DIB → one top-down
-//! BGRA frame, ready for `DibFrame::from_bgra`. Pure logic — the test net
+//! BGRA frame, ready for `PixelFrame::from_bgra` (#76). Pure logic — the test net
 //! synthesizes DIB bytes directly (the acceptance matrix: 24/32bpp,
 //! top-down/bottom-up, BI_BITFIELDS masks, V5 headers).
 //!
@@ -178,8 +178,8 @@ pub(crate) fn parse_dib(
 
     let mut bgra = vec![0u8; frame_bytes];
     for row in 0..height {
-        // bottom-up memory flips into the top-down frame (DibFrame's
-        // negative-biHeight convention).
+        // bottom-up memory flips into the top-down frame (the top-down
+        // convention the decode pipeline shares).
         let src_row = if top_down { row } else { height - 1 - row };
         let src_start = pixel_offset + src_row * stride;
         let src = &payload[src_start..src_start + width_u * bytes_per_px];

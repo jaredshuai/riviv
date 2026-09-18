@@ -274,8 +274,17 @@ unsafe fn set_clipboard_image(pixels: &[u8], wide: i32, high: i32) {
             return;
         }
         // SAFETY: `dib` is valid and unselected; the old object is restored
-        // before the DC is deleted.
+        // before the DC is deleted. A failed selection would leave the DC's
+        // 1x1 stock bitmap as the blit source — bail with the symmetric
+        // teardown instead of copying garbage to the clipboard (review
+        // PR #84 F6).
         let src_old = SelectObject(src, HGDIOBJ(dib.0));
+        if src_old.is_invalid() {
+            let _ = DeleteDC(src);
+            let _ = DeleteObject(HGDIOBJ(dib.0));
+            let _ = ReleaseDC(None, screen);
+            return;
+        }
         // SAFETY: plain DC creation/teardown; DeleteDC on every path.
         let mem = CreateCompatibleDC(Some(screen));
         if mem.is_invalid() {
@@ -297,8 +306,19 @@ unsafe fn set_clipboard_image(pixels: &[u8], wide: i32, high: i32) {
             return;
         }
         // SAFETY: `bitmap` is valid and unselected; the old object is
-        // restored before the DC is deleted.
+        // restored before the DC is deleted. Same failed-selection guard
+        // as above: blitting from the stock bitmap would hand the
+        // clipboard a 1x1 garbage DDB (review PR #84 F6).
         let old = SelectObject(mem, HGDIOBJ(bitmap.0));
+        if old.is_invalid() {
+            let _ = DeleteObject(HGDIOBJ(bitmap.0));
+            let _ = DeleteDC(mem);
+            let _ = SelectObject(src, src_old);
+            let _ = DeleteDC(src);
+            let _ = DeleteObject(HGDIOBJ(dib.0));
+            let _ = ReleaseDC(None, screen);
+            return;
+        }
         // SAFETY: both DCs are live; src holds exactly a wide x high frame.
         let _ = BitBlt(mem, 0, 0, wide, high, Some(src), 0, 0, SRCCOPY);
         SelectObject(mem, old);

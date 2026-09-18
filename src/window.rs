@@ -2680,13 +2680,16 @@ fn request_open_virtual(hwnd: HWND, name: &str, source: LoadSource) {
         state.preload = None;
         let render_viewport = request_render_viewport(hwnd, state);
         let background = state.config.windowed_bg();
-        let session = state.load_thread.request(
-            hwnd,
-            source,
-            render_viewport,
-            background,
-            true, // the foreground's first frame gets the paint handshake (#76)
-        );
+        // The foreground's first frame gets the paint handshake (#76) —
+        // except `clipboard:`, whose stream is always a single frame
+        // built by `decode_dib_to_sink` (the wait helper is never
+        // consulted there; skip arming a dead signal — review PR #84
+        // N3). A piped `stdin:` stream CAN be an animation.
+        let wait_first_paint = !matches!(source, LoadSource::Clipboard);
+        let session =
+            state
+                .load_thread
+                .request(hwnd, source, render_viewport, background, wait_first_paint);
         state.session = Some(session);
     }
     refresh_title(hwnd);
