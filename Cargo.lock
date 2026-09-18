@@ -243,6 +243,7 @@ dependencies = [
 name = "riviv"
 version = "0.1.0"
 dependencies = [
+ "gif",
  "image",
  "windows",
  "winresource",

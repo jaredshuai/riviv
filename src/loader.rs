@@ -24,7 +24,10 @@ use image::metadata::Orientation;
 use image::{AnimationDecoder, Frames, GenericImageView, ImageDecoder, ImageFormat, ImageReader};
 
 use crate::anim::{self, FrameScheduler, gif_delay_ms};
-use crate::pixels::{PixelFrame, composite_over_background_in_place};
+use crate::icm;
+use crate::pixels::{
+    PixelFrame, composite_over_background_bgra_in_place, composite_over_background_in_place,
+};
 use crate::surface::Surface;
 
 /// Cumulative decoded-frame budget. Without a total cap a hostile file
@@ -126,10 +129,12 @@ enum Stop {
 /// Request-time decode inputs threaded to the sinks: the mip
 /// pre-generation viewport and the compositing background (upstream
 /// stashes both at request time, viv.c:1557-1558 + the decode-time
-/// composite).
+/// composite), plus the `icm` flag's request-time snapshot (#77 — a
+/// config flip mid-load must not change frames already in flight).
 pub(crate) struct DecodeEnv {
     pub(crate) render_viewport: (i32, i32),
     pub(crate) background: [u8; 3],
+    pub(crate) icm: bool,
 }
 
 pub(crate) fn decode_to_sink(
@@ -246,6 +251,59 @@ fn produce(
     decode_reader(&shown, reader, env, terminate, first_frame_painted, sink)
 }
 
+/// Extract and prepare the ICC->sRGB transform while the decoder is
+/// still alive — `icc_profile` must be called before `into_frames`/
+/// `from_decoder` consumes it (#77). The `icm=0` path short-circuits
+/// BEFORE touching the decoder's metadata: the off decode stays
+/// byte-for-byte the pre-#77 one (no `icc_profile()` call, so a
+/// metadata error cannot even leave a breadcrumb). A metadata read
+/// error downgrades to untagged (the decode itself is unaffected);
+/// formats without ICC support (BMP/ICO/DIB) return `Ok(None)`.
+fn prepare_transform<D: ImageDecoder>(
+    decoder: &mut D,
+    env: &DecodeEnv,
+    shown: &str,
+) -> Option<icm::Transform> {
+    if !env.icm {
+        return None;
+    }
+    let icc = match decoder.icc_profile() {
+        Ok(profile) => profile,
+        Err(e) => {
+            eprintln!("riviv: icm: {shown}: icc_profile() failed ({e}) — decoding untagged");
+            None
+        }
+    };
+    icm::prepare(true, icc, shown)
+}
+
+/// The shared post-decode frame pipeline — ADR 0002 D2's order
+/// (`decode(RGBA) -> ICM -> composite over bg -> BGRA`), identical for
+/// static and animated decodes (#77): when a transform was prepared,
+/// `TranslateBitmapBits` maps the RGBA decode buffer straight into the
+/// master's BGRA layout (the swizzle folded into its output format) and
+/// the composite runs on that BGRA output. A refused transform pass
+/// falls back to the untransformed path for the frame; the
+/// `transform=None` path is byte-for-byte the pre-#77 one (composite
+/// RGBA, `from_rgba` swizzles).
+fn assemble_frame(
+    width: u32,
+    height: u32,
+    mut rgba: Vec<u8>,
+    env: &DecodeEnv,
+    transform: Option<&icm::Transform>,
+) -> PixelFrame {
+    if let Some(transform) = transform {
+        let mut bgra = vec![0u8; rgba.len()];
+        if transform.apply(width, height, &rgba, &mut bgra) {
+            composite_over_background_bgra_in_place(&mut bgra, env.background);
+            return PixelFrame::from_bgra(width, height, bgra);
+        }
+    }
+    composite_over_background_in_place(&mut rgba, env.background);
+    PixelFrame::from_rgba(width, height, rgba)
+}
+
 /// The shared decode dispatch once a format-guessing reader exists —
 /// the single pipeline both the file path (#4) and the `stdin:` bytes
 /// (#65) feed. `shown` prefixes the user-level failure messages (the
@@ -273,6 +331,10 @@ fn decode_reader<R: BufRead + Seek>(
                 .set_limits(image::Limits::default())
                 .map_err(|e| user(e.to_string()))?;
             let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
+            // One ICC->sRGB transform for the whole stream, applied to
+            // each frame at decode (#77) — upstream's GdipLoadImageFrom-
+            // StreamICM slot.
+            let transform = prepare_transform(&mut decoder, &env, shown);
             // GIF frame delays arrive as centiseconds × 10 ms from the image crate;
             // the zero/absent fallback to 100 ms is upstream behavior (viv.c:10749).
             // Every frame costs a full canvas, so the budget gate knows the per-frame
@@ -285,6 +347,7 @@ fn decode_reader<R: BufRead + Seek>(
                 orientation,
                 per_frame_bytes,
                 env,
+                transform.as_ref(),
                 terminate,
                 first_frame_painted,
                 sink,
@@ -300,9 +363,10 @@ fn decode_reader<R: BufRead + Seek>(
             // bitstreams, so still WebP files must take the static decoder or they
             // surface as "no frames decoded" load failures.
             if !decoder.has_animation() {
-                return sink_static(decoder, env, sink);
+                return sink_static(decoder, shown, env, sink);
             }
             let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
+            let transform = prepare_transform(&mut decoder, &env, shown);
             // WebP delays are the decoder's millisecond values, used as-is like
             // upstream's libwebp path (viv.c:10289 — no zero fallback; the scheduler
             // floors zero to 1 ms instead). Per-frame budget cost as for GIF above.
@@ -314,6 +378,7 @@ fn decode_reader<R: BufRead + Seek>(
                 orientation,
                 per_frame_bytes,
                 env,
+                transform.as_ref(),
                 terminate,
                 first_frame_painted,
                 sink,
@@ -321,6 +386,7 @@ fn decode_reader<R: BufRead + Seek>(
         }
         _ => sink_static(
             reader.into_decoder().map_err(|e| user(e.to_string()))?,
+            shown,
             env,
             sink,
         ),
@@ -345,6 +411,7 @@ fn stream_animation(
     orientation: Orientation,
     per_frame_bytes: usize,
     env: DecodeEnv,
+    icm: Option<&icm::Transform>,
     terminate: &AtomicBool,
     first_frame_painted: Option<&crate::loadthread::FirstFramePainted>,
     sink: &mut dyn FnMut(LoadReply),
@@ -382,7 +449,7 @@ fn stream_animation(
         // _viv_orientate_hbitmap per frame, viv.c:10615-10623).
         let mut img = image::DynamicImage::ImageRgba8(frame.into_buffer());
         img.apply_orientation(orientation);
-        let mut buffer = img.into_rgba8();
+        let buffer = img.into_rgba8();
         let (w, h) = buffer.dimensions();
         if w == 0 || h == 0 {
             return Err(user("empty frame".to_string()));
@@ -398,12 +465,10 @@ fn stream_animation(
             Some(_) => {}
         }
         total_frame_bytes += buffer.len();
-        // Resolve transparency against the windowed background — the
-        // render path has no alpha channel of its own. The frame itself
-        // is pure memory since #76; GDI derivations (and their failure
-        // class) live on the UI thread.
-        composite_over_background_in_place(&mut buffer, env.background);
-        let mut frame = PixelFrame::from_rgba(w, h, buffer.into_raw());
+        // ICM -> composite -> PixelFrame (#77/ADR 0002 D2). The frame
+        // itself is pure memory since #76; GDI derivations (and their
+        // failure class) live on the UI thread.
+        let mut frame = assemble_frame(w, h, buffer.into_raw(), &env, icm);
         // The frame's mip pre-generation decision, against the halved
         // request-time viewport (upstream viv.c:10302/10316), bounded by
         // the object budget: once spent, later frames skip mips entirely.
@@ -441,6 +506,7 @@ fn stream_animation(
 
 fn sink_static<D: ImageDecoder>(
     mut decoder: D,
+    shown: &str,
     env: DecodeEnv,
     sink: &mut dyn FnMut(LoadReply),
 ) -> Result<(), Stop> {
@@ -456,18 +522,19 @@ fn sink_static<D: ImageDecoder>(
     // Best-effort like upstream os.c:1545-1600: malformed orientation metadata
     // falls back to no rotation instead of rejecting the image.
     let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
+    // Extract + prepare the ICC->sRGB transform while the decoder is still
+    // alive — `from_decoder` consumes it (#77).
+    let transform = prepare_transform(&mut decoder, &env, shown);
     let mut img = image::DynamicImage::from_decoder(decoder).map_err(|e| user(e.to_string()))?;
     img.apply_orientation(orientation);
     let (w, h) = img.dimensions();
     if w == 0 || h == 0 {
         return Err(user("empty image".to_string()));
     }
-    let mut rgba = img.into_rgba8().into_raw();
-    // Transparent regions show the windowed background instead of the raw
-    // RGB under the alpha channel (upstream composites over
-    // config_windowed_background_color; identity for opaque images).
-    composite_over_background_in_place(&mut rgba, env.background);
-    let mut frame = PixelFrame::from_rgba(w, h, rgba);
+    // ICM -> composite -> PixelFrame (#77/ADR 0002 D2): transparent
+    // regions resolve against the sRGB background AFTER the color
+    // transform, never before it.
+    let mut frame = assemble_frame(w, h, img.into_rgba8().into_raw(), &env, transform.as_ref());
     // A static frame's mip decision is un-gated: one frame's chain is at
     // most ~log2(128M px) ≈ 27 levels + the scratch DC, nowhere near the
     // budget (upstream pre-generates stills the same way, viv.c:10749 —
@@ -1774,7 +1841,195 @@ mod stdin_bytes_tests {
         DecodeEnv {
             render_viewport: (64, 64),
             background: [255, 255, 255],
+            icm: false,
         }
+    }
+
+    fn env_icm(icm: bool) -> DecodeEnv {
+        DecodeEnv { icm, ..env() }
+    }
+
+    /// The first (and only) pixel of a PixelFrame as (R, G, B) — the
+    /// status-bar readout's view of the master buffer.
+    fn first_rgb(frame: &PixelFrame) -> (u8, u8, u8) {
+        crate::pixels::sample_bgra(&frame.pixels, frame.width as i32, 0, 0).unwrap()
+    }
+
+    /// A solid 4×4 PNG of an arbitrary pixel encoded in-memory,
+    /// optionally carrying an embedded ICC profile (#77's end-to-end
+    /// fixture).
+    fn png_pixel_bytes(icc: Option<Vec<u8>>, pixel: [u8; 4]) -> Vec<u8> {
+        let mut png = Vec::new();
+        let mut enc = image::codecs::png::PngEncoder::new(&mut png);
+        if let Some(profile) = icc {
+            image::ImageEncoder::set_icc_profile(&mut enc, profile).expect("icc embed");
+        }
+        image::ImageEncoder::write_image(
+            enc,
+            &image::RgbaImage::from_pixel(4, 4, image::Rgba(pixel)),
+            4,
+            4,
+            image::ExtendedColorType::Rgba8,
+        )
+        .expect("in-memory encode");
+        png
+    }
+
+    /// The suite's standard fixture: a solid 4×4 PNG of (200,60,10).
+    fn png_bytes(icc: Option<Vec<u8>>) -> Vec<u8> {
+        png_pixel_bytes(icc, [200, 60, 10, 255])
+    }
+
+    /// A two-frame 4×4 animated GIF, optionally carrying an embedded ICC
+    /// profile through the de-facto `ICCRGBG1012` application extension —
+    /// the block the gif crate's reader collects into `icc_profile`. Both
+    /// frames are palette index 0 = (200,60,10); the delays differ so the
+    /// per-frame scheduling rides along the same replies.
+    fn animated_gif_bytes(icc: Option<&[u8]>) -> Vec<u8> {
+        let mut out = Vec::new();
+        let palette: &[u8] = &[200, 60, 10, 255, 255, 255];
+        // Scoped so the encoder's Drop (which writes the GIF trailer)
+        // runs before `out` is returned.
+        {
+            let mut enc = gif::Encoder::new(&mut out, 4, 4, palette).expect("gif encoder");
+            if let Some(icc) = icc {
+                enc.write_raw_extension(gif::AnyExtension(0xFF), &[b"ICCRGBG1012", icc])
+                    .expect("icc application extension");
+            }
+            for delay_cs in [10u16, 20] {
+                let mut frame = gif::Frame::from_indexed_pixels(4, 4, vec![0u8; 16], None);
+                frame.delay = delay_cs;
+                enc.write_frame(&frame).expect("gif frame");
+            }
+        }
+        out
+    }
+
+    fn first_frame_pixels(bytes: &[u8], icm: bool) -> PixelFrame {
+        let terminate = AtomicBool::new(false);
+        let mut replies = Vec::new();
+        decode_bytes_to_sink(bytes, env_icm(icm), &terminate, None, &mut |r| {
+            replies.push(r)
+        });
+        match replies.into_iter().next() {
+            Some(LoadReply::FirstFrame { frame, .. }) => frame,
+            other => panic!("expected a first frame, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_tagged_non_srgb_image_is_transformed_before_compositing() {
+        // The whole Stage-1 chain end to end: embedded AdobeRGB-like ICC
+        // -> sRGB on the decode worker. The source pixel (200,60,10) is
+        // deep red under sRGB reading but a muted tone in the wider
+        // space; the transform must land near the characterized mscms
+        // output (the offline expectation, ±2/255 per the #77 L3
+        // acceptance — the screen smoke measured the same value).
+        crate::icm::test_fixtures::require_srgb();
+        let png = png_bytes(Some(crate::icm::test_fixtures::adobe_like_icc()));
+        let frame = first_frame_pixels(&png, true);
+        let (r, g, b) = first_rgb(&frame);
+        assert!(
+            (r as i32 - 239).abs() <= 2 && (g as i32 - 57).abs() <= 2 && b <= 2,
+            "got ({r},{g},{b}), expected the characterized mscms (239,57,0) ±2"
+        );
+    }
+
+    #[test]
+    fn a_transparent_tagged_image_composites_over_the_background_after_the_transform() {
+        // The transparent-tagged regression net (#77 review F1): a
+        // semi-transparent pixel must first take the ICC transform
+        // (moving its color) and THEN composite over the windowed
+        // background — the alpha surviving the transform is what makes
+        // the blend run at all (a forced-opaque alpha would leave the
+        // raw transformed color on screen instead). The expected value
+        // is the characterized transform output run through the
+        // composite's own integer formula `bg + (src - bg) * a / 255`.
+        crate::icm::test_fixtures::require_srgb();
+        let png = png_pixel_bytes(
+            Some(crate::icm::test_fixtures::adobe_like_icc()),
+            [200, 60, 10, 128],
+        );
+        let env = DecodeEnv {
+            background: [10, 20, 30],
+            ..env_icm(true)
+        };
+        let terminate = AtomicBool::new(false);
+        let mut replies = Vec::new();
+        decode_bytes_to_sink(&png, env, &terminate, None, &mut |r| replies.push(r));
+        let Some(LoadReply::FirstFrame { frame, .. }) = replies.into_iter().next() else {
+            panic!("expected a first frame");
+        };
+        let (r, g, b) = first_rgb(&frame);
+        let transformed = [239i32, 57, 0]; // characterized mscms output
+        let expected: Vec<i32> = [10i32, 20, 30]
+            .iter()
+            .zip(transformed)
+            .map(|(bg, t)| bg + (t - bg) * 128 / 255)
+            .collect();
+        assert!(
+            (r as i32 - expected[0]).abs() <= 2
+                && (g as i32 - expected[1]).abs() <= 2
+                && (b as i32 - expected[2]).abs() <= 2,
+            "got ({r},{g},{b}), expected {expected:?} (±2)"
+        );
+    }
+
+    #[test]
+    fn every_frame_of_a_tagged_animation_is_transformed() {
+        // #77's animation acceptance: ONE prepared transform, applied to
+        // EACH decoded frame — not only the first — through the GIF
+        // arm's streaming path, with the per-frame delays riding along
+        // the same replies (10/20 centiseconds -> 100/200 ms).
+        crate::icm::test_fixtures::require_srgb();
+        let gif = animated_gif_bytes(Some(&crate::icm::test_fixtures::adobe_like_icc()));
+        let terminate = AtomicBool::new(false);
+        let mut replies = Vec::new();
+        decode_bytes_to_sink(&gif, env_icm(true), &terminate, None, &mut |r| {
+            replies.push(r)
+        });
+        let mut colors = Vec::new();
+        let mut delays = Vec::new();
+        for reply in &replies {
+            match reply {
+                LoadReply::FirstFrame { frame, delay_ms }
+                | LoadReply::AdditionalFrame { frame, delay_ms } => {
+                    colors.push(first_rgb(frame));
+                    delays.push(*delay_ms);
+                }
+                LoadReply::Complete => {}
+                other => panic!("unexpected reply {other:?}"),
+            }
+        }
+        assert_eq!(colors.len(), 2, "two frames decoded, got {colors:?}");
+        assert_eq!(delays, vec![100, 200]);
+        for (r, g, b) in colors {
+            assert!(
+                (r as i32 - 239).abs() <= 2 && (g as i32 - 57).abs() <= 2 && b <= 2,
+                "every frame lands on the transformed color, got ({r},{g},{b})"
+            );
+        }
+    }
+
+    #[test]
+    fn an_srgb_equivalent_tagged_image_decodes_byte_identical() {
+        // The identity contract end to end: a different-but-equivalent
+        // sRGB blob must NOT round-trip the pixels through the CMM (its
+        // own sRGB->sRGB pass drifts a few LSBs).
+        crate::icm::test_fixtures::require_srgb();
+        let png = png_bytes(Some(crate::icm::test_fixtures::srgb_like_icc()));
+        let frame = first_frame_pixels(&png, true);
+        assert_eq!(first_rgb(&frame), (200, 60, 10), "verbatim decode");
+    }
+
+    #[test]
+    fn icm_off_and_untagged_images_keep_the_decoded_bytes_verbatim() {
+        let tagged = png_bytes(Some(crate::icm::test_fixtures::adobe_like_icc()));
+        let frame = first_frame_pixels(&tagged, false);
+        assert_eq!(first_rgb(&frame), (200, 60, 10), "icm=0 ignores the tag");
+        let untagged = png_bytes(None);
+        let frame = first_frame_pixels(&untagged, true);
+        assert_eq!(first_rgb(&frame), (200, 60, 10), "no profile, no work");
     }
 
     #[test]

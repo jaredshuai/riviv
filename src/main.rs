@@ -95,6 +95,7 @@ mod everything;
 mod filemgmt;
 mod fit;
 mod frame;
+mod icm;
 mod ini;
 mod jumpto_dlg;
 mod keys;

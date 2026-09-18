@@ -56,6 +56,17 @@ pub(crate) fn composite_over_background_in_place(rgba: &mut [u8], bg: [u8; 3]) {
     }
 }
 
+/// The BGRA-order sibling of [`composite_over_background_in_place`]: the
+/// ICM path's transform already emits the master's BGRA layout (#77 —
+/// the swizzle is folded into `TranslateBitmapBits`' output format), so
+/// the composite runs directly on it. The caller's background triple
+/// stays `[R, G, B]` (DecodeEnv's shape, like the RGBA sibling); it is
+/// reversed HERE to match the `[B, G, R]` byte order the BGRA chunks
+/// iterate.
+pub(crate) fn composite_over_background_bgra_in_place(bgra: &mut [u8], bg: [u8; 3]) {
+    composite_over_background_in_place(bgra, [bg[2], bg[1], bg[0]]);
+}
+
 /// Rotate a top-down 32bpp BGRA buffer 90° clockwise (#43; upstream
 /// `_viv_orientate_hbitmap` orientation 6, viv.c:13810-13819: the Edit →
 /// Rotate Clockwise in-memory pass). `src` holds `wide * high` pixels of 4
@@ -215,6 +226,15 @@ mod tests {
         let mut px = vec![10, 20, 30, 99];
         composite_over_background_in_place(&mut px, [255, 255, 255]);
         assert_eq!(px[3], 255);
+    }
+
+    #[test]
+    fn the_bgra_composite_maps_the_background_to_the_swizzled_channels() {
+        // Same blend as the RGBA version, but the buffer is [B,G,R,A] and
+        // the background must land on the right channels (#77 ICM path).
+        let mut px = vec![50, 100, 200, 0]; // BGRA: B=50 G=100 R=200
+        composite_over_background_bgra_in_place(&mut px, [10, 20, 30]);
+        assert_eq!(px, vec![30, 20, 10, 255], "bg [R,G,B]=[10,20,30]");
     }
 
     /// A 2-wide × 3-high ramp; each pixel is its linear index × 4 bytes
