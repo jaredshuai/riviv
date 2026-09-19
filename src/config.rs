@@ -415,13 +415,18 @@ impl Config {
         apply_int!(add_command_line_timeout = "add_command_line_timeout");
         apply_byte!(keep_zoom = "keep_zoom");
         // The renderer is a STRING key (riviv-authored, #80): an
-        // unrecognized value is a user typo — fall back to the safe `gdi`
-        // baseline with a stderr breadcrumb, never the int keys' garbage=0
-        // semantics.
+        // unrecognized value is a user typo — it falls to the safe `gdi`
+        // baseline (design §2) in BOTH overlay passes, never the int keys'
+        // garbage=0 "keep current" shape: a hand-edited appdata file
+        // carrying garbage must not silently resurrect the exe-dir value
+        // (pre-review: the overlay used to keep it).
         if let Some(value) = pairs.get("renderer") {
             match RendererKind::parse_ini(value) {
                 Some(kind) => self.renderer = kind,
-                None => eprintln!("riviv: unrecognized renderer value {value:?}, using gdi"),
+                None => {
+                    eprintln!("riviv: unrecognized renderer value {value:?}, using gdi");
+                    self.renderer = RendererKind::Gdi;
+                }
             }
         }
         if root {
@@ -827,5 +832,24 @@ mod tests {
         let text = ini::serialize(SECTION, &c.to_pairs(false));
         let back = parse_apply(&text, true);
         assert_eq!(back.renderer, RendererKind::Gdi);
+    }
+
+    #[test]
+    fn unrecognized_overlay_renderer_resets_to_gdi_not_the_root_value() {
+        // The two-file overlay (pre-review P3-2): an appdata file carrying
+        // garbage over an exe-dir `renderer=warp` must land on the gdi
+        // baseline — a present-but-invalid value is a typo, not a missing
+        // key, and must not silently resurrect the earlier file's choice.
+        let mut c = Config::default();
+        c.apply_section(&ini::parse("[riviv]\nrenderer=warp\n", SECTION), true);
+        assert_eq!(c.renderer, RendererKind::Warp);
+        c.apply_section(&ini::parse("[riviv]\nrenderer=nope\n", SECTION), false);
+        assert_eq!(c.renderer, RendererKind::Gdi);
+        // A MISSING key in the overlay keeps the root value (the ordinary
+        // overlay semantic, untouched).
+        let mut c = Config::default();
+        c.apply_section(&ini::parse("[riviv]\nrenderer=warp\n", SECTION), true);
+        c.apply_section(&ini::parse("[riviv]\n", SECTION), false);
+        assert_eq!(c.renderer, RendererKind::Warp);
     }
 }

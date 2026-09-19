@@ -163,6 +163,17 @@ pub(crate) struct DrawPlan {
     pub(crate) interp: D2D1_INTERPOLATION_MODE,
 }
 
+/// The L0 pixel-exact predicate (design §4): a render whose size equals
+/// the source's on both axes — NEAREST over an exact integer rect, the
+/// five-piece's resample-free clause. The GDI arm's BitBlt arm compares
+/// against the SELECTED MIP's size instead; at 1:1 mip selection returns
+/// level 0 (the full source), so the two predicates agree exactly where
+/// the byte-exact contract applies (off-1:1 the arms diverge by design —
+/// #81's filter table owns that surface).
+pub(crate) fn one_to_one_render(rw: i32, rh: i32, sw: i32, sh: i32) -> bool {
+    rw == sw && rh == sh
+}
+
 /// Build the plan from the window state — the SAME scene_rect math the GDI
 /// blit runs (design §4's geometry clause), against the master's full-size
 /// bitmap: the D2D arm never participates in the mip chain.
@@ -186,7 +197,7 @@ pub(crate) fn draw_plan(
         rw,
         rh,
         interp: d2d_interp_mode(
-            rw == sw && rh == sh,
+            one_to_one_render(rw, rh, sw, sh),
             state.config.shrink_blit_mode == 1,
             state.config.mag_filter == 1,
             rw < sw || rh < sh,
@@ -974,6 +985,17 @@ mod tests {
     }
 
     // ---- d2d_interp_mode (#80's two tiers) ----
+
+    #[test]
+    fn the_one_to_one_predicate_requires_both_axes_to_match_the_source() {
+        // L0's core predicate (pre-review P3-3: pinned directly, not just
+        // end-to-end through the smoke): both axes must equal the source —
+        // a match on one axis alone is still a filtered render.
+        assert!(one_to_one_render(300, 200, 300, 200));
+        assert!(!one_to_one_render(300, 201, 300, 200));
+        assert!(!one_to_one_render(301, 200, 300, 200));
+        assert!(!one_to_one_render(150, 100, 300, 200));
+    }
 
     #[test]
     fn one_to_one_is_always_nearest() {

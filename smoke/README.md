@@ -51,12 +51,12 @@ powershell -ExecutionPolicy Bypass -File smoke\smoke80-d2d.ps1 -Exe <other build
 | S8a | minimized-start warp instance dumps the image (content-checked) at WM_CLOSE | the D2D dump renders from the CPU master inside the dump call - no Present, no WM_PAINT dependency |
 | S8b | gdi twin of S8 | SKIP by design (pre-existing background-paint gate, master-identical, smoke78 SKIP semantics); observed behavior recorded in the detail line |
 
-Known finding (2026-09-19): S3b fails on the letterbox ALPHA only - the
-warp dump writes A=255 everywhere (D2D `Clear`) while the gdi dump leaves
-the DIB-zeroed A=0 in the letterbox (GDI never writes the alpha byte;
-RGB is pixel-identical). The two dump arms are therefore not
-byte-identical in PNG form, which breaks the design's golden
-cross-arm comparison premise - adjudication pending.
+Adjudicated (2026-09-19, commit 028abf7): S3b's original failure was the
+letterbox ALPHA only - warp wrote A=255 (D2D `Clear`) while gdi left the
+DIB-zeroed A=0 (GDI never writes the alpha byte; RGB was pixel-identical).
+The dump contract is now the fully opaque viewport BOTH arms render, and
+the gdi channel forces A=255 on readback - S3b asserts byte-identical
+files and passes.
 
 ## smoke79-dpi.ps1(#79 PerMonitorV2 DPI,专项)
 
