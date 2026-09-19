@@ -1341,15 +1341,14 @@ fn on_ok(dlg: HWND) {
             }
         }
     }
-    // SAFETY: the dialog-state borrow ends above (model is owned); the
-    // owner borrow spans only the commit/re-anchor/invalidate/save —
-    // none pump.
     // SAFETY: the dialog-state borrow ends above (model is owned). The
     // owner borrow spans only the commit/re-anchor/invalidate—save —
     // `refresh_status` re-enters `state_of` (its SendMessageW calls run
     // synchronously inside), so it MUST run after that borrow drops:
     // overlapping `&mut WindowState` is UB (state_of's contract), caught
-    // in post-merge review (Codex/cubic round 3).
+    // in post-merge review (Codex/cubic round 3). The repaint call below
+    // is inside the borrow on purpose: its FindWindowEx lookup takes NO
+    // state borrow (#78).
     let effects = unsafe {
         state_of(owner).map(|owner_state| {
             let effects = model.commit(&mut owner_state.config);

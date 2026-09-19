@@ -975,6 +975,9 @@ unsafe extern "system" fn view_proc(
         // Screen coords in lparam — producer-independent (right-click via
         // DefWindowProc above; keyboard SHIFT+F10 goes to the focused
         // owner instead). TrackPopupMenu anchors on the owner like today.
+        // NEVER DefWindowProc this arm: the default procedure forwards a
+        // child's WM_CONTEXTMENU to the PARENT, and the owner's own arm
+        // would run on_contextmenu a second time — double menu.
         WM_CONTEXTMENU => {
             on_contextmenu(owner, lparam);
             LRESULT(0)
