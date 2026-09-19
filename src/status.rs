@@ -280,8 +280,12 @@ pub(crate) fn update(hwnd: HWND, snapshot: &StatusSnapshot) {
         // formulas serve this v5.82 bar, whose font is system-DPI — so the
         // scaling source matches the thing being measured on every
         // monitor (upstream reads the same number from its os DC,
-        // os.c:818; the pre-#79 screen-DC read returned this value, and
-        // the 96 floor keeps its failed-DC default).
+        // os.c:818; the pre-#79 screen-DC read returned this value).
+        // SAFETY: resolved in the CALLING THREAD's DPI context — GetDpiForSystem
+        // is only "process-wide" for aware threads (an unaware thread would
+        // read 96). The UI thread's PMv2 default (checked at startup in
+        // window::run) makes this the real system DPI; the 96 floor only
+        // guards a failed (0) return.
         let dpi = GetDpiForSystem().max(96);
         let hdc = GetDC(Some(hwnd));
         if hdc.is_invalid() {

@@ -9,13 +9,13 @@
       </requestedPrivileges>
     </security>
   </trustInfo>
-  <!-- DPI-only manifest (#79). The 2016 namespace is required for
+  <!-- Awareness-only manifest (#79). The 2016 namespace is required for
        dpiAwareness (the 2005 one only knows the dpiAware element); the
        fallback list makes pre-1703 systems take System awareness — exactly
        the pre-#79 behavior (SetProcessDPIAware). The legacy dpiAware=true
        line below is the documented belt-and-suspenders for loaders that
        predate the 2016 element (both are honored, newer wins); today it is
-       unreachable — the GetDpiForWindow import floors the OS at 1607,
+       unreachable — the GetDpiForSystem import floors the OS at 1607,
        where dpiAwareness is already understood. Deliberately NO
        Common-Controls v6 dependency: riviv has shipped without a manifest,
        i.e. on comctl32 5.82 classic chrome, and #79's zero-diff acceptance

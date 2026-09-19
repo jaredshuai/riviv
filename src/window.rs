@@ -64,7 +64,9 @@ use windows::Win32::UI::Controls::{
     ICC_BAR_CLASSES, ICC_STANDARD_CLASSES, ICC_WIN95_CLASSES, INITCOMMONCONTROLSEX,
     InitCommonControlsEx, NM_CLICK, NMHDR, NMMOUSE, SB_GETPARTS, WM_MOUSELEAVE,
 };
-use windows::Win32::UI::HiDpi::GetDpiForSystem;
+use windows::Win32::UI::HiDpi::{
+    GetDpiForSystem, GetProcessDpiAwareness, PROCESS_DPI_UNAWARE, PROCESS_PER_MONITOR_DPI_AWARE,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetCapture, GetKeyNameTextW, GetKeyState, GetKeyboardLayout, MAPVK_VK_TO_VSC, MapVirtualKeyExW,
     ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_CONTROL, VK_ESCAPE,
@@ -6511,14 +6513,21 @@ fn view_target_size(client: (i32, i32), chrome_h: i32) -> (i32, i32) {
 /// The rect a WM_DPICHANGED should resize the window to (#79): the
 /// system's suggested rect — already scaled for the new DPI — whenever
 /// the window is free-floating; `None` while the geometry is owned
-/// elsewhere: fullscreen (the monitor cover is authoritative; the
+/// elsewhere. Fullscreen: the monitor cover is authoritative (the
 /// suggestion scales the CURRENT rect by the DPI ratio, which would
 /// un-cover a monitor whose pixel size didn't change with its scale
-/// factor), maximized (the same ratio-scaled suggestion would shrink the
-/// window off the work area the window manager keeps it covering — the
-/// manager re-maximizes onto the new monitor itself on a cross-monitor
-/// move), and minimized (the restore geometry stands; a suggestion built
-/// from a placeholder rect is meaningless).
+/// factor). Maximized: the same ratio-scaled suggestion — documented as
+/// the current window scaled, i.e. the maximize bounds scaled — would
+/// shrink the window off the work area while IsZoomed stays true; the
+/// window manager is expected to keep a zoomed window covering its
+/// monitor through a cross-monitor move (mainstream apps skip on
+/// IsZoomed the same way). Minimized: the OS-documented suggestion says
+/// nothing about iconic windows — what it would deliver (a
+/// placeholder-derived rect, or a scaled restore rect) is unobserved and
+/// not programmatically observable, so we keep the restore geometry
+/// standing; if the OS does rescale iconic windows itself our skip just
+/// declines to fight it, and the worst case stays bounded (pre-scale
+/// proportions until the next move).
 fn dpi_change_target_rect(
     fullscreen: bool,
     zoomed: bool,
@@ -6783,6 +6792,11 @@ unsafe extern "system" fn wnd_proc(
             // DPI in wparam needs no store: chrome keeps system-DPI
             // proportions on every monitor by design (issue #79's
             // LOGPIXELS audit) and the image re-fits through on_size.
+            // Any process can post this message, so a null pointer is
+            // guarded like WM_GETMINMAXINFO's below rather than trusted.
+            if lparam.0 == 0 {
+                return LRESULT(0);
+            }
             // SAFETY: lparam points to a RECT for the duration of the
             // message (Win32 contract).
             let suggested = unsafe { *(lparam.0 as *const RECT) };
@@ -7395,9 +7409,13 @@ fn initial_status_height() -> i32 {
     // System DPI — the bar this estimates is chrome, and chrome keeps
     // system-DPI proportions on every monitor by design (#79's audit:
     // the v5.82 status bar sizes itself from system-DPI defaults). The
-    // pre-#79 screen-DC read returned the same number; GetDpiForSystem
-    // says it without borrowing a DC.
-    // SAFETY: process-wide query on the calling thread.
+    // pre-#79 screen-DC read returned the same number.
+    // SAFETY: resolved in the CALLING THREAD's DPI context — GetDpiForSystem
+    // is only "process-wide" for aware threads (an unaware thread would
+    // read 96). riviv never switches a thread's context (no
+    // SetThreadDpiAwareness anywhere), so the UI thread's PMv2 default —
+    // guaranteed by the run() self-check — makes this the real system DPI.
+    // The 96 floor only guards a failed (0) return.
     let dpi = unsafe { GetDpiForSystem() }.max(96);
     // SAFETY: read-only system-metric queries.
     let border = unsafe { GetSystemMetrics(SM_CYBORDER) };
@@ -7455,6 +7473,33 @@ pub(crate) fn run() -> Result<(), String> {
     // SetProcessDPIAware and its "no DPI-sensitive query may run before
     // awareness is set" ordering hazard are gone; the window receives
     // WM_DPICHANGED when its monitor's DPI changes.
+    //
+    // Runtime self-check (external review P2-5): deleting
+    // SetProcessDPIAware also deleted the old fail-loud signal, and a
+    // broken/edited manifest degrades SILENTLY to unaware — virtualized
+    // geometry, DWM-stretched rendering. UNAWARE can never be legitimate
+    // (the manifest's own fallback list bottoms out at System), so it
+    // fails loud (ADR 0001); System-aware is either a pre-1703 OS taking
+    // the documented fallback or a broken PerMonitorV2 token — a stderr
+    // breadcrumb distinguishes nothing here, so it just names both. The
+    // PMv1-vs-PMv2 distinction is not observable through this API; the
+    // manifest-readback smoke (smoke79 S2.1) owns that tier.
+    // SAFETY: a read-only query on the calling process (None = the
+    // current process).
+    let awareness = unsafe { GetProcessDpiAwareness(None) }
+        .map(|a| a.0)
+        .unwrap_or(-1);
+    if awareness == PROCESS_DPI_UNAWARE.0 {
+        return Err(
+            "process is DPI-unaware — the embedded PerMonitorV2 manifest is missing or broken; rebuild the exe"
+                .to_string(),
+        );
+    }
+    if awareness != PROCESS_PER_MONITOR_DPI_AWARE.0 {
+        eprintln!(
+            "riviv: DPI awareness is system, not per-monitor (pre-1703 OS fallback, or a broken manifest token)"
+        );
+    }
     // One-shot language detection (upstream `localization_init`, WinMain's
     // second call after `os_init`, viv.c:5158-5159). Before any window
     // exists so the very first title and status-bar text are in the right

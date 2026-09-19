@@ -474,9 +474,12 @@ fn on_size(dlg: HWND) {
         // system DPI the controls use (pre-review 3 caught the first
         // draft's per-window read making the dialog a two-DPI-source
         // element on mixed-DPI monitors; the pre-#79 screen-DC read
-        // returned this same value, and the 96 floor keeps its failed-DC
-        // default).
-        // SAFETY (outer block): process-wide query on the UI thread.
+        // returned this same value).
+        // SAFETY (outer block): resolved in the CALLING THREAD's DPI
+        // context — GetDpiForSystem is only "process-wide" for aware
+        // threads (an unaware thread would read 96); the UI thread's PMv2
+        // default (self-checked at startup in window::run) makes this the
+        // real system DPI. The 96 floor only guards a failed (0) return.
         let dpi = GetDpiForSystem().max(96) as i32;
         let edge = 12 * dpi / 96;
         let gap = 6 * dpi / 96;

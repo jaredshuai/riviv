@@ -61,7 +61,7 @@ const REBAR_CLASS: PCWSTR = w!("riviv_rebar");
 
 /// The strip's height while shown (upstream `_viv_get_controls_high`,
 /// viv.c:11441-11447): a FIXED `32 * logical / 96` — never measured from
-/// the window. `dpi` is the process LOGPIXELSX (96 at 100%, 192 at 200%).
+/// the window. `dpi` is the system DPI (96 at 100%, 192 at 200%).
 pub(crate) fn controls_height(dpi: i32) -> i32 {
     (32 * dpi) / 96
 }
@@ -265,7 +265,11 @@ pub(crate) fn glyph_mask(glyph: Glyph, size: i32) -> Vec<bool> {
 pub(crate) fn logical_dpi() -> i32 {
     static DPI: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
     *DPI.get_or_init(|| {
-        // SAFETY: process-wide query taking no inputs.
+        // SAFETY: resolved in the CALLING THREAD's DPI context — GetDpiForSystem
+        // is only "process-wide" for aware threads (an unaware thread would
+        // read 96). riviv never switches a thread's context, so the PMv2
+        // default (self-checked at startup in window::run) makes this the
+        // real system DPI; the 96 floor only guards a failed (0) return.
         unsafe { GetDpiForSystem() as i32 }.max(96)
     })
 }

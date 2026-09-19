@@ -35,6 +35,7 @@ public class S79 {
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hwnd, int cmd);
     [DllImport("user32.dll")] public static extern bool IsZoomed(IntPtr hwnd);
+    [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hwnd);
     [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr hwnd, uint cmd);
     [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr hwnd, IntPtr hdc, uint flags);
     [DllImport("user32.dll")] public static extern IntPtr GetDC(IntPtr hwnd);
@@ -314,6 +315,12 @@ if ($adopted) {
             $r3.R -eq $fsRect.R -and $r3.B -eq $fsRect.B) (
             "rect=" + $r3.L + ',' + $r3.T + ',' + $r3.R + ',' + $r3.B + ' want=' +
             $fsRect.L + ',' + $fsRect.T + ',' + $fsRect.R + ',' + $fsRect.B)
+        if ($red0) {
+            $redFs = Wait-Until { Is-Red (Capture-Center $view) } 10000
+            Check 'S4.3 fullscreen repaint path keeps the image rendered' $redFs ('center=' + ((Capture-Center $view) -join ','))
+        } else {
+            Skip 'S4.3 fullscreen repaint path keeps the image rendered' ('upstream render assert did not hold')
+        }
         [void][S79]::SendMessageW($main, 0x0111, [IntPtr]35, [IntPtr]::Zero)  # exit fullscreen
         Wait-Until {
             $r = Get-WinRect $script:main
@@ -321,10 +328,64 @@ if ($adopted) {
         } 8000 | Out-Null
     } else {
         Skip 'S4.2 fullscreen window ignores the suggestion' ('fullscreen did not take')
+        Skip 'S4.3 fullscreen repaint path keeps the image rendered' ('fullscreen did not take')
+    }
+
+    # S4.4 minimized: pins OUR handler's skip contract only -- what the OS
+    # actually delivers to an iconic window is undocumented and not
+    # programmatically observable (external review P1); if the OS ever
+    # rescales iconic windows itself, our skip just declines to fight it.
+    [void][S79]::ShowWindow($main, 6)  # SW_MINIMIZE
+    $minOk = Wait-Until { [S79]::IsIconic($script:main) } 8000
+    if ($minOk) {
+        $minRect = Get-WinRect $main
+        Write-RectPtr $rectPtr 5 5 500 400
+        [void][S79]::SendMessageW($main, 0x02E0, $wp144, $rectPtr)
+        Start-Sleep -Milliseconds 400
+        $r4 = Get-WinRect $main
+        Check 'S4.4 minimized window ignores the suggestion (restore geometry untouched)' (
+            [S79]::IsIconic($main) -and
+            $r4.L -eq $minRect.L -and $r4.T -eq $minRect.T -and
+            $r4.R -eq $minRect.R -and $r4.B -eq $minRect.B) (
+            "rect=" + $r4.L + ',' + $r4.T + ',' + $r4.R + ',' + $r4.B)
+        [void][S79]::ShowWindow($main, 9)  # SW_RESTORE
+        Wait-Until { -not [S79]::IsIconic($script:main) } 8000 | Out-Null
+    } else {
+        Skip 'S4.4 minimized window ignores the suggestion' ('minimize did not take')
     }
 } else {
-    Skip 'S4.1/S4.2 authority-geometry scenarios' ('adoption failed earlier')
+    Skip 'S4.1/S4.2/S4.3/S4.4 authority-geometry scenarios' ('adoption failed earlier')
 }
+
+# ---- S5: children do not forward WM_DPICHANGED to the owner ----------------
+# DefWindowProc's treatment of this message on CHILD windows is
+# undocumented; if it forwarded to the parent the way it synthesizes
+# WM_CONTEXTMENU, the owner's arm would resize the MAIN window with a
+# child-delivered rect (external review P2-3). Pin: bait-rect deliveries
+# to each child leave every rect untouched.
+$baseMain = Get-WinRect $main
+$baseView = Get-WinRect $view
+Write-RectPtr $rectPtr 10 10 800 600
+$children = @()
+$viewChild = [S79]::FindWindowExW($main, [IntPtr]::Zero, 'riviv_view', [NullString]::Value)
+$rebarChild = [S79]::FindWindowExW($main, [IntPtr]::Zero, 'riviv_rebar', [NullString]::Value)
+$barChild = [S79]::FindWindowExW($main, [IntPtr]::Zero, 'msctls_statusbar32', [NullString]::Value)
+if ($viewChild -ne [IntPtr]::Zero) { $children += ,@($viewChild, 'riviv_view') }
+if ($rebarChild -ne [IntPtr]::Zero) { $children += ,@($rebarChild, 'riviv_rebar') }
+if ($barChild -ne [IntPtr]::Zero) { $children += ,@($barChild, 'msctls_statusbar32') }
+$fwOk = $true
+foreach ($pair in $children) {
+    [void][S79]::SendMessageW($pair[0], 0x02E0, $wp144, $rectPtr)
+    Start-Sleep -Milliseconds 300
+    $m = Get-WinRect $main
+    $v = Get-WinRect $view
+    if (-not ($m.L -eq $baseMain.L -and $m.T -eq $baseMain.T -and $m.R -eq $baseMain.R -and $m.B -eq $baseMain.B -and
+            $v.L -eq $baseView.L -and $v.T -eq $baseView.T -and $v.R -eq $baseView.R -and $v.B -eq $baseView.B)) {
+        $fwOk = $false
+        Write-Output ('  leak after delivery to ' + $pair[1] + ': main=(' + $m.L + ',' + $m.T + ',' + $m.R + ',' + $m.B + ') view=(' + $v.L + ',' + $v.T + ',' + $v.R + ',' + $v.B + ')')
+    }
+}
+Check 'S5 child deliveries do not reach the owner arm (no DefWindowProc forwarding)' $fwOk ('see leak lines above')
 
 # ---- teardown -------------------------------------------------------------
 [Runtime.InteropServices.Marshal]::FreeHGlobal($rectPtr)
