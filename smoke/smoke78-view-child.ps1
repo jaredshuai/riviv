@@ -2,17 +2,18 @@
 # ASCII-only source (PS5.1 ANSI trap). Staged-ini discipline: precheck +
 # cleanup, force-kill only (no WM_CLOSE writeback).
 #
-# 入库说明(PR #86 评审处置轮):本脚本是 #78(riviv_view 视口子 HWND)的
-# 专项冒烟,随 PR #86 入库为可复现脚本(先例:installer/smoke26-assoc.ps1)。
-# 运行需 Windows PowerShell 5.1;真输入场景(键鼠注入/前台像素采样)只需
-# 普通前台权限,与管理员无关,无需提权。被测构建经 -Exe 驱动,默认
-# D:\codespace\riviv\target\release\riviv.exe(改 $Exe 路径可换构建);
-# 实例一律运行在 %TEMP%\riviv-78-smoke 里的暂存副本上,ini 分阶段写入,
-# 结束即清理。
-# SKIP 语义:S6/S7 依赖显示存活;当「后台进程显示闸」未解除时(进程从未
-# 被激活,Windows 不为它产出 WM_PAINT —— master 同形预存,probe78-bg.ps1
-# 已验证与 master 一致,非 #78 引入)输出 SKIP,属预期而非失败;#78 相关
-# 的结构/路由场景(S1-S5、S8)全部硬断言,不受该闸影响。
+# In-repo copy (PR #86 review round; precedent: installer/smoke26-assoc.ps1):
+# the dedicated smoke for the #78 viewport-child HWND. Runs under Windows
+# PowerShell 5.1; the real-input scenarios (key/mouse injection, foreground
+# pixel sampling) need plain foreground rights, no elevation. Drive the
+# build under test with -Exe (default D:\codespace\riviv\target\release\
+# riviv.exe). Every instance runs from a staged copy in %TEMP%\riviv-78-smoke
+# with a per-phase ini that is cleaned up on exit.
+# SKIP semantics: S6/S7 need a live display; while the pre-existing
+# background-process paint gate (a never-activated process gets no WM_PAINT -
+# master-identical, verified by probe78-bg.ps1, NOT a #78 regression) has not
+# lifted, they SKIP by design. The #78 structure/routing scenarios
+# (S1-S5, S8) hard-assert and are unaffected by that gate.
 param([string]$Exe = 'D:\codespace\riviv\target\release\riviv.exe')
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Drawing
@@ -42,6 +43,8 @@ public class S78 {
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] public static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr extra);
     [DllImport("user32.dll")] public static extern bool GetCursorInfo(ref CURSORINFO pci);
+    [DllImport("user32.dll")] public static extern bool SetCursorPos(int x, int y);
+    [DllImport("user32.dll")] public static extern IntPtr SendMessageTimeout(IntPtr h, uint m, IntPtr w, IntPtr l, uint flags, uint timeout, out IntPtr result);
     [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L, T, R, B; }
     [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X, Y; }
     [StructLayout(LayoutKind.Sequential)] public struct CURSORINFO { public int cbSize; public int flags; public IntPtr hCursor; public POINT pt; }
@@ -107,6 +110,19 @@ function Wait-Window($p) {
     throw "no window appeared"
 }
 
+# Poll a background process's title until it differs from $notThis (posted
+# messages to a background process can service arbitrarily late under load).
+function Wait-Title3($p, $notThis, $ms) {
+    $t = ''
+    for ($i = 0; $i -lt [int]($ms / 100); $i++) {
+        Start-Sleep -Milliseconds 100
+        $p.Refresh()
+        $t = $p.MainWindowTitle
+        if ($t -ne $notThis -and $t -ne '') { return $t }
+    }
+    return $t
+}
+
 function Client-Origin($h) {
     $pt = New-Object S78+POINT; $pt.X = 0; $pt.Y = 0
     [S78]::ClientToScreen($h, [ref]$pt) | Out-Null
@@ -166,9 +182,7 @@ try {
     [Runtime.InteropServices.Marshal]::Copy($bytes, 0, [IntPtr]::Add($mem, 20), $bytes.Length)
     [S78]::GlobalUnlock($hmem) | Out-Null
     [S78]::PostMessage($view, $WM_DROPFILES, $hmem, [IntPtr]::Zero) | Out-Null
-    Start-Sleep -Milliseconds 900
-    $p.Refresh()
-    $t = $p.MainWindowTitle
+    $t = Wait-Title3 $p ($p.MainWindowTitle) 4000
     # Title-only assertion here: while the process has never been brought
     # forward, Windows gates WM_PAINT generation for image adoptions and
     # even PrintWindow reads the stale surface (verified identical on
@@ -176,6 +190,14 @@ try {
     # a menu activation alone does NOT lift it, a fullscreen resize does).
     # The pixel scenarios run after the S5 fullscreen dance below.
     Check 'S4 drop forwarded to the owner (request adopted)' ($t -like 'blue.png*') ("title='$t'")
+    if ($t -notlike 'blue.png*') {
+        # Wedged-instance diagnostics: does the UI thread still service
+        # SENT messages, and are sibling riviv processes interfering?
+        $res = [IntPtr]::Zero
+        $sm = [S78]::SendMessageTimeout($h, 0x0000, [IntPtr]::Zero, [IntPtr]::Zero, 2, 2000, [ref]$res)
+        $alive2 = (Get-Process riviv -ErrorAction SilentlyContinue | Measure-Object).Count
+        Write-Output ("S4-DIAG responding=" + ($sm -ne [IntPtr]::Zero) + " rivivProcs=" + $alive2)
+    }
 
     # S5 double-click fullscreen via the child, twice (enter + exit).
     $WM_LBUTTONDBLCLK = 0x0203
@@ -319,34 +341,58 @@ try {
 
     $t0 = $null; $p3.Refresh(); $t0 = $p3.MainWindowTitle
     [S78]::PostMessage($v3h, 0x0201, [IntPtr]::Zero, $lpDown) | Out-Null  # WM_LBUTTONDOWN (action 4 = next)
-    Start-Sleep -Milliseconds 500
-    $p3.Refresh(); $t1 = $p3.MainWindowTitle
+    $t1 = Wait-Title3 $p3 $t0 4000
     Check 'S8a WM_LBUTTONDOWN to child navigates' ($t1 -ne $t0 -and $t1 -ne '') ("$t0 -> $t1")
     [S78]::PostMessage($v3h, 0x0202, [IntPtr]::Zero, $lpDown) | Out-Null  # WM_LBUTTONUP (no drag live: no-op arm)
     Start-Sleep -Milliseconds 250
 
+    # Foreground + cursor onto the viewport BEFORE the M-button pair:
+    # ShowCursor is per-input-queue - a BACKGROUND process's
+    # ShowCursor(FALSE) never hides the on-screen cursor owned by the
+    # foreground queue, so the hide is only observable with the app
+    # foreground and the cursor over it (the earlier flaky passes were
+    # moments the cursor happened to be there).
+    $o3 = New-Object S78+POINT; $o3.X = 0; $o3.Y = 0
+    [S78]::ClientToScreen($h3, [ref]$o3) | Out-Null
+    [S78]::SetCursorPos([int]($o3.X + 400), [int]($o3.Y + 250)) | Out-Null
+    for ($i = 0; $i -lt 10; $i++) {
+        [S78]::SetForegroundWindow($h3) | Out-Null
+        if ([S78]::GetForegroundWindow() -eq $h3) { break }
+        [S78]::keybd_event(0x12, 0, 0, [UIntPtr]::Zero)
+        [S78]::SetForegroundWindow($h3) | Out-Null
+        [S78]::keybd_event(0x12, 0, 2, [UIntPtr]::Zero)
+        Start-Sleep -Milliseconds 120
+    }
+    Start-Sleep -Milliseconds 250
     [S78]::PostMessage($v3h, 0x0207, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null  # WM_MBUTTONDOWN: mscroll starts
-    Start-Sleep -Milliseconds 350
-    $ci = New-Object S78+CURSORINFO
-    $ci.cbSize = [System.Runtime.InteropServices.Marshal]::SizeOf($ci)
-    [S78]::GetCursorInfo([ref]$ci) | Out-Null
-    $mHidden = (($ci.flags -band 1) -eq 0)
+    # Poll, not a single read: a BACKGROUND process may service the posted
+    # message well past any fixed wait under load (S8b flaked exactly there
+    # on the pre-fix binary too - timing, not behavior).
+    $mHidden = $false
+    for ($i = 0; $i -lt 30; $i++) {
+        Start-Sleep -Milliseconds 100
+        $ci = New-Object S78+CURSORINFO
+        $ci.cbSize = [System.Runtime.InteropServices.Marshal]::SizeOf($ci)
+        [S78]::GetCursorInfo([ref]$ci) | Out-Null
+        if ((($ci.flags -band 1) -eq 0)) { $mHidden = $true; break }
+    }
     [S78]::PostMessage($v3h, 0x0208, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null  # WM_MBUTTONUP: ends, re-shows
-    Start-Sleep -Milliseconds 350
-    $ci2 = New-Object S78+CURSORINFO
-    $ci2.cbSize = [System.Runtime.InteropServices.Marshal]::SizeOf($ci2)
-    [S78]::GetCursorInfo([ref]$ci2) | Out-Null
-    $mShownBack = (($ci2.flags -band 1) -ne 0)
+    $mShownBack = $false
+    for ($i = 0; $i -lt 30; $i++) {
+        Start-Sleep -Milliseconds 100
+        $ci2 = New-Object S78+CURSORINFO
+        $ci2.cbSize = [System.Runtime.InteropServices.Marshal]::SizeOf($ci2)
+        [S78]::GetCursorInfo([ref]$ci2) | Out-Null
+        if ((($ci2.flags -band 1) -ne 0)) { $mShownBack = $true; break }
+    }
     Check 'S8b M-button pair to child (hide + restore cursor)' ($mHidden -and $mShownBack) ("downHidden=$mHidden upVisible=$mShownBack")
 
     $p3.Refresh(); $t1b = $p3.MainWindowTitle
     [S78]::PostMessage($v3h, 0x0204, [IntPtr]::Zero, $lpDown) | Out-Null  # WM_RBUTTONDOWN (action 2 = prev)
-    Start-Sleep -Milliseconds 500
-    $p3.Refresh(); $t2 = $p3.MainWindowTitle
+    $t2 = Wait-Title3 $p3 $t1b 4000
     Check 'S8c WM_RBUTTONDOWN to child navigates' ($t2 -ne $t1b -and $t2 -ne '') ("$t1b -> $t2")
     [S78]::PostMessage($v3h, 0x0206, [IntPtr]::Zero, $lpDown) | Out-Null  # WM_RBUTTONDBLCLK (action 2 again)
-    Start-Sleep -Milliseconds 500
-    $p3.Refresh(); $t3 = $p3.MainWindowTitle
+    $t3 = Wait-Title3 $p3 $t2 4000
     Check 'S8d WM_RBUTTONDBLCLK to child navigates' ($t3 -ne $t2 -and $t3 -ne '') ("$t2 -> $t3")
     [S78]::PostMessage($v3h, 0x0205, [IntPtr]::Zero, $lpDown) | Out-Null  # WM_RBUTTONUP: swallowed under action 2
     Start-Sleep -Milliseconds 400
@@ -356,8 +402,7 @@ try {
 
     $wpX = [IntPtr](0x00010000)  # HIWORD=XBUTTON1, keys=0
     [S78]::PostMessage($v3h, 0x020B, $wpX, $lpDown) | Out-Null  # WM_XBUTTONDOWN (action 2 = nav)
-    Start-Sleep -Milliseconds 500
-    $p3.Refresh(); $t4 = $p3.MainWindowTitle
+    $t4 = Wait-Title3 $p3 $t3 4000
     Check 'S8f WM_XBUTTONDOWN to child navigates' ($t4 -ne $t3 -and $t4 -ne '') ("$t3 -> $t4")
 } finally {
     if ($p3 -and !$p3.HasExited) { Stop-Process -Id $p3.Id -Force }
