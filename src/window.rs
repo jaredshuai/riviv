@@ -8424,11 +8424,20 @@ pub(crate) fn run() -> Result<(), String> {
                 state.gpu_kind = effective;
             }
             None => {
+                // Only a FAILED D2D-family request degraded (acceptance
+                // round: an unconditional flash here fired on every default
+                // gdi launch — `built` is legitimately None for gdi — and
+                // the 3s temp text outranked the FNF/failed status verdicts
+                // (window.rs's temp-over-everything chain), breaking the
+                // default path's status parity). The gdi baseline stays
+                // silent; its evidence channel is the stderr breadcrumb.
                 state.gpu_init_failed = request.wants_d2d();
-                flash = Some(format!(
-                    "renderer {} init failed — using gdi",
-                    request.to_ini()
-                ));
+                if request.wants_d2d() {
+                    flash = Some(format!(
+                        "renderer {} init failed — using gdi",
+                        request.to_ini()
+                    ));
+                }
             }
         }
     }
