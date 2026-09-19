@@ -6509,13 +6509,27 @@ fn view_target_size(client: (i32, i32), chrome_h: i32) -> (i32, i32) {
 }
 
 /// The rect a WM_DPICHANGED should resize the window to (#79): the
-/// system's suggested rect — already scaled for the new DPI — whenever the
-/// window is free-floating; `None` in fullscreen, where the monitor cover
-/// is the authoritative geometry and the suggestion (the current rect
-/// scaled by the DPI ratio) would un-cover a monitor whose pixel size
-/// didn't change with its scale factor.
-fn dpi_change_target_rect(fullscreen: bool, suggested: &RECT) -> Option<RECT> {
-    if fullscreen { None } else { Some(*suggested) }
+/// system's suggested rect — already scaled for the new DPI — whenever
+/// the window is free-floating; `None` while the geometry is owned
+/// elsewhere: fullscreen (the monitor cover is authoritative; the
+/// suggestion scales the CURRENT rect by the DPI ratio, which would
+/// un-cover a monitor whose pixel size didn't change with its scale
+/// factor), maximized (the same ratio-scaled suggestion would shrink the
+/// window off the work area the window manager keeps it covering — the
+/// manager re-maximizes onto the new monitor itself on a cross-monitor
+/// move), and minimized (the restore geometry stands; a suggestion built
+/// from a placeholder rect is meaningless).
+fn dpi_change_target_rect(
+    fullscreen: bool,
+    zoomed: bool,
+    iconic: bool,
+    suggested: &RECT,
+) -> Option<RECT> {
+    if fullscreen || zoomed || iconic {
+        None
+    } else {
+        Some(*suggested)
+    }
 }
 
 fn on_size(hwnd: HWND) {
@@ -6756,12 +6770,13 @@ unsafe extern "system" fn wnd_proc(
             // PerMonitorV2 (#79): the window's monitor DPI changed (dragged
             // across mixed-DPI monitors, or the scale factor changed).
             // Adopt the system's suggested rect — already scaled for the
-            // new DPI — except in fullscreen, where the monitor cover is
-            // the authoritative geometry (the suggestion scales the
-            // CURRENT rect by the DPI ratio, wrong for a borderless cover
-            // when the monitor's pixel size didn't change with its scale
-            // factor); there a repaint is all that's needed. The
-            // SetWindowPos re-enters wnd_proc with WM_SIZE → on_size → the
+            // new DPI — while the window is free-floating. Fullscreen,
+            // maximized, and minimized windows skip it (their geometry is
+            // owned by the fullscreen logic / the window manager — the
+            // ratio-scaled suggestion would un-cover or shrink them; see
+            // dpi_change_target_rect); a repaint is all that's needed
+            // there. The SetWindowPos re-enters wnd_proc with WM_SIZE →
+            // on_size → the
             // #78 layout chain unchanged (chrome first, the viewport child
             // last and pinned HWND_BOTTOM). SWP_NOZORDER keeps this arm
             // free of any z-order side effect (#80's invariant). The new
@@ -6776,7 +6791,10 @@ unsafe extern "system" fn wnd_proc(
             let fullscreen = unsafe { state_of(hwnd) }
                 .map(|state| state.fullscreen)
                 .unwrap_or(false);
-            match dpi_change_target_rect(fullscreen, &suggested) {
+            // SAFETY: read-only zoomed/iconic queries on the live window
+            // (the same pair WM_MOVE gates its tracking on).
+            let (zoomed, iconic) = unsafe { (IsZoomed(hwnd).as_bool(), IsIconic(hwnd).as_bool()) };
+            match dpi_change_target_rect(fullscreen, zoomed, iconic, &suggested) {
                 Some(target) => {
                     // SAFETY: hwnd is live; re-enters wnd_proc with WM_SIZE
                     // — no borrow is live here. Fail-soft like the frame
@@ -6794,12 +6812,12 @@ unsafe extern "system" fn wnd_proc(
                     }
                 }
                 None => {
-                    // Fullscreen: the rect stays the monitor cover. No
-                    // repaint is strictly needed (the scale change doesn't
-                    // move the monitor's pixels), but repaint() routes the
-                    // invalidation to the child that actually owns the
-                    // viewport pixels — the owner's own client has been
-                    // validation-only since #78.
+                    // Fullscreen/maximized/minimized: the authoritative
+                    // geometry stands. No repaint is strictly needed (the
+                    // scale change doesn't move the monitor's pixels), but
+                    // repaint() routes the invalidation to the child that
+                    // actually owns the viewport pixels — the owner's own
+                    // client has been validation-only since #78.
                     repaint(hwnd);
                 }
             }
@@ -8283,7 +8301,10 @@ mod tests {
             right: 810,
             bottom: 620,
         };
-        assert_eq!(dpi_change_target_rect(false, &suggested), Some(suggested));
+        assert_eq!(
+            dpi_change_target_rect(false, false, false, &suggested),
+            Some(suggested)
+        );
     }
 
     #[test]
@@ -8298,6 +8319,37 @@ mod tests {
             right: 2880,
             bottom: 1620,
         };
-        assert_eq!(dpi_change_target_rect(true, &suggested), None);
+        assert_eq!(dpi_change_target_rect(true, false, false, &suggested), None);
+    }
+
+    #[test]
+    fn dpi_change_keeps_the_maximized_cover() {
+        // A maximized window's current rect is the maximize bounds; the
+        // ratio-scaled suggestion (2880x1740 -> 2160x1305 at 200%->150%)
+        // shrinks it off the work area while IsZoomed stays true — the
+        // window manager owns that geometry (and re-maximizes onto the new
+        // monitor itself on a cross-monitor move), so the suggestion is
+        // skipped (pre-review 3's P2).
+        let suggested = RECT {
+            left: 360,
+            top: 315,
+            right: 2520,
+            bottom: 1620,
+        };
+        assert_eq!(dpi_change_target_rect(false, true, false, &suggested), None);
+    }
+
+    #[test]
+    fn dpi_change_keeps_the_minimized_restore_geometry() {
+        // An iconic window's rect is the minimize placeholder — a
+        // suggestion built from it is meaningless; the restore geometry
+        // stands until the user restores.
+        let suggested = RECT {
+            left: -32000,
+            top: -32000,
+            right: -31840,
+            bottom: -31960,
+        };
+        assert_eq!(dpi_change_target_rect(false, false, true, &suggested), None);
     }
 }

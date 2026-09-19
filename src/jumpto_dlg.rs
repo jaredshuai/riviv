@@ -34,7 +34,7 @@ use windows::Win32::Foundation::{GetLastError, HWND, LPARAM, LRESULT, RECT, WPAR
 use windows::Win32::Graphics::Gdi::{
     COLOR_BTNFACE, DEFAULT_GUI_FONT, GetStockObject, GetSysColorBrush, HBRUSH, HGDIOBJ,
 };
-use windows::Win32::UI::HiDpi::GetDpiForWindow;
+use windows::Win32::UI::HiDpi::GetDpiForSystem;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     EnableWindow, SetFocus, VK_DOWN, VK_NEXT, VK_PRIOR, VK_UP,
 };
@@ -468,12 +468,16 @@ fn on_size(dlg: HWND) {
         let button_wide = rect.right - rect.left;
         let button_high = rect.bottom - rect.top;
 
-        // The dialog's own window DPI (#79): this is a TOP-LEVEL
-        // hand-built window — under PerMonitorV2 it follows whichever
-        // monitor it sits on, same source as its controls' creation-time
-        // metrics. The 96 floor is the pre-#79 failed-DC default.
-        // SAFETY (outer block): a per-window query on our own live window.
-        let dpi = GetDpiForWindow(dlg).max(96) as i32;
+        // System DPI (#79's LOGPIXELS audit): everything else in this
+        // hand-built dialog sizes from GetDialogBaseUnits — a system-font
+        // metric that CANNOT be per-monitor — so the margins read the same
+        // system DPI the controls use (pre-review 3 caught the first
+        // draft's per-window read making the dialog a two-DPI-source
+        // element on mixed-DPI monitors; the pre-#79 screen-DC read
+        // returned this same value, and the 96 floor keeps its failed-DC
+        // default).
+        // SAFETY (outer block): process-wide query on the UI thread.
+        let dpi = GetDpiForSystem().max(96) as i32;
         let edge = 12 * dpi / 96;
         let gap = 6 * dpi / 96;
 

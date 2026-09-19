@@ -37,7 +37,7 @@ windows = { version = "0.62", features = [
     "Win32_Security",
     "Win32_UI_ColorSystem",
     "Win32_UI_Controls",
-    # GetDpiForWindow/GetDpiForSystem — PMv2 manifest 后的 DPI 真源(#79)
+    # GetDpiForSystem — chrome/对话框四点统一系统 DPI 源(#79;PMv2 manifest 后)
     "Win32_UI_HiDpi",
     "Win32_UI_Controls_Dialogs",
     "Win32_UI_Input_KeyboardAndMouse",

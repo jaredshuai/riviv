@@ -33,6 +33,8 @@ public class S79 {
     [DllImport("shcore.dll")] public static extern int GetDpiForMonitor(IntPtr hmon, int type, out uint x, out uint y);
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hwnd);
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hwnd, int cmd);
+    [DllImport("user32.dll")] public static extern bool IsZoomed(IntPtr hwnd);
     [DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr hwnd, uint cmd);
     [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr hwnd, IntPtr hdc, uint flags);
     [DllImport("user32.dll")] public static extern IntPtr GetDC(IntPtr hwnd);
@@ -263,6 +265,65 @@ if ($adopted) {
     Skip 'S3.9 view remains bottom-most' ('adoption failed')
     Skip 'S3.10 image still renders at scaled size' ('adoption failed')
     Skip 'S3.11/S3.12 restore' ('adoption failed')
+}
+
+# ---- S4: authority-owned geometry ignores the suggestion ------------------
+# Pre-review 3's P2: the DPI-ratio suggestion built from a maximized
+# window's rect shrinks it off the work area while IsZoomed stays true --
+# the arm must skip it (fullscreen: same reasoning, unit-tested side).
+if ($adopted) {
+    # S4.1 maximized
+    [void][S79]::ShowWindow($main, 3)  # SW_MAXIMIZE
+    $maxOk = Wait-Until { [S79]::IsZoomed($script:main) } 8000
+    if ($maxOk) {
+        $maxRect = Get-WinRect $main
+        $w = $maxRect.R - $maxRect.L; $h = $maxRect.B - $maxRect.T
+        # bait: the maximized rect itself scaled 1.5x (what a naive arm
+        # would adopt, un-covering the work area)
+        Write-RectPtr $rectPtr 0 0 ([int]($w * 3 / 2)) ([int]($h * 3 / 2))
+        [void][S79]::SendMessageW($main, 0x02E0, $wp144, $rectPtr)
+        Start-Sleep -Milliseconds 400
+        $r2 = Get-WinRect $main
+        $still = [S79]::IsZoomed($main)
+        Check 'S4.1 maximized window ignores the suggestion (keeps the cover)' (
+            $still -and $r2.L -eq $maxRect.L -and $r2.T -eq $maxRect.T -and
+            $r2.R -eq $maxRect.R -and $r2.B -eq $maxRect.B) (
+            "rect=" + $r2.L + ',' + $r2.T + ',' + $r2.R + ',' + $r2.B + ' want=' +
+            $maxRect.L + ',' + $maxRect.T + ',' + $maxRect.R + ',' + $maxRect.B + ' zoomed=' + $still)
+        [void][S79]::ShowWindow($main, 1)  # SW_RESTORE
+        Wait-Until { -not [S79]::IsZoomed($script:main) } 8000 | Out-Null
+    } else {
+        Skip 'S4.1 maximized window ignores the suggestion' ('maximize did not take')
+    }
+
+    # S4.2 fullscreen (WM_COMMAND 35, the 79-ab script's proven trigger)
+    [void][S79]::SendMessageW($main, 0x0111, [IntPtr]35, [IntPtr]::Zero)
+    $fsRect = $null
+    $fsOk = Wait-Until {
+        $r = Get-WinRect $script:main
+        if (($r.R - $r.L) -ge 2800) { $script:fsRect = $r; return $true }
+        return $false
+    } 8000
+    if ($fsOk) {
+        Write-RectPtr $rectPtr 10 10 900 700
+        [void][S79]::SendMessageW($main, 0x02E0, $wp144, $rectPtr)
+        Start-Sleep -Milliseconds 400
+        $r3 = Get-WinRect $main
+        Check 'S4.2 fullscreen window ignores the suggestion (keeps the cover)' (
+            $r3.L -eq $fsRect.L -and $r3.T -eq $fsRect.T -and
+            $r3.R -eq $fsRect.R -and $r3.B -eq $fsRect.B) (
+            "rect=" + $r3.L + ',' + $r3.T + ',' + $r3.R + ',' + $r3.B + ' want=' +
+            $fsRect.L + ',' + $fsRect.T + ',' + $fsRect.R + ',' + $fsRect.B)
+        [void][S79]::SendMessageW($main, 0x0111, [IntPtr]35, [IntPtr]::Zero)  # exit fullscreen
+        Wait-Until {
+            $r = Get-WinRect $script:main
+            ($r.R - $r.L) -lt 2800
+        } 8000 | Out-Null
+    } else {
+        Skip 'S4.2 fullscreen window ignores the suggestion' ('fullscreen did not take')
+    }
+} else {
+    Skip 'S4.1/S4.2 authority-geometry scenarios' ('adoption failed earlier')
 }
 
 # ---- teardown -------------------------------------------------------------

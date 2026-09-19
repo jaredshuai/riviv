@@ -33,6 +33,8 @@ powershell -ExecutionPolicy Bypass -File smoke\smoke79-dpi.ps1 -Exe <其他构�
 | S2.2 | 窗口 DPI = 所在显示器有效 DPI | `GetDpiForWindow` 对 `GetDpiForMonitor`(per-monitor 语义本体) |
 | S3.1–S3.5 | 前置状态 | riviv_view/riviv_rebar 子窗存在;图像已渲染(PrintWindow flag2);视口铺满 chrome 之上;条带高 = `controls_height(系统 DPI)` |
 | S3.6–S3.11 | 合成 DPI 变更链 | SendMessage 投 144-DPI 建议矩形(1.5x 居中)→ 主窗逐字采纳 → #78 dock 链重跑(视口铺满新客户区、chrome 不变、条带仍系统 DPI)→ 视口仍 z 序最底(**`GW_HWNDNEXT` 才是「下方」,`GW_HWNDPREV` 是「上方」**)→ 图像仍渲染 → 再投 96-DPI 原矩形恢复 |
+| S4.1 | 最大化态忽略建议矩形 | SW_MAXIMIZE 后投「最大化矩形×1.5」诱饵 → IsZoomed 保持且 rect 逐值不变(DPI 比例建议会把最大化窗缩离工作区,预审三 P2 的回归位) |
+| S4.2 | 全屏态忽略建议矩形 | WM_COMMAND 35 进全屏 → 投任意建议矩形 → rect 恒等于覆盖矩形(monitor 覆盖权威,设计 §3/F3 的真链路背书) |
 | S3.3/S3.10/S3.12 | 渲染断言 | 依赖前台激活解除显示闸;闸未解除时输出 SKIP(同 smoke78 的 SKIP 语义),几何断言不受影响硬跑 |
 
 ## smoke78-view-child.ps1(#78 视口子 HWND,PR #86 专项)
