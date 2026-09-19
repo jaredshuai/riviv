@@ -1186,6 +1186,9 @@ fn gpu_runtime_failure(owner: HWND) {
     // subtraction measures across the 2^32 wrap like C's DWORD arithmetic.
     // SAFETY: pure tick query.
     let now_ms = unsafe { GetTickCount() };
+    // The post-rebuild invalidation target, applied after the state borrow
+    // ends (see the tail comment).
+    let mut rebuilt_view: Option<HWND> = None;
     // SAFETY: the borrow spans the ladder decision and the (non-pumping)
     // COM rebuild; nothing dispatches messages.
     if let Some(state) = unsafe { state_of(owner) } {
@@ -1216,7 +1219,6 @@ fn gpu_runtime_failure(owner: HWND) {
         // escalation pins WARP — the request mode is ignored from here).
         state.gpu = None;
         let view = state.viewport;
-        let mut rebuilt = false;
         match crate::gpu::create(view, crate::gpu::owner_of(view), kind) {
             Ok((stack, effective)) => {
                 state.gpu_kind = if escalated {
@@ -1225,23 +1227,27 @@ fn gpu_runtime_failure(owner: HWND) {
                     effective
                 };
                 state.gpu = Some(stack);
-                rebuilt = true;
+                // The failing paint already validated its region without
+                // drawing — a static image has no timer or hover to repaint
+                // it, so the recovered frame would hang blank until the next
+                // input. Queue the viewport for the pump to repaint with a
+                // fresh upload from the CPU master (no re-decode).
+                rebuilt_view = Some(view);
             }
             Err(e) => {
                 state.gpu_init_failed = true;
                 eprintln!("riviv: renderer rebuild failed ({e}), staying on gdi");
             }
         }
-        if rebuilt {
-            // The failing paint already validated its region without
-            // drawing — a static image has no timer or hover to repaint it,
-            // so the recovered frame would hang blank until the next input.
-            // Queue the viewport now; the pump paints it with a fresh
-            // upload from the CPU master (no re-decode).
-            // SAFETY: invalidates our own child; no state borrow is live.
-            unsafe {
-                let _ = InvalidateRect(Some(view), None, false);
-            }
+    }
+    // The statement stands OUTSIDE the state if-let on purpose (pre-review
+    // P3-1: a SAFETY comment must read true against the lexical scope it
+    // sits in) — the borrow ended inside the if-let above (its last use).
+    if let Some(view) = rebuilt_view {
+        // SAFETY: invalidates our own child; no state borrow is live (the
+        // borrow ended at its last use inside the if-let above).
+        unsafe {
+            let _ = InvalidateRect(Some(view), None, false);
         }
     }
 }

@@ -47,6 +47,7 @@ use windows::Win32::Graphics::Dxgi::{
     DXGI_SCALING_NONE, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG, DXGI_SWAP_EFFECT_FLIP_DISCARD,
     DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIDevice, IDXGIFactory2, IDXGISurface, IDXGISwapChain1,
 };
+use windows::Win32::Graphics::Gdi::ValidateRect;
 use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, PAINTSTRUCT};
 use windows::Win32::UI::WindowsAndMessaging::{GetClientRect, GetParent, IsIconic};
 use windows::core::Interface;
@@ -788,6 +789,18 @@ fn loss_kind(code: windows::core::HRESULT) -> &'static str {
 pub(crate) fn paint_d2d(view: HWND, owner: HWND) -> PaintOutcome {
     // SAFETY: read-only query on the live owner.
     if unsafe { IsIconic(owner) }.as_bool() {
+        // The skip still must CONSUME the update region (pre-review P2-1):
+        // the animation timer keeps invalidating a minimized window, and a
+        // WM_PAINT answered without BeginPaint/ValidateRect leaves the
+        // region dirty — the queue regenerates WM_PAINT every idle pass and
+        // the paint spins hot until restore. The GDI arm's unconditional
+        // BeginPaint validates implicitly (upstream viv.c:4066 too); this
+        // is the D2D arm's explicit equivalent.
+        // SAFETY: validates our own child's whole client area; no borrow is
+        // live.
+        unsafe {
+            let _ = ValidateRect(Some(view), None);
+        }
         return PaintOutcome::Painted;
     }
     // SAFETY: BeginPaint/EndPaint bracket the whole draw; the state borrow
