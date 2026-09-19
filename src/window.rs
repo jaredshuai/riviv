@@ -6518,10 +6518,17 @@ fn view_target_size(client: (i32, i32), chrome_h: i32) -> (i32, i32) {
 /// un-cover a monitor whose pixel size didn't change with its scale
 /// factor). Maximized: the same ratio-scaled suggestion — documented as
 /// the current window scaled, i.e. the maximize bounds scaled — would
-/// shrink the window off the work area while IsZoomed stays true; the
-/// window manager is expected to keep a zoomed window covering its
-/// monitor through a cross-monitor move (mainstream apps skip on
-/// IsZoomed the same way). Minimized: the OS-documented suggestion says
+/// shrink the window off the work area while IsZoomed stays true, so a
+/// same-monitor scale change must be skipped. A cross-monitor move of a
+/// zoomed window (Win+Shift+Arrow) is the open case: whether its
+/// suggestion is the new monitor's maximize bounds (adopt, one reading
+/// of the official samples) or the OS re-maximizes itself and merely
+/// notifies (skip, the mainstream IsZoomed-skip pattern) is
+/// unverifiable without mixed-DPI hardware — QA item #15 collects the
+/// real-machine evidence. The skip is chosen because its failure mode
+/// is bounded (pre-scale proportions until the next re-maximize) while
+/// adoption risks the work-area shrink if the suggestion is
+/// ratio-scaled after all. Minimized: the OS-documented suggestion says
 /// nothing about iconic windows — what it would deliver (a
 /// placeholder-derived rect, or a scaled restore rect) is unobserved and
 /// not programmatically observable, so we keep the restore geometry
@@ -8396,5 +8403,23 @@ mod tests {
             bottom: -31960,
         };
         assert_eq!(dpi_change_target_rect(false, false, true, &suggested), None);
+    }
+
+    #[test]
+    fn dpi_change_passes_a_degenerate_suggestion_through_untouched() {
+        // The arm never second-guesses the OS: a zero-area suggestion is
+        // adopted verbatim in the floating state (the system's own
+        // WM_GETMINMAXINFO floor then clamps the resulting window) — the
+        // design §3 "degenerate rect" case (external review 3 P3).
+        let suggested = RECT {
+            left: 100,
+            top: 100,
+            right: 100,
+            bottom: 100,
+        };
+        assert_eq!(
+            dpi_change_target_rect(false, false, false, &suggested),
+            Some(suggested)
+        );
     }
 }
