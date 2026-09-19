@@ -280,7 +280,7 @@ pub(crate) fn update(hwnd: HWND, snapshot: &StatusSnapshot) {
         // formulas serve this v5.82 bar, whose font is system-DPI — so the
         // scaling source matches the thing being measured on every
         // monitor (upstream reads the same number from its os DC,
-        // os.c:817; the pre-#79 screen-DC read returned this value, and
+        // os.c:818; the pre-#79 screen-DC read returned this value, and
         // the 96 floor keeps its failed-DC default).
         let dpi = GetDpiForSystem().max(96);
         let hdc = GetDC(Some(hwnd));

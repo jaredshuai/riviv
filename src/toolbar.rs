@@ -258,7 +258,10 @@ pub(crate) fn glyph_mask(glyph: Glyph, size: i32) -> Vec<bool> {
 /// or the buttons desync from the strip — PerMonitorV2 changes the IMAGE
 /// viewport's per-monitor exactness, not chrome's proportions). The
 /// pre-#79 screen-DC read returned this same number; the 96 floor keeps
-/// the old failed-DC default.
+/// the old failed-DC default. (This once-only freeze next to status.rs's
+/// per-refresh read is the same split master had — and if the system DPI
+/// ever changes mid-run, the strip freezing while the part math re-reads
+/// is the smaller evil than the buttons desyncing from their cells.)
 pub(crate) fn logical_dpi() -> i32 {
     static DPI: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
     *DPI.get_or_init(|| {

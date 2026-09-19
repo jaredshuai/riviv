@@ -153,7 +153,7 @@ $ctx = [S79]::GetWindowDpiAwarenessContext($main)
 $pmv2 = [IntPtr](-4)  # DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
 Check 'S2.1 live window context is PerMonitorV2' ([S79]::AreDpiAwarenessContextsEqual($ctx, $pmv2)) ('ctx handle compare failed (opaque handle, raw=' + $ctx.ToInt64() + ')')
 $wdpi = [S79]::GetDpiForWindow($main)
-$mon = [S79]::MonitorFromWindow($main, 1)  # MONITOR_DEFAULTTONEAREST
+$mon = [S79]::MonitorFromWindow($main, 2)  # MONITOR_DEFAULTTONEAREST (2; 1 is TOPRIMARY)
 $mdpi = [uint32]0
 $unused = [uint32]0
 [void][S79]::GetDpiForMonitor($mon, 0, [ref]$mdpi, [ref]$unused)

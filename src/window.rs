@@ -6794,12 +6794,13 @@ unsafe extern "system" fn wnd_proc(
                     }
                 }
                 None => {
-                    // Fullscreen: the rect stays the monitor cover.
-                    // SAFETY: our live child-less client; invalidates the
-                    // whole client like other full repaints.
-                    unsafe {
-                        let _ = InvalidateRect(Some(hwnd), None, true);
-                    }
+                    // Fullscreen: the rect stays the monitor cover. No
+                    // repaint is strictly needed (the scale change doesn't
+                    // move the monitor's pixels), but repaint() routes the
+                    // invalidation to the child that actually owns the
+                    // viewport pixels — the owner's own client has been
+                    // validation-only since #78.
+                    repaint(hwnd);
                 }
             }
             LRESULT(0)
