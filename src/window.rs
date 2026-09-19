@@ -41,9 +41,8 @@ use windows::Win32::Foundation::{
     RECT, SetLastError, WIN32_ERROR, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, COLOR_BTNFACE, EndPaint, GetMonitorInfoW, HBRUSH, InvalidateRect,
-    MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint, MonitorFromRect, MonitorFromWindow,
-    PAINTSTRUCT, PtInRect, ScreenToClient, UpdateWindow,
+    COLOR_BTNFACE, GetMonitorInfoW, HBRUSH, InvalidateRect, MONITOR_DEFAULTTOPRIMARY, MONITORINFO,
+    MonitorFromPoint, MonitorFromRect, MonitorFromWindow, PtInRect, ScreenToClient, UpdateWindow,
 };
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoCreateInstance,
@@ -81,10 +80,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     DestroyMenu, DestroyWindow, DispatchMessageW, EnableMenuItem, FindWindowA, FindWindowExW,
     GWL_EXSTYLE, GWL_STYLE, GWLP_USERDATA, GetClientRect, GetCursorPos, GetForegroundWindow,
     GetMenu, GetMessageW, GetParent, GetSystemMetrics, GetWindowLongPtrW, GetWindowRect, HICON,
-    HMENU, HTCAPTION, HTMENU, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST, IDC_ARROW, IMAGE_ICON,
-    IsIconic, IsZoomed, KillTimer, LR_DEFAULTCOLOR, LoadCursorW, LoadImageW, MB_ICONERROR,
-    MB_ICONQUESTION, MB_OK, MENU_ITEM_FLAGS, MF_BYCOMMAND, MF_CHECKED, MF_ENABLED, MF_GRAYED,
-    MF_POPUP, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MFT_RADIOCHECK, MINMAXINFO, MSG,
+    HMENU, HTCAPTION, HTMENU, HWND_BOTTOM, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST, IDC_ARROW,
+    IMAGE_ICON, IsIconic, IsZoomed, KillTimer, LR_DEFAULTCOLOR, LoadCursorW, LoadImageW,
+    MB_ICONERROR, MB_ICONQUESTION, MB_OK, MENU_ITEM_FLAGS, MF_BYCOMMAND, MF_CHECKED, MF_ENABLED,
+    MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MFT_RADIOCHECK, MINMAXINFO, MSG,
     MenuItemFromPoint, MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassExW,
     SC_MONITORPOWER, SHOW_WINDOW_CMD, SM_CXICON, SM_CXSMICON, SM_CYICON, SM_CYSMICON, SW_MAXIMIZE,
     SW_RESTORE, SW_SHOW, SW_SHOWNORMAL, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOCOPYBITS,
@@ -519,7 +518,10 @@ fn update_src_pixel(hwnd: HWND, force: bool, update_statusbar: bool) -> bool {
         // The render rect exactly as paint anchors it (upstream
         // `_viv_get_src_pixel_pos`, viv.c:15020-15057): the panscan-scaled
         // render size, centered by the pan term minus the drag offset,
-        // against the viewport (client minus status bar and controls).
+        // against the viewport — the `riviv_view` child's client rect
+        // (#78), numerically identical to the ScreenToClient(owner)
+        // coordinate read above since the child anchors at the owner's
+        // client origin (chrome is bottom-docked only).
         let (vp, src) = viewport_and_src(hwnd, state);
         // Upstream gates the whole walk on a frame being displayed
         // (viv.c:15030's `_viv_frame_count` check).
@@ -1011,6 +1013,22 @@ unsafe extern "system" fn view_proc(
             on_drop_files(owner, HDROP(wparam.0 as *mut c_void));
             LRESULT(0)
         }
+        // Keyboard insurance (Codex review P1): focus is DESIGNED to stay on
+        // the owner (button arms return 0 without DefWindowProc, and
+        // WM_MOUSEACTIVATE's default activates the top-level — live-verified
+        // with GetGUIThreadInfo). If some external SetFocus ever parks the
+        // keyboard on the child anyway, forward the keymap dispatch instead of
+        // stranding every shortcut. Same handler, same lparam — hwnd-free.
+        WM_KEYDOWN => {
+            on_keydown(owner, wparam, lparam);
+            LRESULT(0)
+        }
+        WM_SYSKEYDOWN => {
+            on_keydown(owner, wparam, lparam);
+            // SAFETY: like the owner's arm — the default procedure owns
+            // Alt+F4 / Alt+Space / F10.
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
         // SAFETY: parameters are exactly this callback's own; the default
         // procedure owns everything unlisted — WM_SETCURSOR's class-cursor
         // chain (IDC_ARROW, same as the owner), WM_NCHITTEST,
@@ -1481,7 +1499,11 @@ fn lparam_point(lparam: LPARAM) -> POINT {
 /// invalidate never reaches it, so the child is looked up directly — a pure
 /// window query taking NO state borrow, safe under any live
 /// `&mut WindowState` a caller may still hold (options_dlg's commit path).
-/// Falls back to the owner only in the pre-creation window.
+/// Falls back to the owner only in the pre-creation window: the owner's
+/// WM_PAINT is validation-only since #78 (no pixels of its own), so the
+/// fallback produces nothing visible — it merely upholds the
+/// "something gets invalidated" invariant and is unreachable once the
+/// child exists (every real caller runs after `run()` creates it).
 pub(crate) fn repaint(hwnd: HWND) {
     // SAFETY: a child-class lookup scoped to this window's own children;
     // queues a WM_PAINT, never pumps messages.
@@ -2804,6 +2826,11 @@ fn request_render_viewport(hwnd: HWND, state: &WindowState) -> (i32, i32) {
     // The request-time viewport is the child's live rect (#78); the legacy
     // estimate below only covers the pre-creation window, which no real
     // request can reach (loads start after `run()` creates the child).
+    // Pre-#78 legacy arm: it has always subtracted the status-bar height
+    // ONLY — never the toolbar strip's (a formula inherited from before
+    // #45) — so it is NOT numerically identical to the child's rect;
+    // that mismatch is exactly why the child rect superseded it as the
+    // source of truth.
     if !state.viewport.is_invalid() {
         let mut view = RECT::default();
         // SAFETY: a pure rect query on our own child — no pumping, safe
@@ -6467,6 +6494,19 @@ pub(crate) fn apply_drop_files(hwnd: HWND, hdrop: HDROP) {
     }
 }
 
+/// The viewport child's target size for an owner client rect (#78): the
+/// width passes through and the height loses the bottom-docked chrome.
+/// Every piece of chrome is bottom-docked only and the child anchors at
+/// the owner's client origin (0, 0), so client-minus-chrome IS the child
+/// rect — this formula is the single source of truth, shared by the
+/// initial creation in `run()` and by every later resize in `on_size`.
+/// Both axes clamp at 0 (a degenerate client must not hand CreateWindowExW
+/// or SetWindowPos a negative size). #79 (PMv2) will rework the chrome
+/// bookkeeping — re-derive from here when it does.
+fn view_target_size(client: (i32, i32), chrome_h: i32) -> (i32, i32) {
+    (client.0.max(0), (client.1 - chrome_h).max(0))
+}
+
 fn on_size(hwnd: HWND) {
     // Upstream `_viv_on_size`'s first act (viv.c:1583-1615): track the
     // windowed rect for the config. Never iconic, never fullscreen; a
@@ -6574,22 +6614,24 @@ fn on_size(hwnd: HWND) {
         let mut client = RECT::default();
         // SAFETY: read-only rect query on the live window.
         let _ = unsafe { GetClientRect(hwnd, &mut client) };
-        Some((
-            state.viewport,
-            client.right - client.left,
-            (client.bottom
-                - client.top
-                - crate::status::height(state.status)
-                - state.controls.height())
-            .max(0),
-        ))
+        let (wide, high) = view_target_size(
+            (client.right - client.left, client.bottom - client.top),
+            crate::status::height(state.status) + state.controls.height(),
+        );
+        Some((state.viewport, wide, high))
     });
     if let Some((view, wide, high)) = view_target {
+        // HWND_BOTTOM pins the "chrome always above the viewport" invariant
+        // (#78 review): re-affirmed on every on_size. The rects never
+        // intersect so there is no visual difference today, the forms agree
+        // with master in the degenerate short-client case (negative
+        // rebar.top), and #80's swapchain-on-child makes the invariant a
+        // hard prerequisite — so assert it structurally instead of trusting
+        // creation order.
         // SAFETY: our live child, resized on the owning thread. Fail-soft
         // like the dock calls above — a failed resize leaves the child at
         // the old rect until the next on_size (transient, self-healing).
-        let _ =
-            unsafe { SetWindowPos(view, None, 0, 0, wide, high, SWP_NOZORDER | SWP_NOACTIVATE) };
+        let _ = unsafe { SetWindowPos(view, Some(HWND_BOTTOM), 0, 0, wide, high, SWP_NOACTIVATE) };
     }
     // Re-anchor the pan offset for the new viewport (upstream WM_SIZE,
     // viv.c:1643-1651: reproject the center-source anchor onto the new
@@ -6688,15 +6730,12 @@ unsafe extern "system" fn wnd_proc(
         WM_PAINT => {
             // The viewport child owns the client pixels (#78); with
             // WS_CLIPCHILDREN the owner's visible client is fully covered
-            // by its children (viewport + chrome), so this pass only
-            // validates whatever region was exposed.
-            // SAFETY: bracketed by BeginPaint/EndPaint on the WM_PAINT DC.
-            unsafe {
-                let mut ps = PAINTSTRUCT::default();
-                let _ = BeginPaint(hwnd, &mut ps);
-                let _ = EndPaint(hwnd, &ps);
-            }
-            LRESULT(0)
+            // by its children (viewport + chrome), so the owner's paint is
+            // validation-only. DefWindowProc's WM_PAINT is exactly the
+            // empty BeginPaint/EndPaint pair, so delegate to it.
+            // SAFETY: parameters are exactly this callback's own; the
+            // default procedure validates the update region.
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
         WM_SIZE => {
             on_size(hwnd);
@@ -7766,6 +7805,10 @@ pub(crate) fn run() -> Result<(), String> {
     let (status_h, controls_h) = (unsafe { state_of(hwnd) }).map_or((0, 0), |state| {
         (crate::status::height(state.status), state.controls.height())
     });
+    let (view_w, view_h) = view_target_size(
+        (client.right - client.left, client.bottom - client.top),
+        status_h + controls_h,
+    );
     // SAFETY: all parameters valid; the child dies with its parent (Windows
     // destroys children first — before the owner's WM_NCDESTROY frees the
     // state box, so no child message can ever touch a freed slot).
@@ -7777,8 +7820,8 @@ pub(crate) fn run() -> Result<(), String> {
             WS_CHILD | WS_VISIBLE,
             0,
             0,
-            (client.right - client.left).max(0),
-            (client.bottom - client.top - status_h - controls_h).max(0),
+            view_w,
+            view_h,
             Some(hwnd),
             None,
             Some(hinstance.into()),
@@ -8152,5 +8195,31 @@ mod tests {
                 bottom: 400
             }
         );
+    }
+
+    // ---- the viewport child's target size (#78) ----
+
+    #[test]
+    fn view_target_size_passes_a_normal_client_through_minus_the_chrome() {
+        // The everyday path: the width is the client width as-is, the
+        // height loses exactly the bottom-docked chrome (status bar +
+        // controls strip).
+        assert_eq!(view_target_size((1920, 1080), 100), (1920, 980));
+    }
+
+    #[test]
+    fn view_target_size_never_hands_out_a_negative_dimension() {
+        // Chrome taller than the client (a degenerate short window): the
+        // negative difference clamps to 0 instead of reaching
+        // CreateWindowExW/SetWindowPos as a negative size.
+        assert_eq!(view_target_size((800, 60), 100), (800, 0));
+    }
+
+    #[test]
+    fn view_target_size_degenerates_to_zero_for_a_nonpositive_client() {
+        // A zero or negative client rect (e.g. the pre-layout query in
+        // run()) yields (0, 0) on both axes — never negative.
+        assert_eq!(view_target_size((0, 0), 10), (0, 0));
+        assert_eq!(view_target_size((-5, -5), 0), (0, 0));
     }
 }
