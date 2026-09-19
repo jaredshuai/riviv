@@ -31,6 +31,7 @@ public class S79 {
     [DllImport("user32.dll")] public static extern uint GetDpiForSystem();
     [DllImport("user32.dll")] public static extern IntPtr MonitorFromWindow(IntPtr h, uint flags);
     [DllImport("shcore.dll")] public static extern int GetDpiForMonitor(IntPtr hmon, int type, out uint x, out uint y);
+    [DllImport("user32.dll")] public static extern bool GetMonitorInfoW(IntPtr hmon, ref MONINFO mi);
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hwnd);
     [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hwnd, int cmd);
@@ -48,6 +49,7 @@ public class S79 {
     [DllImport("gdi32.dll")] public static extern uint GetPixel(IntPtr hdc, int x, int y);
     [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L, T, R, B; }
     [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X, Y; }
+    [StructLayout(LayoutKind.Sequential)] public struct MONINFO { public int cb; public RECT rc; public RECT rcm; public uint flags; }
 }
 '@)
 
@@ -78,6 +80,15 @@ function Get-Client($h) {
     $r = New-Object S79+RECT
     [void][S79]::GetClientRect($h, [ref]$r)
     return $r
+}
+function Get-MonitorRect($h) {
+    # The rect of the monitor the window sits on (MONITOR_DEFAULTTONEAREST):
+    # the fullscreen invariant compares the window rect against THIS rect.
+    $mon = [S79]::MonitorFromWindow($h, 2)
+    $mi = New-Object S79+MONINFO
+    $mi.cb = [Runtime.InteropServices.Marshal]::SizeOf($mi)
+    [void][S79]::GetMonitorInfoW($mon, [ref]$mi)
+    return $mi.rc
 }
 function Client-Origin($h) {
     $p = New-Object S79+POINT
@@ -297,24 +308,27 @@ if ($adopted) {
         Skip 'S4.1 maximized window ignores the suggestion' ('maximize did not take')
     }
 
-    # S4.2 fullscreen (WM_COMMAND 35, the 79-ab script's proven trigger)
+    # S4.2 fullscreen (WM_COMMAND 35, the 79-ab script's proven trigger).
+    # The fullscreen invariant is geometric, not a pixel threshold: the
+    # window rect EQUALS its monitor's rect (external review P3 - a
+    # hardcoded width threshold silently SKIPs on narrower displays).
     [void][S79]::SendMessageW($main, 0x0111, [IntPtr]35, [IntPtr]::Zero)
-    $fsRect = $null
     $fsOk = Wait-Until {
         $r = Get-WinRect $script:main
-        if (($r.R - $r.L) -ge 2800) { $script:fsRect = $r; return $true }
-        return $false
+        $m = Get-MonitorRect $script:main
+        ($r.L -eq $m.L) -and ($r.T -eq $m.T) -and ($r.R -eq $m.R) -and ($r.B -eq $m.B)
     } 8000
     if ($fsOk) {
         Write-RectPtr $rectPtr 10 10 900 700
         [void][S79]::SendMessageW($main, 0x02E0, $wp144, $rectPtr)
         Start-Sleep -Milliseconds 400
         $r3 = Get-WinRect $main
+        $m3 = Get-MonitorRect $main
         Check 'S4.2 fullscreen window ignores the suggestion (keeps the cover)' (
-            $r3.L -eq $fsRect.L -and $r3.T -eq $fsRect.T -and
-            $r3.R -eq $fsRect.R -and $r3.B -eq $fsRect.B) (
+            $r3.L -eq $m3.L -and $r3.T -eq $m3.T -and
+            $r3.R -eq $m3.R -and $r3.B -eq $m3.B) (
             "rect=" + $r3.L + ',' + $r3.T + ',' + $r3.R + ',' + $r3.B + ' want=' +
-            $fsRect.L + ',' + $fsRect.T + ',' + $fsRect.R + ',' + $fsRect.B)
+            $m3.L + ',' + $m3.T + ',' + $m3.R + ',' + $m3.B)
         if ($red0) {
             $redFs = Wait-Until { Is-Red (Capture-Center $view) } 10000
             Check 'S4.3 fullscreen repaint path keeps the image rendered' $redFs ('center=' + ((Capture-Center $view) -join ','))
@@ -324,7 +338,8 @@ if ($adopted) {
         [void][S79]::SendMessageW($main, 0x0111, [IntPtr]35, [IntPtr]::Zero)  # exit fullscreen
         Wait-Until {
             $r = Get-WinRect $script:main
-            ($r.R - $r.L) -lt 2800
+            $m = Get-MonitorRect $script:main
+            ($r.L -ne $m.L) -or ($r.T -ne $m.T) -or ($r.R -ne $m.R) -or ($r.B -ne $m.B)
         } 8000 | Out-Null
     } else {
         Skip 'S4.2 fullscreen window ignores the suggestion' ('fullscreen did not take')
