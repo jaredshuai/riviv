@@ -5,6 +5,59 @@
 入库)。回归矩阵的其余脚本目前仍散落在 `%TEMP%\riviv-test\`(未纳入版本控
 制),待 #80「后台进程显示闸」重访时再评估批量入库。
 
+## smoke80-d2d.ps1 (#80 D2D renderer + -dump-viewport)
+
+Drives the #80 renderer stack (`renderer = auto|d2d|warp|gdi`) and the
+`-dump-viewport <path>` WM_CLOSE readback channel. Run:
+
+```text
+powershell -ExecutionPolicy Bypass -File smoke\smoke80-d2d.ps1
+powershell -ExecutionPolicy Bypass -File smoke\smoke80-d2d.ps1 -Exe <other build>
+```
+
+- ASCII-only PS 5.1 script (smoke78/79 discipline). Every instance runs from
+  a staged exe copy in `%TEMP%\riviv-80-smoke`; the staged ini is deleted
+  before EVERY launch (WM_CLOSE writes config back, so a leftover renderer
+  key would fake cross-scenario regressions). Close is always WM_CLOSE
+  (PostMessage to the owner): taskkill would skip the dump entirely.
+- The probe is `SetProcessDPIAware` (200% dev machine, smoke79 lesson).
+- stderr is captured per launch (`Start-Process -RedirectStandardError`);
+  the startup breadcrumb `riviv: renderer=<req> backend=<eff>` is the S1
+  assertion channel. Exit codes are read via `GetExitCodeProcess` on a raw
+  handle captured while the process is alive: PS 5.1 `Start-Process
+  -PassThru` objects lose `.Handle`/`.ExitCode` once the process exits.
+- Fixtures are built in-script: the giant-frame PNG (S5) is hand-written at
+  2^24+1 px wide because GDI+ refuses >65535 AND the gate threshold is a
+  runtime `GetMaximumBitmapSize()` query - 16385 is NOT giant on machines
+  where WARP reports 2^23 (measured value on the dev machine). The GIF (S6)
+  is hand-built (2 frames, 10 s delays, uncompressed-LZW recipe) because
+  this .NET's GDI+ `Encoder` lacks `FrameDelay`.
+- Summary line `SMOKE80 RESULT: PASS=N FAIL=M SKIP=K`; `FAIL > 0` exits 1,
+  and the stage dir with dump PNGs + stderr captures is kept as evidence.
+
+### Scene table
+
+| Scenario | Assertion | Notes |
+| --- | --- | --- |
+| S1a (gdi/d2d/warp/auto) | stderr breadcrumb `riviv: renderer=<req> backend=<eff>` per ini value | d2d/auto expect `d2d/hw` where hardware D3D11 exists; `warp` expects `d2d/warp` |
+| S1b | `renderer=frobnicate` -> `renderer=gdi backend=gdi` + `unrecognized renderer value` hint | invalid string value falls back to gdi |
+| S1c | missing key -> `renderer=gdi backend=gdi` | the default |
+| S2 | warp dump channel: adopted image + WM_CLOSE -> PNG on disk, exit 0, dims == view client rect | |
+| S3a-S3f | L0: the same 1:1 scene dumped through warp AND gdi | file bytes equal; non-white bbox == source rect at source size; every bbox pixel RGBA == source; both arms pixel-exact |
+| S4a-S4c | resize chain: after SetWindowPos the dump dims follow the NEW viewport while the 1:1 bbox stays the source size | swapchain ResizeBuffers + target rebuild |
+| S5a-S5c | giant gate: `exceeds the D2D max bitmap ... rendering it via gdi` stderr line after the startup breadcrumb; process alive; dump still succeeds, exit 0 | GDI fallback channel (paint gate tears the stack down) |
+| S6a-S6d | animation re-upload: dumps before/after `AnimationFrameStep` (cmd 100) differ; frame 0 = red, frame 1 = blue at 1:1 | frame_gen bump re-uploads |
+| S7a-S7b | rotation re-upload: after `EditRotate90` (cmd 23) the bbox swaps 120x80 -> 80x120 and the content equals the source rotated 90 CW | rotate bumps frame_gen |
+| S8a | minimized-start warp instance dumps the image (content-checked) at WM_CLOSE | the D2D dump renders from the CPU master inside the dump call - no Present, no WM_PAINT dependency |
+| S8b | gdi twin of S8 | SKIP by design (pre-existing background-paint gate, master-identical, smoke78 SKIP semantics); observed behavior recorded in the detail line |
+
+Known finding (2026-09-19): S3b fails on the letterbox ALPHA only - the
+warp dump writes A=255 everywhere (D2D `Clear`) while the gdi dump leaves
+the DIB-zeroed A=0 in the letterbox (GDI never writes the alpha byte;
+RGB is pixel-identical). The two dump arms are therefore not
+byte-identical in PNG form, which breaks the design's golden
+cross-arm comparison premise - adjudication pending.
+
 ## smoke79-dpi.ps1(#79 PerMonitorV2 DPI,专项)
 
 验证 DPI manifest 生效与 `WM_DPICHANGED` 布局链。运行方式:

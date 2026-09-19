@@ -474,8 +474,19 @@ pub(crate) fn dump_viewport_gdi(view: HWND, owner: HWND) -> Result<(u32, u32, Ve
     // SAFETY: `bits` points at exactly len readable bytes of the fresh
     // section (32bpp, top-down, tightly packed — the header above).
     let bgra = unsafe { std::slice::from_raw_parts(bits.cast::<u8>(), len) };
+    let mut bgra = bgra.to_vec();
+    // Force the alpha byte opaque (smoke80 S3b): GDI never writes a
+    // destination alpha — FillRect leaves the section's zero-initialized
+    // 0 in the letterbox while the blit copies the master's 255 — but the
+    // dump channel's contract is the fully opaque viewport BOTH arms
+    // render (the window has no transparency semantics), and the D2D arm
+    // writes 255 everywhere (Clear's a=1.0). Without this the two stacks'
+    // goldens differ in the letterbox alpha and byte comparison breaks.
+    for px in bgra.chunks_mut(4) {
+        px[3] = 255;
+    }
     let mut rgba = vec![0u8; len];
-    crate::pixels::bgra_to_rgba(bgra, &mut rgba);
+    crate::pixels::bgra_to_rgba(&bgra, &mut rgba);
     // SAFETY: restore the stock bitmap so the section is deletable, then
     // tear the DC down (the documented GDI order, as in surface.rs's Face).
     unsafe {
