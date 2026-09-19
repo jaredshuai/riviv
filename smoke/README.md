@@ -5,6 +5,36 @@
 入库)。回归矩阵的其余脚本目前仍散落在 `%TEMP%\riviv-test\`(未纳入版本控
 制),待 #80「后台进程显示闸」重访时再评估批量入库。
 
+## smoke79-dpi.ps1(#79 PerMonitorV2 DPI,专项)
+
+验证 DPI manifest 生效与 `WM_DPICHANGED` 布局链。运行方式:
+
+```text
+powershell -ExecutionPolicy Bypass -File smoke\smoke79-dpi.ps1
+powershell -ExecutionPolicy Bypass -File smoke\smoke79-dpi.ps1 -Exe <其他构建路径>
+```
+
+- 被测 exe 复制到 `%TEMP%\riviv-79-smoke` 暂存副本上跑(该目录同时生成
+  red512.png 断言素材),退出即清理,ini 永不落在真实构建旁。
+- **探针进程自身先 `SetProcessDPIAware()`**:本机 200% 缩放,unaware 探针的
+  几何读数会被 DPI 虚拟化折半,断言全错(2026-09-19 diag79 实证)。
+- **合成 `WM_DPICHANGED` 必须用 `SendMessage`**:`PostMessage` 对该消息被 OS
+  拒收(返回 FALSE,同日实证);SendMessage 跨线程投递由目标线程执行,建议
+  矩形指针在调用期天然有效。
+- 汇总行 `SMOKE79 RESULT: PASS=N FAIL=M SKIP=K`;`FAIL > 0` 时退出码 1。
+
+### 场景表
+
+| 场景 | 断言 | 说明 |
+| --- | --- | --- |
+| S1.1–S1.3 | manifest 读回 | exe 资源明文 XML 含 `PerMonitorV2`、`name="riviv"`、SMI/2016 命名空间(防空 manifest 静默回归成 unaware) |
+| S1.4 | 窗口出现 | FindWindowW 空标题须 `[NullString]::Value` |
+| S2.1 | 活窗上下文 = PMv2 | `GetWindowDpiAwarenessContext` 句柄是不透明值,必须 `AreDpiAwarenessContextsEqual` 比,不能拿 -4 直比 |
+| S2.2 | 窗口 DPI = 所在显示器有效 DPI | `GetDpiForWindow` 对 `GetDpiForMonitor`(per-monitor 语义本体) |
+| S3.1–S3.5 | 前置状态 | riviv_view/riviv_rebar 子窗存在;图像已渲染(PrintWindow flag2);视口铺满 chrome 之上;条带高 = `controls_height(系统 DPI)` |
+| S3.6–S3.11 | 合成 DPI 变更链 | SendMessage 投 144-DPI 建议矩形(1.5x 居中)→ 主窗逐字采纳 → #78 dock 链重跑(视口铺满新客户区、chrome 不变、条带仍系统 DPI)→ 视口仍 z 序最底(**`GW_HWNDNEXT` 才是「下方」,`GW_HWNDPREV` 是「上方」**)→ 图像仍渲染 → 再投 96-DPI 原矩形恢复 |
+| S3.3/S3.10/S3.12 | 渲染断言 | 依赖前台激活解除显示闸;闸未解除时输出 SKIP(同 smoke78 的 SKIP 语义),几何断言不受影响硬跑 |
+
 ## smoke78-view-child.ps1(#78 视口子 HWND,PR #86 专项)
 
 驱动 `riviv_view` 子窗的结构、消息路由与生命周期。运行方式:

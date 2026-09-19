@@ -32,9 +32,9 @@ use std::sync::Mutex;
 
 use windows::Win32::Foundation::{GetLastError, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    COLOR_BTNFACE, DEFAULT_GUI_FONT, GetDC, GetDeviceCaps, GetStockObject, GetSysColorBrush,
-    HBRUSH, HGDIOBJ, LOGPIXELSY, ReleaseDC,
+    COLOR_BTNFACE, DEFAULT_GUI_FONT, GetStockObject, GetSysColorBrush, HBRUSH, HGDIOBJ,
 };
+use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     EnableWindow, SetFocus, VK_DOWN, VK_NEXT, VK_PRIOR, VK_UP,
 };
@@ -468,13 +468,12 @@ fn on_size(dlg: HWND) {
         let button_wide = rect.right - rect.left;
         let button_high = rect.bottom - rect.top;
 
-        // os_logical_high — the system DPI (riviv is DPI-aware; the
-        // screen DC's LOGPIXELSY is the same number upstream stores).
-        // SAFETY (outer block): short-lived screen DC query, released
-        // before the layout continues.
-        let dc = GetDC(None);
-        let dpi = GetDeviceCaps(Some(dc), LOGPIXELSY).max(96);
-        let _ = ReleaseDC(None, dc);
+        // The dialog's own window DPI (#79): this is a TOP-LEVEL
+        // hand-built window — under PerMonitorV2 it follows whichever
+        // monitor it sits on, same source as its controls' creation-time
+        // metrics. The 96 floor is the pre-#79 failed-DC default.
+        // SAFETY (outer block): a per-window query on our own live window.
+        let dpi = GetDpiForWindow(dlg).max(96) as i32;
         let edge = 12 * dpi / 96;
         let gap = 6 * dpi / 96;
 

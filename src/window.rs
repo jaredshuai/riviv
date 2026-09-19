@@ -37,8 +37,8 @@ use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::Path;
 
 use windows::Win32::Foundation::{
-    ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, GetLastError, HMODULE, HWND, LPARAM, LRESULT, POINT,
-    RECT, SetLastError, WIN32_ERROR, WPARAM,
+    ERROR_ALREADY_EXISTS, GetLastError, HMODULE, HWND, LPARAM, LRESULT, POINT, RECT, SetLastError,
+    WIN32_ERROR, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
     COLOR_BTNFACE, GetMonitorInfoW, HBRUSH, InvalidateRect, MONITOR_DEFAULTTOPRIMARY, MONITORINFO,
@@ -64,6 +64,7 @@ use windows::Win32::UI::Controls::{
     ICC_BAR_CLASSES, ICC_STANDARD_CLASSES, ICC_WIN95_CLASSES, INITCOMMONCONTROLSEX,
     InitCommonControlsEx, NM_CLICK, NMHDR, NMMOUSE, SB_GETPARTS, WM_MOUSELEAVE,
 };
+use windows::Win32::UI::HiDpi::GetDpiForSystem;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetCapture, GetKeyNameTextW, GetKeyState, GetKeyboardLayout, MAPVK_VK_TO_VSC, MapVirtualKeyExW,
     ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_CONTROL, VK_ESCAPE,
@@ -85,20 +86,20 @@ use windows::Win32::UI::WindowsAndMessaging::{
     MB_ICONERROR, MB_ICONQUESTION, MB_OK, MENU_ITEM_FLAGS, MF_BYCOMMAND, MF_CHECKED, MF_ENABLED,
     MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MFT_RADIOCHECK, MINMAXINFO, MSG,
     MenuItemFromPoint, MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassExW,
-    SC_MONITORPOWER, SHOW_WINDOW_CMD, SM_CXICON, SM_CXSMICON, SM_CYICON, SM_CYSMICON, SW_MAXIMIZE,
-    SW_RESTORE, SW_SHOW, SW_SHOWNORMAL, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOCOPYBITS,
-    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SYSTEM_METRICS_INDEX, SendMessageW, SetCursorPos,
-    SetForegroundWindow, SetMenu, SetProcessDPIAware, SetTimer, SetWindowLongPtrW, SetWindowPos,
+    SC_MONITORPOWER, SHOW_WINDOW_CMD, SM_CXICON, SM_CXSMICON, SM_CYBORDER, SM_CYICON, SM_CYSMICON,
+    SW_MAXIMIZE, SW_RESTORE, SW_SHOW, SW_SHOWNORMAL, SWP_FRAMECHANGED, SWP_NOACTIVATE,
+    SWP_NOCOPYBITS, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SYSTEM_METRICS_INDEX, SendMessageW,
+    SetCursorPos, SetForegroundWindow, SetMenu, SetTimer, SetWindowLongPtrW, SetWindowPos,
     SetWindowTextW, ShowCursor, ShowWindow, TPM_CENTERALIGN, TPM_LEFTBUTTON, TPM_VCENTERALIGN,
     TrackPopupMenu, TranslateMessage, USER_TIMER_MINIMUM, WINDOW_EX_STYLE, WINDOW_STYLE,
-    WM_ACTIVATE, WM_COMMAND, WM_CONTEXTMENU, WM_COPYDATA, WM_DESTROY, WM_DROPFILES, WM_ENDSESSION,
-    WM_ERASEBKGND, WM_GETMINMAXINFO, WM_INITMENU, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_MOVE, WM_NCCREATE,
-    WM_NCDESTROY, WM_NCLBUTTONDOWN, WM_NCXBUTTONDBLCLK, WM_NCXBUTTONDOWN, WM_NOTIFY, WM_NULL,
-    WM_PAINT, WM_PASTE, WM_QUERYENDSESSION, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP,
-    WM_SIZE, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_TIMER, WM_XBUTTONDBLCLK, WM_XBUTTONDOWN, WNDCLASSEXW,
-    WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN, WS_EX_ACCEPTFILES, WS_OVERLAPPEDWINDOW, WS_POPUP,
-    WS_SYSMENU, WS_THICKFRAME, WS_VISIBLE, WindowFromPoint,
+    WM_ACTIVATE, WM_COMMAND, WM_CONTEXTMENU, WM_COPYDATA, WM_DESTROY, WM_DPICHANGED, WM_DROPFILES,
+    WM_ENDSESSION, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_INITMENU, WM_KEYDOWN, WM_LBUTTONDBLCLK,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_MOVE, WM_NCCREATE, WM_NCDESTROY, WM_NCLBUTTONDOWN, WM_NCXBUTTONDBLCLK, WM_NCXBUTTONDOWN,
+    WM_NOTIFY, WM_NULL, WM_PAINT, WM_PASTE, WM_QUERYENDSESSION, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN,
+    WM_RBUTTONUP, WM_SIZE, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_TIMER, WM_XBUTTONDBLCLK,
+    WM_XBUTTONDOWN, WNDCLASSEXW, WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN, WS_EX_ACCEPTFILES,
+    WS_OVERLAPPEDWINDOW, WS_POPUP, WS_SYSMENU, WS_THICKFRAME, WS_VISIBLE, WindowFromPoint,
 };
 use windows::core::{HSTRING, PCSTR, PCWSTR, PWSTR, w};
 
@@ -6507,6 +6508,16 @@ fn view_target_size(client: (i32, i32), chrome_h: i32) -> (i32, i32) {
     (client.0.max(0), (client.1 - chrome_h).max(0))
 }
 
+/// The rect a WM_DPICHANGED should resize the window to (#79): the
+/// system's suggested rect — already scaled for the new DPI — whenever the
+/// window is free-floating; `None` in fullscreen, where the monitor cover
+/// is the authoritative geometry and the suggestion (the current rect
+/// scaled by the DPI ratio) would un-cover a monitor whose pixel size
+/// didn't change with its scale factor.
+fn dpi_change_target_rect(fullscreen: bool, suggested: &RECT) -> Option<RECT> {
+    if fullscreen { None } else { Some(*suggested) }
+}
+
 fn on_size(hwnd: HWND) {
     // Upstream `_viv_on_size`'s first act (viv.c:1583-1615): track the
     // windowed rect for the config. Never iconic, never fullscreen; a
@@ -6739,6 +6750,58 @@ unsafe extern "system" fn wnd_proc(
         }
         WM_SIZE => {
             on_size(hwnd);
+            LRESULT(0)
+        }
+        WM_DPICHANGED => {
+            // PerMonitorV2 (#79): the window's monitor DPI changed (dragged
+            // across mixed-DPI monitors, or the scale factor changed).
+            // Adopt the system's suggested rect — already scaled for the
+            // new DPI — except in fullscreen, where the monitor cover is
+            // the authoritative geometry (the suggestion scales the
+            // CURRENT rect by the DPI ratio, wrong for a borderless cover
+            // when the monitor's pixel size didn't change with its scale
+            // factor); there a repaint is all that's needed. The
+            // SetWindowPos re-enters wnd_proc with WM_SIZE → on_size → the
+            // #78 layout chain unchanged (chrome first, the viewport child
+            // last and pinned HWND_BOTTOM). SWP_NOZORDER keeps this arm
+            // free of any z-order side effect (#80's invariant). The new
+            // DPI in wparam needs no store: chrome keeps system-DPI
+            // proportions on every monitor by design (issue #79's
+            // LOGPIXELS audit) and the image re-fits through on_size.
+            // SAFETY: lparam points to a RECT for the duration of the
+            // message (Win32 contract).
+            let suggested = unsafe { *(lparam.0 as *const RECT) };
+            // SAFETY: read-only state-pointer query on the live window;
+            // the borrow spans only the bool read.
+            let fullscreen = unsafe { state_of(hwnd) }
+                .map(|state| state.fullscreen)
+                .unwrap_or(false);
+            match dpi_change_target_rect(fullscreen, &suggested) {
+                Some(target) => {
+                    // SAFETY: hwnd is live; re-enters wnd_proc with WM_SIZE
+                    // — no borrow is live here. Fail-soft like the frame
+                    // rebuilds' unchecked SetWindowPos calls.
+                    unsafe {
+                        let _ = SetWindowPos(
+                            hwnd,
+                            None,
+                            target.left,
+                            target.top,
+                            target.right - target.left,
+                            target.bottom - target.top,
+                            SWP_NOZORDER | SWP_NOACTIVATE,
+                        );
+                    }
+                }
+                None => {
+                    // Fullscreen: the rect stays the monitor cover.
+                    // SAFETY: our live child-less client; invalidates the
+                    // whole client like other full repaints.
+                    unsafe {
+                        let _ = InvalidateRect(Some(hwnd), None, true);
+                    }
+                }
+            }
             LRESULT(0)
         }
         WM_MOVE => {
@@ -7310,25 +7373,19 @@ fn make_rect_completely_visible_core(rect: RECT, target: RECT, source: RECT) -> 
 /// from the system status font and border metrics; we reproduce that
 /// formula (border * 2 + font height) at the system DPI.
 fn initial_status_height() -> i32 {
-    // SAFETY: desktop DC queries on the calling thread.
-    unsafe {
-        let hdc = windows::Win32::Graphics::Gdi::GetDC(None);
-        if hdc.is_invalid() {
-            return 0;
-        }
-        let dpi = windows::Win32::Graphics::Gdi::GetDeviceCaps(
-            Some(hdc),
-            windows::Win32::Graphics::Gdi::LOGPIXELSY,
-        );
-        let _ = windows::Win32::Graphics::Gdi::ReleaseDC(None, hdc);
-        // Upstream's bar at 96 DPI is 22 px (SM_CYVTHUMB=20 + borders);
-        // scale from there — comctl32's own formula is font-height based
-        // and lands on the same value.
-        let border = windows::Win32::UI::WindowsAndMessaging::GetSystemMetrics(
-            windows::Win32::UI::WindowsAndMessaging::SM_CYBORDER,
-        );
-        ((20 * dpi) / 96) + border * 2
-    }
+    // System DPI — the bar this estimates is chrome, and chrome keeps
+    // system-DPI proportions on every monitor by design (#79's audit:
+    // the v5.82 status bar sizes itself from system-DPI defaults). The
+    // pre-#79 screen-DC read returned the same number; GetDpiForSystem
+    // says it without borrowing a DC.
+    // SAFETY: process-wide query on the calling thread.
+    let dpi = unsafe { GetDpiForSystem() }.max(96);
+    // SAFETY: read-only system-metric queries.
+    let border = unsafe { GetSystemMetrics(SM_CYBORDER) };
+    // Upstream's bar at 96 DPI is 22 px (SM_CYVTHUMB=20 + borders); scale
+    // from there — comctl32's own formula is font-height based and lands
+    // on the same value.
+    ((20 * dpi as i32) / 96) + border * 2
 }
 
 pub(crate) fn fatal(message: &str) -> ! {
@@ -7374,22 +7431,11 @@ fn load_icon_resource(
 }
 
 pub(crate) fn run() -> Result<(), String> {
-    // SAFETY: process-wide and must run before ANY DPI-sensitive query —
-    // a GetMonitorInfo/GetCursorPos-scale call while still unaware LOCKS
-    // the process into DPI virtualization and later SetProcessDPIAware
-    // calls fail with ERROR_ACCESS_DENIED (the config work's first-run
-    // rect queries monitors, so this leads everything; upstream gets the
-    // same guarantee from its manifest's dpiAware=true). ERROR_ACCESS_DENIED
-    // means the process is already DPI-aware — a success state; any other
-    // failure undermines the whole 1:1 / work-area geometry model, so fail
-    // loud (ADR 0001).
-    if !unsafe { SetProcessDPIAware() }.as_bool() {
-        // SAFETY: reading the thread's last error immediately after the failed call.
-        let gle = unsafe { GetLastError().0 };
-        if gle != ERROR_ACCESS_DENIED.0 {
-            return Err(format!("SetProcessDPIAware failed (GLE={gle})"));
-        }
-    }
+    // DPI awareness comes from the embedded manifest's PerMonitorV2 (#79,
+    // applied by the loader before any user code) — the old first-line
+    // SetProcessDPIAware and its "no DPI-sensitive query may run before
+    // awareness is set" ordering hazard are gone; the window receives
+    // WM_DPICHANGED when its monitor's DPI changes.
     // One-shot language detection (upstream `localization_init`, WinMain's
     // second call after `os_init`, viv.c:5158-5159). Before any window
     // exists so the very first title and status-bar text are in the right
@@ -8221,5 +8267,36 @@ mod tests {
         // run()) yields (0, 0) on both axes — never negative.
         assert_eq!(view_target_size((0, 0), 10), (0, 0));
         assert_eq!(view_target_size((-5, -5), 0), (0, 0));
+    }
+
+    // ---- WM_DPICHANGED rect adoption (#79) ----
+
+    #[test]
+    fn dpi_change_adopts_the_suggested_rect_verbatim_when_free_floating() {
+        // The system's suggestion is already scaled for the new DPI
+        // (anchored so the cursor stays proportionally placed): a windowed
+        // window adopts it byte-for-byte — no clamping, no re-anchoring.
+        let suggested = RECT {
+            left: 10,
+            top: 20,
+            right: 810,
+            bottom: 620,
+        };
+        assert_eq!(dpi_change_target_rect(false, &suggested), Some(suggested));
+    }
+
+    #[test]
+    fn dpi_change_keeps_the_monitor_cover_in_fullscreen() {
+        // The suggestion is the CURRENT rect scaled by the DPI ratio — for
+        // a borderless monitor cover that un-covers a monitor whose pixel
+        // size didn't change with its scale factor, so fullscreen ignores
+        // it and keeps the cover.
+        let suggested = RECT {
+            left: 0,
+            top: 0,
+            right: 2880,
+            bottom: 1620,
+        };
+        assert_eq!(dpi_change_target_rect(true, &suggested), None);
     }
 }
