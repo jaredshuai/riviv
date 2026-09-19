@@ -22,7 +22,7 @@ use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM}
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BeginPaint, COLOR_3DHIGHLIGHT, COLOR_3DSHADOW,
     COLOR_BTNFACE, CreateBitmap, CreateDIBSection, DIB_RGB_COLORS, DeleteObject, EndPaint,
-    FillRect, GetDC, GetDeviceCaps, HBITMAP, LOGPIXELSX, PAINTSTRUCT,
+    FillRect, HBITMAP, PAINTSTRUCT,
 };
 use windows::Win32::UI::Controls::{
     CCS_NODIVIDER, CCS_NORESIZE, CCS_TOP, CDDS_PREPAINT, CDRF_NOTIFYITEMDRAW, HIMAGELIST,
@@ -33,6 +33,7 @@ use windows::Win32::UI::Controls::{
     TBSTYLE_EX_HIDECLIPPEDBUTTONS, TBSTYLE_EX_MIXEDBUTTONS, TBSTYLE_FLAT, TBSTYLE_GROUP,
     TBSTYLE_LIST, TBSTYLE_SEP, TBSTYLE_TOOLTIPS, TBSTYLE_TRANSPARENT, TOOLBARCLASSNAME,
 };
+use windows::Win32::UI::HiDpi::GetDpiForSystem;
 use windows::Win32::UI::WindowsAndMessaging::{
     CS_DBLCLKS, CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetDlgItem, HMENU,
     IDC_ARROW, LoadCursorW, RegisterClassExW, SendMessageW, WINDOW_EX_STYLE, WINDOW_STYLE,
@@ -60,7 +61,7 @@ const REBAR_CLASS: PCWSTR = w!("riviv_rebar");
 
 /// The strip's height while shown (upstream `_viv_get_controls_high`,
 /// viv.c:11441-11447): a FIXED `32 * logical / 96` — never measured from
-/// the window. `dpi` is the process LOGPIXELSX (96 at 100%, 192 at 200%).
+/// the window. `dpi` is the system DPI (96 at 100%, 192 at 200%).
 pub(crate) fn controls_height(dpi: i32) -> i32 {
     (32 * dpi) / 96
 }
@@ -250,26 +251,26 @@ pub(crate) fn glyph_mask(glyph: Glyph, size: i32) -> Vec<bool> {
 
 // ---- Win32 shell --------------------------------------------------------
 
-/// The process logical DPI, read once like upstream's `os_logical_wide`
-/// (os.c:817-818, captured during init and never re-read). riviv goes
-/// DPI-aware before any window exists, so the screen DC reports the real
-/// value; a failed DC falls back to 96 exactly like the upstream default.
+/// The system DPI, read once like upstream's `os_logical_wide` (os.c:817-
+/// 818, captured during init and never re-read). Chrome keeps system-DPI
+/// proportions on EVERY monitor by design (#79's LOGPIXELS audit: the
+/// strip-height formula and the image-list cell must share one DPI source
+/// or the buttons desync from the strip — PerMonitorV2 changes the IMAGE
+/// viewport's per-monitor exactness, not chrome's proportions). The
+/// pre-#79 screen-DC read returned this same number; the 96 floor keeps
+/// the old failed-DC default. (This once-only freeze next to status.rs's
+/// per-refresh read is the same split master had — and if the system DPI
+/// ever changes mid-run, the strip freezing while the part math re-reads
+/// is the smaller evil than the buttons desyncing from their cells.)
 pub(crate) fn logical_dpi() -> i32 {
     static DPI: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
     *DPI.get_or_init(|| {
-        // SAFETY: GetDC(None) borrows the shared screen DC and the paired
-        // ReleaseDC returns it in the same scope; both calls are
-        // process-wide queries with no caller-owned inputs.
-        unsafe {
-            let dc = GetDC(None);
-            let dpi = if dc.is_invalid() {
-                96
-            } else {
-                GetDeviceCaps(Some(dc), LOGPIXELSX)
-            };
-            let _ = windows::Win32::Graphics::Gdi::ReleaseDC(None, dc);
-            dpi
-        }
+        // SAFETY: resolved in the CALLING THREAD's DPI context — GetDpiForSystem
+        // is only "process-wide" for aware threads (an unaware thread would
+        // read 96). riviv never switches a thread's context, so the PMv2
+        // default (self-checked at startup in window::run) makes this the
+        // real system DPI; the 96 floor only guards a failed (0) return.
+        unsafe { GetDpiForSystem() as i32 }.max(96)
     })
 }
 

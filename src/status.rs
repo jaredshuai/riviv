@@ -13,11 +13,12 @@
 
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    GetDC, GetDeviceCaps, GetTextExtentPoint32W, HDC, HGDIOBJ, LOGPIXELSY, ReleaseDC, SelectObject,
+    GetDC, GetTextExtentPoint32W, HDC, HGDIOBJ, ReleaseDC, SelectObject,
 };
 use windows::Win32::UI::Controls::{
     SB_GETPARTS, SB_GETRECT, SB_SETPARTS, SB_SETTEXTW, SBARS_SIZEGRIP,
 };
+use windows::Win32::UI::HiDpi::GetDpiForSystem;
 use windows::Win32::UI::WindowsAndMessaging::{
     CallWindowProcW, CreateWindowExW, GWL_WNDPROC, GetSystemMetrics, GetWindowRect, HMENU,
     SM_CXBORDER, SM_CXEDGE, SM_CXVSCROLL, SendMessageW, SetWindowLongPtrW, WINDOW_STYLE,
@@ -275,17 +276,17 @@ pub(crate) fn update(hwnd: HWND, snapshot: &StatusSnapshot) {
     // the DC is borrowed for the measurements and released before the
     // function returns.
     unsafe {
-        // System DPI from the desktop DC (the process is system-DPI-aware
-        // — SetProcessDPIAware in window::run — so one reading covers the
-        // bar; upstream reads LOGPIXELSX from its os DC, os.c:817).
-        let screen = GetDC(None);
-        let dpi = if screen.is_invalid() {
-            96
-        } else {
-            let d = GetDeviceCaps(Some(screen), LOGPIXELSY);
-            let _ = ReleaseDC(None, screen);
-            d as u32
-        };
+        // System DPI by design (#79's LOGPIXELS audit): the part-width
+        // formulas serve this v5.82 bar, whose font is system-DPI — so the
+        // scaling source matches the thing being measured on every
+        // monitor (upstream reads the same number from its os DC,
+        // os.c:818; the pre-#79 screen-DC read returned this value).
+        // SAFETY: resolved in the CALLING THREAD's DPI context — GetDpiForSystem
+        // is only "process-wide" for aware threads (an unaware thread would
+        // read 96). The UI thread's PMv2 default (checked at startup in
+        // window::run) makes this the real system DPI; the 96 floor only
+        // guards a failed (0) return.
+        let dpi = GetDpiForSystem().max(96);
         let hdc = GetDC(Some(hwnd));
         if hdc.is_invalid() {
             // Fail-soft: without the control's DC the texts cannot be
