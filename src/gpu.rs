@@ -812,6 +812,19 @@ pub(crate) fn paint_d2d(view: HWND, owner: HWND) -> PaintOutcome {
         unsafe {
             let _ = ValidateRect(Some(view), None);
         }
+        // The #76 handshake fires here too (pre-review 3-a): the GDI arm's
+        // iconic paint still runs its body and releases the worker's held
+        // frame — skipping it here would park the decode at the 5 s cap and
+        // delay an animation adopted while minimized (an arm divergence,
+        // not a D2D constraint: "rendered" for the handshake's purpose
+        // means "the adoption was consumed by a paint", iconic included).
+        // SAFETY: the borrow spans the signal take and notify; nothing
+        // pumps.
+        if let Some(signal) = unsafe { state_of(owner) }.and_then(|s| s.paint_signal.take()) {
+            let (lock, cvar) = &*signal;
+            *lock.lock().unwrap() = true;
+            cvar.notify_all();
+        }
         return PaintOutcome::Painted;
     }
     // SAFETY: BeginPaint/EndPaint bracket the whole draw; the state borrow

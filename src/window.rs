@@ -399,6 +399,12 @@ pub(crate) struct WindowState {
     /// stack rebuild is due only when a NEW image has since bumped the
     /// counter — same-image paints must not churn the device stack.
     pub(crate) gpu_gate_gen: u64,
+    /// The last shape the giant-frame gate flashed for (sorted dims;
+    /// #80 pre-review 3-b): the status notice is one-shot per DISTINCT
+    /// oversized image, so the gen-bump churn pathology (a giant animation
+    /// rebuilding the stack every frame) cannot park the temp text
+    /// permanently over the status verdict chain.
+    pub(crate) gpu_gate_flashed: Option<(u32, u32)>,
     /// One-way latch: the stack creation failed for environment reasons —
     /// no auto rebuild attempts (each would just fail again; design §7's
     /// initialization tier).
@@ -1158,19 +1164,33 @@ fn gpu_rebuild_if_due(view: HWND, owner: HWND) {
 /// The giant-image gate's teardown (#80 design §5): the frame cannot be a
 /// D2D bitmap, so the stack dies and THIS frame renders through GDI (the
 /// flip interop ban forbids GDI on the swapchain's HWND, so a same-HWND
-/// hybrid is not an option). One stderr line + one status flash per
-/// oversized image; the next new image rebuilds via gpu_rebuild_if_due.
+/// hybrid is not an option). The status flash is one-shot per DISTINCT
+/// oversized image (sorted dims — a rotate of the same giant frame swaps
+/// them): the gen-bump churn pathology (a giant ANIMATION rebuilding the
+/// stack per frame, pre-review 3-b) would otherwise re-flash every cycle
+/// and the 3 s temp text would sit permanently over the status verdict
+/// chain. The stderr breadcrumb still fires on every teardown (the
+/// evidence channel has no masking problem); the next new image rebuilds
+/// via gpu_rebuild_if_due.
 fn gpu_giant_frame(view: HWND, owner: HWND, wide: u32, high: u32, max: u32) {
-    // SAFETY: the borrow spans the teardown and the two flag stores.
+    // Sorted so a rotated giant frame is still "the same image".
+    let shape = (wide.min(high), wide.max(high));
+    let mut flash = false;
+    // SAFETY: the borrow spans the teardown and the flag stores only —
+    // paint_degraded below re-borrows, so it runs after this block.
     if let Some(state) = unsafe { state_of(owner) } {
         state.gpu = None;
         state.gpu_gate_gen = state.frame_gen;
+        flash = state.gpu_gate_flashed != Some(shape);
+        state.gpu_gate_flashed = Some(shape);
     }
     eprintln!("riviv: frame {wide}x{high} exceeds the D2D max bitmap {max}; rendering it via gdi");
-    status_set_temp_text(
-        owner,
-        Some("frame too large for d2d — using gdi".to_string()),
-    );
+    if flash {
+        status_set_temp_text(
+            owner,
+            Some("frame too large for d2d — using gdi".to_string()),
+        );
+    }
     crate::paint::paint_degraded(view, owner);
 }
 
@@ -3988,10 +4008,11 @@ fn on_slideshow_timer(hwnd: HWND) {
             // The walk reached the list end. Exit exactly like File→Exit
             // (WM_DESTROY saves the config and quits the pump); the
             // WM_TIMER dispatch touches no state after this handler
-            // returns.
-            // SAFETY: legal on the owning thread; synchronously runs
-            // WM_DESTROY/WM_NCDESTROY with no borrow live.
-            let _ = unsafe { DestroyWindow(hwnd) };
+            // returns. on_close (not bare DestroyWindow) so an armed
+            // -dump-viewport still lands its PNG on THIS close path too
+            // (#80 pre-review 3-c: the slideshow tail used to bypass the
+            // dump).
+            on_close(hwnd);
         } else if !close_armed {
             nav_next(hwnd, false, false, false, false);
         }
@@ -6053,9 +6074,11 @@ fn on_command(hwnd: HWND, cmd: menu::Cmd) {
         menu::Cmd::FileExit => {
             // Upstream `_viv_exit` (viv.c:1883-1888) saves the config and
             // quits the pump; riviv's WM_DESTROY does both on the way out.
-            // SAFETY: legal on the owning thread; synchronously runs
-            // WM_DESTROY/WM_NCDESTROY with no borrow live.
-            let _ = unsafe { DestroyWindow(hwnd) };
+            // on_close (not bare DestroyWindow) so an armed -dump-viewport
+            // still lands its PNG on THIS close path too (#80 pre-review
+            // 3-c); without the switch armed on_close is exactly
+            // DestroyWindow.
+            on_close(hwnd);
         }
         // The Edit → clipboard family (#41; upstream viv.c:2335-2353, the
         // same order).
@@ -8183,6 +8206,7 @@ pub(crate) fn run() -> Result<(), String> {
         gpu_kind: crate::config::RendererKind::Gdi,
         frame_gen: 0,
         gpu_gate_gen: 0,
+        gpu_gate_flashed: None,
         gpu_failures: Vec::new(),
         gpu_init_failed: false,
         gpu_pending_fatal: false,
