@@ -25,6 +25,21 @@ pub(crate) fn rgba8_to_bgra_in_place(buf: &mut [u8]) {
     }
 }
 
+/// The dump channels' swizzle (#80): packed top-down BGRA rows (a DIB
+/// section the dump owns, or a D2D CPU-read mapping flattened row by row)
+/// into RGBA for `image::RgbaImage`. `src` and `dst` hold the same byte
+/// count; alpha passes through (both stacks render opaque frames — the
+/// master invariant).
+pub(crate) fn bgra_to_rgba(src: &[u8], dst: &mut [u8]) {
+    let (src_px, src_tail) = src.as_chunks::<4>();
+    let (dst_px, dst_tail) = dst.as_chunks_mut::<4>();
+    debug_assert!(src_tail.is_empty() && dst_tail.is_empty());
+    debug_assert_eq!(src_px.len(), dst_px.len());
+    for (d, s) in dst_px.iter_mut().zip(src_px) {
+        *d = [s[2], s[1], s[0], s[3]];
+    }
+}
+
 /// Composite RGBA pixels over `bg`, forcing alpha to opaque: the DIB render
 /// path (StretchBlt SRCCOPY) has no alpha channel of its own, so transparent
 /// pixels must be resolved against the windowed background at decode time —
@@ -189,6 +204,27 @@ mod tests {
         let mut pixels = vec![10, 20, 30, 255, 1, 2, 3, 128];
         rgba8_to_bgra_in_place(&mut pixels);
         assert_eq!(pixels, vec![30, 20, 10, 255, 3, 2, 1, 128]);
+    }
+
+    #[test]
+    fn bgra_to_rgba_swizzles_rows_and_keeps_alpha() {
+        // The dump swizzle: [B,G,R,A] rows become [R,G,B,A]; alpha rides
+        // along untouched (both dump arms render opaque frames).
+        let src = vec![30, 20, 10, 255, 3, 2, 1, 128];
+        let mut dst = vec![0u8; src.len()];
+        bgra_to_rgba(&src, &mut dst);
+        assert_eq!(dst, vec![10, 20, 30, 255, 1, 2, 3, 128]);
+    }
+
+    #[test]
+    fn bgra_to_rgba_is_the_in_place_swatch_inverse() {
+        // Chaining the two swizzles restores any pixel row byte for byte
+        // (the golden A/B compare leans on this symmetry).
+        let src = vec![7u8, 8, 9, 250, 1, 2, 3, 255];
+        let mut mid = vec![0u8; src.len()];
+        bgra_to_rgba(&src, &mut mid);
+        rgba8_to_bgra_in_place(&mut mid);
+        assert_eq!(mid, src);
     }
 
     #[test]

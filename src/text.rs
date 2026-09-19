@@ -172,11 +172,15 @@ pub(crate) fn thousands_grouped(n: u64) -> String {
 /// Dimension part: `W x H (N KB)` — file size ceiled to KB and
 /// thousands-grouped (viv.c:11132-11181). The size clause is omitted when
 /// no file is attached to the display (unknown size); nothing at all is
-/// shown when no image is displayed.
+/// shown when no image is displayed. `backend` (#80) appends the effective
+/// D2D backend as a suffix (` d2d/hw` / ` d2d/warp`) — the suffix is part
+/// of the measured width (the caller measures the composed string);
+/// `None` (the gdi baseline) keeps the text byte-identical to upstream.
 pub(crate) fn status_dimension_text(
     wide: Option<i32>,
     high: Option<i32>,
     file_bytes: Option<u64>,
+    backend: Option<&str>,
 ) -> String {
     let (Some(w), Some(h)) = (wide, high) else {
         return String::new();
@@ -187,6 +191,10 @@ pub(crate) fn status_dimension_text(
     {
         let kb = bytes.div_ceil(1024);
         text.push_str(&format!(" ({} KB)", thousands_grouped(kb)));
+    }
+    if let Some(backend) = backend {
+        text.push(' ');
+        text.push_str(backend);
     }
     text
 }
@@ -496,35 +504,55 @@ mod tests {
     #[test]
     fn dimension_text_pairs_size_with_grouped_kilobytes() {
         // viv.c:11132-11181: plain W x H, size ceiled to KB, KB grouped.
+        // The gdi baseline passes no backend — the text is upstream's
+        // byte-for-byte.
         assert_eq!(
-            status_dimension_text(Some(1920), Some(1080), Some(1_263_616)),
+            status_dimension_text(Some(1920), Some(1080), Some(1_263_616), None),
             "1920 x 1080 (1,234 KB)"
         );
         assert_eq!(
-            status_dimension_text(Some(800), Some(600), Some(1)),
+            status_dimension_text(Some(800), Some(600), Some(1), None),
             "800 x 600 (1 KB)",
             "sub-KB files ceil up to 1 KB"
         );
         assert_eq!(
-            status_dimension_text(Some(800), Some(600), Some(1024)),
+            status_dimension_text(Some(800), Some(600), Some(1024), None),
             "800 x 600 (1 KB)",
             "an exact KB is not rounded up"
         );
     }
 
     #[test]
+    fn dimension_text_appends_the_d2d_backend_suffix() {
+        // #80: the effective D2D backend rides the dimension part (the
+        // "which renderer was live" ticket evidence); gdi shows nothing.
+        assert_eq!(
+            status_dimension_text(Some(640), Some(480), None, Some("d2d/hw")),
+            "640 x 480 d2d/hw"
+        );
+        assert_eq!(
+            status_dimension_text(Some(640), Some(480), Some(2048), Some("d2d/warp")),
+            "640 x 480 (2 KB) d2d/warp",
+            "the suffix trails the size clause"
+        );
+    }
+
+    #[test]
     fn dimension_text_omits_unknown_size_and_blank_without_image() {
         assert_eq!(
-            status_dimension_text(Some(1920), Some(1080), None),
+            status_dimension_text(Some(1920), Some(1080), None, None),
             "1920 x 1080"
         );
         assert_eq!(
-            status_dimension_text(Some(1920), Some(1080), Some(0)),
+            status_dimension_text(Some(1920), Some(1080), Some(0), None),
             "1920 x 1080",
             "upstream skips a zero size (viv.c:11152)"
         );
-        assert_eq!(status_dimension_text(None, None, Some(5)), "");
-        assert_eq!(status_dimension_text(None, None, None), "");
+        assert_eq!(
+            status_dimension_text(None, None, Some(5), Some("d2d/hw")),
+            ""
+        );
+        assert_eq!(status_dimension_text(None, None, None, None), "");
     }
 
     #[test]
