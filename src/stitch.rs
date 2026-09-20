@@ -12,30 +12,58 @@
 //! dest rect exactly — no gaps, no overlap (only per-tile resampler phase,
 //! which upstream accepts; viv.c:14233-14235).
 //!
-//! This module is the pure math. Its GDI-shell consumer was mip
+//! This module is the pure math. Its original GDI-shell consumer was mip
 //! generation in `surface.rs`, deleted with the #81 mip retirement
-//! (ADR 0002 D7); the partition math is retained because #82's giant-image
-//! tiling explicitly reuses it. Paint never tiles: since #81 shrink
-//! sources are the full-resolution face, and any ≥32768-extent shrink
-//! takes upstream's own no-mip clip-region shape instead (viv.c:4264-4283,
-//! the HALFTONE path must NOT be cut — filter alignment, viv.c:4253-4257)
-//! while magnify is viewport-clipped before blitting (#7's `clip_blit`).
+//! (ADR 0002 D7); the partition math survives because #82's giant-image
+//! tiling explicitly reuses it — and #81's own paint path already reuses
+//! the sized variant twice for the extreme-source regime: since #81
+//! shrink sources are the full-resolution face, a source extent past
+//! [`STRETCH_SOURCE_STITCH_TRIGGER`] cannot be stretched in one call (the
+//! giant-panorama black image), so paint builds a transient relief
+//! intermediate through 512-px slices (upstream's own generation tiling)
+//! and keeps 2^21 sliced blits as the allocation-failure degrade. Milder
+//! ≥32768-extent shrinks keep upstream's own no-mip clip-region shape
+//! (viv.c:4264-4283, the HALFTONE path must NOT be cut — filter
+//! alignment, viv.c:4253-4257) and magnify is viewport-clipped before
+//! blitting (#7's `clip_blit`).
 
 use crate::zoom::BlitRect;
 
 /// Source tile edge in px (upstream `_VIV_STRETCH_BLT_STITCH_SIZE`,
 /// viv.c:288). Must satisfy `TILE * 3.1 * 16 < 32768` so one tile's dest
 /// extent can never hit the StretchBlt limit under max zoom + pan.
-#[allow(dead_code)] // its caller (mip generation) died with #81; #82's tiling reuses it
 pub(crate) const STITCH_TILE_SIZE: i32 = 512;
 
 /// The StretchBlt extent limit that forces the tiled path (upstream's
 /// `< 32768` fast-path test, viv.c:14933).
 pub(crate) const STRETCH_EXTENT_LIMIT: i32 = 32768;
 
+/// The SOURCE-extent regime boundary that forces the #81 giant-relief
+/// paint (see `surface::build_giant_relief`). Empirical, this machine
+/// (Win11 GDI, #81 smoke census): a single full-rect StretchBlt renders
+/// from a 40000x256 and a 4,000,000x1 face, sliced 2^21 blits render from
+/// faces up to 6,291,456 wide, but on a 8,388,608-wide (2^23) face even
+/// 2^21-wide slice calls silently fail (the classic giant-panorama black
+/// image; the failure tracks the FACE WIDTH, not the per-call rect) —
+/// only 512-px slices read such faces (exactly upstream's generation
+/// tiling, which pre-#81 used to build mips from them). Upstream never
+/// single-blits these sources at paint (its mip chain keeps paint sources
+/// small); riviv's #81 face-direct path meets them head-on, so paint
+/// builds a transient relief intermediate instead.
+pub(crate) const STRETCH_SOURCE_STITCH_TRIGGER: i32 = 1 << 22; // 4,194,304
+
+/// The source slice edge of the sliced-blit DEGRADE path (the fallback
+/// when the relief intermediate cannot be allocated): per-call source
+/// extents ≤ 2^21 render from faces in the trigger band (proven up to
+/// 6,291,456 wide); past 2^23-wide faces even these fail, which is why
+/// the relief is the primary path.
+pub(crate) const STRETCH_SOURCE_SLICE: i32 = 1 << 21; // 2,097,152
+
 /// Decompose `blit` into source-tiled pieces whose dst rects tile the
 /// original dst rect exactly, culling everything outside `clip`
-/// (an `(x, y, w, h)` viewport rect).
+/// (an `(x, y, w, h)` viewport rect). `tile` is the source tile edge
+/// (upstream's fixed 512; the #81 sliced paint passes
+/// [`STRETCH_SOURCE_SLICE`]).
 ///
 /// Faithful to viv.c:14933-15014 including its asymmetries: the row guard
 /// is `dst_y2 >= clip_y` (INCLUSIVE — a row whose bottom edge sits exactly
@@ -50,8 +78,11 @@ pub(crate) const STRETCH_EXTENT_LIMIT: i32 = 32768;
 /// zero-extent StretchBlt and abort the whole chain on its failure
 /// (viv.c:14999-15002 returns FALSE) — a latent upstream defect this port
 /// deliberately does not carry (review finding, PR #18).
-#[allow(dead_code)] // its caller (mip generation) died with #81; #82's tiling reuses it
-pub(crate) fn stitch_tiles(blit: BlitRect, clip: (i32, i32, i32, i32)) -> Vec<BlitRect> {
+pub(crate) fn stitch_tiles_sized(
+    tile: i32,
+    blit: BlitRect,
+    clip: (i32, i32, i32, i32),
+) -> Vec<BlitRect> {
     let BlitRect {
         dx,
         dy,
@@ -90,7 +121,7 @@ pub(crate) fn stitch_tiles(blit: BlitRect, clip: (i32, i32, i32, i32)) -> Vec<Bl
         if dst_y >= clip_bottom {
             break;
         }
-        let src_high = src_yrun.min(STITCH_TILE_SIZE);
+        let src_high = src_yrun.min(tile);
         // The projection maps the source RECT [sy, sy+sh) onto [dy, dy+dh),
         // so tile edges are measured from the rect origin — upstream's
         // absolute form (viv.c:14964: (src_y + src_high)*hDest/hSrc) is
@@ -104,7 +135,7 @@ pub(crate) fn stitch_tiles(blit: BlitRect, clip: (i32, i32, i32, i32)) -> Vec<Bl
             let mut src_x = sx;
             let mut src_xrun = w_src;
             while src_xrun > 0 {
-                let src_wide = src_xrun.min(STITCH_TILE_SIZE);
+                let src_wide = src_xrun.min(tile);
                 let dst_x2 = (i64::from(src_x + src_wide - sx) * i64::from(w_dest)
                     / i64::from(w_src)
                     + i64::from(dx)) as i32;
@@ -134,6 +165,14 @@ pub(crate) fn stitch_tiles(blit: BlitRect, clip: (i32, i32, i32, i32)) -> Vec<Bl
         src_yrun -= src_high;
     }
     tiles
+}
+
+/// Upstream's fixed 512-px tiling — the [`stitch_tiles_sized`] call the
+/// #82 tiling will make (`#allow` until then; the tests keep the math
+/// pinned meanwhile).
+#[allow(dead_code)] // #82's tiling reuses it
+pub(crate) fn stitch_tiles(blit: BlitRect, clip: (i32, i32, i32, i32)) -> Vec<BlitRect> {
+    stitch_tiles_sized(STITCH_TILE_SIZE, blit, clip)
 }
 
 #[cfg(test)]
@@ -310,5 +349,57 @@ mod tests {
         // 32767 everywhere: still a single tile (the limit is strict <).
         let tiles = stitch_tiles(blit(32767, 32767, 32767, 32767), (0, 0, 32767, 32767));
         assert_eq!(tiles.len(), 1);
+    }
+
+    // ---- stitch_tiles_sized (#81's extreme-source sliced paint) ----
+
+    #[test]
+    fn a_custom_slice_edges_cuts_the_same_exact_partition() {
+        // The #81 sliced paint's shape: a 16,777,217-wide fit-shrink into
+        // ~1000 px, cut into 2^21 slices — 8 full slices plus a 1-px tail
+        // (16777217 = 8*2^21 + 1) whose dest run is the final pixel.
+        // Every per-slice SOURCE extent stays ≤ 2^21 (the proven-good
+        // single-blit band) and the dst runs still partition the dest.
+        let whole = blit(1000, 1, 16777217, 1);
+        let tiles = stitch_tiles_sized(STRETCH_SOURCE_SLICE, whole, (0, 0, 1000, 1));
+        assert_eq!(tiles.len(), 9);
+        assert_eq!(tiles[0].sw, STRETCH_SOURCE_SLICE);
+        assert_eq!(tiles[7].sx, 7 * STRETCH_SOURCE_SLICE);
+        assert_eq!(tiles[7].sw, STRETCH_SOURCE_SLICE);
+        assert_eq!(tiles.last().unwrap().sx, 8 * STRETCH_SOURCE_SLICE);
+        assert_eq!(
+            tiles.last().unwrap().sw,
+            16777217 - 8 * STRETCH_SOURCE_SLICE
+        );
+        let mut prev_right = 0;
+        for t in &tiles {
+            assert!(t.sw <= STRETCH_SOURCE_SLICE);
+            assert!(t.dw >= 1, "a zero-area slice would have been dropped");
+            assert_eq!(t.dx, prev_right);
+            prev_right = t.dx + t.dw;
+        }
+        assert_eq!(prev_right, 1000);
+    }
+
+    #[test]
+    fn the_delegation_keeps_upstreams_512_tiling_byte_for_byte() {
+        // stitch_tiles(blit, clip) is exactly the 512-px sized call — the
+        // #82 tiling will consume this identity.
+        let b = blit(2000, 16, 40000, 256);
+        assert_eq!(
+            stitch_tiles(b, (0, 0, 2000, 16)),
+            stitch_tiles_sized(STITCH_TILE_SIZE, b, (0, 0, 2000, 16))
+        );
+    }
+
+    #[test]
+    fn the_extreme_source_constants_stay_a_factor_two_apart() {
+        // Trigger at 2^22, slices of 2^21: anything that enters the sliced
+        // regime is cut to at most half the trigger — every API call lands
+        // inside the proven-good band with margin (the empirical basis:
+        // 4M-wide single blits render, 2^23-wide ones go black).
+        assert_eq!(STRETCH_SOURCE_STITCH_TRIGGER, 1 << 22);
+        assert_eq!(STRETCH_SOURCE_SLICE, 1 << 21);
+        assert_eq!(STRETCH_SOURCE_STITCH_TRIGGER, STRETCH_SOURCE_SLICE * 2);
     }
 }

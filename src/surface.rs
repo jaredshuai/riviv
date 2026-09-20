@@ -26,7 +26,8 @@ use std::mem::size_of;
 use windows::Win32::Foundation::GetLastError;
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS,
-    DeleteDC, DeleteObject, HBITMAP, HDC, HGDIOBJ, SelectObject,
+    DeleteDC, DeleteObject, HALFTONE, HBITMAP, HDC, HGDIOBJ, SRCCOPY, SelectObject,
+    SetStretchBltMode, StretchBlt,
 };
 
 use crate::pixels::{PixelFrame, rotate_bgra_90_cw, rotate_bgra_270_cw};
@@ -103,6 +104,137 @@ impl Drop for Face {
             let _ = DeleteObject(HGDIOBJ(self.bitmap.0));
         }
     }
+}
+
+/// The transient intermediate an extreme-source giant's paint draws from
+/// (#81, ADR 0002 D7's transition until #82's tiling). A face whose max
+/// dimension reaches [`crate::stitch::STRETCH_SOURCE_STITCH_TRIGGER`]
+/// cannot be stretched by a single full-rect call NOR by wide slice calls
+/// (the #81 smoke census: 2^21 slices render from faces up to 6,291,456
+/// wide and fail on 2^23-wide ones — the failure tracks the FACE width;
+/// only 512-px slices read such faces, exactly the tiling upstream's mip
+/// generation always used for them). So paint builds this relief ONCE per
+/// paint: a fresh DIB sized ≤ 2^21 on its max axis, filled from the face
+/// through [`crate::stitch::stitch_tiles_sized`] 512-px slices in HALFTONE
+/// (upstream's generation mode, viv.c:14231), then the scene's ONE blit
+/// runs from the relief. Transient by design — no chain, no cache, no
+/// budget: the escape-arm doctrine until #82's D2D tiling owns giants.
+pub(crate) struct GiantRelief {
+    bitmap: HBITMAP,
+    /// The relief's DC with the relief DIB selected — the paint blit's
+    /// source. Valid for the struct's lifetime.
+    pub(crate) memdc: HDC,
+    stock: HGDIOBJ,
+    /// The relief's dimensions (the blit's source extents).
+    pub(crate) wide: i32,
+    pub(crate) high: i32,
+}
+
+impl Drop for GiantRelief {
+    fn drop(&mut self) {
+        // SAFETY: we exclusively own the relief; restoring the DC's stock
+        // bitmap before deleting it and then deleting the deselected DIB
+        // is the documented GDI teardown order.
+        unsafe {
+            let _ = SelectObject(self.memdc, self.stock);
+            let _ = DeleteDC(self.memdc);
+            let _ = DeleteObject(HGDIOBJ(self.bitmap.0));
+        }
+    }
+}
+
+/// Build the [`GiantRelief`] for a `mw x mh` face selected at `src_dc`.
+/// The divisor is the power of two that lands the relief's max axis at or
+/// under `STRETCH_SOURCE_STITCH_TRIGGER / 2` (2^21) — inside the band a
+/// single full-rect blit is proven to render from. Every failure cleans
+/// up what it took and returns `None` (the caller degrades to sliced
+/// blits — the paint-path doctrine, never a fatal inside the state
+/// borrow). Runs on the UI thread; per-call objects only.
+pub(crate) fn build_giant_relief(src_dc: HDC, mw: i32, mh: i32) -> Option<GiantRelief> {
+    if src_dc.is_invalid() || mw <= 0 || mh <= 0 {
+        return None;
+    }
+    let target = crate::stitch::STRETCH_SOURCE_STITCH_TRIGGER / 2;
+    let mut k = 1i32;
+    while mw.max(mh) / k > target {
+        k <<= 1;
+    }
+    let wide = ((mw + k - 1) / k).max(1);
+    let high = ((mh + k - 1) / k).max(1);
+    let zeros = vec![0u8; wide as usize * high as usize * 4];
+    let bitmap = create_bgra_dib(wide, high, &zeros).ok()?;
+    // SAFETY: None gives a screen-compatible DC owned by this thread for
+    // the relief's lifetime.
+    let memdc = unsafe { CreateCompatibleDC(None) };
+    if memdc.is_invalid() {
+        // SAFETY: the DIB is owned and selected nowhere — plain
+        // DeleteObject is the correct teardown.
+        unsafe {
+            let _ = DeleteObject(HGDIOBJ(bitmap.0));
+        }
+        return None;
+    }
+    // SAFETY: `bitmap` is a valid owned DIB; the stock handle returned
+    // here stays owned by the DC (never deleted by us).
+    let stock = unsafe { SelectObject(memdc, HGDIOBJ(bitmap.0)) };
+    if stock.is_invalid() {
+        // SAFETY: selection failed, so the DC still holds its stock 1x1
+        // bitmap — plain DeleteDC is correct; the DIB drops below.
+        unsafe {
+            let _ = DeleteDC(memdc);
+            let _ = DeleteObject(HGDIOBJ(bitmap.0));
+        }
+        return None;
+    }
+    // Upstream's generation posture (viv.c:14231): HALFTONE on the
+    // DESTINATION DC for the downscale pass, whatever tier the final
+    // paint blit runs in.
+    // SAFETY: plain mode setter on the live relief DC.
+    unsafe {
+        let _ = SetStretchBltMode(memdc, HALFTONE);
+    }
+    let whole = crate::zoom::BlitRect {
+        dx: 0,
+        dy: 0,
+        dw: wide,
+        dh: high,
+        sx: 0,
+        sy: 0,
+        sw: mw,
+        sh: mh,
+    };
+    for tile in crate::stitch::stitch_tiles_sized(
+        crate::stitch::STITCH_TILE_SIZE,
+        whole,
+        (0, 0, wide, high),
+    ) {
+        // SAFETY: tiles come from the pure partition of the whole blit;
+        // `src_dc` holds exactly the mw x mh face. Fail-soft per tile
+        // like upstream's generation (viv.c:14237-14243) — one lost tile
+        // costs a seam, not the relief.
+        let _ = unsafe {
+            StretchBlt(
+                memdc,
+                tile.dx,
+                tile.dy,
+                tile.dw,
+                tile.dh,
+                Some(src_dc),
+                tile.sx,
+                tile.sy,
+                tile.sw,
+                tile.sh,
+                SRCCOPY,
+            )
+        };
+    }
+    Some(GiantRelief {
+        bitmap,
+        memdc,
+        stock,
+        wide,
+        high,
+    })
 }
 
 /// A frame's GDI face: the CPU master ([`PixelFrame`], the source of
