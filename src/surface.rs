@@ -114,7 +114,10 @@ impl Drop for Face {
 /// wide and fail on 2^23-wide ones — the failure tracks the FACE width;
 /// only 512-px slices read such faces, exactly the tiling upstream's mip
 /// generation always used for them). So paint builds this relief ONCE per
-/// paint: a fresh DIB sized ≤ 2^21 on its max axis, filled from the face
+/// paint: a fresh DIB sized at most `STRETCH_SOURCE_STITCH_TRIGGER / 2 + 1`
+/// (2^21 + 1 — the integer-division divisor walk can leave one pixel over;
+/// both sit far inside the census-proven single-blit band) on its max axis,
+/// filled from the face
 /// through [`crate::stitch::stitch_tiles_sized`] 512-px slices in HALFTONE
 /// (upstream's generation mode, viv.c:14231), then the scene's ONE blit
 /// runs from the relief. Transient by design — no chain, no cache, no
@@ -145,7 +148,8 @@ impl Drop for GiantRelief {
 
 /// Build the [`GiantRelief`] for a `mw x mh` face selected at `src_dc`.
 /// The divisor is the power of two that lands the relief's max axis at or
-/// under `STRETCH_SOURCE_STITCH_TRIGGER / 2` (2^21) — inside the band a
+/// one pixel over `STRETCH_SOURCE_STITCH_TRIGGER / 2` (the integer
+/// division can leave a single pixel over) — inside the band a
 /// single full-rect blit is proven to render from. Every failure cleans
 /// up what it took and returns `None` (the caller degrades to sliced
 /// blits — the paint-path doctrine, never a fatal inside the state

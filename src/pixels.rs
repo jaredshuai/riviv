@@ -1,7 +1,6 @@
 //! Pixel-buffer math (pure logic, unit-tested).
 //!
-//! M2 seam: mipmap generation math (#9) lands here beside the BGRA
-//! conversion and the alpha compositing (#3, landed — the composite
+//! BGRA conversion and the alpha compositing (#3, landed — the composite
 //! background itself is a runtime parameter since #24, snapshot from
 //! the config at request time).
 //!
@@ -10,7 +9,7 @@
 //! cross-thread boundary carries no GDI objects) and what every
 //! consumer reads directly (the RGB status readout, the clipboard image
 //! blit's source, the rotate pass, the future D2D upload). The GDI face
-//! (DIB section + memory DC + mips) is a UI-thread derivation owned by
+//! (DIB section + memory DC) is a UI-thread derivation owned by
 //! `surface::Surface`.
 
 /// image crate yields RGBA rows (top-down); GDI 32bpp DIBs want BGRA.

@@ -427,13 +427,13 @@ $p = Start-Riv '' 's1-frob.err' $false
 $main = Wait-Main $p
 $code = Close-Main $p $main
 $err = Read-Err 's1-frob.err'
-Check 'S1b frobnicate falls back to gdi + unrecognized hint' (($code -eq 0) -and $err.Contains('riviv: renderer=gdi backend=gdi') -and $err.Contains('unrecognized renderer value')) ("exit=$code stderr=[$($err.Trim())]")
+Check 'S1b frobnicate falls back to the default (auto since #81) + unrecognized hint' (($code -eq 0) -and $err.Contains('riviv: renderer=auto backend=') -and $err.Contains('unrecognized renderer value') -and $err.Contains('using auto')) ("exit=$code stderr=[$($err.Trim())]")
 Reset-Ini "[riviv]`r`nx=60`r`ny=60`r`nwide=1000`r`nhigh=700`r`n"
 $p = Start-Riv '' 's1-missing.err' $false
 $main = Wait-Main $p
 $code = Close-Main $p $main
 $err = Read-Err 's1-missing.err'
-Check 'S1c missing key defaults to gdi' (($code -eq 0) -and $err.Contains('riviv: renderer=gdi backend=gdi') -and (-not $err.Contains('unrecognized'))) ("exit=$code stderr=[$($err.Trim())]")
+Check 'S1c missing key defaults to auto (the #81 flip)' (($code -eq 0) -and $err.Contains('riviv: renderer=auto backend=') -and (-not $err.Contains('unrecognized'))) ("exit=$code stderr=[$($err.Trim())]")
 Kill-Riviv
 Reset-Ini ''
 

@@ -769,7 +769,7 @@ if ($padOk) {
     }
     if ($margDetail -eq '') { $margDetail = 'all four strips pure magenta in both arms' }
     Check 'S2p-d margins pure background color (both arms)' $margsOk $margDetail
-    # Image box == the 2x replica at exactly (20,15): boundary +-0 by build.
+    # Image box == the 2x replica at ($padL,$padT): boundary +-0 by build.
     $bw2 = [Px]::CompareRgb($qw.B, $qw.W, $padL, $padT, $src192, 192)
     $bg2 = [Px]::CompareRgb($qg.B, $qg.W, $padL, $padT, $src192, 192)
     Check 'S2p-e image box == 2x replica at (32,15), boundary +-0px (both arms)' (($bw2 -eq $null) -and ($bg2 -eq $null)) "warp-first=$bw2 gdi-first=$bg2"
