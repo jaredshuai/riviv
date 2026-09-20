@@ -40,6 +40,8 @@ DXGI flip 的 GDI 互操作禁令是 **per-HWND**(官方原文 "Use flip model i
 
 `renderer = auto | d2d | warp | gdi`(默认 gdi,M6 末翻 auto);auto = 硬件 → WARP → (过渡期 GDI / 删除后 fatal)。WARP 是同一代码路径的枚举值,测试矩阵成本≈0;状态栏显示实际后端消灭「不可复现」类工单;不做驱动黑名单。失败三层(ADR 0001 的扩展):初始化失败=环境→温和降级;运行期 `D2DERR_RECREATE_TARGET`/`DEVICE_REMOVED`→从 master 重上传(不重解码);10s 内 3 次运行期失败→WARP;WARP 也败才 fatal。paint 路径内一律 degrade-not-fatal。**GDI 删除判据写死**(#82):auto 全环境初始化成功 + golden 冻结 + 一个稳定发布周期;不设无判据的「再保留一里程碑」。
 
+> **#81 落地后记(2026-09-20,外部评审 AI2)**:上段「默认 gdi,M6 末翻 auto」的翻默认已随 #81 落地——missing 键与未识别值双路均落 `auto`(详见 D7/D10 的同日后记与 README #81 条目)。迁移面注意:#80 保存的 ini 已显式写入 `renderer=gdi`(保存恒写当时值),这批 ini 升级后**保持 gdi**,翻默认只惠及无键/新建 ini。
+
 ### D6. 插值映射与 1:1 契约(#81)
 
 两臂各 2 档是用户可见 ini 面(`shrink_blit_mode`/`mag_filter`,config.rs:52-53):1:1=NEAREST+整数矩形;shrink 0→NEAREST、1(HALFTONE 默认)→`HIGH_QUALITY_CUBIC`(不一致且更好,记 Differences);mag 0(COLORONCOLOR 默认)→NEAREST、1(HALFTONE)→LINEAR。`ID2D1DeviceContext::DrawBitmap` 收完整 `D2D1_INTERPOLATION_MODE` 六档(windows-rs 签名已核;咨询二「需 spike 验证是否要走 DrawImage」的说法过虑)。**1:1 五件套**(缺一即破):`SetUnitMode(PIXELS)` + identity 变换审计 + 整数矩形 + 位图/target/swapchain 三处 `B8G8R8A8_UNORM`(用 `_SRGB` 会线性化出 ±1 差) + NEAREST(+ALIASED/COPY)。1:1 的空间零重采样在**任何** icm 设置下都成立;RGB 字节不变仅颜色管线 identity 时成立——这是两条独立断言。`SetBrushOrgEx` parity 是**删除**不是迁移(D2D 无 dither)。

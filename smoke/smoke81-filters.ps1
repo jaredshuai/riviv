@@ -855,16 +855,19 @@ $s0g = Run-Scene 'gdi' 0 @('shrink_blit_mode=0') $png640 's3c-shrink0-gdi.png' '
 $s0ok = ($s0w.Code -eq 0) -and ($s0g.Code -eq 0) -and (Test-Path $s0w.Out) -and (Test-Path $s0g.Out)
 Check 'S3c-shrink0 both dumps ran clean (exit 0, files exist)' $s0ok ("warp exit=$($s0w.Code) gdi exit=$($s0g.Code)")
 if ($s0ok) {
+    # Byte equality is THE assertion (external review AI2 P3: the earlier
+    # shape let two arms diverge by a uniform source-pixel phase and still
+    # pass). The phase census below stays as failure DIAGNOSTICS only -
+    # this build measured plain byte equality, and a divergence means a
+    # real behavior change on one arm that must go red.
     $eq0 = [Px]::BytesEqual([IO.File]::ReadAllBytes($s0w.Out), [IO.File]::ReadAllBytes($s0g.Out))
-    if ($eq0) {
-        Check 'S3c-shrink0 warp(NEAREST) and gdi(COLORONCOLOR) byte-identical' $true 'file bytes equal'
-    } else {
+    $diag0 = ''
+    if (-not $eq0) {
         $cw = [Px]::PhaseCensus([Px]::Load($s0w.Out).B, 320, 0, 0, 320, 240, $photo640, 640, 480)
         $cg = [Px]::PhaseCensus([Px]::Load($s0g.Out).B, 320, 0, 0, 320, 240, $photo640, 640, 480)
-        $okW = ($cw -match 'exact=[A-D]+')
-        $okG = ($cg -match 'exact=[A-D]+')
-        Check 'S3c-shrink0 not byte-identical but each arm matches ONE uniform phase model' ($okW -and $okG) "warp: $cw | gdi: $cg"
+        $diag0 = " warp: $cw | gdi: $cg"
     }
+    Check 'S3c-shrink0 warp(NEAREST) and gdi(COLORONCOLOR) byte-identical' $eq0 ("file bytes differ -$diag0")
 }
 Kill-Riviv
 Reset-Ini ''

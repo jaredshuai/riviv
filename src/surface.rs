@@ -232,7 +232,11 @@ pub(crate) fn build_giant_relief(src_dc: HDC, mw: i32, mh: i32) -> Option<GiantR
     // the relief's lifetime.
     let memdc = unsafe { CreateCompatibleDC(None) };
     if memdc.is_invalid() {
-        degrading("CreateCompatibleDC failed");
+        // SAFETY: reading the thread's last error immediately after the
+        // failed call (the ensure_face diagnostic parity, external review
+        // AI2 P3).
+        let gle = unsafe { GetLastError().0 };
+        degrading(&format!("CreateCompatibleDC failed (GLE={gle})"));
         // SAFETY: the DIB is owned and selected nowhere — plain
         // DeleteObject is the correct teardown.
         unsafe {
@@ -244,7 +248,7 @@ pub(crate) fn build_giant_relief(src_dc: HDC, mw: i32, mh: i32) -> Option<GiantR
     // here stays owned by the DC (never deleted by us).
     let stock = unsafe { SelectObject(memdc, HGDIOBJ(bitmap.0)) };
     if stock.is_invalid() {
-        degrading("SelectObject failed");
+        degrading("SelectObject failed to select the relief DIB");
         // SAFETY: selection failed, so the DC still holds its stock 1x1
         // bitmap — plain DeleteDC is correct; the DIB drops below.
         unsafe {
