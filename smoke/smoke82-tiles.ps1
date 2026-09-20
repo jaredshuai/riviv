@@ -1049,6 +1049,12 @@ Kill-Riviv
 Reset-Ini ''
 
 # ---------------------------------------------------------------------------
+# NOTE (external review AI1 P2-1): the FORCED -tile plan deliberately
+# bypasses the frame-budget check, so this frame runs over cap and the LRU
+# evicts frame tiles DURING the frame - a diagnostic half-coverage by
+# design. S9 asserts the budget ARITHMETIC (evictions happen, resident
+# stays under cap); it does NOT assert full coverage, and the natural
+# (unforced) path is what the no-half-cover unit tests pin.
 # S9: the pressure Check - force LRU evictions cheaply in ONE frame. With
 # -tile 4 on the 900x600 ramp at a fit-capped (1:1) viewport, the whole
 # master is the visible preimage: ceil(900/4) x ceil(600/4) = 225 x 150 =

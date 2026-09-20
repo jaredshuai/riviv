@@ -744,7 +744,7 @@ impl GpuStack {
         // SAFETY: `staging` holds exactly wide*high*4 readable bytes (filled
         // row by row above) and outlives this synchronous copy; the
         // properties struct is a valid stack temporary.
-        let bitmap = unsafe {
+        let bitmap = match unsafe {
             self.context.CreateBitmap(
                 D2D_SIZE_U {
                     width: wide,
@@ -754,8 +754,17 @@ impl GpuStack {
                 row_bytes as u32,
                 &bitmap_properties(D2D1_BITMAP_OPTIONS_NONE),
             )
-        }
-        .map_err(|e| format!("D2D tile CreateBitmap({wide}x{high}) failed: {e}"))?;
+        } {
+            Ok(bitmap) => bitmap,
+            Err(e) => {
+                // The staging buffer dies with this call either way; the
+                // ledger must not keep counting it (external review AI1
+                // P2-4: a failed creation used to leave `inflight` stuck at
+                // the staging size for the rest of the session).
+                self.ledger.note_inflight(0);
+                return Err(format!("D2D tile CreateBitmap({wide}x{high}) failed: {e}"));
+            }
+        };
         // Dropped here, not at the end of the function: the staging buffer
         // is dead the moment the (synchronous) copy returned.
         drop(staging);
@@ -848,6 +857,19 @@ impl GpuStack {
                     .ok_or_else(|| format!("level {level} tile source is unavailable"))?;
                 let mut missing = 0usize;
                 let mut last_error: Option<String> = None;
+                // Pass 1: mark every already-resident tile of THIS frame hot
+                // before any insert can evict — an insert then only reclaims
+                // NON-frame (cold) entries. Without this, panning towards
+                // decreasing tile indices could insert new tiles whose
+                // eviction of the not-yet-touched still-visible ones left
+                // letterbox holes mid-image (external review AI1 P2-1: the
+                // plan's `frame_bytes <= cap` guarantee is only sound with
+                // this recency fixup; the forced `-tile` diagnostic bypasses
+                // the guarantee and may partially cover by design).
+                for quad in &tiles {
+                    self.tile_lru.touch(&quad.key);
+                }
+                // Pass 2: upload what is missing.
                 for quad in &tiles {
                     if self.tile_lru.touch(&quad.key) {
                         continue;

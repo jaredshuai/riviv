@@ -382,8 +382,9 @@ pub(crate) struct WindowState {
     /// failed-load clear.
     pub(crate) virtual_display: bool,
     /// The D2D/DXGI stack (#80): `Some` while the viewport paints through
-    /// D2D, `None` on the GDI arm (renderer=gdi / init failure / the
-    /// giant-frame gate). Created in run() after the viewport child exists.
+    /// D2D — giants included since #82 (the stack draws them as an overview
+    /// level or tiles) — `None` on the GDI arm (renderer=gdi / init failure
+    /// / a session degrade). Created in run() after the viewport child exists.
     pub(crate) gpu: Option<crate::gpu::GpuStack>,
     /// The effective renderer kind for (re)builds (#80): the config request
     /// resolved at creation (auto → hardware/WARP by what succeeded), and

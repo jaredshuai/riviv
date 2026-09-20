@@ -18,7 +18,9 @@
 //!   discipline `stitch.rs` established for the GDI arm's tiling. Adjacent
 //!   tiles therefore share their dest and clip edges bit for bit: no gap,
 //!   no overlap, no dropped or duplicated column (the ticket's 缝/重复列/
-//!   丢列 clause).
+//!   丢列 clause) — with one documented exception: the degenerate-fringe
+//!   rule (`clip.w.max(1)`) lets a 1-source-px interior that maps under a
+//!   destination pixel own one anyway, a ≤1 px overlap in place of a hole.
 //! - **Haloed, interior-clipped.** Each tile's bitmap carries
 //!   [`FILTER_HALO_NATIVE`] source pixels of its neighbourhood so a filter tap may
 //!   cross the block edge, and the draw is clipped to the tile's *logical*
@@ -47,9 +49,8 @@ pub(crate) const TILE_EDGE: i32 = 1024;
 
 /// Filter-support margin carried by every tile bitmap, in source pixels at
 /// the drawn level. D2D does not document its tap counts, so this number is
-/// EMPIRICAL, and it is deliberately a constant rather than a scale-derived
-/// formula — a variation that should have been strictly safer was measured
-/// to be worse:
+/// EMPIRICAL — pinned under `smoke82` S2b's configuration and kept a
+/// constant:
 ///
 /// - A fixed margin of 8 let a 0.65x shrink's filter taps reach outside the
 ///   tile bitmap into clamped territory: the tile-boundary columns differed
@@ -57,14 +58,15 @@ pub(crate) const TILE_EDGE: i32 = 1024;
 ///   pixel count (2026-09-20, a 900x600 image into 583x389).
 /// - 32 removed that (`smoke82` S2b: whole-frame max delta 1, boundary
 ///   step equal to the untiled reference's).
-/// - Deriving the margin from the draw scale instead (`32 / scale`, the
-///   "taps reach further when the draw shrinks" argument) was tried on
-///   2026-09-20 and MEASURED WORSE at the very configuration 32 was tuned
-///   for: the same S2b comparison went from max delta 1 to 21 and the
-///   boundary step from 0.299 to 3.887 — i.e. D2D's filtered pull of a
-///   sub-rect source is not monotone in the bitmap's size, so a bigger
-///   margin is not automatically a safer one. A derived margin needs its
-///   own measurement campaign against the resampler, not an argument.
+/// - A scale-derived variant (`32 / scale`) was tried once during
+///   development and measured worse under S2b's configuration (max delta
+///   1 -> 21, boundary step 0.299 -> 3.887), which is why it did not ship.
+///   That trial is NOT reproducible from the repo and S2b is a forced
+///   level-0 deep shrink (~0.4x), not the (0.5, 1] regime the constant is
+///   tuned for — so it disproves that variant in that configuration only
+///   and establishes no general property of D2D (external review AI1
+///   P2-2). A derived margin would need its own measurement campaign
+///   across the regime, not a single trial.
 ///
 /// Known residual, recorded rather than papered over: on an ANISOTROPIC
 /// frame — one axis at or above the master's (which forces level 0, see
@@ -223,7 +225,14 @@ impl DestRect {
 /// (`dest_origin + src * dest_extent / src_extent`) reproduces the untiled
 /// draw's to within an f32 ULP, which is what keeps a filtered draw from
 /// drifting per tile.
-pub(crate) fn src_to_dest_f(src: f32, dest_origin: i32, dest_extent: i32, src_extent: i32) -> f32 {
+///
+/// The source arrives as i32 on purpose: casting it to f32 FIRST would lose
+/// integer precision past 2^24, and a 16777217-wide stripe's late tiles
+/// map at coordinates where a lost unit is a whole destination pixel once
+/// the pan offset cancels the magnitude (external review AI1 P2-3: with
+/// `src as f32`, the tile at source 16777221 under a -16776716 pan drew at
+/// 504/506 instead of 505 — a visible shift on this repo's own fixture).
+pub(crate) fn src_to_dest_f(src: i32, dest_origin: i32, dest_extent: i32, src_extent: i32) -> f32 {
     (f64::from(dest_origin) + f64::from(src) * f64::from(dest_extent) / f64::from(src_extent))
         as f32
 }
@@ -301,7 +310,10 @@ pub(crate) fn visible_dest(dest: &Rect, viewport: &Rect) -> Option<Rect> {
 /// extreme stripe rendered BLANK while uploading all 16385 level-0 tiles
 /// (71 MB) — found by the #82 smoke on this repo's own 2^24+1 fixture. The
 /// per-axis test both fixes that and restores the invariant the halo
-/// sizing relies on (a tiled draw's scale is in (0.5, 1] per axis).
+/// sizing leans on it (a tiled draw's scale is in (0.5, 1] per axis — for
+/// the uniform-zoom overview regime; a FORCED `-tile` frame at level 0, a
+/// 1-px axis magnified, or anisotropic panscan zoom sit outside it, which
+/// is part of the recorded halo residual).
 pub(crate) fn detail_level(master_w: i32, master_h: i32, render_w: i32, render_h: i32) -> u32 {
     if master_w <= 0 || master_h <= 0 || render_w <= 0 || render_h <= 0 {
         return 0;
@@ -406,17 +418,20 @@ pub(crate) struct FrameGeometry {
 ///    a level eventually fits the device and returns `Base`, at the extreme
 ///    the 1×1 level.
 ///
-/// The CPU level budget is an input because the level bitmap is materialized
-/// on the CPU before it is uploaded ([`crate::mip::LevelCache`]): a level the
-/// cache would refuse must not be planned at all, or the caller has nothing
-/// to draw and blanks the frame. Without it, a just-under-the-load-cap
-/// extreme-aspect frame (e.g. 16389x8189 at 50% — level 1 is 134 MB against a
-/// 128 MB cache) rendered as an empty letterbox on every paint in that zoom
-/// band, a regression the removed #80 gate had covered with its GDI
-/// hand-off. Deepening to a level the cache can hold keeps the frame drawing.
+/// The CPU level budget is an input because a GENERATED level (level >= 1)
+/// is materialized on the CPU before it is uploaded ([`crate::mip::LevelCache`]):
+/// a level the cache would refuse must not be planned at all, or the caller
+/// has nothing to draw and blanks the frame. Without it, a
+/// just-under-the-load-cap extreme-aspect frame (e.g. 16389x8189 at 50% —
+/// level 1 is 134 MB against a 128 MB cache) rendered as an empty letterbox
+/// on every paint in that zoom band, a regression the removed #80 gate had
+/// covered with its GDI hand-off. Level 0 is exempt — it is the master
+/// itself, never copied into the cache (external review AI1 P1-1).
 ///
 /// `resident` reports whether a tile is already uploaded (the caller's LRU
-/// answers it) so the budget is charged for *new* uploads only.
+/// answers it); the GPU budget is charged for the frame's whole working set
+/// (resident + fresh), so a frame that cannot fit alongside its own resident
+/// tiles deepens rather than drawing with holes.
 pub(crate) fn plan_frame(
     frame_gen: u64,
     geometry: FrameGeometry,
@@ -443,9 +458,8 @@ pub(crate) fn plan_frame(
     // full-resolution master through the prefiltered cubic, which is both
     // sharper than any box-level tap-in and the byte-for-byte path every
     // existing assertion and golden was frozen against.
-    let level_w = master_w <= max_bitmap as i32;
-    let level_h = master_h <= max_bitmap as i32;
-    let mut level = if level_w && level_h {
+    let master_fits_device = master_w <= max_bitmap as i32 && master_h <= max_bitmap as i32;
+    let mut level = if master_fits_device {
         0
     } else {
         detail_level(master_w, master_h, render_w, render_h)
@@ -454,12 +468,18 @@ pub(crate) fn plan_frame(
     loop {
         let (level_w, level_h) = mip::mip_size(master_w, master_h, level);
         let device_fits = level_w <= max_bitmap as i32 && level_h <= max_bitmap as i32;
-        // The CPU side gates BOTH arms: the level bitmap is materialized
-        // before it is uploaded, and a tiled draw is cut FROM that same
-        // bitmap — a level the cache would refuse is undrawable either way,
-        // so the ladder must deepen instead of planning it (planning it
-        // leaves the caller nothing to draw, which blanks the frame).
-        let cpu_fits = bgra_bytes(i64::from(level_w) * i64::from(level_h)) <= level_budget_bytes;
+        // The CPU side gates only GENERATED levels (level >= 1): those
+        // materialize through the level cache, and a level the cache would
+        // refuse is undrawable — planning it leaves the caller nothing to
+        // draw, so the ladder must deepen instead. Level 0 is NOT that: it
+        // is the master itself, already resident within the decoder's own
+        // budget and never copied into the cache, so the cache cap has no
+        // business rejecting it (external review AI1 P1-1: gating level 0
+        // pushed every > 128 MiB device-fitting master — 8000x5000, a
+        // common large photo — onto a box mip, magnifying it at 1:1 and
+        // breaking the #81 full-resolution contract).
+        let cpu_fits =
+            level == 0 || bgra_bytes(i64::from(level_w) * i64::from(level_h)) <= level_budget_bytes;
         if device_fits && cpu_fits && forced.is_none() {
             return FramePlan::Base { level };
         }
@@ -474,12 +494,16 @@ pub(crate) fn plan_frame(
                 edge,
                 resident,
             );
-            let fresh: u64 = tiles
-                .iter()
-                .filter(|t| !resident(&t.key))
-                .map(|t| t.bytes())
-                .sum();
-            if !tiles.is_empty() && (forced.is_some() || fresh <= cap_bytes) {
+            // The budget is charged for the frame's WHOLE working set —
+            // resident tiles included, not just the fresh uploads. With the
+            // caller marking every already-resident frame key hot BEFORE
+            // uploading (see `GpuStack::prepare`), an insert can then only
+            // reclaim NON-frame entries, so a planned frame never evicts
+            // one of its own tiles mid-frame: no half-covered frame. The
+            // forced `-tile` diagnostic deliberately bypasses this check
+            // (it may partially cover — that is the pressure probe).
+            let frame_bytes: u64 = tiles.iter().map(|t| t.bytes()).sum();
+            if !tiles.is_empty() && (forced.is_some() || frame_bytes <= cap_bytes) {
                 return FramePlan::Tiles { level, tiles };
             }
         }
@@ -531,13 +555,13 @@ fn tile_requests(
                 continue;
             }
             let src = interior.haloed(halo, &bounds);
-            let dest_x = src_to_dest_f(src.x as f32, dest.x, dest.w, level_w);
-            let dest_y = src_to_dest_f(src.y as f32, dest.y, dest.h, level_h);
+            let dest_x = src_to_dest_f(src.x, dest.x, dest.w, level_w);
+            let dest_y = src_to_dest_f(src.y, dest.y, dest.h, level_h);
             let dest_rect = DestRect {
                 x: dest_x,
                 y: dest_y,
-                w: src_to_dest_f(src.right() as f32, dest.x, dest.w, level_w) - dest_x,
-                h: src_to_dest_f(src.bottom() as f32, dest.y, dest.h, level_h) - dest_y,
+                w: src_to_dest_f(src.right(), dest.x, dest.w, level_w) - dest_x,
+                h: src_to_dest_f(src.bottom(), dest.y, dest.h, level_h) - dest_y,
             };
             // The clip partitions the mapped preimage — except that an
             // interior whose mapped extent truncates to zero pixels would
@@ -692,6 +716,14 @@ impl<K: PartialEq + Copy> Lru<K> {
 /// path owns, so "bounded" and "not leaking" are statements about numbers
 /// rather than a feeling. Classes are the ticket's four; the counters feed
 /// the close-time stats line the smoke asserts on.
+///
+/// Scope honesty (external review AI1 P3-2): `gpu_resident` counts the
+/// resident tiles plus a level >= 1 base bitmap — it does NOT count the
+/// level-0 master's device bitmap (an ordinary session's single upload;
+/// such sessions print no stats line anyway), and the cap applies to the
+/// tile LRU only, so a Tiles -> Base zoom transition can transiently hold
+/// cap + overview. Peak VRAM in the giant regime is therefore bounded by
+/// cap + one overview bitmap, not by cap alone.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct MemLedger {
     /// The decoded master plus every cached CPU mip level.
@@ -1265,9 +1297,14 @@ mod tests {
     }
 
     #[test]
-    fn resident_tiles_are_not_charged_against_the_frame_budget() {
-        // The same plan twice: with every tile already uploaded the second
-        // frame costs nothing, so it stays tiled even under a tiny budget.
+    fn the_budget_charges_the_frames_whole_working_set_not_just_fresh_uploads() {
+        // The half-cover fix (external review AI1 P2-1): the GPU budget is
+        // charged for resident + fresh together. A frame whose tiles are
+        // ALL already resident fits any cap that can hold them (their bytes
+        // are the same bytes), so re-planning it stays tiled; but a frame
+        // whose working set exceeds the cap deepens even when most of it is
+        // resident — the alternative is evicting one of its own tiles
+        // mid-frame and leaving a hole.
         let dest = Rect::new(0, 0, 40000, 40000);
         let viewport = Rect::new(0, 0, 1920, 1080);
         let args = (40000, 40000, 40000, 40000);
@@ -1283,21 +1320,126 @@ mod tests {
         let FramePlan::Tiles { tiles: first, .. } = probe else {
             panic!("expected tiles at 1:1");
         };
+        let working_set: u64 = first.iter().map(|t| t.bytes()).sum();
         let resident = first.clone();
         let hit = move |k: &TileKey| resident.iter().any(|t| t.key == *k);
+        // Cap that holds the working set: stays tiled, zero uploads needed.
         let plan = plan_frame(
             4,
             geom((args.0, args.1), (args.2, args.3), dest, viewport),
             16384,
-            0,
+            working_set,
             u64::MAX,
             None,
             &hit,
         );
         assert!(
             matches!(plan, FramePlan::Tiles { .. }),
-            "zero fresh bytes must not force a coarser plan: {plan:?}"
+            "a resident working set within the cap must stay tiled: {plan:?}"
         );
+        // Cap below the working set: deepens (uniformly coarser), never a
+        // half-covered frame.
+        let plan = plan_frame(
+            4,
+            geom((args.0, args.1), (args.2, args.3), dest, viewport),
+            16384,
+            working_set - 1,
+            u64::MAX,
+            None,
+            &hit,
+        );
+        let FramePlan::Tiles { level: coarse, .. } = plan else {
+            panic!("expected a coarser tiled plan: {plan:?}");
+        };
+        assert!(
+            coarse >= 1,
+            "the plan must deepen, not half-cover: {plan:?}"
+        );
+    }
+
+    #[test]
+    fn a_fitting_master_over_the_cache_cap_stays_level_zero() {
+        // The P1-1 regression (external review AI1): 8000x5000 is 160 MB —
+        // over the 128 MiB LEVEL CACHE cap — but it FITS the device and the
+        // decoder budget, so it is the #81 full-resolution path at every
+        // zoom: 1:1 and shrink both draw the master, never a box mip. The
+        // cache cap has no say over level 0 (the master is never copied
+        // into the cache).
+        let budget = crate::mip::LEVEL_CACHE_BYTES;
+        let onetoone = plan_frame(
+            1,
+            geom(
+                (8000, 5000),
+                (8000, 5000),
+                Rect::new(0, 0, 8000, 5000),
+                Rect::new(0, 0, 1920, 1080),
+            ),
+            16384,
+            u64::MAX,
+            budget,
+            None,
+            &never,
+        );
+        assert_eq!(onetoone, FramePlan::Base { level: 0 });
+        let shrink = plan_frame(
+            1,
+            geom(
+                (8000, 5000),
+                (4000, 2500),
+                Rect::new(0, 0, 4000, 2500),
+                Rect::new(0, 0, 1920, 1080),
+            ),
+            16384,
+            u64::MAX,
+            budget,
+            None,
+            &never,
+        );
+        assert_eq!(
+            shrink,
+            FramePlan::Base { level: 0 },
+            "an ordinary shrink samples the full master (the #81 path)"
+        );
+    }
+
+    #[test]
+    fn the_sub_pixel_projection_carries_i64_precision_past_two_pow_24() {
+        // f32 cannot hold every integer past 2^24. Casting the SOURCE to
+        // f32 first (the old signature) shifted late tiles of a
+        // 16777217-wide stripe once the pan offset cancelled the
+        // magnitude: source 16777221 under a -16776716 pan drew at 504 or
+        // 506 instead of 505 (external review AI1 P2-3). The projection
+        // must take the i32 source and round once, at the end.
+        let d = src_to_dest_f(16_777_221, -16_776_716, 16_777_217, 16_777_217);
+        assert_eq!(d, 505.0);
+        // And adjacent source columns stay distinguishable where the
+        // destination has the granularity to show it.
+        let a = src_to_dest_f(16_777_216, -16_776_716, 16_777_217, 16_777_217);
+        let b = src_to_dest_f(16_777_217, -16_776_716, 16_777_217, 16_777_217);
+        assert_eq!((a, b), (500.0, 501.0));
+    }
+
+    #[test]
+    fn pre_touching_the_frames_keys_shields_them_from_eviction() {
+        // The draw-time half of the P2-1 fix: after every frame key is
+        // touched (pass 1 in `GpuStack::prepare`), an insert can only
+        // reclaim NON-frame entries while the frame fits the cap.
+        let mut lru = Lru::new(400);
+        lru.insert(90u32, 100); // cold, from an earlier frame
+        for k in [1u32, 2, 3] {
+            assert!(!lru.insert(k, 100).is_empty() || true);
+        }
+        // (entries 1,2,3 total 300 + the cold 100 = 400, exactly the cap)
+        assert_eq!(lru.total_bytes(), 400);
+        // Pass 1: the frame touches its keys.
+        for k in [&1u32, &2, &3] {
+            assert!(lru.touch(k), "all frame keys are resident");
+        }
+        // Pass 2: admitting a small new frame member evicts the COLD entry.
+        let evicted = lru.insert(4u32, 50);
+        assert_eq!(evicted, vec![90], "the cold non-frame entry goes first");
+        assert!(lru.contains(&1) && lru.contains(&2) && lru.contains(&3) && lru.contains(&4));
+        assert_eq!(lru.total_bytes(), 350);
     }
 
     #[test]
@@ -1563,15 +1705,12 @@ mod tests {
     }
 
     #[test]
-    fn the_halo_is_the_measured_constant_not_a_derived_one() {
-        // The margin is empirical (see FILTER_HALO_NATIVE): D2D's filtered
-        // pull of a sub-rect source is not monotone in the bitmap size, and
-        // a scale-derived widening (`32 / scale`) was measured WORSE at the
-        // configuration the constant was tuned for (smoke82 S2b: whole-frame
-        // max delta 1 -> 21, boundary step 0.299 -> 3.887). Pinning the value
-        // here means a future "optimization" of it has to read that record
-        // and re-run the S2b comparison, rather than silently halving the
-        // margin.
+    fn the_halo_constant_is_pinned_at_32() {
+        // The margin is empirical, pinned by smoke82 S2b (the constant's doc
+        // records what that does — and does NOT — establish about a derived
+        // variant). Pinning the value here means a future "optimization" of
+        // it has to read that record and re-run the S2b comparison, rather
+        // than silently halving the margin.
         assert_eq!(FILTER_HALO_NATIVE, 32);
         // The tiles carry exactly that margin, on both axes, clamped to the
         // level (a tile at the level's edge must not name an out-of-image
