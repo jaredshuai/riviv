@@ -428,10 +428,11 @@ pub(crate) struct FrameGeometry {
 /// covered with its GDI hand-off. Level 0 is exempt — it is the master
 /// itself, never copied into the cache (external review AI1 P1-1).
 ///
-/// `resident` reports whether a tile is already uploaded (the caller's LRU
-/// answers it); the GPU budget is charged for the frame's whole working set
-/// (resident + fresh), so a frame that cannot fit alongside its own resident
-/// tiles deepens rather than drawing with holes.
+/// The GPU budget is charged for the frame's whole working set (resident
+/// tiles included), so a frame that cannot fit alongside its own resident
+/// tiles deepens rather than drawing with holes. Residency itself is no
+/// longer an input — the working set is the same bytes either way (the
+/// caller's pre-touch pass makes the LRU respect it at draw time).
 pub(crate) fn plan_frame(
     frame_gen: u64,
     geometry: FrameGeometry,
@@ -439,7 +440,6 @@ pub(crate) fn plan_frame(
     cap_bytes: u64,
     level_budget_bytes: u64,
     forced_edge: Option<i32>,
-    resident: &dyn Fn(&TileKey) -> bool,
 ) -> FramePlan {
     let (master_w, master_h) = geometry.master;
     let (render_w, render_h) = geometry.render;
@@ -485,15 +485,7 @@ pub(crate) fn plan_frame(
         }
         if cpu_fits {
             let edge = forced.unwrap_or(TILE_EDGE);
-            let tiles = tile_requests(
-                frame_gen,
-                level,
-                (level_w, level_h),
-                &dest,
-                &vis,
-                edge,
-                resident,
-            );
+            let tiles = tile_requests(frame_gen, level, (level_w, level_h), &dest, &vis, edge);
             // The budget is charged for the frame's WHOLE working set —
             // resident tiles included, not just the fresh uploads. With the
             // caller marking every already-resident frame key hot BEFORE
@@ -531,7 +523,6 @@ fn tile_requests(
     dest: &Rect,
     vis: &Rect,
     edge: i32,
-    _resident: &dyn Fn(&TileKey) -> bool,
 ) -> Vec<TileRequest> {
     let (level_w, level_h) = level_dims;
     let bounds = Rect::new(0, 0, level_w, level_h);
@@ -563,15 +554,14 @@ fn tile_requests(
                 w: src_to_dest_f(src.right(), dest.x, dest.w, level_w) - dest_x,
                 h: src_to_dest_f(src.bottom(), dest.y, dest.h, level_h) - dest_y,
             };
-            // The clip partitions the mapped preimage — except that an
-            // interior whose mapped extent truncates to zero pixels would
-            // own nothing, and the destination pixel it should have shared
-            // would be left at the letterbox colour (the untiled draw has
-            // no such hole). Degenerate-fringe rule: every non-empty
-            // interior owns at least one destination pixel; only a source
-            // run that maps under a pixel wide can trigger it, in which
-            // case the 1-px overlap with the next tile (row-major draw
-            // order) is strictly better than a hole.
+            // Degenerate-fringe rule: every non-empty interior owns at least
+            // one destination pixel (`.max(1)`). The neighbouring tile's
+            // clip shares this tile's integer edge, so a collapsed interior
+            // would not leave a hole — the rule is a defensive ownership
+            // guarantee under any future rounding change, at the cost of a
+            // <=1 px overlap (both tiles draw the same source there under
+            // the same global phase; wording corrected per external review
+            // AI3 P3).
             let cx = src_to_dest(interior.x, dest.x, dest.w, level_w);
             let cy = src_to_dest(interior.y, dest.y, dest.h, level_h);
             let clip = Rect::new(
@@ -679,6 +669,27 @@ impl<K: PartialEq + Copy> Lru<K> {
         evicted
     }
 
+    /// Evict the coldest entries until the total fits `budget`, WITHOUT
+    /// changing the cap future inserts respect: the budget here is a
+    /// one-frame headroom calculation (cap minus a base bitmap — external
+    /// review AI3 P2-2), not a policy change.
+    pub(crate) fn trim_to(&mut self, budget: u64) -> Vec<K> {
+        let mut evicted = Vec::new();
+        while self.bytes > budget && !self.entries.is_empty() {
+            let idx = self
+                .entries
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, e)| e.2)
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            let (old, old_bytes, _) = self.entries.remove(idx);
+            self.bytes -= old_bytes;
+            evicted.push(old);
+        }
+        evicted
+    }
+
     /// Lower (or raise) the cap, returning whatever no longer fits. The
     /// live path derives its cap once at stack build, so this is the
     /// policy's test surface plus the hook a per-frame re-cap under
@@ -723,7 +734,10 @@ impl<K: PartialEq + Copy> Lru<K> {
 /// such sessions print no stats line anyway), and the cap applies to the
 /// tile LRU only, so a Tiles -> Base zoom transition can transiently hold
 /// cap + overview. Peak VRAM in the giant regime is therefore bounded by
-/// cap + one overview bitmap, not by cap alone.
+/// cap + one overview bitmap, not by cap alone (since the AI3 P2-2 fix
+/// the Base arm trims the tile LRU to the overview's remaining headroom,
+/// so the strict `gpu <= cap` bound holds across the Tiles -> Base zoom
+/// transition as well).
 #[derive(Debug, Clone, Default)]
 pub(crate) struct MemLedger {
     /// The decoded master plus every cached CPU mip level.
@@ -788,10 +802,6 @@ impl MemLedger {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn never(_: &TileKey) -> bool {
-        false
-    }
 
     /// The plan's geometry in one value: `(master, render, dest, viewport)`.
     fn geom(master: (i32, i32), render: (i32, i32), dest: Rect, viewport: Rect) -> FrameGeometry {
@@ -872,7 +882,6 @@ mod tests {
             u64::MAX,
             u64::MAX,
             None,
-            &never,
         );
         let FramePlan::Base { level } = plan else {
             panic!("the stripe's overview must be a single bitmap: {plan:?}");
@@ -911,7 +920,6 @@ mod tests {
                 u64::MAX,
                 u64::MAX,
                 Some(edge),
-                &never,
             );
             let FramePlan::Tiles { tiles, .. } = plan else {
                 panic!("{mw}x{mh} -> {rw}x{rh} (edge {edge}): expected tiles, got {plan:?}");
@@ -993,7 +1001,7 @@ mod tests {
         let (mw, mh, rw, rh) = (900i32, 600i32, 583, 389);
         let scene = Rect::new(153, 0, rw, rh);
         let vis = visible_dest(&scene, &Rect::new(0, 0, 674, 246)).expect("visible");
-        let tiles = tile_requests(1, 0, (mw, mh), &scene, &vis, 256, &never);
+        let tiles = tile_requests(1, 0, (mw, mh), &scene, &vis, 256);
         assert!(tiles.len() >= 4);
         let global = f64::from(rw) / f64::from(mw);
         for t in &tiles {
@@ -1027,7 +1035,6 @@ mod tests {
             u64::MAX,
             u64::MAX,
             None,
-            &never,
         );
         let FramePlan::Tiles { tiles, .. } = plan else {
             panic!("a 1:1 giant must tile, got {plan:?}");
@@ -1068,7 +1075,6 @@ mod tests {
             u64::MAX,
             u64::MAX,
             None,
-            &never,
         );
         let FramePlan::Tiles { tiles, .. } = plan else {
             panic!("expected tiles");
@@ -1087,7 +1093,6 @@ mod tests {
             u64::MAX,
             u64::MAX,
             None,
-            &never,
         );
         let FramePlan::Tiles { tiles, .. } = plan else {
             panic!("expected tiles");
@@ -1113,7 +1118,6 @@ mod tests {
             u64::MAX,
             u64::MAX,
             Some(1024),
-            &never,
         );
         let FramePlan::Tiles { tiles, .. } = plan else {
             panic!("expected tiles");
@@ -1167,7 +1171,6 @@ mod tests {
             u64::MAX,
             u64::MAX,
             Some(1024),
-            &never,
         );
         let FramePlan::Tiles { tiles, .. } = plan else {
             panic!("expected tiles");
@@ -1199,7 +1202,6 @@ mod tests {
             u64::MAX,
             u64::MAX,
             None,
-            &never,
         );
         assert_eq!(plan, FramePlan::Base { level: 0 });
         assert_eq!(
@@ -1215,7 +1217,6 @@ mod tests {
                 u64::MAX,
                 u64::MAX,
                 None,
-                &never
             ),
             FramePlan::Base { level: 0 }
         );
@@ -1233,7 +1234,6 @@ mod tests {
             u64::MAX,
             u64::MAX,
             None,
-            &never,
         );
         let FramePlan::Base { level } = plan else {
             panic!("a deep shrink of a giant is the overview: {plan:?}");
@@ -1259,7 +1259,6 @@ mod tests {
             u64::MAX,
             u64::MAX,
             None,
-            &never,
         );
         let FramePlan::Tiles { level, tiles } = plan else {
             panic!("expected tiles");
@@ -1286,7 +1285,6 @@ mod tests {
             1024 * 1024,
             u64::MAX,
             None,
-            &never,
         );
         let FramePlan::Base { level } = plan else {
             panic!("pressure must coarsen to a single bitmap: {plan:?}");
@@ -1315,14 +1313,11 @@ mod tests {
             u64::MAX,
             u64::MAX,
             None,
-            &never,
         );
         let FramePlan::Tiles { tiles: first, .. } = probe else {
             panic!("expected tiles at 1:1");
         };
         let working_set: u64 = first.iter().map(|t| t.bytes()).sum();
-        let resident = first.clone();
-        let hit = move |k: &TileKey| resident.iter().any(|t| t.key == *k);
         // Cap that holds the working set: stays tiled, zero uploads needed.
         let plan = plan_frame(
             4,
@@ -1331,7 +1326,6 @@ mod tests {
             working_set,
             u64::MAX,
             None,
-            &hit,
         );
         assert!(
             matches!(plan, FramePlan::Tiles { .. }),
@@ -1346,7 +1340,6 @@ mod tests {
             working_set - 1,
             u64::MAX,
             None,
-            &hit,
         );
         let FramePlan::Tiles { level: coarse, .. } = plan else {
             panic!("expected a coarser tiled plan: {plan:?}");
@@ -1378,7 +1371,6 @@ mod tests {
             u64::MAX,
             budget,
             None,
-            &never,
         );
         assert_eq!(onetoone, FramePlan::Base { level: 0 });
         let shrink = plan_frame(
@@ -1393,7 +1385,6 @@ mod tests {
             u64::MAX,
             budget,
             None,
-            &never,
         );
         assert_eq!(
             shrink,
@@ -1459,7 +1450,6 @@ mod tests {
             u64::MAX,
             u64::MAX,
             Some(512),
-            &never,
         );
         let FramePlan::Tiles { level, tiles } = plan else {
             panic!("the forced edge must produce tiles: {plan:?}");
@@ -1489,7 +1479,6 @@ mod tests {
                 u64::MAX,
                 u64::MAX,
                 None,
-                &never
             ),
             FramePlan::Blank
         );
@@ -1506,7 +1495,6 @@ mod tests {
                 u64::MAX,
                 u64::MAX,
                 None,
-                &never
             ),
             FramePlan::Blank
         );
@@ -1598,6 +1586,34 @@ mod tests {
     }
 
     #[test]
+    fn trim_to_evicts_coldest_to_a_headroom_budget_without_changing_the_cap() {
+        // The Base-arm headroom call (external review AI3 P2-2): after a
+        // giant's 1:1 panning filled the LRU near cap, zooming out to fit
+        // must reclaim the overview bitmap's headroom from the COLDEST
+        // tiles while leaving the insert cap untouched for the zoom back.
+        let mut lru = Lru::new(300);
+        for k in [1u32, 2, 3] {
+            lru.insert(k, 100);
+        }
+        assert_eq!(lru.total_bytes(), 300);
+        assert_eq!(lru.cap(), 300);
+        // Headroom for a 150-byte overview: trim to 150 - two coldest go
+        // (300 - 100 = 200 is still over 150).
+        let evicted = lru.trim_to(150);
+        assert_eq!(evicted, vec![1, 2], "the coldest entries go, in order");
+        assert_eq!(lru.total_bytes(), 100);
+        assert!(!lru.contains(&1) && !lru.contains(&2) && lru.contains(&3));
+        assert_eq!(lru.cap(), 300, "the policy cap is unchanged");
+        // A later insert still respects the ORIGINAL cap.
+        assert!(lru.insert(4, 90).is_empty());
+        assert_eq!(lru.total_bytes(), 190);
+        // A budget of 0 clears everything (an overview as large as the cap).
+        let all = lru.trim_to(0);
+        assert_eq!(all.len(), 2);
+        assert_eq!(lru.total_bytes(), 0);
+    }
+
+    #[test]
     fn budget_cap_clamps_the_driver_budget_into_our_own_range() {
         // No DXGI answer → the self-set cap.
         assert_eq!(budget_cap(None), SELF_CAP_BYTES);
@@ -1659,7 +1675,6 @@ mod tests {
             u64::MAX,
             u64::MAX,
             None,
-            &never,
         );
         let FramePlan::Tiles { tiles, .. } = plan else {
             panic!("expected tiles: {plan:?}");
@@ -1727,7 +1742,6 @@ mod tests {
             u64::MAX,
             u64::MAX,
             Some(2048),
-            &never,
         );
         let FramePlan::Tiles { tiles, .. } = plan else {
             panic!("expected tiles: {plan:?}");
@@ -1761,7 +1775,6 @@ mod tests {
             u64::MAX,
             budget,
             None,
-            &never,
         );
         let FramePlan::Base { level } = plan else {
             panic!("the frame must draw as one bitmap: {plan:?}");
@@ -1787,7 +1800,6 @@ mod tests {
             u64::MAX,
             u64::MAX,
             None,
-            &never,
         );
         let FramePlan::Base { level: deep } = ample else {
             panic!("expected Base");

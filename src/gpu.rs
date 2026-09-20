@@ -797,6 +797,10 @@ impl GpuStack {
         src: &mut dyn LevelSource,
     ) -> Result<(), String> {
         self.forced_edge = diag.tile_edge.filter(|edge| *edge > 0);
+        // Reset first, assign on success: an Err exit below (a refused
+        // level, a failed base upload) must not leave the PREVIOUS frame's
+        // scene in the close-time stats line (external review AI3 P3).
+        self.scene = Scene::Clear;
         // A new frame generation invalidates every tile and every cached
         // CPU level (their pixels can never be drawn again).
         src.rebind(frame_gen);
@@ -809,8 +813,6 @@ impl GpuStack {
         let dest = crate::tile::Rect::new(plan.dx, plan.dy, plan.rw, plan.rh);
         let viewport = crate::tile::Rect::new(0, 0, plan.cw, plan.ch);
         let frame_plan = {
-            let lru = &self.tile_lru;
-            let resident = move |key: &crate::tile::TileKey| lru.contains(key);
             crate::tile::plan_frame(
                 frame_gen,
                 crate::tile::FrameGeometry {
@@ -826,7 +828,6 @@ impl GpuStack {
                 // deepen here instead of blanking the frame later.
                 crate::mip::LEVEL_CACHE_BYTES,
                 self.forced_edge, // synced from the window state per paint
-                &resident,
             )
         };
         match frame_plan {
@@ -842,6 +843,19 @@ impl GpuStack {
                     .level(level)
                     .ok_or_else(|| format!("level {level} source is unavailable"))?;
                 self.ensure_base(frame_gen, level, wide, high, pixels)?;
+                // The overview bitmap counts against the same cap the tile
+                // LRU fills: a giant panned at 1:1 (LRU near cap) then
+                // zoomed out to fit would otherwise report — and hold —
+                // cap + overview. Trim the LRU to the remaining headroom
+                // so `gpu <= cap` holds on this transition too (external
+                // review AI3 P2-2; the S5c sweep asserts the strict bound).
+                let base = crate::tile::bgra_bytes(i64::from(wide) * i64::from(high));
+                if level > 0 {
+                    for key in self.tile_lru.trim_to(self.cap_bytes.saturating_sub(base)) {
+                        self.tiles.retain(|(k, _)| *k != key);
+                        self.ledger.tile_evictions += 1;
+                    }
+                }
                 self.scene = Scene::Base {
                     level,
                     w: wide,
@@ -857,7 +871,6 @@ impl GpuStack {
                 let (level_w, level_h, pixels) = src
                     .level(level)
                     .ok_or_else(|| format!("level {level} tile source is unavailable"))?;
-                let mut missing = 0usize;
                 let mut last_error: Option<String> = None;
                 // Pass 1: mark every already-resident tile of THIS frame hot
                 // before any insert can evict — an insert then only reclaims
@@ -890,8 +903,8 @@ impl GpuStack {
                                 // Refused: a single tile larger than the
                                 // whole cap. Its column shows the cleared
                                 // background this frame (the fallback the
-                                // ticket's ladder is meant to keep rare).
-                                missing += 1;
+                                // ticket's ladder is meant to keep rare) â
+                                // the post-pass verification below counts it.
                             }
                         }
                         Err(e) => {
@@ -899,7 +912,6 @@ impl GpuStack {
                             // below: a persistent failure would otherwise print
                             // once per tile per paint (animations included).
                             last_error = Some(e);
-                            missing += 1;
                         }
                     }
                 }
@@ -912,7 +924,11 @@ impl GpuStack {
                     .iter()
                     .filter(|q| self.tiles.iter().any(|(k, _)| *k == q.key))
                     .count();
-                missing += tiles.len() - resident_now;
+                // The post-pass count is the ground truth: it covers upload
+                // failures, refusals, AND same-frame evictions uniformly
+                // (external review AI3 P3: the per-tile increments used to
+                // double-count with it).
+                let missing = tiles.len() - resident_now;
                 if missing > 0 {
                     eprintln!(
                         "riviv: {missing} of {} tiles are not resident this frame{}",
@@ -1194,6 +1210,7 @@ impl GpuStack {
             plan,
         } = req;
         self.forced_edge = diag.tile_edge.filter(|edge| *edge > 0);
+        self.scene = Scene::Clear;
         if cw == 0 || ch == 0 {
             return Err(format!("viewport is {cw}x{ch} — nothing to dump"));
         }
@@ -1233,6 +1250,21 @@ impl GpuStack {
         // peak is what survives the call.
         self.ledger
             .note_inflight((cw as u64 * ch as u64 * 4).saturating_mul(2));
+        // The readback tail runs as one unit so the in-flight accounting is
+        // restored on EVERY exit: the six failure paths between here and
+        // the old success-path reset used to strand the staging bytes in
+        // the ledger (external review AI3 P2-1 - the same defect AI1 P2-4
+        // fixed in upload_tile, not synced to this arm), and the dump runs
+        // at WM_CLOSE, exactly when the stats line is about to be read.
+        let read = self.dump_readback(cw, ch);
+        self.ledger.note_inflight(0);
+        read
+    }
+
+    /// The dump's readback tail: staging bitmap, copy, map, rows, unmap,
+    /// the BGRA-to-RGBA decode. Every `?` here is a caller-side in-flight
+    /// reset away from leaking the accounting (see `dump`).
+    fn dump_readback(&mut self, cw: u32, ch: u32) -> Result<(u32, u32, Vec<u8>), String> {
         // SAFETY: the context is live; the properties struct outlives the
         // call; the bitmap is created bare (never set as the target).
         let readback = unsafe {
@@ -1298,7 +1330,6 @@ impl GpuStack {
         unsafe { readback.Unmap() }.map_err(|e| format!("dump Unmap failed: {e}"))?;
         let mut rgba = vec![0u8; bgra.len()];
         crate::pixels::bgra_to_rgba(&bgra, &mut rgba);
-        self.ledger.note_inflight(0);
         Ok((cw, ch, rgba))
     }
 }

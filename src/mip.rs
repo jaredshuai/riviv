@@ -80,14 +80,16 @@ pub(crate) fn downscale_box(src: &[u8], image_w: i32, image_h: i32, level: u32) 
         for dx in 0..dest_w as usize {
             let x0 = dx * sw / dest_w as usize;
             let x1 = ((dx + 1) * sw / dest_w as usize).max(x0 + 1).min(sw);
-            let mut sum = [0u32; 4];
-            let mut count = 0u32;
+            // u64 accumulators: zero cost, and immune to any future block
+            // geometry (external review AI3 P3).
+            let mut sum = [0u64; 4];
+            let mut count = 0u64;
             for y in y0..y1 {
                 let row = y * sw * 4;
                 for x in x0..x1 {
                     let px = row + x * 4;
                     for (c, s) in sum.iter_mut().zip(&src[px..px + 4]) {
-                        *c += u32::from(*s);
+                        *c += u64::from(*s);
                     }
                     count += 1;
                 }
