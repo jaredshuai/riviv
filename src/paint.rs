@@ -12,19 +12,18 @@
 //!
 //! The blit path follows upstream's paint (viv.c:4133-4236): destination
 //! size == source size → BitBlt (the pixel-exact 1:1 path); shrinking →
-//! HALFTONE + brush-org realignment; magnifying → COLORONCOLOR (the default
-//! `config_mag_filter`). Alpha compositing (#3) is landed — transparent
-//! pixels are resolved against the windowed background at decode time, so
-//! this path blits opaque pixels only.
+//! HALFTONE or COLORONCOLOR by `shrink_blit_mode`; magnifying → COLORONCOLOR
+//! or HALFTONE by `mag_filter` (upstream's default config). Alpha
+//! compositing (#3) is landed — transparent pixels are resolved against the
+//! windowed background at decode time, so this path blits opaque pixels
+//! only.
 //!
-//! #9: the source is the mipmap level selected for the render size
-//! (upstream `_viv_get_mipmap` at viv.c:4167 — the chain extends lazily,
-//! then all three arms measure against the LEVEL's size, not the
-//! original's). The ≥32768 stitch itself lives in mip generation
-//! (`surface.rs` via `stitch.rs`); paint only meets giant extents on the
-//! HALFTONE shrink path, where upstream keeps ONE full-rect StretchBlt
-//! behind a simple clip region (viv.c:4264-4283) — cutting the rect would
-//! realign the filter taps (viv.c:4253-4257).
+//! #81 (ADR 0002 D7) retires the #9 mip chain: the source is the frame's
+//! single full-resolution face (`surface::with_face_source`), all three
+//! arms measure against the ORIGINAL's size, and the ≥32768 extent gate on
+//! the shrink path takes upstream's own no-mip shape — ONE full-rect
+//! StretchBlt behind a simple clip region (viv.c:4264-4283) — cutting the
+//! rect would realign the filter taps (viv.c:4253-4257).
 //!
 //! #80 splits the scene from the WM_PAINT bracket: [`render_scene`] draws
 //! blit + strips onto ANY DC — the GDI dump channel and the giant-frame
@@ -40,11 +39,9 @@ use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BeginPaint, BitBlt, COLORONCOLOR, CreateCompatibleDC,
     CreateDIBSection, CreateRectRgn, CreateSolidBrush, DIB_RGB_COLORS, DeleteDC, DeleteObject,
     ERROR, EndPaint, FillRect, GetDC, HALFTONE, HDC, HGDIOBJ, PAINTSTRUCT, ReleaseDC, SRCCOPY,
-    SelectClipRgn, SelectObject, SetBrushOrgEx, SetStretchBltMode, StretchBlt,
+    SelectClipRgn, SelectObject, SetStretchBltMode, StretchBlt,
 };
 use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
-
-use crate::mip;
 
 use crate::stitch::STRETCH_EXTENT_LIMIT;
 use crate::window::{fatal, state_of};
@@ -94,9 +91,9 @@ pub(crate) fn paint(view: HWND, owner: HWND) {
 }
 
 /// The scene body of the GDI arm: gather the fit inputs and the
-/// mode-resolved background, blit the current frame's view (mip-selected),
-/// then fill the letterbox strips around it. Shared verbatim by the
-/// WM_PAINT bracket (above), the giant-frame degrade pass
+/// mode-resolved background, blit the current frame's view from its
+/// full-resolution face, then fill the letterbox strips around it. Shared
+/// verbatim by the WM_PAINT bracket (above), the giant-frame degrade pass
 /// ([`paint_degraded`]) and the GDI dump channel ([`dump_viewport_gdi`]).
 /// `paint_clip` is the update-rect source for the giant-extent clip region
 /// (WM_PAINT passes ps.rcPaint; the off-paint channels pass the whole
@@ -107,7 +104,7 @@ pub(crate) fn render_scene(hdc: HDC, owner: HWND, client: RECT, paint_clip: RECT
     // SAFETY: GDI draws onto `hdc` only (the caller owns its lifetime);
     // the state borrows span the draw calls, none of which pump messages —
     // no second `state_of` borrow can be taken while one is live (PR #10
-    // P1). The mip chain extension inside (ensure_mips) is
+    // P1). The on-demand face build inside (with_face_source) is
     // degrade-not-fatal by design for the same reason: the fatal modal
     // pumps messages and would alias this borrow.
     unsafe {
@@ -149,8 +146,8 @@ pub(crate) fn render_scene(hdc: HDC, owner: HWND, client: RECT, paint_clip: RECT
             // The two blit filters (config.c:41-42; 0 = COLORONCOLOR
             // "Nearest", 1 = HALFTONE "Linear"): the shrink arm keys on
             // `shrink_blit_mode`, the magnify arm on `mag_filter`
-            // (upstream viv.c:4205-4237 — brush-org realignment rides the
-            // HALFTONE SHRINK only).
+            // (upstream viv.c:4205-4237; its brush-org dither realignment
+            // was dropped with #81 — README Differences).
             let halftone_shrink = state.config.shrink_blit_mode == 1;
             let halftone_mag = state.config.mag_filter == 1;
             // The zoom/pan view decides the destination rect (upstream
@@ -165,28 +162,28 @@ pub(crate) fn render_scene(hdc: HDC, owner: HWND, client: RECT, paint_clip: RECT
             let dy = client.top + rdy;
             img = (dx, dy, rw, rh);
             if rw > 0 && rh > 0 {
-                // Mip selection by render size (upstream viv.c:4167): extend
-                // the frame's chain to the selected level on demand, then
-                // paint from the level that is actually usable — a truncated
-                // chain degrades to a shallower source, never a blank image.
-                let target = mip::select_mip_level(sw, sh, rw, rh);
-                let level = surface.ensure_mips(sw, sh, target);
-                surface.with_mip_source(level, |src_dc, mw, mh| {
+                // Single-bitmap direct draw (#81, ADR 0002 D7): the GDI arm
+                // stretches from the frame's full-resolution face — no mip
+                // selection, no chain. mw/mh are always the master dims, so
+                // the three arms below measure against the ORIGINAL's size.
+                surface.with_face_source(|src_dc, mw, mh| {
                     if rw == mw && rh == mh {
                         // Pixel-exact 1:1 — BitBlt, no resampling (upstream's
                         // equal-size arm, viv.c:4164-4173; plain BitBlt even
                         // for huge extents, GDI clips).
                         let _ = BitBlt(hdc, dx, dy, rw, rh, Some(src_dc), 0, 0, SRCCOPY);
                     } else if rw < mw || rh < mh {
-                        // Upstream shrink path (viv.c:4205-4214): HALFTONE +
-                        // brush-org realignment anchored to the destination
-                        // image (viv.c:4205-4209 uses -rx,-ry, so the dither
-                        // pattern does not drift as the image moves) when
-                        // `shrink_blit_mode` is Linear; Nearest is plain
-                        // COLORONCOLOR with no brush org.
+                        // Upstream shrink path (viv.c:4205-4214): HALFTONE
+                        // when `shrink_blit_mode` is Linear, COLORONCOLOR
+                        // otherwise. Upstream realigns the HALFTONE dither
+                        // pattern to the image origin here (viv.c:4205-4209
+                        // `SetBrushOrgEx(-rx,-ry)`); riviv deleted that
+                        // parity in #81 — D2D has no dither, and a
+                        // 32bpp→32bpp StretchBlt does not dither in
+                        // practice, so the brush org had nothing left to
+                        // anchor (README Differences).
                         if halftone_shrink {
                             let _ = SetStretchBltMode(hdc, HALFTONE);
-                            let _ = SetBrushOrgEx(hdc, -dx, -dy, None);
                         } else {
                             let _ = SetStretchBltMode(hdc, COLORONCOLOR);
                         }
@@ -195,14 +192,17 @@ pub(crate) fn render_scene(hdc: HDC, owner: HWND, client: RECT, paint_clip: RECT
                             || rw >= STRETCH_EXTENT_LIMIT
                             || rh >= STRETCH_EXTENT_LIMIT
                         {
-                            // Giant extents (a mid-zoom shrink whose selected
-                            // level is still ≥32768): one full-rect StretchBlt
-                            // behind a simple clip region — upstream's
-                            // halftone pattern (viv.c:4264-4283). The rect
-                            // must NOT be cut (filter alignment), and GDI
-                            // walks a complex clip region slowly, so the DC
-                            // gets a single-rect region instead: the update
-                            // paint rect intersected with the viewport.
+                            // Giant extents: with the chain retired (#81) ANY
+                            // ≥32768-source shrink lands here — upstream's
+                            // own no-mip shape (the tall-narrow quirk cases,
+                            // viv.c:4264-4283), not a new behavior class:
+                            // one full-rect StretchBlt behind a simple clip
+                            // region — upstream's halftone pattern
+                            // (viv.c:4264-4283). The rect must NOT be cut
+                            // (filter alignment), and GDI walks a complex
+                            // clip region slowly, so the DC gets a
+                            // single-rect region instead: the update paint
+                            // rect intersected with the viewport.
                             let l = paint_clip.left.max(client.left);
                             let t = paint_clip.top.max(client.top);
                             let r = paint_clip.right.min(client.right);

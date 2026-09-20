@@ -12,18 +12,21 @@
 //! dest rect exactly — no gaps, no overlap (only per-tile resampler phase,
 //! which upstream accepts; viv.c:14233-14235).
 //!
-//! This module is the pure math; the GDI shell (mip generation in
-//! `surface.rs`) consumes it. Paint never needs it: after mips, shrink
-//! sources stay under the limit except through upstream's no-mip quirk
-//! cases, where the HALFTONE path must NOT be cut (filter alignment,
-//! viv.c:4253-4257) and uses a clip region instead (viv.c:4264-4283), and
-//! magnify is viewport-clipped before blitting (#7's `clip_blit`).
+//! This module is the pure math. Its GDI-shell consumer was mip
+//! generation in `surface.rs`, deleted with the #81 mip retirement
+//! (ADR 0002 D7); the partition math is retained because #82's giant-image
+//! tiling explicitly reuses it. Paint never tiles: since #81 shrink
+//! sources are the full-resolution face, and any ≥32768-extent shrink
+//! takes upstream's own no-mip clip-region shape instead (viv.c:4264-4283,
+//! the HALFTONE path must NOT be cut — filter alignment, viv.c:4253-4257)
+//! while magnify is viewport-clipped before blitting (#7's `clip_blit`).
 
 use crate::zoom::BlitRect;
 
 /// Source tile edge in px (upstream `_VIV_STRETCH_BLT_STITCH_SIZE`,
 /// viv.c:288). Must satisfy `TILE * 3.1 * 16 < 32768` so one tile's dest
 /// extent can never hit the StretchBlt limit under max zoom + pan.
+#[allow(dead_code)] // its caller (mip generation) died with #81; #82's tiling reuses it
 pub(crate) const STITCH_TILE_SIZE: i32 = 512;
 
 /// The StretchBlt extent limit that forces the tiled path (upstream's
@@ -47,6 +50,7 @@ pub(crate) const STRETCH_EXTENT_LIMIT: i32 = 32768;
 /// zero-extent StretchBlt and abort the whole chain on its failure
 /// (viv.c:14999-15002 returns FALSE) — a latent upstream defect this port
 /// deliberately does not carry (review finding, PR #18).
+#[allow(dead_code)] // its caller (mip generation) died with #81; #82's tiling reuses it
 pub(crate) fn stitch_tiles(blit: BlitRect, clip: (i32, i32, i32, i32)) -> Vec<BlitRect> {
     let BlitRect {
         dx,

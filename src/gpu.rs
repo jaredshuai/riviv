@@ -30,10 +30,10 @@ use windows::Win32::Graphics::Direct2D::{
     D2D1_ANTIALIAS_MODE_ALIASED, D2D1_BITMAP_OPTIONS, D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
     D2D1_BITMAP_OPTIONS_CPU_READ, D2D1_BITMAP_OPTIONS_NONE, D2D1_BITMAP_OPTIONS_TARGET,
     D2D1_BITMAP_PROPERTIES1, D2D1_DEVICE_CONTEXT_OPTIONS_NONE, D2D1_FACTORY_TYPE_SINGLE_THREADED,
-    D2D1_INTERPOLATION_MODE, D2D1_INTERPOLATION_MODE_LINEAR,
-    D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, D2D1_MAP_OPTIONS_READ, D2D1_PRIMITIVE_BLEND_COPY,
-    D2D1_UNIT_MODE_PIXELS, D2D1CreateFactory, ID2D1Bitmap, ID2D1Device, ID2D1DeviceContext,
-    ID2D1Factory1, ID2D1Image, ID2D1RenderTarget,
+    D2D1_INTERPOLATION_MODE, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,
+    D2D1_INTERPOLATION_MODE_LINEAR, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
+    D2D1_MAP_OPTIONS_READ, D2D1_PRIMITIVE_BLEND_COPY, D2D1_UNIT_MODE_PIXELS, D2D1CreateFactory,
+    ID2D1Bitmap, ID2D1Device, ID2D1DeviceContext, ID2D1Factory1, ID2D1Image, ID2D1RenderTarget,
 };
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP};
 use windows::Win32::Graphics::Direct3D11::{
@@ -100,10 +100,14 @@ pub(crate) fn failure_window(
     }
 }
 
-/// The #80 minimal two-tier filter map (#81 owns the full table): a 1:1
-/// render is NEAREST unconditionally (the pixel-exact contract); a shrink
-/// follows `shrink_blit_mode`, a magnify follows `mag_filter` — the same
-/// 0=Nearest/1=Linear values the GDI arms read (config.c:41-42).
+/// The #81 full filter table (ADR 0002 D6): a 1:1 render is NEAREST
+/// unconditionally (the pixel-exact contract); a shrink follows
+/// `shrink_blit_mode`, a magnify follows `mag_filter` — the same
+/// 0=Nearest/1=Linear ini tiers the GDI arms read (config.c:41-42), but
+/// the D2D arm renders the shrink Linear tier as HIGH_QUALITY_CUBIC: a
+/// prefiltered cubic beats GDI HALFTONE on strong downscales (recorded as
+/// a README Differences item; the ini tier's user-visible name stays
+/// "Linear").
 pub(crate) fn d2d_interp_mode(
     is_1x1: bool,
     shrink_linear: bool,
@@ -114,7 +118,7 @@ pub(crate) fn d2d_interp_mode(
         D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR
     } else if shrinking {
         if shrink_linear {
-            D2D1_INTERPOLATION_MODE_LINEAR
+            D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC
         } else {
             D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR
         }
@@ -166,18 +170,19 @@ pub(crate) struct DrawPlan {
 
 /// The L0 pixel-exact predicate (design §4): a render whose size equals
 /// the source's on both axes — NEAREST over an exact integer rect, the
-/// five-piece's resample-free clause. The GDI arm's BitBlt arm compares
-/// against the SELECTED MIP's size instead; at 1:1 mip selection returns
-/// level 0 (the full source), so the two predicates agree exactly where
-/// the byte-exact contract applies (off-1:1 the arms diverge by design —
-/// #81's filter table owns that surface).
+/// five-piece's resample-free clause. Since #81 retired the mip chain the
+/// GDI arm compares against the face's size, which IS the master's — so
+/// this predicate is the shared 1:1 test of BOTH arms on their whole
+/// domain (the off-1:1 filter selection is #81's table's surface).
 pub(crate) fn one_to_one_render(rw: i32, rh: i32, sw: i32, sh: i32) -> bool {
     rw == sw && rh == sh
 }
 
 /// Build the plan from the window state — the SAME scene_rect math the GDI
 /// blit runs (design §4's geometry clause), against the master's full-size
-/// bitmap: the D2D arm never participates in the mip chain.
+/// bitmap: since #81 retired the mip chain (ADR 0002 D7) both arms draw
+/// from the single full-resolution source and the interpolation comes from
+/// the #81 full filter table.
 pub(crate) fn draw_plan(
     state: &crate::window::WindowState,
     cw: i32,
@@ -977,6 +982,10 @@ pub(crate) fn owner_of(view: HWND) -> HWND {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows::Win32::Graphics::Direct2D::{
+        D2D1_INTERPOLATION_MODE_ANISOTROPIC, D2D1_INTERPOLATION_MODE_CUBIC,
+        D2D1_INTERPOLATION_MODE_MULTI_SAMPLE_LINEAR,
+    };
 
     // ---- failure_window (design §7) ----
 
@@ -1046,7 +1055,7 @@ mod tests {
         assert_eq!(failures, vec![u32::MAX - 100, 300]);
     }
 
-    // ---- d2d_interp_mode (#80's two tiers) ----
+    // ---- d2d_interp_mode (#81's full filter table) ----
 
     #[test]
     fn the_one_to_one_predicate_requires_both_axes_to_match_the_source() {
@@ -1076,8 +1085,9 @@ mod tests {
     fn shrinking_follows_shrink_blit_mode() {
         assert_eq!(
             d2d_interp_mode(false, true, false, true),
-            D2D1_INTERPOLATION_MODE_LINEAR,
-            "shrink_blit_mode=1 (HALFTONE) draws linear"
+            D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,
+            "shrink_blit_mode=1 (HALFTONE) draws high-quality cubic — \
+             the #81/ADR 0002 D6 upgrade over GDI HALFTONE"
         );
         assert_eq!(
             d2d_interp_mode(false, false, false, true),
@@ -1097,6 +1107,23 @@ mod tests {
             d2d_interp_mode(false, false, false, false),
             D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
             "mag_filter=0 (COLORONCOLOR) draws nearest"
+        );
+    }
+
+    #[test]
+    fn the_draw_bitmap_mode_enum_pins_the_six_d2d1_1_h_values() {
+        // The full D2D1_INTERPOLATION_MODE table the DrawBitmap signature
+        // takes, value-pinned against d2d1_1.h so a windows-rs
+        // regeneration or a wrong-tier constant in the #81 filter table
+        // fails loudly instead of shipping a silently different kernel.
+        assert_eq!(D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR.0 as u32, 0);
+        assert_eq!(D2D1_INTERPOLATION_MODE_LINEAR.0 as u32, 1);
+        assert_eq!(D2D1_INTERPOLATION_MODE_CUBIC.0 as u32, 2);
+        assert_eq!(D2D1_INTERPOLATION_MODE_MULTI_SAMPLE_LINEAR.0 as u32, 3);
+        assert_eq!(D2D1_INTERPOLATION_MODE_ANISOTROPIC.0 as u32, 4);
+        assert_eq!(
+            D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC.0 as u32, 5,
+            "the shrink Linear tier's kernel"
         );
     }
 
