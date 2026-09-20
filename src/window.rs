@@ -65,7 +65,7 @@ use windows::Win32::UI::Controls::{
     InitCommonControlsEx, NM_CLICK, NMHDR, NMMOUSE, SB_GETPARTS, WM_MOUSELEAVE,
 };
 use windows::Win32::UI::HiDpi::{
-    GetDpiForSystem, GetProcessDpiAwareness, PROCESS_DPI_UNAWARE, PROCESS_PER_MONITOR_DPI_AWARE,
+    GetProcessDpiAwareness, PROCESS_DPI_UNAWARE, PROCESS_PER_MONITOR_DPI_AWARE,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetCapture, GetKeyNameTextW, GetKeyState, GetKeyboardLayout, MAPVK_VK_TO_VSC, MapVirtualKeyExW,
@@ -88,21 +88,20 @@ use windows::Win32::UI::WindowsAndMessaging::{
     MB_ICONERROR, MB_ICONQUESTION, MB_OK, MENU_ITEM_FLAGS, MF_BYCOMMAND, MF_CHECKED, MF_ENABLED,
     MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MFT_RADIOCHECK, MINMAXINFO, MSG,
     MenuItemFromPoint, MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassExW,
-    SC_MONITORPOWER, SHOW_WINDOW_CMD, SM_CXICON, SM_CXSMICON, SM_CYBORDER, SM_CYICON, SM_CYSMICON,
-    SW_MAXIMIZE, SW_RESTORE, SW_SHOW, SW_SHOWNORMAL, SWP_FRAMECHANGED, SWP_NOACTIVATE,
-    SWP_NOCOPYBITS, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SYSTEM_METRICS_INDEX, SendMessageW,
-    SetCursorPos, SetForegroundWindow, SetMenu, SetTimer, SetWindowLongPtrW, SetWindowPos,
-    SetWindowTextW, ShowCursor, ShowWindow, TPM_CENTERALIGN, TPM_LEFTBUTTON, TPM_VCENTERALIGN,
-    TrackPopupMenu, TranslateMessage, USER_TIMER_MINIMUM, WINDOW_EX_STYLE, WINDOW_STYLE,
-    WM_ACTIVATE, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_COPYDATA, WM_DESTROY, WM_DPICHANGED,
-    WM_DROPFILES, WM_ENDSESSION, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_INITMENU, WM_KEYDOWN,
-    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE,
-    WM_MOUSEWHEEL, WM_MOVE, WM_NCCREATE, WM_NCDESTROY, WM_NCLBUTTONDOWN, WM_NCXBUTTONDBLCLK,
-    WM_NCXBUTTONDOWN, WM_NOTIFY, WM_NULL, WM_PAINT, WM_PASTE, WM_QUERYENDSESSION, WM_RBUTTONDBLCLK,
-    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SIZE, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_TIMER,
-    WM_XBUTTONDBLCLK, WM_XBUTTONDOWN, WNDCLASSEXW, WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN,
-    WS_EX_ACCEPTFILES, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_SYSMENU, WS_THICKFRAME, WS_VISIBLE,
-    WindowFromPoint,
+    SC_MONITORPOWER, SHOW_WINDOW_CMD, SM_CXICON, SM_CXSMICON, SM_CYICON, SM_CYSMICON, SW_MAXIMIZE,
+    SW_RESTORE, SW_SHOW, SW_SHOWNORMAL, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOCOPYBITS,
+    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SYSTEM_METRICS_INDEX, SendMessageW, SetCursorPos,
+    SetForegroundWindow, SetMenu, SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowTextW,
+    ShowCursor, ShowWindow, TPM_CENTERALIGN, TPM_LEFTBUTTON, TPM_VCENTERALIGN, TrackPopupMenu,
+    TranslateMessage, USER_TIMER_MINIMUM, WINDOW_EX_STYLE, WINDOW_STYLE, WM_ACTIVATE, WM_CLOSE,
+    WM_COMMAND, WM_CONTEXTMENU, WM_COPYDATA, WM_DESTROY, WM_DPICHANGED, WM_DROPFILES,
+    WM_ENDSESSION, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_INITMENU, WM_KEYDOWN, WM_LBUTTONDBLCLK,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_MOVE, WM_NCCREATE, WM_NCDESTROY, WM_NCLBUTTONDOWN, WM_NCXBUTTONDBLCLK, WM_NCXBUTTONDOWN,
+    WM_NOTIFY, WM_NULL, WM_PAINT, WM_PASTE, WM_QUERYENDSESSION, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN,
+    WM_RBUTTONUP, WM_SIZE, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_TIMER, WM_XBUTTONDBLCLK,
+    WM_XBUTTONDOWN, WNDCLASSEXW, WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN, WS_EX_ACCEPTFILES,
+    WS_OVERLAPPEDWINDOW, WS_POPUP, WS_SYSMENU, WS_THICKFRAME, WS_VISIBLE, WindowFromPoint,
 };
 use windows::core::{HSTRING, PCSTR, PCWSTR, PWSTR, w};
 
@@ -3096,7 +3095,7 @@ fn queue_preload(hwnd: HWND, entry: &PlaylistEntry) {
     // The request-time decode inputs snapshot together, exactly like a
     // foreground open (upstream snapshots _viv_load_render_wide/high per
     // load, viv.c:1557-1558).
-    let env = decode_env(hwnd, state);
+    let env = decode_env(state);
     let session = state.load_thread.request(
         hwnd,
         LoadSource::File(entry.path.clone()),
@@ -3263,7 +3262,7 @@ pub(crate) fn request_open(hwnd: HWND, path: &OsStr, origin: OpenOrigin<'_>) {
         // The request-time decode inputs snapshot together — a
         // color/icm change mid-load must not flip frames already in
         // flight.
-        let env = decode_env(hwnd, state);
+        let env = decode_env(state);
         // Clear any existing preload and start fresh (upstream
         // `_viv_clear_preload` inside `_viv_open`'s fresh-start arm,
         // viv.c:1512-1513) — placed after the not-found verdict, which
@@ -3295,54 +3294,13 @@ pub(crate) fn request_open(hwnd: HWND, path: &OsStr, origin: OpenOrigin<'_>) {
     refresh_status(hwnd);
 }
 
-/// The request-time render area for a decode job (upstream
-/// `_viv_load_render_wide/high`, viv.c:1557-1558): the client WIDTH
-/// as-is, the height minus the status bar — upstream subtracts the bar
-/// from the height only. The startup request can race the bar's first
-/// layout (it is created 0x0 and self-sizes) — a zero measured height
-/// falls back to the formula run() sized the initial window with (cubic,
-/// PR #18).
-fn request_render_viewport(hwnd: HWND, state: &WindowState) -> (i32, i32) {
-    // The request-time viewport is the child's live rect (#78); the legacy
-    // estimate below only covers the pre-creation window, which no real
-    // request can reach (loads start after `run()` creates the child).
-    // Pre-#78 legacy arm: it has always subtracted the status-bar height
-    // ONLY — never the toolbar strip's (a formula inherited from before
-    // #45) — so it is NOT numerically identical to the child's rect;
-    // that mismatch is exactly why the child rect superseded it as the
-    // source of truth.
-    if !state.viewport.is_invalid() {
-        let mut view = RECT::default();
-        // SAFETY: a pure rect query on our own child — no pumping, safe
-        // inside the caller's borrow like the stores around it.
-        let _ = unsafe { GetClientRect(state.viewport, &mut view) };
-        return (
-            (view.right - view.left).max(0),
-            (view.bottom - view.top).max(0),
-        );
-    }
-    let mut client = RECT::default();
-    // SAFETY: a pure window query on the live hwnd — no pumping, safe
-    // inside the caller's borrow like the stores around it.
-    let _ = unsafe { GetClientRect(hwnd, &mut client) };
-    let bar_h = match status::height(state.status) {
-        0 => initial_status_height(),
-        h => h,
-    };
-    (
-        client.right - client.left,
-        (client.bottom - client.top - bar_h).max(0),
-    )
-}
-
 /// The request-time decode-input snapshot shared by every load request
-/// — the render viewport (the worker's mip pre-generation target, from
-/// `request_render_viewport`) plus the compositing background and the
-/// `icm` flag (#77): all three snapshot together so a color/icm change
-/// mid-load cannot flip frames already in flight.
-fn decode_env(hwnd: HWND, state: &WindowState) -> DecodeEnv {
+/// — the compositing background and the `icm` flag (#77), snapshot
+/// together so a color/icm change mid-load cannot flip frames already in
+/// flight. (The render viewport the mip pre-generation used to ride
+/// along with died with the #81 mip retirement.)
+fn decode_env(state: &WindowState) -> DecodeEnv {
     DecodeEnv {
-        render_viewport: request_render_viewport(hwnd, state),
         background: state.config.windowed_bg(),
         icm: state.config.icm != 0,
     }
@@ -3396,7 +3354,7 @@ fn request_open_virtual(hwnd: HWND, name: &str, source: LoadSource) {
         state.pending_file_bytes = None;
         // A fresh start drops any parked preload (viv.c:1512-1513).
         state.preload = None;
-        let env = decode_env(hwnd, state);
+        let env = decode_env(state);
         // The foreground's first frame gets the paint handshake (#76) —
         // except `clipboard:`, whose stream is always a single frame
         // built by `decode_dib_to_sink` (the wait helper is never
@@ -4288,9 +4246,11 @@ fn delete_current(hwnd: HWND, permanently: bool) {
 /// #43 `_viv_edit_rotate` (viv.c:7715-7768): fire the shell rotate90/
 /// rotate270 verb and WAIT — the OS photo handler rewrites the file on
 /// disk (upstream's own re-encode route; riviv keeps it verbatim, see
-/// README Differences) — then rotate every loaded frame in memory, drop
-/// the mips, re-anchor the view at the swapped dimensions, and refresh
-/// the POS/RGB sample, the status bar and the paint. The decode-complete
+/// README Differences) — then rotate every loaded frame in memory,
+/// re-anchor the view at the swapped dimensions, and refresh
+/// the POS/RGB sample, the status bar and the paint. (Masters rotate and
+/// the GDI face rebuilds at the next paint; there is no mip chain to
+/// drop since #81, ADR 0002 D7.) The decode-complete
 /// gate is upstream's own "wait for the image to load" FIXME
 /// (`_viv_frame_loaded_count == _viv_frame_count`, viv.c:7721-7723); a
 /// failed verb launch skips the memory pass too (fail-soft).
@@ -7953,31 +7913,6 @@ fn make_rect_completely_visible_core(rect: RECT, target: RECT, source: RECT) -> 
     r
 }
 
-/// The status bar's height before its window exists (used only for the
-/// startup load's pre-generation viewport fallback — the live bar is
-/// measured via `status::height` afterwards). comctl32 sizes a status bar
-/// from the system status font and border metrics; we reproduce that
-/// formula (border * 2 + font height) at the system DPI.
-fn initial_status_height() -> i32 {
-    // System DPI — the bar this estimates is chrome, and chrome keeps
-    // system-DPI proportions on every monitor by design (#79's audit:
-    // the v5.82 status bar sizes itself from system-DPI defaults). The
-    // pre-#79 screen-DC read returned the same number.
-    // SAFETY: resolved in the CALLING THREAD's DPI context — GetDpiForSystem
-    // is only "process-wide" for aware threads (an unaware thread would
-    // read 96). riviv never switches a thread's context (no
-    // SetThreadDpiAwareness anywhere), so the UI thread's PMv2 default —
-    // guaranteed by the run() self-check — makes this the real system DPI.
-    // The 96 floor only guards a failed (0) return.
-    let dpi = unsafe { GetDpiForSystem() }.max(96);
-    // SAFETY: read-only system-metric queries.
-    let border = unsafe { GetSystemMetrics(SM_CYBORDER) };
-    // Upstream's bar at 96 DPI is 22 px (SM_CYVTHUMB=20 + borders); scale
-    // from there — comctl32's own formula is font-height based and lands
-    // on the same value.
-    ((20 * dpi as i32) / 96) + border * 2
-}
-
 pub(crate) fn fatal(message: &str) -> ! {
     let text = to_wide(message);
     // SAFETY: a null owner is allowed for a modal error box (system-level
@@ -8514,7 +8449,11 @@ pub(crate) fn run() -> Result<(), String> {
     // SAFETY: the read-only borrow ends inside the map.
     let (request, view_target) = (unsafe { state_of(hwnd) })
         .map(|state| (state.config.renderer, state.viewport))
-        .unwrap_or((RendererKind::Gdi, HWND::default()));
+        // The fallback mirrors the config default (auto since #81); the
+        // path is unreachable in practice (state missing = the window is
+        // going away) and either value ends at the same environmental
+        // degrade below.
+        .unwrap_or((RendererKind::Auto, HWND::default()));
     let mut init_error: Option<String> = None;
     let built = if request.wants_d2d() {
         match crate::gpu::create(view_target, hwnd, request) {

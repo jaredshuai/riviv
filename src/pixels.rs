@@ -1,7 +1,6 @@
 //! Pixel-buffer math (pure logic, unit-tested).
 //!
-//! M2 seam: mipmap generation math (#9) lands here beside the BGRA
-//! conversion and the alpha compositing (#3, landed — the composite
+//! BGRA conversion and the alpha compositing (#3, landed — the composite
 //! background itself is a runtime parameter since #24, snapshot from
 //! the config at request time).
 //!
@@ -10,7 +9,7 @@
 //! cross-thread boundary carries no GDI objects) and what every
 //! consumer reads directly (the RGB status readout, the clipboard image
 //! blit's source, the rotate pass, the future D2D upload). The GDI face
-//! (DIB section + memory DC + mips) is a UI-thread derivation owned by
+//! (DIB section + memory DC) is a UI-thread derivation owned by
 //! `surface::Surface`.
 
 /// image crate yields RGBA rows (top-down); GDI 32bpp DIBs want BGRA.
@@ -124,18 +123,11 @@ pub(crate) fn rotate_bgra_270_cw(src: &[u8], wide: usize, high: usize, dst: &mut
 /// GDI face is derived from it on the UI thread; device-loss recovery
 /// and the D2D upload (#80) will re-derive from these bytes without
 /// re-decoding.
-///
-/// `mip_target` is the decode-side mip pre-generation decision (the
-/// pure `select_mip_level` + budget-gate math, kept verbatim in the
-/// loader): how many levels the UI thread pre-generates when it builds
-/// the frame's GDI face. Zero means "no pre-generation" (the gate spent
-/// the animation's budget, or the viewport asked for none).
 #[derive(Debug)]
 pub(crate) struct PixelFrame {
     pub(crate) pixels: Box<[u8]>,
     pub(crate) width: u32,
     pub(crate) height: u32,
-    pub(crate) mip_target: u32,
 }
 
 impl PixelFrame {
@@ -167,7 +159,6 @@ impl PixelFrame {
             pixels: bgra.into_boxed_slice(),
             width,
             height,
-            mip_target: 0,
         }
     }
 
@@ -351,10 +342,11 @@ mod tests {
     }
 
     #[test]
-    fn pixelframe_from_bgra_keeps_bytes_and_defaults_to_no_pregen() {
+    fn pixelframe_from_bgra_keeps_bytes_and_dimensions() {
+        // The BGRA-native entry boxes the bytes as-is; the dimensions
+        // ride along for the load protocol's test surface.
         let frame = PixelFrame::from_bgra(1, 2, vec![1, 2, 3, 255, 4, 5, 6, 255]);
         assert_eq!(&frame.pixels[..], &[1, 2, 3, 255, 4, 5, 6, 255]);
-        assert_eq!(frame.mip_target, 0, "the decode side sets it explicitly");
         assert_eq!(frame.dims(), (1, 2));
     }
 

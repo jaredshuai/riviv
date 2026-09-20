@@ -2,7 +2,8 @@
 //!
 //! M3: the M2 feature set (Win32 window + GDI rendering, animated
 //! GIF/WebP playback, background decoding, playlist navigation, zoom/pan,
-//! fullscreen, giant-image stitching + mipmaps) plus the settings layer
+//! fullscreen, giant-image handling — the stitching of #9, reshaped by
+//! #81) plus the settings layer
 //! (#19): the window rect is remembered across runs in a `[riviv]` ini
 //! (`config.rs`/`ini.rs`) with upstream's 60% first-run auto-fit, and the
 //! M1 image-sized startup window is gone — windows never resize on load
@@ -39,7 +40,8 @@
 //! Module layout (each module is an M2 seam):
 //! - `anim` — animation frame scheduling + delay fallbacks + the streamed-loading
 //!   stall branch (#3/#4, landed); M2 seams left: the rate table
-//! - `pixels` — BGRA conversion + alpha compositing (#3, landed); M2: mip math (#9)
+//! - `pixels` — BGRA conversion + alpha compositing (#3, landed); the CPU
+//!   frame (`PixelFrame`, #76)
 //! - `fit` — fit-to-window math (the zoom curve's level 0)
 //! - `zoom` — 16-step zoom presets, wheel/cursor anchoring, pan clamping,
 //!   the temporary 1:1 mode, the resize re-anchor and the fullscreen
@@ -49,7 +51,7 @@
 //! - `cursor` — the fullscreen cursor-hide state machine, pure
 //!   show/timer/effects decisions (#8, landed)
 //! - `surface` — DIB section + memory DC; one per decoded frame (#3, landed);
-//!   M2: mipmap surfaces (#9)
+//!   the #76 on-demand face (the #81 direct-draw source)
 //! - `loader` — streaming decode pipeline + the load reply state machine
 //!   (#3/#4, landed)
 //! - `loadthread` — background decode session: worker thread, reply queue,
@@ -69,14 +71,15 @@
 //!   compose, the WM_TIMER advance gate and the rate readout (#37)
 //! - `custom_rate_dlg` — the Set Custom Rate dialog over that model
 //!   (hand-built, the #22 dialog pattern) (#37)
-//! - `paint` — WM_PAINT render; M2: stitch/mip (#9); zoom/pan offsets,
+//! - `paint` — WM_PAINT render (the face-direct blit + letterbox strips;
+//!   the ≥32768 shrink gate since #81); zoom/pan offsets,
 //!   the BitBlt 1:1 path and the COLORONCOLOR magnify filter landed (#7);
 //!   #80: the scene body extracted (`render_scene`/`scene_rect`) for the
 //!   dump/degrade channels
 //! - `gpu` — the D2D/DXGI viewport stack (#80): GpuStack (device chain,
 //!   frame upload keyed by frame_gen, WM_SIZE resize, the three-tier
 //!   failure ladder, the WM_CLOSE dump readback) behind the `renderer`
-//!   ini key; the GDI arm stays the default byte-identical baseline
+//!   ini key; #81: the full filter table, and `auto` is the default
 //! - `playlist` — playlist model + navigation math + recursive folder/wildcard
 //!   entry construction (#6, landed)
 //! - `status` — the status-bar common control: creation, height, and the
@@ -84,7 +87,7 @@
 //! - `window` — wnd_proc shell, pump, input/open actions, animation timer,
 //!   reply handler, playlist wiring, zoom/pan mouse+key wiring, the
 //!   fullscreen toggle and the cursor-hide timers
-//!   (#3/#4/#5/#6/#7/#8, landed); M2: stitch/mip (#9)
+//!   (#3/#4/#5/#6/#7/#8, landed); M2: the giant-image gates (#9, #81 shape)
 
 #![windows_subsystem = "windows"]
 

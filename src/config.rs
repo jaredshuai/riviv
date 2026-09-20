@@ -39,8 +39,10 @@ const APPDATA_DIR: &str = "riviv";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum RendererKind {
-    /// Hardware D2D → WARP → GDI: the transitional ladder (#80; #82 deletes
-    /// the GDI tier and makes the final failure fatal).
+    /// Hardware D2D → WARP → GDI: the transitional ladder and the #81
+    /// default (ADR 0002 D5; #82 deletes the GDI tier and makes the final
+    /// failure fatal).
+    #[default]
     Auto,
     /// Pure hardware D2D — an init failure drops straight to GDI, never
     /// WARP: forcing hardware is a diagnostic/repro request, silently
@@ -48,9 +50,8 @@ pub(crate) enum RendererKind {
     D2d,
     /// Pure WARP — the golden/CI tier (cross-machine-deterministic pixels).
     Warp,
-    /// The GDI path — today's behavior, byte-for-byte (#80's default; #81
-    /// flips the default to `auto`).
-    #[default]
+    /// The GDI path — the pre-#80 byte-for-byte baseline; an explicit
+    /// escape key now that #81 made `auto` the default.
     Gdi,
 }
 
@@ -162,7 +163,7 @@ pub(crate) struct Config {
     pub(crate) keep_zoom: i32,
     /// riviv-authored key (#80; upstream has no such setting): which paint
     /// backend the viewport uses — `auto | d2d | warp | gdi` (a STRING key;
-    /// missing or unrecognized falls back to the `gdi` baseline). See
+    /// missing or unrecognized falls back to the `auto` default). See
     /// [`RendererKind`] for the semantics.
     pub(crate) renderer: RendererKind,
     /// The per-command keyboard bindings (#25; upstream keeps these OUTSIDE
@@ -237,7 +238,7 @@ impl Default for Config {
             title_bar_format: 1,
             add_command_line_timeout: 500,
             keep_zoom: 0,
-            renderer: RendererKind::Gdi,
+            renderer: RendererKind::Auto,
             keys: KeyMap::default(),
         }
     }
@@ -415,17 +416,18 @@ impl Config {
         apply_int!(add_command_line_timeout = "add_command_line_timeout");
         apply_byte!(keep_zoom = "keep_zoom");
         // The renderer is a STRING key (riviv-authored, #80): an
-        // unrecognized value is a user typo — it falls to the safe `gdi`
-        // baseline (design §2) in BOTH overlay passes, never the int keys'
-        // garbage=0 "keep current" shape: a hand-edited appdata file
-        // carrying garbage must not silently resurrect the exe-dir value
-        // (pre-review: the overlay used to keep it).
+        // unrecognized value is a user typo — it falls to the safe `auto`
+        // baseline (design §2, the #81 default) in BOTH overlay passes,
+        // never the int keys' garbage=0 "keep current" shape: a
+        // hand-edited appdata file carrying garbage must not silently
+        // resurrect the exe-dir value (pre-review: the overlay used to
+        // keep it).
         if let Some(value) = pairs.get("renderer") {
             match RendererKind::parse_ini(value) {
                 Some(kind) => self.renderer = kind,
                 None => {
-                    eprintln!("riviv: unrecognized renderer value {value:?}, using gdi");
-                    self.renderer = RendererKind::Gdi;
+                    eprintln!("riviv: unrecognized renderer value {value:?}, using auto");
+                    self.renderer = RendererKind::Auto;
                 }
             }
         }
@@ -815,36 +817,38 @@ mod tests {
     }
 
     #[test]
-    fn missing_renderer_key_defaults_to_gdi() {
-        // No key at all: the safe baseline stands (the M6 default; #81
-        // flips it to auto).
+    fn missing_renderer_key_defaults_to_auto() {
+        // No key at all: the #81 default stands (hardware → WARP → GDI,
+        // the transitional ladder).
         let c = parse_apply("[riviv]\n", true);
-        assert_eq!(c.renderer, RendererKind::Gdi);
+        assert_eq!(c.renderer, RendererKind::Auto);
+        let d = Config::default();
+        assert_eq!(d.renderer, RendererKind::Auto, "the struct default agrees");
     }
 
     #[test]
-    fn unrecognized_renderer_value_falls_back_to_gdi() {
+    fn unrecognized_renderer_value_falls_back_to_auto() {
         // A hand-edited typo keeps the default (string keys never inherit
-        // the int keys' garbage=0 semantics) — and stays gdi across a
+        // the int keys' garbage=0 semantics) — and stays auto across a
         // round-trip (the fallback is what gets saved).
         let c = parse_apply("[riviv]\nrenderer=frobnicate\n", true);
-        assert_eq!(c.renderer, RendererKind::Gdi);
+        assert_eq!(c.renderer, RendererKind::Auto);
         let text = ini::serialize(SECTION, &c.to_pairs(false));
         let back = parse_apply(&text, true);
-        assert_eq!(back.renderer, RendererKind::Gdi);
+        assert_eq!(back.renderer, RendererKind::Auto);
     }
 
     #[test]
-    fn unrecognized_overlay_renderer_resets_to_gdi_not_the_root_value() {
+    fn unrecognized_overlay_renderer_resets_to_auto_not_the_root_value() {
         // The two-file overlay (pre-review P3-2): an appdata file carrying
-        // garbage over an exe-dir `renderer=warp` must land on the gdi
-        // baseline — a present-but-invalid value is a typo, not a missing
+        // garbage over an exe-dir `renderer=warp` must land on the `auto`
+        // default — a present-but-invalid value is a typo, not a missing
         // key, and must not silently resurrect the earlier file's choice.
         let mut c = Config::default();
         c.apply_section(&ini::parse("[riviv]\nrenderer=warp\n", SECTION), true);
         assert_eq!(c.renderer, RendererKind::Warp);
         c.apply_section(&ini::parse("[riviv]\nrenderer=nope\n", SECTION), false);
-        assert_eq!(c.renderer, RendererKind::Gdi);
+        assert_eq!(c.renderer, RendererKind::Auto);
         // A MISSING key in the overlay keeps the root value (the ordinary
         // overlay semantic, untouched).
         let mut c = Config::default();

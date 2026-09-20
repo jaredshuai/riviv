@@ -1,6 +1,16 @@
 //! Mipmap level selection (issue #9's port of upstream `_viv_get_mipmap`'s
 //! size math, viv.c:14146-14300).
 //!
+//! Since #81 (ADR 0002 D7 — mip retirement for regular sizes) the runtime
+//! NEVER calls these functions: the GDI arm draws shrinks from the single
+//! full-resolution face and the D2D arm samples the full master. The
+//! quirk parity below is deliberately DROPPED, not kept: level selection
+//! is no longer an observable behavior, so replicating the quirk would be
+//! deliberately worse output (recorded in README Differences). The
+//! functions and their counterexample tests stay as the math regression
+//! net for #82's giant-image tiering, which the #82 ticket explicitly
+//! reuses.
+//!
 //! Levels are numbered from 0 = the original frame; level k has size
 //! `((w+1) >> k, (h+1) >> k)` computed from the ORIGINAL dimensions each
 //! time — never by iteratively halving the previous level (for w=5 the
@@ -10,20 +20,22 @@
 //! [`select_mip_level`] is a verbatim port of upstream's loop, including
 //! its quirk: the render size is compared against `mip_wide` on BOTH sides
 //! — `render_h >= mip_w` — and `mip_h` never participates (viv.c:14181 and
-//! 14287, identical at both sites). We keep it byte-for-byte because it
-//! changes which level paints (a wide-short image in a tall viewport picks
-//! a shallower level than the "correct" compare would), and parity beats
-//! correctness here (see the counterexample tests below).
+//! 14287, identical at both sites). Kept byte-for-byte as the historical
+//! record of what the #9–#80 chain actually selected (a wide-short image
+//! in a tall viewport picked a shallower level than the "correct" compare
+//! would have — see the counterexample tests below).
 //!
-//! Invariants that downstream paint relies on (provable from the loop, and
-//! pinned by tests): a returned level > 0 always satisfies `rw < mw` (the
-//! mag arm never sees a mip); `rh < mh` is NOT guaranteed — the quirk can
-//! hand the shrink arm a level far shorter than the render height, and the
-//! shrink arm then vertically magnifies that mip (upstream does the same).
+//! Invariants of the loop (provable, and pinned by tests): a returned
+//! level > 0 always satisfies `rw < mw` (the mag arm never saw a mip);
+//! `rh < mh` is NOT guaranteed — the quirk could hand the shrink arm a
+//! level far shorter than the render height, and the shrink arm then
+//! vertically magnified that mip (upstream does the same). #82's tiering
+//! inherits these properties if it reuses the loop.
 
 /// Size of mipmap `level` for an `image_wide x image_high` frame. Level 0
 /// is the frame itself. Each dimension rounds `(dim+1)/2^k` down and clamps
 /// at 1 (viv.c:14158-14169/14264-14275).
+#[allow(dead_code)] // runtime callers died with #81; #82's tiering reuses this
 pub(crate) fn mip_size(image_w: i32, image_h: i32, level: u32) -> (i32, i32) {
     if level == 0 {
         return (image_w.max(1), image_h.max(1));
@@ -42,6 +54,7 @@ pub(crate) fn mip_size(image_w: i32, image_h: i32, level: u32) -> (i32, i32) {
 /// would no longer fit the render; generation fills levels 1..=level on
 /// demand (the chain caches them for the frame's lifetime, freed on frame
 /// replacement like upstream's `_viv_mipmap_free`, viv.c:1252-1258).
+#[allow(dead_code)] // runtime callers died with #81; #82's tiering reuses this
 pub(crate) fn select_mip_level(image_w: i32, image_h: i32, render_w: i32, render_h: i32) -> u32 {
     // Level 1's size and the early returns, viv.c:14158-14190.
     let (mip_w, mip_h) = mip_size(image_w, image_h, 1);
@@ -174,15 +187,16 @@ mod tests {
     }
 
     #[test]
-    fn pregeneration_depth_matches_what_paint_selects_for_the_same_view() {
-        // The worker pre-generates with (viewport/2) — for the same
-        // window, paint's fit render (≈ viewport) always fits within what
-        // that depth cached, so resize-grow needs nothing new. A
-        // regression here would strand paint generating on the UI thread.
+    fn selection_at_half_the_viewport_never_exceeds_selection_at_the_full_viewport() {
+        // A monotonicity property of the selection loop (the #82 tiering's
+        // coarse-then-fine ladder leans on it): for the same window,
+        // selecting against HALF the viewport (the coarse estimate the old
+        // #9 pre-generation used) always lands on a level >= the one the
+        // full-viewport fit render selects — never shallower.
         let (vw, vh) = (2000i32, 1200i32);
-        let pregen = select_mip_level(40000, 256, vw / 2, vh / 2);
+        let coarse = select_mip_level(40000, 256, vw / 2, vh / 2);
         let fit_render_w = vw; // 40000x256 fit into 2000x1200 → 2000x12
-        let paint = select_mip_level(40000, 256, fit_render_w, 12);
-        assert!(pregen >= paint);
+        let fine = select_mip_level(40000, 256, fit_render_w, 12);
+        assert!(coarse >= fine);
     }
 }

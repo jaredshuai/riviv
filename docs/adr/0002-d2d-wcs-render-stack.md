@@ -40,6 +40,8 @@ DXGI flip 的 GDI 互操作禁令是 **per-HWND**(官方原文 "Use flip model i
 
 `renderer = auto | d2d | warp | gdi`(默认 gdi,M6 末翻 auto);auto = 硬件 → WARP → (过渡期 GDI / 删除后 fatal)。WARP 是同一代码路径的枚举值,测试矩阵成本≈0;状态栏显示实际后端消灭「不可复现」类工单;不做驱动黑名单。失败三层(ADR 0001 的扩展):初始化失败=环境→温和降级;运行期 `D2DERR_RECREATE_TARGET`/`DEVICE_REMOVED`→从 master 重上传(不重解码);10s 内 3 次运行期失败→WARP;WARP 也败才 fatal。paint 路径内一律 degrade-not-fatal。**GDI 删除判据写死**(#82):auto 全环境初始化成功 + golden 冻结 + 一个稳定发布周期;不设无判据的「再保留一里程碑」。
 
+> **#81 落地后记(2026-09-20,外部评审 AI2)**:上段「默认 gdi,M6 末翻 auto」的翻默认已随 #81 落地——missing 键与未识别值双路均落 `auto`(详见 D7/D10 的同日后记与 README #81 条目)。迁移面注意:#80 保存的 ini 已显式写入 `renderer=gdi`(保存恒写当时值),这批 ini 升级后**保持 gdi**,翻默认只惠及无键/新建 ini。
+
 ### D6. 插值映射与 1:1 契约(#81)
 
 两臂各 2 档是用户可见 ini 面(`shrink_blit_mode`/`mag_filter`,config.rs:52-53):1:1=NEAREST+整数矩形;shrink 0→NEAREST、1(HALFTONE 默认)→`HIGH_QUALITY_CUBIC`(不一致且更好,记 Differences);mag 0(COLORONCOLOR 默认)→NEAREST、1(HALFTONE)→LINEAR。`ID2D1DeviceContext::DrawBitmap` 收完整 `D2D1_INTERPOLATION_MODE` 六档(windows-rs 签名已核;咨询二「需 spike 验证是否要走 DrawImage」的说法过虑)。**1:1 五件套**(缺一即破):`SetUnitMode(PIXELS)` + identity 变换审计 + 整数矩形 + 位图/target/swapchain 三处 `B8G8R8A8_UNORM`(用 `_SRGB` 会线性化出 ±1 差) + NEAREST(+ALIASED/COPY)。1:1 的空间零重采样在**任何** icm 设置下都成立;RGB 字节不变仅颜色管线 identity 时成立——这是两条独立断言。`SetBrushOrgEx` parity 是**删除**不是迁移(D2D 无 dither)。
@@ -47,6 +49,8 @@ DXGI flip 的 GDI 互操作禁令是 **per-HWND**(官方原文 "Use flip model i
 ### D7. mip 与巨图(#81/#82)
 
 常规尺寸(≤ `GetMaximumBitmapSize()` 运行时查询,勿硬编码 16384)单张位图直绘,mip 链退役;`mip.rs` 纯函数与 counterexample 测试**保留**(巨图分级数学继续服役)。**放弃 mip 选择 quirk 的 parity**(mip.rs 在案的 `render_h` vs `mip_wide` 比较怪癖):D2D 下级别选择不再是可观测行为,复刻 quirk=故意输出更差画面——记 Differences。深缩质量后备:`HIGH_QUALITY_CUBIC` 自带 prefilter,不足则 ANISOTROPIC / Scale 效果。巨图(> max,D2D 上限典型 16384 **小于** GDI 32768→巨图覆盖面变大):overview 位图 + LRU tile 缓存(GPU 驻留 O(视口)),tile 带 halo、同一全局映射与采样相位、接缝零容差;预算从 `MIP_GDI_OBJECT_BUDGET`(自设 1000 对象,surface.rs:57)换字节记账 + `IDXGIAdapter3::QueryVideoMemoryInfo` 真值。
+
+> **#81 落地后记(2026-09-20,外部评审 AI1 P3-6)**:上段的 `MIP_GDI_OBJECT_BUDGET` 与链式预算已随 #81 删除(#82 的字节记账从零起算,不再以对象计数为起点);实现期 census 发现 GDI StretchBlt 的失败随 **face 宽度**而非单次调用 extent(4M 宽 face 可整矩形直绘、6.29M 宽 face 上 2^21 分片可绘、≥2^23 宽 face 仅 512px 分片可读——即上游 mip 生成历来依赖的形状),故 #81 为 GDI 臂 ≥2^22 源加了**临时 GiantRelief 中介**(每 paint 建一次 ~2^21 DIB、512px HALFTONE 分片生成、单 blit 出图;无链无缓存)作为 #82 D2D tiling 接管前的过渡——#82 设计 tile/预算时以本后记与 issue #81 的 census 数据(issuecomment-5748005538/5748006943)为准,勿再引用已删除的预算机制。
 
 ### D8. 时序与线程(#80)
 
@@ -59,6 +63,8 @@ D2D/D3D 对象只在 UI 线程(factory SINGLE_THREADED;D3D11 不加 SINGLETHREAD
 ### D10. 验收基础设施(#80/#81)
 
 分级:L0 字节精确(1:1+identity 颜色,dump 断言)/ L1 与 GDI golden 字节一致(整数倍 Nearest 放大、边界)/ L2 视觉等价(线性档 MAE+无接缝)/ L3 色彩不变量(纯 Rust 单测,离线解析期望值)。**主入口=进程内回读 dump**(`CPU_READ` bitmap→CopyFromRenderTarget→Map→PNG;GDI 栈同通道从 master 实现,两栈 golden 互比),**勿以 PrintWindow 为 D3D 内容契约**(默认 flag 不捕获 flip;`PW_RENDERFULLCONTENT` 行为先 spike 三环境);golden 语料固定 WARP 生成跨机器确定;RGB 状态栏读出升级为断言通道(master 直读)。冒烟脚本存量手段(BitBlt 抓 DC/GetPixel 采样)在 D2D 视口上失效——采集入口随 #80 换,断言逻辑尽量保留。
+
+> **#81 落地后记(2026-09-20)**:上段「golden 语料固定 WARP 生成」在 #81 落地为 **GDI 臂生成**(票面原文「GDI 栈生成→冻结入仓」,`smoke/golden81/`)——L1 正确性由比 golden 更硬的独立 oracle 承担(整数放大 dump 与 `src[x/k,y/k]` 复制模型逐像素相等,与生成臂无关),golden 只做跨 build 漂移检测,且每轮冒烟同时断言 warp==gdi 逐字节(warp-vs-golden 传递成立)。#82 冻结语料时择一而定,并更新本后记。
 
 ### 非目标(M6 明确不做)
 
