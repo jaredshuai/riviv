@@ -1300,6 +1300,19 @@ fn gpu_view_resized(view: HWND) {
         // (design §6).
         eprintln!("riviv: gpu resize failed: {e}");
         gpu_runtime_failure(owner);
+        // The ladder's rebuild path queues an Invalidate (async); this is
+        // the RESIZE path, where the success branch below repaints
+        // synchronously — a transient failure with immediate recovery must
+        // not lose that synchronous repaint under continued border
+        // dragging (external review AI1). UpdateWindow is a no-op when the
+        // update region is empty (the ladder left the stack dead and GDI
+        // took over), so the call is free on that arm.
+        // SAFETY: synchronously dispatches our own child's WM_PAINT when
+        // its update region is non-empty — we are in a WM_SIZE handler,
+        // not inside a paint, and no state borrow is live.
+        unsafe {
+            let _ = UpdateWindow(view);
+        }
         return;
     }
     // The back buffer was discarded by the resize: repaint NOW and
