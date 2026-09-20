@@ -43,9 +43,10 @@ use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_ALPHA_MODE_IGNORE, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
-    DXGI_ERROR_DEVICE_REMOVED, DXGI_ERROR_DEVICE_RESET, DXGI_MWA_NO_ALT_ENTER, DXGI_PRESENT,
-    DXGI_SCALING_NONE, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG, DXGI_SWAP_EFFECT_FLIP_DISCARD,
-    DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIDevice, IDXGIFactory2, IDXGISurface, IDXGISwapChain1,
+    DXGI_ERROR_DEVICE_REMOVED, DXGI_ERROR_DEVICE_RESET, DXGI_ERROR_DRIVER_INTERNAL_ERROR,
+    DXGI_MWA_NO_ALT_ENTER, DXGI_PRESENT, DXGI_SCALING_NONE, DXGI_SWAP_CHAIN_DESC1,
+    DXGI_SWAP_CHAIN_FLAG, DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_USAGE_RENDER_TARGET_OUTPUT,
+    IDXGIDevice, IDXGIFactory2, IDXGISurface, IDXGISwapChain1,
 };
 use windows::Win32::Graphics::Gdi::ValidateRect;
 use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, PAINTSTRUCT};
@@ -214,8 +215,31 @@ pub(crate) enum PaintOutcome {
     /// caller tears the stack down (giant-image gate) and re-renders this
     /// frame through GDI.
     GiantFrame { wide: u32, high: u32, max: u32 },
-    /// EndDraw or Present reported device loss — the failure ladder decides.
+    /// EndDraw or Present reported DEVICE LOSS — the failure ladder decides
+    /// (rebuild same kind → 3-in-10s escalate to WARP → deferred fatal).
     DeviceLost,
+    /// A NON-loss failure the ladder cannot fix (a deterministic error:
+    /// `D2DERR_NOT_SUPPORTED`, Present `INVALID_CALL` after a bad resize …).
+    /// Escalating these would rebuild the same broken stack forever and end
+    /// in the deferred fatal — but ADR 0001 files them as USER-level: the
+    /// caller degrades the session to GDI (teardown + one-shot flash +
+    /// stderr), keeping the old image on screen instead of exiting
+    /// (external review AI2 P1: the old two-way misclassification froze the
+    /// frame on non-loss Present codes and fatal'd on non-loss EndDraws).
+    Unrecoverable { hr: i32 },
+}
+
+/// The one HRESULT table both arms share (external review AI2 P1): a code
+/// is DEVICE LOSS when a same-spec rebuild can plausibly fix it — the
+/// documented loss codes plus `DRIVER_INTERNAL_ERROR`, which the D3D11
+/// samples treat as device-gone. Everything else that FAILS is
+/// deterministic trouble the ladder cannot outlive. `DXGI_STATUS_OCCLUDED`
+/// is a SUCCESS code and never reaches here.
+pub(crate) fn is_device_loss(hr: windows::core::HRESULT) -> bool {
+    hr == DXGI_ERROR_DEVICE_REMOVED
+        || hr == DXGI_ERROR_DEVICE_RESET
+        || hr == DXGI_ERROR_DRIVER_INTERNAL_ERROR
+        || hr == D2DERR_RECREATE_TARGET
 }
 
 // ---------------------------------------------------------------------------
@@ -224,13 +248,16 @@ pub(crate) enum PaintOutcome {
 
 pub(crate) struct GpuStack {
     // Field order IS the drop order (COM wrappers Release in declaration
-    // order, design §3): the target bitmap (the back buffer's only D2D
-    // reference) first, the uploaded frame bitmap next (no back-buffer
-    // reference, but it dies with the context), then the context, the
-    // swapchain, the D2D/DXGI device pair, the factory, the D3D device.
-    // Both stored as their PARENT interface (ID2D1Image / ID2D1Bitmap):
-    // windows-rs 0.62 generates no CanInto upcasts, so the draw/target
-    // params take the exact type — one QI at creation, none per frame.
+    // order, design §3; the Drop impl above enforces the first, critical
+    // steps as executable code): the target bitmap (the back buffer's D2D
+    // reference — ours plus the context's own, unbound in Drop), the
+    // uploaded frame bitmap (no back-buffer reference; Releases by its own
+    // COM refcount), then the context, the swapchain, the D2D/DXGI device
+    // pair, the factory, the D3D device.
+    // Both bitmaps are stored as their PARENT interface (ID2D1Image /
+    // ID2D1Bitmap): windows-rs 0.62 generates no CanInto upcasts, so the
+    // draw/target params take the exact type — one QI at creation, none per
+    // frame.
     target: Option<ID2D1Image>,
     bitmap: Option<ID2D1Bitmap>,
     context: ID2D1DeviceContext,
@@ -300,7 +327,7 @@ pub(crate) fn create(
     // 2. DXGI device → D2D factory → D2D device → device context (design
     //    §3-2). SINGLE_THREADED: every object here lives on the UI thread
     //    only (ADR 0002 D8).
-    // SAFETY: cast is a pure QI over the freshly built, live device.
+    // (cast is a safe QI in windows-core 0.62 — no unsafe, no label.)
     let dxgi_device: IDXGIDevice = d3d_device
         .cast()
         .map_err(|e| format!("cast to IDXGIDevice failed: {e}"))?;
@@ -492,35 +519,27 @@ impl GpuStack {
     /// The degenerate-image arm of the paint (and the upload-failure
     /// degrade: the previous frame must not linger behind a failed adopt).
     /// BeginDraw reports nothing (void); EndDraw is the loss channel.
-    fn present_clear(&mut self, bg: [u8; 3]) -> PaintOutcome {
-        // SAFETY: the context is live; the color struct outlives the call.
+    /// One BeginDraw→Clear[→DrawBitmap]→EndDraw pass — the ONE scene body
+    /// the present paths and the dump share (external review AI2: the dump
+    /// used to duplicate the sequence, so a paint-path drift would have
+    /// been invisible to the L0 channel). `plan = None` is the blank
+    /// letterbox pass (the degenerate-image arm and the upload-failure
+    /// degrade). The EndDraw HRESULT is the sole error channel
+    /// (BeginDraw/DrawBitmap report nothing themselves).
+    fn draw_pass(
+        &mut self,
+        bg: [u8; 3],
+        plan: Option<&DrawPlan>,
+    ) -> Result<(), windows::core::Error> {
+        // SAFETY: the context and (when the plan draws) the uploaded bitmap
+        // are live; every rectangle/parameter outlives the calls; nothing
+        // pumps.
         unsafe {
             self.context.BeginDraw();
             let color = bg_color_f(bg);
             self.context.Clear(Some(&color));
-            if let Err(e) = self.context.EndDraw(None, None) {
-                eprintln!(
-                    "riviv: EndDraw failed ({e}, {}) — device loss ladder",
-                    loss_kind(e.code())
-                );
-                return PaintOutcome::DeviceLost;
-            }
-            present(&self.swapchain)
-        }
-    }
-
-    /// One frame: BeginDraw → Clear (the letterbox IS the Clear — the GDI
-    /// arm's strip concept does not exist here, design §4) → DrawBitmap
-    /// with the full source rect and the plan's dest rect → EndDraw →
-    /// Present(0,0). The rw>0&&rh>0 guard mirrors the GDI arm's.
-    fn draw_frame(&mut self, plan: &DrawPlan) -> PaintOutcome {
-        // SAFETY: the context and the uploaded bitmap are live; every
-        // rectangle/parameter outlives the call; nothing pumps.
-        unsafe {
-            self.context.BeginDraw();
-            let color = bg_color_f(plan.bg);
-            self.context.Clear(Some(&color));
-            if plan.rw > 0
+            if let Some(plan) = plan
+                && plan.rw > 0
                 && plan.rh > 0
                 && let Some(bitmap) = self.bitmap.as_ref()
             {
@@ -544,19 +563,46 @@ impl GpuStack {
                 };
                 // Full source rect, no perspective: the dest rect carries
                 // the whole view math (unit PIXELS + identity transform).
-                // DrawBitmap reports nothing itself — its errors surface at
-                // the EndDraw below (the loss channel).
                 self.context
                     .DrawBitmap(bitmap, Some(&dest), 1.0, plan.interp, Some(&src), None);
             }
-            if let Err(e) = self.context.EndDraw(None, None) {
-                eprintln!(
-                    "riviv: EndDraw failed ({e}, {}) — device loss ladder",
-                    loss_kind(e.code())
-                );
-                return PaintOutcome::DeviceLost;
-            }
-            present(&self.swapchain)
+            self.context.EndDraw(None, None)
+        }
+    }
+
+    /// Classify one EndDraw failure through the shared table: loss codes
+    /// take the ladder, everything else is session-degrade (the old code
+    /// lumped ALL failures into the ladder — a deterministic error would
+    /// have rebuilt, escalated to WARP and finally fatal'd what ADR 0001
+    /// files as a user-level degrade; external review AI2 P1).
+    fn enddraw_outcome(&self, e: windows::core::Error) -> PaintOutcome {
+        let hr = e.code();
+        if is_device_loss(hr) {
+            eprintln!("riviv: EndDraw failed ({e}) — device loss ladder");
+            PaintOutcome::DeviceLost
+        } else {
+            eprintln!("riviv: EndDraw failed ({e}) — degrading the session to gdi");
+            PaintOutcome::Unrecoverable { hr: hr.0 }
+        }
+    }
+
+    /// One blank-letterbox frame: the scene pass plus Present.
+    /// The degenerate-image arm of the paint (and the upload-failure
+    /// degrade: the previous frame must not linger behind a failed adopt).
+    fn present_clear(&mut self, bg: [u8; 3]) -> PaintOutcome {
+        match self.draw_pass(bg, None) {
+            Ok(()) => present(&self.swapchain),
+            Err(e) => self.enddraw_outcome(e),
+        }
+    }
+
+    /// One frame: the scene pass (the letterbox IS the Clear — the GDI
+    /// arm's strip concept does not exist here, design §4) plus
+    /// Present(0,0). The rw>0&&rh>0 guard lives in the shared pass.
+    fn draw_frame(&mut self, plan: &DrawPlan) -> PaintOutcome {
+        match self.draw_pass(plan.bg, Some(plan)) {
+            Ok(()) => present(&self.swapchain),
+            Err(e) => self.enddraw_outcome(e),
         }
     }
 
@@ -568,8 +614,11 @@ impl GpuStack {
         if wide == 0 || high == 0 {
             return Ok(());
         }
-        // SAFETY: releasing the target before ResizeBuffers is the
-        // documented sequence (every buffer reference must be gone).
+        // Release the target before ResizeBuffers — the documented
+        // sequence requires EVERY back-buffer reference gone: the context's
+        // own (SetTarget(None) below) and ours (the field drop). The
+        // uploaded frame bitmap holds no back-buffer reference and stays.
+        // SAFETY: plain unbind on the live context.
         unsafe {
             self.context.SetTarget(None);
         }
@@ -626,6 +675,20 @@ impl GpuStack {
         if cw == 0 || ch == 0 {
             return Err(format!("viewport is {cw}x{ch} — nothing to dump"));
         }
+        // The readback copies cw×ch out of the TARGET — a stale smaller
+        // back buffer (a resize that failed and latched) would zero-fill
+        // the staging bitmap and sail through with exit 0 (external review
+        // AI2). Validate against the swapchain's actual buffer size first;
+        // a mismatch is an error the caller answers with the GDI channel.
+        // SAFETY: read-only description query on the live swapchain.
+        let desc = unsafe { self.swapchain.GetDesc1() }
+            .map_err(|e| format!("dump GetDesc1 failed: {e}"))?;
+        if desc.Width != cw || desc.Height != ch {
+            return Err(format!(
+                "swapchain is {}x{} but the viewport is {cw}x{ch}",
+                desc.Width, desc.Height
+            ));
+        }
         if let Some((frame_gen, wide, high, pixels)) = frame {
             if frame_exceeds_max_bitmap(wide, high, self.max_bitmap) {
                 return Err(format!(
@@ -635,41 +698,12 @@ impl GpuStack {
             }
             self.ensure_upload(frame_gen, wide, high, pixels)?;
         }
-        // SAFETY: the context and bitmap are live; the color/rect structs
-        // outlive their calls; nothing pumps.
-        unsafe {
-            self.context.BeginDraw();
-            let color = bg_color_f(bg);
-            self.context.Clear(Some(&color));
-            if let (Some(plan), Some(bitmap)) = (plan.as_ref(), self.bitmap.as_ref())
-                && plan.rw > 0
-                && plan.rh > 0
-            {
-                let (mw, mh) = match self.uploaded {
-                    Some((_, w, h)) => (w, h),
-                    None => (0, 0),
-                };
-                let dest = D2D_RECT_F {
-                    left: plan.dx as f32,
-                    top: plan.dy as f32,
-                    right: (plan.dx + plan.rw) as f32,
-                    bottom: (plan.dy + plan.rh) as f32,
-                };
-                let src = D2D_RECT_F {
-                    left: 0.0,
-                    top: 0.0,
-                    right: mw as f32,
-                    bottom: mh as f32,
-                };
-                // The dump's DrawBitmap reports nothing itself — errors
-                // surface at the EndDraw below.
-                self.context
-                    .DrawBitmap(bitmap, Some(&dest), 1.0, plan.interp, Some(&src), None);
-            }
-            self.context
-                .EndDraw(None, None)
-                .map_err(|e| format!("dump EndDraw failed: {e}"))?;
-        }
+        // The SAME scene pass the present paths run (external review AI2:
+        // a duplicated sequence here would let paint-path drift go
+        // invisible to the L0 channel) — minus the Present, so a
+        // never-shown window dumps identically.
+        self.draw_pass(bg, plan.as_ref())
+            .map_err(|e| format!("dump EndDraw failed: {e}"))?;
         // The readback staging bitmap: CPU_READ | CANNOT_DRAW, viewport
         // sized, the same UNORM format (design §9).
         // SAFETY: the context is live; the properties struct outlives the
@@ -686,8 +720,9 @@ impl GpuStack {
             )
         }
         .map_err(|e| format!("dump readback CreateBitmap failed: {e}"))?;
-        // SAFETY: the context upcasts to its render-target base (the copy
-        // SOURCE); the readback bitmap is the destination.
+        // The context upcasts to its render-target base (the copy SOURCE);
+        // the readback bitmap is the destination (cast is a safe QI in
+        // windows-core 0.62 — no SAFETY label needed, external review AI2).
         let rt: ID2D1RenderTarget = self
             .context
             .cast()
@@ -699,7 +734,7 @@ impl GpuStack {
             bottom: ch,
         };
         // SAFETY: dest point None = (0,0); the source rect covers the whole
-        // target; both objects are live.
+        // target (size-validated above); both objects are live.
         unsafe { readback.CopyFromRenderTarget(None, &rt, Some(&src_rect)) }
             .map_err(|e| format!("dump CopyFromRenderTarget failed: {e}"))?;
         // SAFETY: a READ map on a CPU_READ bitmap is the documented access;
@@ -708,11 +743,21 @@ impl GpuStack {
             .map_err(|e| format!("dump Map failed: {e}"))?;
         let pitch = mapped.pitch as usize;
         let row_bytes = cw as usize * 4;
+        if mapped.bits.is_null() || pitch < row_bytes {
+            let mapped_pitch = mapped.pitch;
+            // Unmap before failing: the mapping must not outlive the call
+            // chain even on the error path.
+            // SAFETY: paired with the Map above; nothing reads the bits.
+            let _ = unsafe { readback.Unmap() };
+            return Err(format!(
+                "dump Map gave pitch {mapped_pitch} for a {row_bytes}-byte row"
+            ));
+        }
         let mut bgra = vec![0u8; row_bytes * ch as usize];
         for (row, dst_row) in bgra.chunks_mut(row_bytes).enumerate() {
-            // SAFETY: the mapped region holds pitch*ch readable bytes; each
-            // row's first cw*4 bytes land in the packed output (pitch ≥
-            // row_bytes is D2D's map contract).
+            // SAFETY: the guards above pinned pitch ≥ row_bytes and a
+            // non-null base; the mapped region holds pitch*ch readable
+            // bytes for the lifetime of the map.
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     mapped.bits.add(row * pitch),
@@ -732,13 +777,25 @@ impl GpuStack {
 
 impl Drop for GpuStack {
     fn drop(&mut self) {
-        // The field declaration order IS the release order (Rust drops
-        // fields in order; each COM wrapper Releases in its own Drop):
-        // target bitmap → uploaded bitmap → context → swapchain → d2d
-        // device → dxgi device → factory → d3d device (design §3). The
-        // device-chain fields are never dereferenced in normal operation —
-        // they exist so the WHOLE stack dies together (ADR 0002 D8, "one
-        // struct 生死与共"); reading them here pins that keep-alive intent.
+        // Executable teardown order (external review AI2 P2-5: the order
+        // used to live only in a comment — any future field inserted with a
+        // back-buffer reference would silently break ResizeBuffers' "no
+        // buffer references" precondition). Unbind the target first so the
+        // CONTEXT's own back-buffer reference is released deterministically,
+        // then our two bitmaps (each Releases by its own COM refcount —
+        // the uploaded frame bitmap never depended on the context). The
+        // remaining fields (context → swapchain → d2d device → dxgi device
+        // → factory → d3d device) drop in DECLARATION order, which the
+        // language guarantees; they exist so the whole stack dies together
+        // (ADR 0002 D8).
+        // SAFETY: the context is live; SetTarget(None) is the plain unbind.
+        unsafe { self.context.SetTarget(None) };
+        self.target = None;
+        self.bitmap = None;
+        // The device-chain fields are never dereferenced — they exist to
+        // HOLD the COM references so the whole stack dies together (ADR
+        // 0002 D8); this read is the deliberate keep-alive pin (and keeps
+        // dead_code quiet about fields whose only job is existence).
         let _keepalive = (
             &self.d2d_device,
             &self.dxgi_device,
@@ -751,37 +808,26 @@ impl Drop for GpuStack {
 /// Present(0,0) — the interactive/animation posture (no vsync-blocking
 /// Present(1), #8's lesson). DXGI_STATUS_OCCLUDED is a SUCCESS code — a
 /// benign skip (another window covers us; the next WM_PAINT re-renders,
-/// design §13-4: no polling recovery in #80). Any other failure code is
-/// NOT a device loss (the ladder's two codes are checked first) but is
-/// never silently swallowed either: an unexpected Present failure that
-/// kept recurring would read as "the window went blank for no reason" —
-/// one stderr line per occurrence is the repo's degrade-diagnostics
-/// channel.
-unsafe fn present(swapchain: &IDXGISwapChain1) -> PaintOutcome {
-    // SAFETY: the swapchain is live; flags 0 = the plain interactive form.
+/// design §13-4: no polling recovery in #80). Loss codes take the ladder;
+/// any OTHER failure is deterministic trouble a rebuild cannot fix
+/// (`INVALID_CALL` after a bad resize, …) — the old code just logged it
+/// and reported Painted, leaving a permanently frozen frame with no
+/// recovery path (external review AI2 P1); it now degrades the session to
+/// GDI through [`PaintOutcome::Unrecoverable`].
+fn present(swapchain: &IDXGISwapChain1) -> PaintOutcome {
+    // SAFETY: the shared reference guarantees the swapchain is live; flags
+    // 0 = the plain interactive form.
     let hr = unsafe { swapchain.Present(0, DXGI_PRESENT(0)) };
-    if hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET {
+    if is_device_loss(hr) {
         PaintOutcome::DeviceLost
+    } else if hr.is_err() {
+        eprintln!(
+            "riviv: Present returned {:#010x} — degrading the session to gdi",
+            hr.0 as u32
+        );
+        PaintOutcome::Unrecoverable { hr: hr.0 }
     } else {
-        if hr.is_err() {
-            eprintln!(
-                "riviv: Present returned {:#010x} — frame skipped",
-                hr.0 as u32
-            );
-        }
         PaintOutcome::Painted
-    }
-}
-
-/// The EndDraw loss classifier (design §7): D2DERR_RECREATE_TARGET is the
-/// documented device-loss code; ANY other EndDraw failure routes through
-/// the same ladder — a rebuild is cheaper than painting on a dead device,
-/// and the ladder's 3-in-10s window bounds the churn either way.
-fn loss_kind(code: windows::core::HRESULT) -> &'static str {
-    if code == D2DERR_RECREATE_TARGET {
-        "D2DERR_RECREATE_TARGET"
-    } else {
-        "other failure"
     }
 }
 
@@ -861,11 +907,14 @@ pub(crate) fn paint_d2d(view: HWND, owner: HWND) -> PaintOutcome {
             let master = img.surface().master();
             (master.width, master.height)
         });
+        // The defensive fallback is u32::MAX, NOT 0: a zero floor would
+        // push every frame through the giant gate (external review AI2).
+        // Unreachable in practice — paint_d2d only runs with a live stack.
         let max_bitmap = state
             .gpu
             .as_ref()
             .map(|gpu| gpu.max_bitmap)
-            .unwrap_or_default();
+            .unwrap_or(u32::MAX);
         if let Some((mw, mh)) = dims
             && frame_exceeds_max_bitmap(mw, mh, max_bitmap)
         {
@@ -1089,13 +1138,29 @@ mod tests {
     }
 
     #[test]
-    fn recreate_target_is_the_documented_loss_code() {
-        // The classifier names the documented EndDraw code and lumps every
-        // other failure into the same ladder bucket.
-        assert_eq!(loss_kind(D2DERR_RECREATE_TARGET), "D2DERR_RECREATE_TARGET");
-        assert_eq!(
-            loss_kind(windows::core::HRESULT(0x8000_4005_u32 as _)),
-            "other failure"
-        );
+    fn the_shared_loss_table_separates_rebuildable_from_deterministic() {
+        // External review AI2 P1: the loss codes (ladder — a same-spec
+        // rebuild can plausibly fix them) vs everything else (session
+        // degrade to GDI — a deterministic error the ladder would only
+        // escalate into a wrong fatal).
+        for hr in [
+            DXGI_ERROR_DEVICE_REMOVED,
+            DXGI_ERROR_DEVICE_RESET,
+            DXGI_ERROR_DRIVER_INTERNAL_ERROR,
+            D2DERR_RECREATE_TARGET,
+        ] {
+            assert!(is_device_loss(hr), "{:#010x} is a loss code", hr.0 as u32);
+        }
+        // E_INVALIDARG / D2DERR_NOT_SUPPORTED style failures: NOT loss.
+        for hr in [
+            windows::core::HRESULT(0x8007_0057_u32 as _), // E_INVALIDARG
+            windows::core::HRESULT(0x8899_0001_u32 as _), // D2DERR_NOT_SUPPORTED-ish
+        ] {
+            assert!(
+                !is_device_loss(hr),
+                "{:#010x} is not a loss code",
+                hr.0 as u32
+            );
+        }
     }
 }

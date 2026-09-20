@@ -1114,6 +1114,9 @@ fn paint_view(view: HWND, owner: HWND) {
                 gpu_giant_frame(view, owner, wide, high, max);
             }
             crate::gpu::PaintOutcome::DeviceLost => gpu_runtime_failure(owner),
+            crate::gpu::PaintOutcome::Unrecoverable { hr } => {
+                gpu_session_degrade(view, owner, hr);
+            }
         }
     }
     // The ladder's final tier defers its fatal to HERE: the paint's state
@@ -1123,6 +1126,29 @@ fn paint_view(view: HWND, owner: HWND) {
         .is_some_and(|state| std::mem::take(&mut state.gpu_pending_fatal));
     if fatal_now {
         fatal("the D2D renderer keeps failing (WARP included) — giving up");
+    }
+}
+
+/// The session-level degrade for deterministic non-loss failures (external
+/// review AI2 P1): the ladder cannot fix these (a rebuild reproduces the
+/// same error), and escalating them would end in the deferred fatal —
+/// ADR 0001 files them as USER-level instead: teardown (the flip interop
+/// ban forbids GDI on the swapchain's HWND), one-shot flash + stderr, and
+/// an immediate invalidate so the GDI arm repaints the just-validated
+/// region instead of freezing on the last flip frame.
+fn gpu_session_degrade(view: HWND, owner: HWND, hr: i32) {
+    // SAFETY: the borrow spans the teardown and the latch store only.
+    if let Some(state) = unsafe { state_of(owner) } {
+        state.gpu = None;
+        state.gpu_init_failed = true;
+    }
+    eprintln!("riviv: unrecoverable renderer error ({hr:#010x}) — the session stays on gdi");
+    status_set_temp_text(owner, Some("renderer error — using gdi".to_string()));
+    // SAFETY: invalidates our own child; no borrow is live, and this runs
+    // OUTSIDE the paint (paint_view resolves outcomes after paint_d2d
+    // returned).
+    unsafe {
+        let _ = InvalidateRect(Some(view), None, false);
     }
 }
 
@@ -1144,7 +1170,7 @@ fn gpu_rebuild_if_due(view: HWND, owner: HWND) {
         {
             return;
         }
-        let kind = state.gpu_kind;
+        let kind = rebuild_kind(state.config.renderer, state.gpu_kind);
         match crate::gpu::create(view, crate::gpu::owner_of(view), kind) {
             Ok((stack, effective)) => {
                 state.gpu = Some(stack);
@@ -1153,11 +1179,31 @@ fn gpu_rebuild_if_due(view: HWND, owner: HWND) {
             Err(e) => {
                 // The environment lost its device stack since startup:
                 // latch instead of retrying per paint (design §7's init
-                // tier — one stderr line, the flash already ran at init).
+                // tier). With the auto ladder honored above, create has
+                // already tried hardware AND WARP by the time this runs
+                // (external review AI2 P2-3: the old code passed the
+                // EFFECTIVE kind, so an auto session that lost its hardware
+                // latched straight to GDI without ever trying WARP).
                 state.gpu_init_failed = true;
                 eprintln!("riviv: renderer rebuild failed ({e}), staying on gdi");
+                status_set_temp_text(owner, Some("renderer unavailable — using gdi".to_string()));
             }
         }
+    }
+}
+
+/// The rebuild request kind (external review AI2 P2-3): a session that
+/// ESCALATED to WARP rebuilds WARP (the escalation is permanent — D5's
+/// "WARP 是永久兜底"); every other session re-issues its CONFIG request,
+/// so `auto` gets create's full hardware→WARP ladder on every rebuild
+/// instead of being pinned to whatever the startup happened to build.
+/// `d2d`/`warp` pass through unchanged (their single-driver semantics
+/// stand, design §13-6).
+fn rebuild_kind(config_kind: RendererKind, gpu_kind: RendererKind) -> RendererKind {
+    if gpu_kind == RendererKind::Warp {
+        RendererKind::Warp
+    } else {
+        config_kind
     }
 }
 
@@ -1206,9 +1252,13 @@ fn gpu_runtime_failure(owner: HWND) {
     // subtraction measures across the 2^32 wrap like C's DWORD arithmetic.
     // SAFETY: pure tick query.
     let now_ms = unsafe { GetTickCount() };
-    // The post-rebuild invalidation target, applied after the state borrow
-    // ends (see the tail comment).
+    // The post-borrow repaint/degrade targets (external review AI2 P2-4:
+    // the latch and the fatal tier used to return silently — the last flip
+    // frame froze on screen and the deferred fatal could sit unfired
+    // forever with no paint coming).
     let mut rebuilt_view: Option<HWND> = None;
+    let mut degraded_view: Option<HWND> = None;
+    let mut fatal_view: Option<HWND> = None;
     // SAFETY: the borrow spans the ladder decision and the (non-pumping)
     // COM rebuild; nothing dispatches messages.
     if let Some(state) = unsafe { state_of(owner) } {
@@ -1218,55 +1268,74 @@ fn gpu_runtime_failure(owner: HWND) {
         // The timestamps live on the WINDOW STATE, not the stack: the
         // ladder rebuilds the stack on every loss, and history dying with
         // it would make the 3-in-10s escalation unreachable (design §7).
-        let already_warp = state
-            .gpu
-            .as_ref()
-            .is_some_and(|gpu| gpu.backend == crate::gpu::backend_label(false));
+        // The WARP check reads the KIND (the escalation pin), not the
+        // backend label string (pre-review nit).
+        let already_warp = state.gpu_kind == RendererKind::Warp;
         let verdict = crate::gpu::failure_window(now_ms, already_warp, &mut state.gpu_failures);
         let (kind, escalated) = match verdict {
-            crate::gpu::FailureVerdict::None => (state.gpu_kind, false),
+            crate::gpu::FailureVerdict::None => {
+                (rebuild_kind(state.config.renderer, state.gpu_kind), false)
+            }
             crate::gpu::FailureVerdict::Escalate => (RendererKind::Warp, true),
             crate::gpu::FailureVerdict::Fatal => {
                 // WARP is failing too: GDI takes over and the deferred
-                // fatal fires after the paint returns.
+                // fatal fires after the paint returns — but only if a paint
+                // COMES: the failing paint validated without drawing, so
+                // queue one now (the fatal check sits at paint_view's
+                // tail). The early return is fine — the tail block below
+                // runs on the fatal_view this arm just set.
                 state.gpu = None;
                 state.gpu_init_failed = true;
                 state.gpu_pending_fatal = true;
-                return;
+                fatal_view = Some(state.viewport);
+                (RendererKind::Warp, true)
             }
         };
-        // Drop the dead stack, rebuild, remember the effective kind (the
-        // escalation pins WARP — the request mode is ignored from here).
-        state.gpu = None;
-        let view = state.viewport;
-        match crate::gpu::create(view, crate::gpu::owner_of(view), kind) {
-            Ok((stack, effective)) => {
-                state.gpu_kind = if escalated {
-                    RendererKind::Warp
-                } else {
-                    effective
-                };
-                state.gpu = Some(stack);
-                // The failing paint already validated its region without
-                // drawing — a static image has no timer or hover to repaint
-                // it, so the recovered frame would hang blank until the next
-                // input. Queue the viewport for the pump to repaint with a
-                // fresh upload from the CPU master (no re-decode).
-                rebuilt_view = Some(view);
-            }
-            Err(e) => {
-                state.gpu_init_failed = true;
-                eprintln!("riviv: renderer rebuild failed ({e}), staying on gdi");
+        if fatal_view.is_none() {
+            // Drop the dead stack, rebuild, remember the effective kind
+            // (the escalation pins WARP — the request mode is ignored from
+            // here).
+            state.gpu = None;
+            let view = state.viewport;
+            match crate::gpu::create(view, crate::gpu::owner_of(view), kind) {
+                Ok((stack, effective)) => {
+                    state.gpu_kind = if escalated {
+                        RendererKind::Warp
+                    } else {
+                        effective
+                    };
+                    state.gpu = Some(stack);
+                    // The failing paint already validated its region without
+                    // drawing — a static image has no timer or hover to
+                    // repaint it, so the recovered frame would hang blank
+                    // until the next input. Queue the viewport for the pump
+                    // to repaint with a fresh upload from the CPU master
+                    // (no re-decode).
+                    rebuilt_view = Some(view);
+                }
+                Err(e) => {
+                    // Even the ladder's WARP tier could not build: latch
+                    // (the auto request already exhausted hardware+WARP
+                    // inside create) — visibly: flash + a queued GDI
+                    // repaint instead of a silently frozen frame.
+                    state.gpu_init_failed = true;
+                    eprintln!("riviv: renderer rebuild failed ({e}), staying on gdi");
+                    status_set_temp_text(
+                        owner,
+                        Some("renderer unavailable — using gdi".to_string()),
+                    );
+                    degraded_view = Some(view);
+                }
             }
         }
     }
-    // The statement stands OUTSIDE the state if-let on purpose (pre-review
+    // The statements stand OUTSIDE the state if-let on purpose (pre-review
     // P3-1: a SAFETY comment must read true against the lexical scope it
     // sits in) — the borrow ended inside the if-let above (its last use).
-    if let Some(view) = rebuilt_view {
-        // SAFETY: invalidates our own child; no state borrow is live (the
-        // borrow ended at its last use inside the if-let above).
-        unsafe {
+    // SAFETY: invalidates our own child in each arm; no state borrow is
+    // live (the borrow ended at its last use inside the if-let above).
+    unsafe {
+        if let Some(view) = fatal_view.or(rebuilt_view).or(degraded_view) {
             let _ = InvalidateRect(Some(view), None, false);
         }
     }
@@ -8622,6 +8691,35 @@ pub(crate) fn run() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rebuilds_reissue_the_config_request_until_warp_is_pinned() {
+        // External review AI2 P2-3: an `auto` session that lost its
+        // hardware must re-run create's full hardware→WARP ladder on every
+        // rebuild — passing the EFFECTIVE kind would have latched it to
+        // GDI on the first hardware failure without ever trying WARP (the
+        // D5 "WARP is the permanent fallback" tier). Only an escalation to
+        // WARP (or a warp request) pins WARP.
+        assert_eq!(
+            rebuild_kind(RendererKind::Auto, RendererKind::D2d),
+            RendererKind::Auto,
+            "auto+hardware re-issues auto (create retries hw then warp)"
+        );
+        assert_eq!(
+            rebuild_kind(RendererKind::Auto, RendererKind::Warp),
+            RendererKind::Warp,
+            "the escalation pin outlives rebuilds"
+        );
+        assert_eq!(
+            rebuild_kind(RendererKind::D2d, RendererKind::D2d),
+            RendererKind::D2d,
+            "explicit d2d keeps its single-driver semantics (design §13-6)"
+        );
+        assert_eq!(
+            rebuild_kind(RendererKind::Warp, RendererKind::Warp),
+            RendererKind::Warp
+        );
+    }
 
     #[test]
     fn rapid_handoff_appends_when_something_is_loaded() {
