@@ -45,11 +45,17 @@ pub(crate) const STRETCH_EXTENT_LIMIT: i32 = 32768;
 /// faces up to 6,291,456 wide, but on a 8,388,608-wide (2^23) face even
 /// 2^21-wide slice calls silently fail (the classic giant-panorama black
 /// image; the failure tracks the FACE WIDTH, not the per-call rect) —
-/// only 512-px slices read such faces (exactly upstream's generation
-/// tiling, which pre-#81 used to build mips from them). Upstream never
-/// single-blits these sources at paint (its mip chain keeps paint sources
-/// small); riviv's #81 face-direct path meets them head-on, so paint
-/// builds a transient relief intermediate instead.
+/// on the SHRINK arm only 512-px slices read such faces (exactly
+/// upstream's generation tiling, which pre-#81 used to build mips from
+/// them; the magnify arm's full-rect HALFTONE is upstream-aligned and
+/// shares the failure — a pre-existing upstream latent defect, not one
+/// riviv introduces). Upstream never single-blits these sources at paint
+/// (its mip chain keeps paint sources small); riviv's #81 face-direct
+/// path meets them head-on, so paint builds a transient relief
+/// intermediate instead. The trigger sits 4.7% past the last
+/// census-proven full-rect point (4,000,000): the (4M, 2^22) band is
+/// interpolated by construction — one point short of a full proof, noted
+/// for #82's census to close.
 pub(crate) const STRETCH_SOURCE_STITCH_TRIGGER: i32 = 1 << 22; // 4,194,304
 
 /// The source slice edge of the sliced-blit DEGRADE path (the fallback

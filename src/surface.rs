@@ -146,11 +146,32 @@ impl Drop for GiantRelief {
     }
 }
 
+/// The relief divisor: the power of two whose division brings `max_dim`
+/// down to `target` (or one pixel over — the integer division can leave a
+/// single pixel; see the tests). Pure: the GDI shell below stays thin and
+/// the sizing math stays under the test net (a sizing error here would
+/// resurrect the exact black-image bug the relief exists to fix).
+fn relief_divisor(max_dim: i32, target: i32) -> i32 {
+    debug_assert!(max_dim >= 1 && target >= 1);
+    let mut k = 1i32;
+    while max_dim / k > target {
+        k <<= 1;
+    }
+    k
+}
+
+/// The relief's axis size for `dim` under divisor `k` — ceil, floored at 1
+/// (a 1-px axis must survive the downscale).
+fn relief_axis(dim: i32, k: i32) -> i32 {
+    ((dim + k - 1) / k).max(1)
+}
+
 /// Build the [`GiantRelief`] for a `mw x mh` face selected at `src_dc`.
-/// The divisor is the power of two that lands the relief's max axis at or
-/// one pixel over `STRETCH_SOURCE_STITCH_TRIGGER / 2` (the integer
-/// division can leave a single pixel over) — inside the band a
-/// single full-rect blit is proven to render from. Every failure cleans
+/// The divisor lands the relief's max axis at or one pixel over
+/// `STRETCH_SOURCE_STITCH_TRIGGER / 2` — inside the band a single
+/// full-rect blit is proven to render from. Dimension precondition: the
+/// loader's 512 MB frame cap bounds each axis ≤ 2^27 px, so the walk's
+/// `dim + k - 1` cannot overflow and k stays ≤ 64. Every failure cleans
 /// up what it took and returns `None` (the caller degrades to sliced
 /// blits — the paint-path doctrine, never a fatal inside the state
 /// borrow). Runs on the UI thread; per-call objects only.
@@ -158,13 +179,18 @@ pub(crate) fn build_giant_relief(src_dc: HDC, mw: i32, mh: i32) -> Option<GiantR
     if src_dc.is_invalid() || mw <= 0 || mh <= 0 {
         return None;
     }
+    debug_assert!(
+        i64::from(mw) * i64::from(mh) * 4 <= crate::loader::MAX_TOTAL_FRAME_BYTES as i64,
+        "the loader's frame cap bounds relief inputs; a hand-built Surface must respect it"
+    );
     let target = crate::stitch::STRETCH_SOURCE_STITCH_TRIGGER / 2;
-    let mut k = 1i32;
-    while mw.max(mh) / k > target {
-        k <<= 1;
-    }
-    let wide = ((mw + k - 1) / k).max(1);
-    let high = ((mh + k - 1) / k).max(1);
+    let k = relief_divisor(mw.max(mh), target);
+    let wide = relief_axis(mw, k);
+    let high = relief_axis(mh, k);
+    // The zero-fill is deliberate (review pre-2 P3-1, declined): a DIB
+    // section's initial contents are not guaranteed, and a failed
+    // generation slice must degrade to deterministic black, not to
+    // whatever the page cache held.
     let zeros = vec![0u8; wide as usize * high as usize * 4];
     let bitmap = create_bgra_dib(wide, high, &zeros).ok()?;
     // SAFETY: None gives a screen-compatible DC owned by this thread for
@@ -407,5 +433,64 @@ impl Surface {
             self.master.width as i32,
             self.master.height as i32,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- the relief sizing math (review pre-2 P3-3: pure + pinned) ----
+
+    const TARGET: i32 = STRETCH_TARGET_FOR_TESTS;
+
+    // The trigger's half, as build_giant_relief computes it.
+    const STRETCH_TARGET_FOR_TESTS: i32 = crate::stitch::STRETCH_SOURCE_STITCH_TRIGGER / 2;
+
+    #[test]
+    fn trigger_band_faces_get_divisor_two() {
+        // A face exactly at the trigger halves once: 2^22 -> 2^21.
+        let k = relief_divisor(crate::stitch::STRETCH_SOURCE_STITCH_TRIGGER, TARGET);
+        assert_eq!(k, 2);
+        assert_eq!(
+            relief_axis(crate::stitch::STRETCH_SOURCE_STITCH_TRIGGER, k),
+            TARGET
+        );
+    }
+
+    #[test]
+    fn the_integer_division_can_leave_one_pixel_over() {
+        // The documented off-by-one (review pre-1 P3-3): a face one past
+        // 2^21 * k satisfies floor(dim/k) == 2^21 while ceil is 2^21+1 —
+        // the census-proven band covers both.
+        let dim = 2 * TARGET + 1;
+        let k = relief_divisor(dim, TARGET);
+        assert_eq!(k, 2);
+        assert_eq!(relief_axis(dim, k), TARGET + 1);
+        // The smoke's own giant: 16777217 = 8*2^21 + 1 -> k=8, relief 2^21+1.
+        let k = relief_divisor(16777217, TARGET);
+        assert_eq!(k, 8);
+        assert_eq!(relief_axis(16777217, k), 2097153);
+    }
+
+    #[test]
+    fn the_census_points_take_the_expected_divisors() {
+        // 6,291,456 = 3*2^21: halving once leaves 1.5*2^21 (still over the
+        // 2^21 target), so it quarters like 2^23 does; 2^27 (the frame
+        // cap's widest legal face) caps at k=64 with no overflow.
+        assert_eq!(relief_divisor(6_291_456, TARGET), 4);
+        assert_eq!(relief_axis(6_291_456, 4), 1_572_864);
+        assert_eq!(relief_divisor(1 << 23, TARGET), 4);
+        assert_eq!(relief_axis(1 << 23, 4), TARGET);
+        let k = relief_divisor(1 << 27, TARGET);
+        assert_eq!(k, 64);
+        assert_eq!(relief_axis(1 << 27, k), 1 << 21);
+    }
+
+    #[test]
+    fn a_one_pixel_axis_survives_any_divisor() {
+        // The 16777217x1 giants: the short axis must stay 1, never 0.
+        assert_eq!(relief_axis(1, 8), 1);
+        assert_eq!(relief_axis(1, 64), 1);
     }
 }
