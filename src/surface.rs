@@ -347,6 +347,17 @@ impl Surface {
         &self.master
     }
 
+    /// The bytes the derived GDI face holds (the DIB section), 0 before
+    /// the first paint builds it — the CPU display class of the #82 byte
+    /// ledger, which owns the accounting while `surface.rs` owns the object.
+    pub(crate) fn face_bytes(&self) -> u64 {
+        if self.face.is_some() {
+            u64::from(self.master.width) * u64::from(self.master.height) * 4
+        } else {
+            0
+        }
+    }
+
     pub(crate) fn width(&self) -> i32 {
         self.master.width as i32
     }

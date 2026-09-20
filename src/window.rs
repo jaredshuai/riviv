@@ -1464,6 +1464,7 @@ fn dump_via_gpu(hwnd: HWND, view: HWND) -> Result<(u32, u32, Vec<u8>), String> {
             master.width,
             master.height,
             master,
+            image.surface().face_bytes(),
         )
     });
     // Field-disjoint from `gpu` (and from the image borrow inside
@@ -1473,11 +1474,12 @@ fn dump_via_gpu(hwnd: HWND, view: HWND) -> Result<(u32, u32, Vec<u8>), String> {
         return Err("no gpu stack".into());
     };
     match prepared {
-        Some((plan, frame_gen, wide, high, master)) => {
+        Some((plan, frame_gen, wide, high, master, face_bytes)) => {
             let mut src = crate::gpu::MasterLevels {
                 master: Some(master),
                 cache: levels,
                 frame_gen,
+                display_bytes: face_bytes,
             };
             gpu.dump(
                 crate::gpu::DumpRequest {
@@ -1496,6 +1498,7 @@ fn dump_via_gpu(hwnd: HWND, view: HWND) -> Result<(u32, u32, Vec<u8>), String> {
                 master: None,
                 cache: levels,
                 frame_gen,
+                display_bytes: 0,
             };
             gpu.dump(
                 crate::gpu::DumpRequest {
@@ -4531,10 +4534,9 @@ fn process_parsed_cl(hwnd: HWND, parsed: &cli::Parsed) {
             state.dump_pending = Some(OsString::from_wide(word));
         }
     }
-    // #82: `-tile <edge>` arms the forced tile grid — for a session that
-    // already built its stack (a single-instance handoff), the value takes
-    // effect on the next rebuild; the startup path sets it before create().
-    // 0/absent clears it.
+    // #82: `-tile <edge>` arms the forced tile grid. The stack reads it from
+    // the state on every PREPARE (not only at build), so a handoff hands it to
+    // the live stack on the next paint; 0/absent clears it.
     // SAFETY: the borrow spans one field store.
     if let Some(state) = unsafe { state_of(hwnd) } {
         state.tile_edge = parsed.tile_edge.filter(|edge| *edge > 0);

@@ -20,7 +20,7 @@
 //!   no overlap, no dropped or duplicated column (the ticket's 缝/重复列/
 //!   丢列 clause).
 //! - **Haloed, interior-clipped.** Each tile's bitmap carries
-//!   [`FILTER_HALO`] source pixels of its neighbourhood so a filter tap may
+//!   [`FILTER_HALO_NATIVE`] source pixels of its neighbourhood so a filter tap may
 //!   cross the block edge, and the draw is clipped to the tile's *logical*
 //!   interior, so every destination pixel is written by exactly one tile
 //!   and the halo's edge-clamped samples never reach the screen. Because
@@ -39,26 +39,45 @@ use crate::mip;
 /// Default source edge of one tile, in pixels *at the drawn level*: a
 /// 1024² tile is 4 MiB of BGRA — small enough that the LRU's granularity
 /// is fine (a viewport needs a handful) and large enough that the halo
-/// overhead ([`FILTER_HALO`] × 2 = 16 px per axis, ~3 %) stays cheap. The
+/// overhead ([`FILTER_HALO_NATIVE`] x 2 per axis, ~3 % at
+/// the default edge) stays cheap. The
 /// ticket names 1024²/2048²; 1024 is the shipping default and
 /// `-tile <edge>` overrides it for the smoke's forced-tiling comparisons.
 pub(crate) const TILE_EDGE: i32 = 1024;
 
 /// Filter-support margin carried by every tile bitmap, in source pixels at
-/// the drawn level. D2D does not document its tap counts, so the size comes
-/// from the worst case the tiled path can present: the level always covers
-/// the render (see [`detail_level`]), so a tiled draw shrinks by at most 2×
-/// — a kernel of native radius r reaches `r / scale` ≤ 2·r source pixels.
-/// 32 px therefore covers a native support of 16 px, far past any cubic
-/// (3-4 px is the usual figure), while NEAREST/LINEAR need 1.
+/// the drawn level. D2D does not document its tap counts, so this number is
+/// EMPIRICAL, and it is deliberately a constant rather than a scale-derived
+/// formula — a variation that should have been strictly safer was measured
+/// to be worse:
 ///
-/// This is measured, not guessed: with a margin of 8 the tile-boundary
-/// columns of a 0.65× shrink differed from the untiled reference by up to
-/// 37 per channel on ~4× the average pixel count (2026-09-20, a 900x600
-/// image into 583x389) — the taps were reaching outside the tile bitmap
-/// into clamped territory. The margin costs bitmap AREA only; a halo pixel
-/// is never an extra *upload* (the neighbouring tile carries it anyway).
-pub(crate) const FILTER_HALO: i32 = 32;
+/// - A fixed margin of 8 let a 0.65x shrink's filter taps reach outside the
+///   tile bitmap into clamped territory: the tile-boundary columns differed
+///   from the untiled reference by up to 37 per channel on ~4x the average
+///   pixel count (2026-09-20, a 900x600 image into 583x389).
+/// - 32 removed that (`smoke82` S2b: whole-frame max delta 1, boundary
+///   step equal to the untiled reference's).
+/// - Deriving the margin from the draw scale instead (`32 / scale`, the
+///   "taps reach further when the draw shrinks" argument) was tried on
+///   2026-09-20 and MEASURED WORSE at the very configuration 32 was tuned
+///   for: the same S2b comparison went from max delta 1 to 21 and the
+///   boundary step from 0.299 to 3.887 — i.e. D2D's filtered pull of a
+///   sub-rect source is not monotone in the bitmap's size, so a bigger
+///   margin is not automatically a safer one. A derived margin needs its
+///   own measurement campaign against the resampler, not an argument.
+///
+/// Known residual, recorded rather than papered over: on an ANISOTROPIC
+/// frame — one axis at or above the master's (which forces level 0, see
+/// [`detail_level`]) while the other axis shrinks by more than ~2x — a wide
+/// kernel's outermost taps on the shrinking axis can still exceed 32 source
+/// pixels. Reachable only with per-axis panscan zoom on a > `max_bitmap`
+/// source under a filtered (non-NEAREST) tier; the failure mode is a 1-2 px
+/// shading at that axis's tile boundaries. The frames the ticket's
+/// acceptance covers (uniform fit / 1:1 / magnify) are unaffected.
+///
+/// The margin costs bitmap AREA only; a halo pixel is never an extra
+/// *upload* (the neighbouring tile carries it anyway).
+pub(crate) const FILTER_HALO_NATIVE: i32 = 32;
 
 /// The self-set GPU-resident cap for base bitmap + tiles when the DXGI
 /// budget is unavailable (or the adapter is not an `IDXGIAdapter3`).
@@ -125,7 +144,7 @@ impl Rect {
 
     /// This rect grown by `m` on every side, then clamped to `bounds`
     /// (the tile halo's shape: never a source rect outside the level).
-    pub(crate) fn expand_clamped(&self, m: i32, bounds: &Rect) -> Rect {
+    pub(crate) fn haloed(&self, m: i32, bounds: &Rect) -> Rect {
         let x = (self.x - m).max(bounds.x);
         let y = (self.y - m).max(bounds.y);
         let r = (self.right() + m).min(bounds.right());
@@ -374,17 +393,27 @@ pub(crate) struct FrameGeometry {
 /// The per-frame ladder (design §1):
 ///
 /// 1. start at [`detail_level`];
-/// 2. a level whose dimensions fit under `max_bitmap` is drawn as ONE
-///    bitmap ([`FramePlan::Base`]) unless a diagnostic `forced_edge` asks
-///    for tiles;
+/// 2. a level whose dimensions fit under `max_bitmap` AND whose CPU bytes
+///    fit `level_budget_bytes` is drawn as ONE bitmap ([`FramePlan::Base`])
+///    unless a diagnostic `forced_edge` asks for tiles;
 /// 3. otherwise cut the visible region's preimage into tiles — if the
 ///    tiles that are not already resident fit `cap_bytes`, draw them;
 /// 4. if they do not, deepen the level (a coarser mip needs strictly fewer
-///    and smaller tiles) and retry. Coarsening is the pressure response
-///    ("先淘汰 GPU 缓存/降 tile 工作集"): it degrades the whole frame
-///    uniformly instead of leaving part of it sharp and part of it stale,
-///    and it terminates — a level eventually fits the device and returns
-///    `Base`, at the extreme the 1×1 level.
+///    and smaller tiles, and — for the Base arm — strictly fewer CPU
+///    bytes) and retry. Coarsening is the pressure response ("先淘汰 GPU
+///    缓存/降 tile 工作集"): it degrades the whole frame uniformly instead
+///    of leaving part of it sharp and part of it stale, and it terminates —
+///    a level eventually fits the device and returns `Base`, at the extreme
+///    the 1×1 level.
+///
+/// The CPU level budget is an input because the level bitmap is materialized
+/// on the CPU before it is uploaded ([`crate::mip::LevelCache`]): a level the
+/// cache would refuse must not be planned at all, or the caller has nothing
+/// to draw and blanks the frame. Without it, a just-under-the-load-cap
+/// extreme-aspect frame (e.g. 16389x8189 at 50% — level 1 is 134 MB against a
+/// 128 MB cache) rendered as an empty letterbox on every paint in that zoom
+/// band, a regression the removed #80 gate had covered with its GDI
+/// hand-off. Deepening to a level the cache can hold keeps the frame drawing.
 ///
 /// `resident` reports whether a tile is already uploaded (the caller's LRU
 /// answers it) so the budget is charged for *new* uploads only.
@@ -393,6 +422,7 @@ pub(crate) fn plan_frame(
     geometry: FrameGeometry,
     max_bitmap: u32,
     cap_bytes: u64,
+    level_budget_bytes: u64,
     forced_edge: Option<i32>,
     resident: &dyn Fn(&TileKey) -> bool,
 ) -> FramePlan {
@@ -400,6 +430,7 @@ pub(crate) fn plan_frame(
     let (render_w, render_h) = geometry.render;
     let dest = geometry.dest;
     let viewport = geometry.viewport;
+
     if master_w <= 0 || master_h <= 0 || render_w <= 0 || render_h <= 0 {
         return FramePlan::Blank;
     }
@@ -422,27 +453,35 @@ pub(crate) fn plan_frame(
     let mut forced = forced_edge.filter(|edge| *edge > 0);
     loop {
         let (level_w, level_h) = mip::mip_size(master_w, master_h, level);
-        let fits = level_w <= max_bitmap as i32 && level_h <= max_bitmap as i32;
-        if fits && forced.is_none() {
+        let device_fits = level_w <= max_bitmap as i32 && level_h <= max_bitmap as i32;
+        // The CPU side gates BOTH arms: the level bitmap is materialized
+        // before it is uploaded, and a tiled draw is cut FROM that same
+        // bitmap — a level the cache would refuse is undrawable either way,
+        // so the ladder must deepen instead of planning it (planning it
+        // leaves the caller nothing to draw, which blanks the frame).
+        let cpu_fits = bgra_bytes(i64::from(level_w) * i64::from(level_h)) <= level_budget_bytes;
+        if device_fits && cpu_fits && forced.is_none() {
             return FramePlan::Base { level };
         }
-        let edge = forced.unwrap_or(TILE_EDGE);
-        let tiles = tile_requests(
-            frame_gen,
-            level,
-            (level_w, level_h),
-            &dest,
-            &vis,
-            edge,
-            resident,
-        );
-        let fresh: u64 = tiles
-            .iter()
-            .filter(|t| !resident(&t.key))
-            .map(|t| t.bytes())
-            .sum();
-        if !tiles.is_empty() && (forced.is_some() || fresh <= cap_bytes) {
-            return FramePlan::Tiles { level, tiles };
+        if cpu_fits {
+            let edge = forced.unwrap_or(TILE_EDGE);
+            let tiles = tile_requests(
+                frame_gen,
+                level,
+                (level_w, level_h),
+                &dest,
+                &vis,
+                edge,
+                resident,
+            );
+            let fresh: u64 = tiles
+                .iter()
+                .filter(|t| !resident(&t.key))
+                .map(|t| t.bytes())
+                .sum();
+            if !tiles.is_empty() && (forced.is_some() || fresh <= cap_bytes) {
+                return FramePlan::Tiles { level, tiles };
+            }
         }
         // Deepen (the forced edge is a one-shot diagnostic: the coarser
         // levels follow the normal rules). A fitting master is never
@@ -459,7 +498,7 @@ pub(crate) fn plan_frame(
 ///
 /// The grid is enumerated windowed — only the cells the preimage actually
 /// touches — and each cell contributes its intersection with the preimage
-/// (the logical interior), expanded by [`FILTER_HALO`] for the bitmap. A
+/// (the logical interior), expanded by [`FILTER_HALO_NATIVE`] for the bitmap. A
 /// cell whose interior is empty contributes nothing.
 fn tile_requests(
     frame_gen: u64,
@@ -472,6 +511,9 @@ fn tile_requests(
 ) -> Vec<TileRequest> {
     let (level_w, level_h) = level_dims;
     let bounds = Rect::new(0, 0, level_w, level_h);
+    // One constant margin, both axes (see FILTER_HALO_NATIVE for why it is
+    // not scale-derived).
+    let halo = FILTER_HALO_NATIVE;
     let pre = preimage(vis, dest, level_w, level_h);
     if pre.is_empty() {
         return Vec::new();
@@ -488,7 +530,7 @@ fn tile_requests(
             if interior.is_empty() {
                 continue;
             }
-            let src = interior.expand_clamped(FILTER_HALO, &bounds);
+            let src = interior.haloed(halo, &bounds);
             let dest_x = src_to_dest_f(src.x as f32, dest.x, dest.w, level_w);
             let dest_y = src_to_dest_f(src.y as f32, dest.y, dest.h, level_h);
             let dest_rect = DestRect {
@@ -796,6 +838,7 @@ mod tests {
             ),
             1 << 23,
             u64::MAX,
+            u64::MAX,
             None,
             &never,
         );
@@ -833,6 +876,7 @@ mod tests {
                 1,
                 geom((mw, mh), (rw, rh), dest, viewport),
                 1 << 23,
+                u64::MAX,
                 u64::MAX,
                 Some(edge),
                 &never,
@@ -949,6 +993,7 @@ mod tests {
             geom((16777217, 1), (16777217, 1), dest, viewport),
             1 << 23,
             u64::MAX,
+            u64::MAX,
             None,
             &never,
         );
@@ -960,7 +1005,7 @@ mod tests {
             let (a, b) = (pair[0], pair[1]);
             assert_eq!(a.clip.right(), b.clip.x, "gap or overlap at {:?}", b.clip);
             // The haloed DRAW rects deliberately overlap their neighbour by
-            // 2×FILTER_HALO — that overlap is exactly what the clip hides,
+            // 2×FILTER_HALO_NATIVE — that overlap is exactly what the clip hides,
             // and a gap here would expose the letterbox colour.
             assert!(
                 a.dest.right() > b.dest.x,
@@ -989,6 +1034,7 @@ mod tests {
             ),
             1 << 23,
             u64::MAX,
+            u64::MAX,
             None,
             &never,
         );
@@ -1007,6 +1053,7 @@ mod tests {
             ),
             1 << 23,
             u64::MAX,
+            u64::MAX,
             None,
             &never,
         );
@@ -1019,7 +1066,7 @@ mod tests {
 
     #[test]
     fn the_halo_expands_the_bitmap_and_draw_but_never_the_clip() {
-        // A tile in the middle of a giant carries FILTER_HALO source pixels
+        // A tile in the middle of a giant carries FILTER_HALO_NATIVE source pixels
         // on each side for its taps, and clips those away again.
         let dest = Rect::new(0, 0, 8192, 1024);
         let plan = plan_frame(
@@ -1031,6 +1078,7 @@ mod tests {
                 Rect::new(0, 0, 8192, 1024),
             ),
             1 << 23,
+            u64::MAX,
             u64::MAX,
             Some(1024),
             &never,
@@ -1045,7 +1093,12 @@ mod tests {
         assert_eq!(t.clip, Rect::new(1024, 0, 1024, 1024));
         assert_eq!(
             t.src,
-            Rect::new(1024 - FILTER_HALO, 0, 1024 + 2 * FILTER_HALO, 1024)
+            Rect::new(
+                1024 - FILTER_HALO_NATIVE,
+                0,
+                1024 + 2 * FILTER_HALO_NATIVE,
+                1024
+            )
         );
         assert_eq!(
             t.dest,
@@ -1060,7 +1113,7 @@ mod tests {
         // The first tile's halo is clamped at the level's edge (no
         // out-of-image source rect).
         assert_eq!(tiles[0].src.x, 0);
-        assert_eq!(tiles[0].src.w, 1024 + FILTER_HALO);
+        assert_eq!(tiles[0].src.w, 1024 + FILTER_HALO_NATIVE);
         assert_eq!(tiles[0].clip.x, 0);
         // The last tile's halo is clamped at the right edge.
         let last = tiles[7];
@@ -1079,6 +1132,7 @@ mod tests {
                 Rect::new(0, 0, 1000, 1000),
             ),
             1 << 23,
+            u64::MAX,
             u64::MAX,
             Some(1024),
             &never,
@@ -1111,6 +1165,7 @@ mod tests {
             ),
             16384,
             u64::MAX,
+            u64::MAX,
             None,
             &never,
         );
@@ -1125,6 +1180,7 @@ mod tests {
                     Rect::new(0, 0, 1920, 1080)
                 ),
                 16384,
+                u64::MAX,
                 u64::MAX,
                 None,
                 &never
@@ -1142,6 +1198,7 @@ mod tests {
                 Rect::new(0, 0, 1920, 1080),
             ),
             16384,
+            u64::MAX,
             u64::MAX,
             None,
             &never,
@@ -1167,6 +1224,7 @@ mod tests {
                 Rect::new(0, 0, 1920, 1080),
             ),
             16384,
+            u64::MAX,
             u64::MAX,
             None,
             &never,
@@ -1194,6 +1252,7 @@ mod tests {
             ),
             16384,
             1024 * 1024,
+            u64::MAX,
             None,
             &never,
         );
@@ -1217,6 +1276,7 @@ mod tests {
             geom((args.0, args.1), (args.2, args.3), dest, viewport),
             16384,
             u64::MAX,
+            u64::MAX,
             None,
             &never,
         );
@@ -1230,6 +1290,7 @@ mod tests {
             geom((args.0, args.1), (args.2, args.3), dest, viewport),
             16384,
             0,
+            u64::MAX,
             None,
             &hit,
         );
@@ -1253,6 +1314,7 @@ mod tests {
                 Rect::new(0, 0, 3000, 2000),
             ),
             16384,
+            u64::MAX,
             u64::MAX,
             Some(512),
             &never,
@@ -1283,6 +1345,7 @@ mod tests {
                 ),
                 16384,
                 u64::MAX,
+                u64::MAX,
                 None,
                 &never
             ),
@@ -1298,6 +1361,7 @@ mod tests {
                     Rect::new(0, 0, 1920, 1080)
                 ),
                 16384,
+                u64::MAX,
                 u64::MAX,
                 None,
                 &never
@@ -1434,5 +1498,161 @@ mod tests {
         ] {
             assert!(line.contains(field), "{field} missing from {line}");
         }
+    }
+
+    #[test]
+    fn adjacent_tile_rows_partition_the_destination_on_the_y_axis() {
+        // The seam partition is per-axis symmetric, but the shipped tests
+        // only exercised x (a 1-px-tall giant): this pins the same edges
+        // vertically, where a gap would be a horizontal seam.
+        let plan = plan_frame(
+            3,
+            geom(
+                (4096, 8192),
+                (4096, 8192),
+                Rect::new(-100, -2500, 4096, 8192),
+                Rect::new(0, 0, 1920, 1080),
+            ),
+            2048,
+            u64::MAX,
+            u64::MAX,
+            None,
+            &never,
+        );
+        let FramePlan::Tiles { tiles, .. } = plan else {
+            panic!("expected tiles: {plan:?}");
+        };
+        assert!(tiles.len() >= 2);
+        // Row-major order: consecutive entries must share an edge only
+        // within a row; a row change restarts at the row's first column,
+        // and the COLUMN comparison is what pins the y axis (a gap there
+        // would be a horizontal seam).
+        for pair in tiles.windows(2) {
+            let (a, b) = (pair[0], pair[1]);
+            if a.key.ty == b.key.ty {
+                assert_eq!(
+                    a.clip.right(),
+                    b.clip.x,
+                    "column gap in row {} at {:?}",
+                    a.key.ty,
+                    b.clip
+                );
+            } else {
+                assert_eq!(
+                    b.clip.x, tiles[0].clip.x,
+                    "row {} restarts off-grid",
+                    b.key.ty
+                );
+                assert!(b.key.ty > a.key.ty, "rows stay in order");
+            }
+        }
+        for t in &tiles {
+            let below = tiles
+                .iter()
+                .find(|o| o.key.tx == t.key.tx && o.key.ty == t.key.ty + 1);
+            if let Some(below) = below {
+                assert!(
+                    below.clip.y <= t.clip.bottom() && t.clip.bottom() <= below.clip.y + 1,
+                    "row gap at {:?} (above ends {})",
+                    below.clip,
+                    t.clip.bottom()
+                );
+            }
+        }
+        assert!(tiles.iter().any(|t| t.key.ty > 0), "more than one row");
+    }
+
+    #[test]
+    fn the_halo_is_the_measured_constant_not_a_derived_one() {
+        // The margin is empirical (see FILTER_HALO_NATIVE): D2D's filtered
+        // pull of a sub-rect source is not monotone in the bitmap size, and
+        // a scale-derived widening (`32 / scale`) was measured WORSE at the
+        // configuration the constant was tuned for (smoke82 S2b: whole-frame
+        // max delta 1 -> 21, boundary step 0.299 -> 3.887). Pinning the value
+        // here means a future "optimization" of it has to read that record
+        // and re-run the S2b comparison, rather than silently halving the
+        // margin.
+        assert_eq!(FILTER_HALO_NATIVE, 32);
+        // The tiles carry exactly that margin, on both axes, clamped to the
+        // level (a tile at the level's edge must not name an out-of-image
+        // source rect).
+        let plan = plan_frame(
+            1,
+            geom(
+                (8192, 512),
+                (8192, 512),
+                Rect::new(0, 0, 8192, 512),
+                Rect::new(0, 0, 8192, 512),
+            ),
+            2048,
+            u64::MAX,
+            u64::MAX,
+            Some(2048),
+            &never,
+        );
+        let FramePlan::Tiles { tiles, .. } = plan else {
+            panic!("expected tiles: {plan:?}");
+        };
+        assert!(tiles.len() >= 3);
+        assert_eq!(tiles[1].src.x, 2048 - FILTER_HALO_NATIVE);
+        assert_eq!(tiles[1].src.w, 2048 + 2 * FILTER_HALO_NATIVE);
+        assert_eq!(
+            tiles[0].src.x, 0,
+            "the first tile's halo clamps at the level"
+        );
+    }
+
+    #[test]
+    fn a_level_over_the_cpu_budget_deepens_instead_of_blanking() {
+        // The refused-level regression the pre-review found: a level whose
+        // CPU bytes exceed the cache cap must never be planned as `Base`
+        // (the cache would refuse it and the paint would blank). 16389x8189
+        // at 50% picks level 1 (134 MB) — over a 128 MB budget — so the
+        // ladder must deepen until a level fits as one bitmap.
+        let budget = 128u64 << 20;
+        let plan = plan_frame(
+            1,
+            geom(
+                (16389, 8189),
+                (8194, 4094),
+                Rect::new(0, 0, 8194, 4094),
+                Rect::new(0, 0, 1920, 1080),
+            ),
+            16384,
+            u64::MAX,
+            budget,
+            None,
+            &never,
+        );
+        let FramePlan::Base { level } = plan else {
+            panic!("the frame must draw as one bitmap: {plan:?}");
+        };
+        let (w, h) = mip::mip_size(16389, 8189, level);
+        assert!(
+            bgra_bytes(i64::from(w) * i64::from(h)) <= budget,
+            "level {level} = {w}x{h} still exceeds the CPU budget"
+        );
+        assert!(level >= 1, "level 0 does not fit the device either");
+        // With an ample budget the same frame takes the shallowest level
+        // that covers the render — the deepen is budget-driven, not a
+        // blanket coarsening.
+        let ample = plan_frame(
+            1,
+            geom(
+                (16389, 8189),
+                (8194, 4094),
+                Rect::new(0, 0, 8194, 4094),
+                Rect::new(0, 0, 1920, 1080),
+            ),
+            16384,
+            u64::MAX,
+            u64::MAX,
+            None,
+            &never,
+        );
+        let FramePlan::Base { level: deep } = ample else {
+            panic!("expected Base");
+        };
+        assert!(deep < level, "an ample budget plans the deeper level");
     }
 }

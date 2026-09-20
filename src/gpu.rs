@@ -144,10 +144,19 @@ pub(crate) trait LevelSource {
     /// `cpu_source` class.
     fn cpu_bytes(&self) -> u64;
 
+    /// Rebind to the frame generation about to draw, dropping any cached
+    /// level of a previous frame (see [`crate::mip::LevelCache::rebind`]).
+    fn rebind(&mut self, frame_gen: u64);
+
     /// Levels built so far (each is a full source pass) — the ledger's
     /// `mip_builds`, and the evidence line's proof that a giant's overview
     /// was really computed.
     fn level_builds(&self) -> u64;
+
+    /// The CPU bytes held by display DERIVATIONS outside this stack (the
+    /// GDI face's DIB) — the ledger's `cpu_display` class. The D2D arm
+    /// never reads it, but it is real memory in the same process.
+    fn display_bytes(&self) -> u64;
 }
 
 /// The master + level cache pair the window state hands the D2D arm
@@ -160,6 +169,9 @@ pub(crate) struct MasterLevels<'a> {
     /// The generation the cache's levels belong to (a new frame clears
     /// them: they were built from the previous frame's pixels).
     pub(crate) frame_gen: u64,
+    /// The derived-CPU-copy bytes outside this stack (the GDI face's DIB),
+    /// read by the caller from the surface it owns.
+    pub(crate) display_bytes: u64,
 }
 
 impl LevelSource for MasterLevels<'_> {
@@ -183,6 +195,15 @@ impl LevelSource for MasterLevels<'_> {
 
     fn level_builds(&self) -> u64 {
         self.cache.builds
+    }
+
+    fn display_bytes(&self) -> u64 {
+        self.display_bytes
+    }
+
+    fn rebind(&mut self, frame_gen: u64) {
+        self.frame_gen = frame_gen;
+        self.cache.rebind(frame_gen);
     }
 }
 
@@ -765,8 +786,9 @@ impl GpuStack {
         src: &mut dyn LevelSource,
     ) -> Result<(), String> {
         self.forced_edge = diag.tile_edge.filter(|edge| *edge > 0);
-        // A new frame generation invalidates every tile (its pixels can
-        // never be drawn again) and the ledger's source class.
+        // A new frame generation invalidates every tile and every cached
+        // CPU level (their pixels can never be drawn again).
+        src.rebind(frame_gen);
         if self.tile_gen != Some(frame_gen) {
             for key in self.tile_lru.clear() {
                 self.tiles.retain(|(k, _)| *k != key);
@@ -788,12 +810,20 @@ impl GpuStack {
                 },
                 self.max_bitmap,
                 self.cap_bytes,
+                // The CPU level budget: the level bitmap is materialized
+                // before upload, so a level the cache would refuse must
+                // deepen here instead of blanking the frame later.
+                crate::mip::LEVEL_CACHE_BYTES,
                 self.forced_edge, // synced from the window state per paint
                 &resident,
             )
         };
         match frame_plan {
             crate::tile::FramePlan::Blank => {
+                // A stale base bitmap must not stay device-resident behind a
+                // frame that does not draw it (the ledger reports tiles only).
+                self.bitmap = None;
+                self.uploaded = None;
                 self.scene = Scene::Clear;
             }
             crate::tile::FramePlan::Base { level } => {
@@ -808,10 +838,16 @@ impl GpuStack {
                 };
             }
             crate::tile::FramePlan::Tiles { level, tiles } => {
+                // Same for the tiled form: the tiles ARE the source here, and a
+                // level bitmap left from an earlier zoom would inflate real VRAM
+                // without showing up in `gpu_resident`.
+                self.bitmap = None;
+                self.uploaded = None;
                 let (level_w, level_h, pixels) = src
                     .level(level)
                     .ok_or_else(|| format!("level {level} tile source is unavailable"))?;
                 let mut missing = 0usize;
+                let mut last_error: Option<String> = None;
                 for quad in &tiles {
                     if self.tile_lru.touch(&quad.key) {
                         continue;
@@ -835,15 +871,22 @@ impl GpuStack {
                             }
                         }
                         Err(e) => {
-                            eprintln!("riviv: tile upload failed ({e}) — leaving this tile blank");
+                            // The per-tile detail goes to the summary line
+                            // below: a persistent failure would otherwise print
+                            // once per tile per paint (animations included).
+                            last_error = Some(e);
                             missing += 1;
                         }
                     }
                 }
                 if missing > 0 {
                     eprintln!(
-                        "riviv: {missing} of {} tiles are not resident this frame",
-                        tiles.len()
+                        "riviv: {missing} of {} tiles are not resident this frame{}",
+                        tiles.len(),
+                        match &last_error {
+                            Some(e) => format!(" (last error: {e})"),
+                            None => String::new(),
+                        }
                     );
                 }
                 self.scene = Scene::Tiles {
@@ -853,6 +896,7 @@ impl GpuStack {
             }
         }
         self.ledger.cpu_source = src.cpu_bytes();
+        self.ledger.cpu_display = src.display_bytes();
         self.ledger.mip_builds = src.level_builds();
         // The base class counts the CURRENT plan's level bitmap: a tiled
         // frame holds no base (the tiles ARE the source), while an overview
@@ -1150,6 +1194,11 @@ impl GpuStack {
             .map_err(|e| format!("dump EndDraw failed: {e}"))?;
         // The readback staging bitmap: CPU_READ | CANNOT_DRAW, viewport
         // sized, the same UNORM format (design §9).
+        // The readback plus the two decoded copies below are this call's
+        // in-flight buffers: the ledger's inflight class covers them, and the
+        // peak is what survives the call.
+        self.ledger
+            .note_inflight((cw as u64 * ch as u64 * 4).saturating_mul(2));
         // SAFETY: the context is live; the properties struct outlives the
         // call; the bitmap is created bare (never set as the target).
         let readback = unsafe {
@@ -1215,6 +1264,7 @@ impl GpuStack {
         unsafe { readback.Unmap() }.map_err(|e| format!("dump Unmap failed: {e}"))?;
         let mut rgba = vec![0u8; bgra.len()];
         crate::pixels::bgra_to_rgba(&bgra, &mut rgba);
+        self.ledger.note_inflight(0);
         Ok((cw, ch, rgba))
     }
 }
@@ -1281,8 +1331,8 @@ fn present(swapchain: &IDXGISwapChain1) -> PaintOutcome {
 
 /// The D2D paint (design §4, ADR 0002 D8 verbatim): IsIconic early-exit →
 /// BeginPaint (rcPaint ignored — a flip back buffer is discarded, the
-/// whole viewport redraws; failure is the GDI arm's fatal) → the giant
-/// gate → upload-if-stale → BeginDraw/Clear/DrawBitmap/EndDraw/Present →
+/// whole viewport redraws; failure is the GDI arm's fatal) → `prepare`
+/// (the plan + its uploads) → BeginDraw/Clear/DrawBitmap/EndDraw/Present →
 /// EndPaint → the #76 paint handshake (the render stack's health is
 /// irrelevant to the decode worker's first-frame wait). Device losses
 /// return as [`PaintOutcome::DeviceLost`] for the router's ladder; nothing
@@ -1368,6 +1418,7 @@ pub(crate) fn paint_d2d(view: HWND, owner: HWND) -> PaintOutcome {
                     master: Some(image.surface().master()),
                     cache: &mut state.levels,
                     frame_gen,
+                    display_bytes: image.surface().face_bytes(),
                 };
                 let diag = crate::gpu::Diagnostics {
                     tile_edge: state.tile_edge,

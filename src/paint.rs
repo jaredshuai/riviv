@@ -93,8 +93,8 @@ pub(crate) fn paint(view: HWND, owner: HWND) {
 /// The scene body of the GDI arm: gather the fit inputs and the
 /// mode-resolved background, blit the current frame's view from its
 /// full-resolution face, then fill the letterbox strips around it. Shared
-/// verbatim by the WM_PAINT bracket (above), the giant-frame degrade pass
-/// ([`paint_degraded`]) and the GDI dump channel ([`dump_viewport_gdi`]).
+/// verbatim by the WM_PAINT bracket (above) and the GDI dump channel
+/// ([`dump_viewport_gdi`]).
 /// `paint_clip` is the update-rect source for the giant-extent clip region
 /// (WM_PAINT passes ps.rcPaint; the off-paint channels pass the whole
 /// client — nothing clips away either way). No fatal inside: the off-paint

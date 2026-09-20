@@ -37,7 +37,7 @@
 /// Size of mipmap `level` for an `image_wide x image_high` frame. Level 0
 /// is the frame itself. Each dimension rounds `(dim+1)/2^k` down and clamps
 /// at 1 (viv.c:14158-14169/14264-14275).
-#[allow(dead_code)] // the historical record + counterexample net (see the module doc)
+/// Live since #82 (the tiering and the level cache both size through it).
 pub(crate) fn mip_size(image_w: i32, image_h: i32, level: u32) -> (i32, i32) {
     if level == 0 {
         return (image_w.max(1), image_h.max(1));
@@ -69,7 +69,6 @@ pub(crate) fn mip_size(image_w: i32, image_h: i32, level: u32) -> (i32, i32) {
 /// forces alpha 255), so a straight 4-byte average is the correct
 /// non-premultiplied filter — no channel needs special treatment, and the
 /// alpha byte averages back to 255 on its own.
-#[allow(dead_code)] // reached through LevelCache::get_or_build
 pub(crate) fn downscale_box(src: &[u8], image_w: i32, image_h: i32, level: u32) -> Vec<u8> {
     let (dest_w, dest_h) = mip_size(image_w, image_h, level);
     debug_assert_eq!(src.len(), image_w as usize * image_h as usize * 4);
@@ -136,6 +135,18 @@ impl LevelCache {
         }
     }
 
+    /// Rebind to a frame generation, dropping the previous frame's levels
+    /// — a caller that never asks for a level of the new frame (an ordinary
+    /// image after a giant) would otherwise keep the old frame's bytes
+    /// resident AND counted into the ledger's source class.
+    pub(crate) fn rebind(&mut self, frame_gen: u64) {
+        if self.frame_gen != frame_gen {
+            self.clear();
+            self.frame_gen = frame_gen;
+            self.builds = 0;
+        }
+    }
+
     /// Drop every level (a new frame generation, or a caller that wants
     /// the CPU bytes back).
     pub(crate) fn clear(&mut self) {
@@ -161,11 +172,7 @@ impl LevelCache {
         frame_gen: u64,
         src: &[u8],
     ) -> Option<(u32, u32, &[u8])> {
-        if self.frame_gen != frame_gen {
-            self.clear();
-            self.frame_gen = frame_gen;
-            self.builds = 0;
-        }
+        self.rebind(frame_gen);
         let (wide, high) = mip_size(image_w as i32, image_h as i32, level);
         if let Some(idx) = self.entries.iter().position(|(l, _)| *l == level) {
             self.lru.touch(&level);
@@ -445,5 +452,95 @@ mod tests {
         // original, never a halving of a previous level).
         let identity = downscale_box(&src, w as i32, h as i32, 0);
         assert_eq!(&identity[0..3], &[255, 255, 255]);
+    }
+
+    // ---- LevelCache (#82's overview/level source) ----
+
+    /// One 4x4 opaque mid-grey canvas whose top-left pixel is white — the
+    /// fixture the cache's level identity is read back from.
+    fn level_fixture() -> Vec<u8> {
+        let mut v = vec![40u8; 4 * 4 * 4];
+        for px in v.chunks_mut(4) {
+            px[3] = 255;
+        }
+        v[0] = 255;
+        v[1] = 255;
+        v[2] = 255;
+        v
+    }
+
+    #[test]
+    fn the_level_cache_builds_once_and_serves_the_same_bytes_afterwards() {
+        let src = level_fixture();
+        let mut cache = LevelCache::new(LEVEL_CACHE_BYTES);
+        let first = cache.get_or_build(1, 4, 4, 7, &src).expect("level 1");
+        let (w, h) = (first.0, first.1);
+        let first_bytes = first.2.to_vec();
+        assert_eq!((w, h), (2, 2), "level 1 of 4x4 is 2x2");
+        assert_eq!(cache.builds, 1, "the first ask builds");
+        let again = cache.get_or_build(1, 4, 4, 7, &src).expect("level 1 again");
+        assert_eq!(
+            again.2,
+            &first_bytes[..],
+            "the second ask serves the cached bytes"
+        );
+        assert_eq!(cache.builds, 1, "and does not rebuild");
+        assert_eq!(cache.bytes(), 2 * 2 * 4);
+    }
+
+    #[test]
+    fn a_new_frame_generation_clears_the_cached_levels() {
+        // The levels are pixels of ONE frame: a generation change must drop
+        // them rather than serve the previous image's bytes.
+        let src = level_fixture();
+        let mut cache = LevelCache::new(LEVEL_CACHE_BYTES);
+        cache.get_or_build(1, 4, 4, 7, &src).expect("level 1");
+        assert!(cache.bytes() > 0);
+        let rebuilt = cache
+            .get_or_build(1, 4, 4, 8, &src)
+            .expect("level 1 of the new frame");
+        assert_eq!(rebuilt.0, 2);
+        assert_eq!(cache.builds, 1, "the counter restarts with the frame");
+        assert_eq!(cache.bytes(), 2 * 2 * 4, "one level, not two");
+    }
+
+    #[test]
+    fn a_level_larger_than_the_whole_cap_is_refused_not_truncated() {
+        // The refusal the plan ladder reads (`plan_frame`'s level budget):
+        // a level that cannot be held must return None, never a partial
+        // bitmap — the caller deepens instead of drawing garbage.
+        let src = level_fixture();
+        let mut cache = LevelCache::new(4);
+        assert!(cache.get_or_build(1, 4, 4, 7, &src).is_none());
+        assert_eq!(cache.builds, 0, "a refused level is not built");
+        assert_eq!(cache.bytes(), 0);
+    }
+
+    #[test]
+    fn the_level_cache_evicts_the_coldest_level_and_rebuilds_it_on_demand() {
+        // The cap holds a 2x2 level (16 B) and a 4x4 level (64 B) exactly;
+        // admitting a 1x1 level must push the COLDEST out, and the pushed
+        // level must come back as a rebuild (never as stale bytes) when it
+        // is asked for again.
+        let src = level_fixture();
+        let mut cache = LevelCache::new(80);
+        cache.get_or_build(1, 4, 4, 7, &src).expect("level 1");
+        cache.get_or_build(0, 4, 4, 7, &src).expect("level 0");
+        assert_eq!(cache.bytes(), 80, "16 + 64");
+        cache.get_or_build(1, 4, 4, 7, &src).expect("level 1 hit");
+        assert_eq!(cache.builds, 2, "the re-ask was a hit");
+        let small = cache
+            .get_or_build(2, 4, 4, 7, &src)
+            .expect("level 2 admits");
+        assert_eq!((small.0, small.1), (1, 1));
+        assert_eq!(cache.builds, 3);
+        assert_eq!(cache.bytes(), 20, "level 0 (coldest) was evicted");
+        let hit = cache.get_or_build(1, 4, 4, 7, &src).expect("level 1 hit");
+        assert_eq!(hit.0, 2);
+        assert_eq!(cache.builds, 3, "level 1 survived the eviction");
+        cache
+            .get_or_build(0, 4, 4, 7, &src)
+            .expect("level 0 rebuild");
+        assert_eq!(cache.builds, 4, "the evicted level rebuilds on demand");
     }
 }
