@@ -96,7 +96,7 @@ File management (upstream semantics, #43): F2 (File→Rename) opens a rename dia
   - [x] M6b: PerMonitorV2 DPI manifest + WM_DPICHANGED handling (fixes 1:1 on mixed-DPI multi-monitor; intentional deviation) (#79, after #78)
   - [x] M6b: D2D minimal path — `renderer=auto|d2d|warp|gdi`, GpuStack with device-loss recovery, pixel-exact 1:1, `--dump-viewport` readback (#80)
   - [x] M6b: filter-mode mapping (2×2 ini matrix, D2D full interpolation table) + mip retirement for regular sizes, default renderer → `auto` (#81)
-  - [ ] M6b: giant-image overview + LRU tiles, VRAM byte budget (#82 — the D2D arm draws giants itself; the GDI deletion was split out into #90)
+  - [x] M6b: giant-image overview + LRU tiles, VRAM byte budget (#82 — the D2D arm draws giants itself; the GDI deletion was split out into #90)
   - [ ] M6b: GDI render-path removal with a frozen golden corpus (#90, closes M6 — split out of #82 on 2026-09-20: the written deletion criteria are `renderer=auto` initialising in every target environment (physical GPU / WARP / RDP / Hyper-V), a frozen golden corpus, and one stable release cycle, and neither the environment evidence nor the release cycle existed at #82's start)
 - Unscheduled candidates (M7 & wishlist): ICM Stage 2 (per-display profile + hot reload + ACM/HDR awareness + GPU ColorManagement effect), HDR/WCG output, D2D effect chain (sharpen etc.), playlist pane/tool window, I18N beyond en/zh-CN, SVG/AVIF/APNG decoders, undo-delete restore, About credits.
 
