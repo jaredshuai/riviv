@@ -70,7 +70,13 @@
 //! - `custom_rate_dlg` — the Set Custom Rate dialog over that model
 //!   (hand-built, the #22 dialog pattern) (#37)
 //! - `paint` — WM_PAINT render; M2: stitch/mip (#9); zoom/pan offsets,
-//!   the BitBlt 1:1 path and the COLORONCOLOR magnify filter landed (#7)
+//!   the BitBlt 1:1 path and the COLORONCOLOR magnify filter landed (#7);
+//!   #80: the scene body extracted (`render_scene`/`scene_rect`) for the
+//!   dump/degrade channels
+//! - `gpu` — the D2D/DXGI viewport stack (#80): GpuStack (device chain,
+//!   frame upload keyed by frame_gen, WM_SIZE resize, the three-tier
+//!   failure ladder, the WM_CLOSE dump readback) behind the `renderer`
+//!   ini key; the GDI arm stays the default byte-identical baseline
 //! - `playlist` — playlist model + navigation math + recursive folder/wildcard
 //!   entry construction (#6, landed)
 //! - `status` — the status-bar common control: creation, height, and the
@@ -95,6 +101,7 @@ mod everything;
 mod filemgmt;
 mod fit;
 mod frame;
+mod gpu;
 mod icm;
 mod ini;
 mod jumpto_dlg;

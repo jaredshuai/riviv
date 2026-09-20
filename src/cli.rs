@@ -213,6 +213,13 @@ pub(crate) struct Parsed {
     /// action — it is a sticky runtime intent applied in the show tail,
     /// never cleared by a later parse and never persisted.
     pub close_after_slideshow: bool,
+    /// `-dump-viewport <path>` (#80): the sticky dump intent — at WM_CLOSE,
+    /// before the window dies, the viewport scene renders once and the PNG
+    /// lands at the path (the automation readback channel, design §9). A
+    /// sticky runtime intent like `close_after_slideshow`: armed by any
+    /// parse (a single-instance handoff arms it in the FIRST instance — no
+    /// special-casing, README-noted), never persisted.
+    pub dump_viewport: Option<Vec<u16>>,
     pub start_fullscreen: bool,
     pub start_window: bool,
     pub start_maximized: bool,
@@ -262,6 +269,13 @@ pub(crate) fn parse(cl: &[u16], is_add: bool, has_current: bool) -> Parsed {
                 // #67 (upstream wishlist viv.c:37): no parameter word —
                 // like /slideshow, it takes nothing and consumes nothing.
                 out.close_after_slideshow = true;
+            } else if eq_switch(arm, "dump-viewport") {
+                // #80 (riviv-authored — upstream has no such switch): the
+                // dump path is the NEXT word (quote-grouped paths arrive
+                // pre-stripped by the tokenizer). A dangling switch stores
+                // the empty tail word — the consumer fails the dump with
+                // exit 2, exactly like a dangling /x parses as 0.
+                out.dump_viewport = Some(param(&mut i));
             } else if eq_switch(arm, "fullscreen") {
                 out.start_fullscreen = true;
                 out.start_window = false;
@@ -732,6 +746,72 @@ mod tests {
         let p = parse(&w("exe \"/close\""), false, false);
         assert!(!p.close_after_slideshow);
         assert_eq!(p.file_count, 1);
+    }
+
+    // ---- the -dump-viewport switch (#80) ----
+
+    #[test]
+    fn dump_viewport_takes_both_spellings_case_insensitively() {
+        // The tokenizer strips the leading character before the arm match,
+        // so `-dump-viewport` and `/dump-viewport` are the same arm (like
+        // every other switch).
+        for cl in [
+            "exe -dump-viewport out.png",
+            "exe /dump-viewport out.png",
+            "exe -DUMP-VIEWPORT out.png",
+            "exe /Dump-Viewport out.png",
+        ] {
+            let p = parse(&w(cl), false, false);
+            assert_eq!(s(p.dump_viewport.as_deref().unwrap()), "out.png", "{cl}");
+            assert!(p.unknown.is_empty(), "{cl}");
+        }
+    }
+
+    #[test]
+    fn dump_viewport_consumes_its_path_without_polluting_the_file_words() {
+        // The path is the parameter word — a file word BEFORE the switch
+        // stays the open target, and the parameter never joins the playlist.
+        let p = parse(&w("exe a.png -dump-viewport shot.png"), false, false);
+        assert_eq!(p.file_count, 1);
+        assert_eq!(s(p.single.as_ref().unwrap()), "a.png");
+        assert_eq!(s(p.dump_viewport.as_deref().unwrap()), "shot.png");
+        // A quoted path with spaces arrives pre-stripped as one word.
+        let p = parse(
+            &w("exe -dump-viewport \"C:\\temp dir\\shot 1.png\" a.png"),
+            false,
+            false,
+        );
+        assert_eq!(
+            s(p.dump_viewport.as_deref().unwrap()),
+            "C:\\temp dir\\shot 1.png"
+        );
+        assert_eq!(s(p.single.as_ref().unwrap()), "a.png");
+        assert_eq!(p.file_count, 1);
+    }
+
+    #[test]
+    fn dump_viewport_without_a_parameter_stores_an_empty_path() {
+        // A dangling switch consumes the empty tail word (string_to_int's
+        // dangling-/x shape) — no panic; the consumer fails the dump.
+        let p = parse(&w("exe -dump-viewport"), false, false);
+        assert_eq!(s(p.dump_viewport.as_deref().unwrap()), "");
+        assert_eq!(p.file_count, 0);
+    }
+
+    #[test]
+    fn dump_viewport_is_a_sticky_intent_not_an_ordered_action() {
+        // Like /close: no ClAction rows, armed regardless of walk position.
+        let p = parse(
+            &w("exe a.png /dump-viewport b.png /slideshow"),
+            false,
+            false,
+        );
+        assert_eq!(
+            p.actions,
+            vec![ClAction::ExitRandom, ClAction::ClearPlaylist]
+        );
+        assert!(p.start_slideshow);
+        assert_eq!(s(p.dump_viewport.as_deref().unwrap()), "b.png");
     }
 
     // ---- the clipboard: pseudo-filename (#66) ----

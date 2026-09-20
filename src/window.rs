@@ -94,21 +94,22 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetCursorPos, SetForegroundWindow, SetMenu, SetTimer, SetWindowLongPtrW, SetWindowPos,
     SetWindowTextW, ShowCursor, ShowWindow, TPM_CENTERALIGN, TPM_LEFTBUTTON, TPM_VCENTERALIGN,
     TrackPopupMenu, TranslateMessage, USER_TIMER_MINIMUM, WINDOW_EX_STYLE, WINDOW_STYLE,
-    WM_ACTIVATE, WM_COMMAND, WM_CONTEXTMENU, WM_COPYDATA, WM_DESTROY, WM_DPICHANGED, WM_DROPFILES,
-    WM_ENDSESSION, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_INITMENU, WM_KEYDOWN, WM_LBUTTONDBLCLK,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_MOVE, WM_NCCREATE, WM_NCDESTROY, WM_NCLBUTTONDOWN, WM_NCXBUTTONDBLCLK, WM_NCXBUTTONDOWN,
-    WM_NOTIFY, WM_NULL, WM_PAINT, WM_PASTE, WM_QUERYENDSESSION, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN,
-    WM_RBUTTONUP, WM_SIZE, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_TIMER, WM_XBUTTONDBLCLK,
-    WM_XBUTTONDOWN, WNDCLASSEXW, WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN, WS_EX_ACCEPTFILES,
-    WS_OVERLAPPEDWINDOW, WS_POPUP, WS_SYSMENU, WS_THICKFRAME, WS_VISIBLE, WindowFromPoint,
+    WM_ACTIVATE, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_COPYDATA, WM_DESTROY, WM_DPICHANGED,
+    WM_DROPFILES, WM_ENDSESSION, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_INITMENU, WM_KEYDOWN,
+    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE,
+    WM_MOUSEWHEEL, WM_MOVE, WM_NCCREATE, WM_NCDESTROY, WM_NCLBUTTONDOWN, WM_NCXBUTTONDBLCLK,
+    WM_NCXBUTTONDOWN, WM_NOTIFY, WM_NULL, WM_PAINT, WM_PASTE, WM_QUERYENDSESSION, WM_RBUTTONDBLCLK,
+    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SIZE, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_TIMER,
+    WM_XBUTTONDBLCLK, WM_XBUTTONDOWN, WNDCLASSEXW, WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN,
+    WS_EX_ACCEPTFILES, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_SYSMENU, WS_THICKFRAME, WS_VISIBLE,
+    WindowFromPoint,
 };
 use windows::core::{HSTRING, PCSTR, PCWSTR, PWSTR, w};
 
 use crate::anim::{ANIMATION_TIMER_ID, RATE_ONE, rate_step};
 use crate::cli;
 use crate::clipboard;
-use crate::config::Config;
+use crate::config::{Config, RendererKind};
 use crate::copydata;
 use crate::cursor::{self, CursorEffects, CursorVisibility};
 use crate::custom_rate_dlg;
@@ -381,6 +382,43 @@ pub(crate) struct WindowState {
     /// `path` lands; cleared by every real-file adoption, blank, and the
     /// failed-load clear.
     pub(crate) virtual_display: bool,
+    /// The D2D/DXGI stack (#80): `Some` while the viewport paints through
+    /// D2D, `None` on the GDI arm (renderer=gdi / init failure / the
+    /// giant-frame gate). Created in run() after the viewport child exists.
+    pub(crate) gpu: Option<crate::gpu::GpuStack>,
+    /// The effective renderer kind for (re)builds (#80): the config request
+    /// resolved at creation (auto → hardware/WARP by what succeeded), and
+    /// Warp after a runtime escalation (the escalation ignores the request
+    /// mode — design §7).
+    pub(crate) gpu_kind: crate::config::RendererKind,
+    /// Bumped at every display-pixel change (#80 design §5): the D2D
+    /// upload compares (gen, w, h) against the resident bitmap and
+    /// re-uploads on mismatch. Pure bookkeeping on the GDI arm.
+    pub(crate) frame_gen: u64,
+    /// The frame_gen the giant-frame gate fired at (#80 design §5): a
+    /// stack rebuild is due only when a NEW image has since bumped the
+    /// counter — same-image paints must not churn the device stack.
+    pub(crate) gpu_gate_gen: u64,
+    /// The last shape the giant-frame gate flashed for (sorted dims;
+    /// #80 pre-review 3-b): the status notice is one-shot per DISTINCT
+    /// oversized image, so the gen-bump churn pathology (a giant animation
+    /// rebuilding the stack every frame) cannot park the temp text
+    /// permanently over the status verdict chain.
+    pub(crate) gpu_gate_flashed: Option<(u32, u32)>,
+    /// One-way latch: the stack creation failed for environment reasons —
+    /// no auto rebuild attempts (each would just fail again; design §7's
+    /// initialization tier).
+    pub(crate) gpu_init_failed: bool,
+    /// Device-loss timestamps inside the escalation window (design §7),
+    /// on the window state so a ladder rebuild cannot erase the history.
+    pub(crate) gpu_failures: Vec<u32>,
+    /// The failure ladder's final tier fired (WARP failed 3-in-10s, design
+    /// §7): the fatal is DEFERRED to after the paint borrow drops — the
+    /// modal pumps messages and would alias `state_of` (PR #10 P1).
+    pub(crate) gpu_pending_fatal: bool,
+    /// The `-dump-viewport` path (#80 design §9): the sticky render-and-
+    /// write intent consumed at WM_CLOSE, before the window dies.
+    pub(crate) dump_pending: Option<OsString>,
 }
 
 /// Window state pointer stored in GWLP_USERDATA between WM_NCCREATE and
@@ -451,6 +489,10 @@ fn status_snapshot(state: &WindowState, hwnd: HWND) -> status::StatusSnapshot {
         frame_remaining: state.config.frame_minus != 0,
         dimensions: state.image.as_ref().map(|i| (i.width(), i.height())),
         file_bytes: state.displayed_file_bytes,
+        // The dimension part's backend suffix rides the live stack (#80
+        // design §8): the gdi baseline stays suffix-free (no visible
+        // difference vs master).
+        backend: state.gpu.as_ref().map(|g| g.backend),
         client_wide: client.right - client.left,
     }
 }
@@ -937,11 +979,19 @@ unsafe extern "system" fn view_proc(
     match msg {
         WM_ERASEBKGND => LRESULT(1), // the paint below fills everything
         WM_PAINT => {
-            paint(hwnd, owner);
+            // The two-arm router (#80 design §4): the D2D stack alive →
+            // gpu::paint_d2d, otherwise the unchanged GDI arm. The
+            // giant-frame gate and the failure ladder resolve inside
+            // paint_view, OUTSIDE the paint functions' state borrows.
+            paint_view(hwnd, owner);
             LRESULT(0)
         }
-        // The owner's on_size drives our rect; nothing to do here.
-        WM_SIZE => LRESULT(0),
+        // The owner's on_size drives our rect; the D2D stack resizes its
+        // swapchain to the (physical-pixel) client rect here (#80 §6).
+        WM_SIZE => {
+            gpu_view_resized(hwnd);
+            LRESULT(0)
+        }
         WM_MOUSEMOVE => {
             on_mouse_move(owner, lparam);
             LRESULT(0)
@@ -1037,6 +1087,423 @@ unsafe extern "system" fn view_proc(
         // chain (IDC_ARROW, same as the owner), WM_NCHITTEST,
         // WM_MOUSEACTIVATE's top-level activation among them.
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The renderer router, the WM_SIZE hook and the failure ladder (#80,
+// design §4/§5/§6/§7). Everything here resolves OUTSIDE the paint
+// functions' state borrows: the fatal modal pumps messages and must never
+// run across one (PR #10 P1).
+// ---------------------------------------------------------------------------
+
+/// The WM_PAINT router (view_proc's arm): the D2D stack alive →
+/// [`crate::gpu::paint_d2d`], otherwise the unchanged GDI arm
+/// ([`paint`]). The giant-frame gate tears the stack down here and
+/// re-renders the frame through GDI; device losses feed the ladder.
+fn paint_view(view: HWND, owner: HWND) {
+    gpu_rebuild_if_due(view, owner);
+    // SAFETY: the read-only borrow ends inside is_some_and.
+    let has_gpu = (unsafe { state_of(owner) }).is_some_and(|state| state.gpu.is_some());
+    if !has_gpu {
+        paint(view, owner);
+    } else {
+        match crate::gpu::paint_d2d(view, owner) {
+            crate::gpu::PaintOutcome::Painted => {}
+            crate::gpu::PaintOutcome::GiantFrame { wide, high, max } => {
+                gpu_giant_frame(view, owner, wide, high, max);
+            }
+            crate::gpu::PaintOutcome::DeviceLost => gpu_runtime_failure(owner),
+            crate::gpu::PaintOutcome::Unrecoverable { hr } => {
+                gpu_session_degrade(view, owner, hr);
+            }
+        }
+    }
+    // The ladder's final tier defers its fatal to HERE: the paint's state
+    // borrows are gone, so the modal may pump (design §7).
+    // SAFETY: the borrow spans the flag take only.
+    let fatal_now = (unsafe { state_of(owner) })
+        .is_some_and(|state| std::mem::take(&mut state.gpu_pending_fatal));
+    if fatal_now {
+        fatal("the D2D renderer keeps failing (WARP included) — giving up");
+    }
+}
+
+/// The session-level degrade for deterministic non-loss failures (external
+/// review AI2 P1): the ladder cannot fix these (a rebuild reproduces the
+/// same error), and escalating them would end in the deferred fatal —
+/// ADR 0001 files them as USER-level instead: teardown (the flip interop
+/// ban forbids GDI on the swapchain's HWND), one-shot flash + stderr, and
+/// an immediate invalidate so the GDI arm repaints the just-validated
+/// region instead of freezing on the last flip frame.
+fn gpu_session_degrade(view: HWND, owner: HWND, hr: i32) {
+    // SAFETY: the borrow spans the teardown and the latch store only.
+    if let Some(state) = unsafe { state_of(owner) } {
+        state.gpu = None;
+        state.gpu_init_failed = true;
+    }
+    eprintln!("riviv: unrecoverable renderer error ({hr:#010x}) — the session stays on gdi");
+    status_set_temp_text(owner, Some("renderer error — using gdi".to_string()));
+    // SAFETY: invalidates our own child; no borrow is live, and this runs
+    // OUTSIDE the paint (paint_view resolves outcomes after paint_d2d
+    // returned).
+    unsafe {
+        let _ = InvalidateRect(Some(view), None, false);
+    }
+}
+
+/// Rebuild the D2D stack when a stack-less paint is due to return to D2D
+/// (#80 design §5's giant-gate reversal): the gate tears the stack down
+/// for ONE oversized image; the next NEW image (frame_gen moved past
+/// `gpu_gate_gen`) rebuilds with the stored effective kind. Same-image
+/// paints never rebuild (no per-paint device churn), and an init failure
+/// latches `gpu_init_failed` so a broken environment never retries.
+fn gpu_rebuild_if_due(view: HWND, owner: HWND) {
+    // SAFETY: the borrow spans the gate check and the (non-pumping) COM
+    // creation; nothing here dispatches messages, so no second state_of
+    // borrow can alias this one.
+    if let Some(state) = unsafe { state_of(owner) } {
+        if state.gpu.is_some()
+            || state.gpu_init_failed
+            || !state.config.renderer.wants_d2d()
+            || state.gpu_gate_gen == state.frame_gen
+        {
+            return;
+        }
+        let kind = rebuild_kind(state.config.renderer, state.gpu_kind);
+        match crate::gpu::create(view, crate::gpu::owner_of(view), kind) {
+            Ok((stack, effective)) => {
+                state.gpu = Some(stack);
+                state.gpu_kind = effective;
+            }
+            Err(e) => {
+                // The environment lost its device stack since startup:
+                // latch instead of retrying per paint (design §7's init
+                // tier). With the auto ladder honored above, create has
+                // already tried hardware AND WARP by the time this runs
+                // (external review AI2 P2-3: the old code passed the
+                // EFFECTIVE kind, so an auto session that lost its hardware
+                // latched straight to GDI without ever trying WARP).
+                state.gpu_init_failed = true;
+                eprintln!("riviv: renderer rebuild failed ({e}), staying on gdi");
+                status_set_temp_text(owner, Some("renderer unavailable — using gdi".to_string()));
+            }
+        }
+    }
+}
+
+/// The rebuild request kind (external review AI2 P2-3): a session that
+/// ESCALATED to WARP rebuilds WARP (the escalation is permanent — D5's
+/// "WARP 是永久兜底"); every other session re-issues its CONFIG request,
+/// so `auto` gets create's full hardware→WARP ladder on every rebuild
+/// instead of being pinned to whatever the startup happened to build.
+/// `d2d`/`warp` pass through unchanged (their single-driver semantics
+/// stand, design §13-6).
+fn rebuild_kind(config_kind: RendererKind, gpu_kind: RendererKind) -> RendererKind {
+    if gpu_kind == RendererKind::Warp {
+        RendererKind::Warp
+    } else {
+        config_kind
+    }
+}
+
+/// The giant-image gate's teardown (#80 design §5): the frame cannot be a
+/// D2D bitmap, so the stack dies and THIS frame renders through GDI (the
+/// flip interop ban forbids GDI on the swapchain's HWND, so a same-HWND
+/// hybrid is not an option). The status flash is one-shot per DISTINCT
+/// oversized image (sorted dims — a rotate of the same giant frame swaps
+/// them): the gen-bump churn pathology (a giant ANIMATION rebuilding the
+/// stack per frame, pre-review 3-b) would otherwise re-flash every cycle
+/// and the 3 s temp text would sit permanently over the status verdict
+/// chain. The stderr breadcrumb still fires on every teardown (the
+/// evidence channel has no masking problem); the next new image rebuilds
+/// via gpu_rebuild_if_due.
+fn gpu_giant_frame(view: HWND, owner: HWND, wide: u32, high: u32, max: u32) {
+    // Sorted so a rotated giant frame is still "the same image".
+    let shape = (wide.min(high), wide.max(high));
+    let mut flash = false;
+    // SAFETY: the borrow spans the teardown and the flag stores only —
+    // paint_degraded below re-borrows, so it runs after this block.
+    if let Some(state) = unsafe { state_of(owner) } {
+        state.gpu = None;
+        state.gpu_gate_gen = state.frame_gen;
+        flash = state.gpu_gate_flashed != Some(shape);
+        state.gpu_gate_flashed = Some(shape);
+    }
+    eprintln!("riviv: frame {wide}x{high} exceeds the D2D max bitmap {max}; rendering it via gdi");
+    if flash {
+        status_set_temp_text(
+            owner,
+            Some("frame too large for d2d — using gdi".to_string()),
+        );
+    }
+    crate::paint::paint_degraded(view, owner);
+}
+
+/// The runtime failure ladder (design §7): one EndDraw/Present/resize
+/// failure → record the timestamp → rebuild the same kind (the master
+/// re-uploads at the next paint, no re-decode); the third failure inside
+/// the 10 s window escalates to WARP permanently; WARP failing 3-in-10s
+/// sets `gpu_pending_fatal` (deferred — paint_view fires it after the
+/// paint borrows drop). Paint paths degrade, never fatal inline (ADR 0002
+/// D5).
+fn gpu_runtime_failure(owner: HWND) {
+    // GetTickCount's native u32 ms domain: failure_window's wrapping
+    // subtraction measures across the 2^32 wrap like C's DWORD arithmetic.
+    // SAFETY: pure tick query.
+    let now_ms = unsafe { GetTickCount() };
+    // The post-borrow repaint/degrade targets (external review AI2 P2-4:
+    // the latch and the fatal tier used to return silently — the last flip
+    // frame froze on screen and the deferred fatal could sit unfired
+    // forever with no paint coming).
+    let mut rebuilt_view: Option<HWND> = None;
+    let mut degraded_view: Option<HWND> = None;
+    let mut fatal_view: Option<HWND> = None;
+    // SAFETY: the borrow spans the ladder decision and the (non-pumping)
+    // COM rebuild; nothing dispatches messages.
+    if let Some(state) = unsafe { state_of(owner) } {
+        if state.gpu.is_none() {
+            return; // defensive: no stack to recover
+        }
+        // The timestamps live on the WINDOW STATE, not the stack: the
+        // ladder rebuilds the stack on every loss, and history dying with
+        // it would make the 3-in-10s escalation unreachable (design §7).
+        // The WARP check reads the KIND (the escalation pin), not the
+        // backend label string (pre-review nit).
+        let already_warp = state.gpu_kind == RendererKind::Warp;
+        let verdict = crate::gpu::failure_window(now_ms, already_warp, &mut state.gpu_failures);
+        let (kind, escalated) = match verdict {
+            crate::gpu::FailureVerdict::None => {
+                (rebuild_kind(state.config.renderer, state.gpu_kind), false)
+            }
+            crate::gpu::FailureVerdict::Escalate => (RendererKind::Warp, true),
+            crate::gpu::FailureVerdict::Fatal => {
+                // WARP is failing too: GDI takes over and the deferred
+                // fatal fires after the paint returns — but only if a paint
+                // COMES: the failing paint validated without drawing, so
+                // queue one now (the fatal check sits at paint_view's
+                // tail). The early return is fine — the tail block below
+                // runs on the fatal_view this arm just set.
+                state.gpu = None;
+                state.gpu_init_failed = true;
+                state.gpu_pending_fatal = true;
+                fatal_view = Some(state.viewport);
+                (RendererKind::Warp, true)
+            }
+        };
+        if fatal_view.is_none() {
+            // Drop the dead stack, rebuild, remember the effective kind
+            // (the escalation pins WARP — the request mode is ignored from
+            // here).
+            state.gpu = None;
+            let view = state.viewport;
+            match crate::gpu::create(view, crate::gpu::owner_of(view), kind) {
+                Ok((stack, effective)) => {
+                    state.gpu_kind = if escalated {
+                        RendererKind::Warp
+                    } else {
+                        effective
+                    };
+                    state.gpu = Some(stack);
+                    // The failing paint already validated its region without
+                    // drawing — a static image has no timer or hover to
+                    // repaint it, so the recovered frame would hang blank
+                    // until the next input. Queue the viewport for the pump
+                    // to repaint with a fresh upload from the CPU master
+                    // (no re-decode).
+                    rebuilt_view = Some(view);
+                }
+                Err(e) => {
+                    // Even the ladder's WARP tier could not build: latch
+                    // (the auto request already exhausted hardware+WARP
+                    // inside create) — visibly: flash + a queued GDI
+                    // repaint instead of a silently frozen frame.
+                    state.gpu_init_failed = true;
+                    eprintln!("riviv: renderer rebuild failed ({e}), staying on gdi");
+                    status_set_temp_text(
+                        owner,
+                        Some("renderer unavailable — using gdi".to_string()),
+                    );
+                    degraded_view = Some(view);
+                }
+            }
+        }
+    }
+    // The statements stand OUTSIDE the state if-let on purpose (pre-review
+    // P3-1: a SAFETY comment must read true against the lexical scope it
+    // sits in) — the borrow ended inside the if-let above (its last use).
+    // SAFETY: invalidates our own child in each arm; no state borrow is
+    // live (the borrow ended at its last use inside the if-let above).
+    unsafe {
+        if let Some(view) = fatal_view.or(rebuilt_view).or(degraded_view) {
+            let _ = InvalidateRect(Some(view), None, false);
+        }
+    }
+}
+
+/// The viewport child's WM_SIZE hook (#80 design §6): resize the
+/// swapchain to the new (physical-pixel — PMv2, #79) client rect, then
+/// invalidate + repaint synchronously (UpdateWindow kills the stretch lag
+/// while the user drags a border). Zero sizes (minimized) keep the old
+/// buffers for the restore. WITHOUT a stack this is the same no-op the
+/// arm always was (the GDI path's repaints come from on_size's chain).
+fn gpu_view_resized(view: HWND) {
+    let mut client = RECT::default();
+    // SAFETY: read-only rect query on our own child; a failed read leaves
+    // the zeroed rect and the size check skips the resize.
+    let _ = unsafe { GetClientRect(view, &mut client) };
+    let wide = (client.right - client.left).max(0) as u32;
+    let high = (client.bottom - client.top).max(0) as u32;
+    if wide == 0 || high == 0 {
+        return;
+    }
+    let owner = crate::gpu::owner_of(view);
+    // SAFETY: the borrow spans the resize call (COM, no pumps).
+    let resize_result = (unsafe { state_of(owner) })
+        .and_then(|state| state.gpu.as_mut().map(|gpu| gpu.resize(wide, high)));
+    let Some(result) = resize_result else {
+        return; // no stack: the GDI arm's WM_SIZE stays a no-op
+    };
+    if let Err(e) = result {
+        // Any HRESULT failure feeds the same ladder as device loss
+        // (design §6).
+        eprintln!("riviv: gpu resize failed: {e}");
+        gpu_runtime_failure(owner);
+        // The ladder's rebuild path queues an Invalidate (async); this is
+        // the RESIZE path, where the success branch below repaints
+        // synchronously — a transient failure with immediate recovery must
+        // not lose that synchronous repaint under continued border
+        // dragging (external review AI1). UpdateWindow is a no-op when the
+        // update region is empty (the ladder left the stack dead and GDI
+        // took over), so the call is free on that arm.
+        // SAFETY: synchronously dispatches our own child's WM_PAINT when
+        // its update region is non-empty — we are in a WM_SIZE handler,
+        // not inside a paint, and no state borrow is live.
+        unsafe {
+            let _ = UpdateWindow(view);
+        }
+        return;
+    }
+    // The back buffer was discarded by the resize: repaint NOW and
+    // synchronously. SAFETY: invalidates our own child and dispatches its
+    // WM_PAINT synchronously — no state borrow is live here.
+    unsafe {
+        let _ = InvalidateRect(Some(view), None, false);
+        let _ = UpdateWindow(view);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The -dump-viewport channel (#80, design §9): WM_CLOSE renders the
+// current viewport scene once and writes the PNG BEFORE the normal
+// teardown, so the automation script fully orchestrates (1:1 / zoom /
+// rotate / fullscreen) and the dump is race-free. Failures are
+// stderr + exit(2) — the automation channel is loud, never a modal.
+// ---------------------------------------------------------------------------
+
+/// WM_CLOSE: consume the sticky dump intent, then the ordinary close
+/// (DestroyWindow runs WM_DESTROY — the config save — and WM_NCDESTROY).
+fn on_close(hwnd: HWND) {
+    // Take the sticky intent first (its own borrow; the dump re-borrows).
+    // SAFETY: the borrow spans the Option take only.
+    let dump = (unsafe { state_of(hwnd) }).and_then(|state| state.dump_pending.take());
+    if let Some(path) = dump {
+        dump_viewport_now(hwnd, path.as_os_str());
+    }
+    // SAFETY: no borrow is live; DestroyWindow synchronously runs
+    // WM_DESTROY/WM_NCDESTROY on the owning thread.
+    unsafe {
+        let _ = DestroyWindow(hwnd);
+    }
+}
+
+/// The dump half of WM_CLOSE: render with whichever stack is live, write
+/// the PNG. The D2D arm's failure (device gone, giant frame) falls back
+/// to the GDI memory-DC channel — a memory DC never draws to the
+/// flip-owned HWND, so the fallback is legal in both arms.
+fn dump_viewport_now(hwnd: HWND, path: &OsStr) {
+    if path.is_empty() {
+        eprintln!("riviv: -dump-viewport needs a path");
+        std::process::exit(2);
+    }
+    // SAFETY: the read-only borrow ends inside the map.
+    let (view, has_gpu) = (unsafe { state_of(hwnd) })
+        .map(|state| (state.viewport, state.gpu.is_some()))
+        .unwrap_or((HWND::default(), false));
+    let readback = if has_gpu {
+        dump_via_gpu(hwnd, view).or_else(|e| {
+            eprintln!("riviv: d2d dump failed ({e}); trying the gdi channel");
+            crate::paint::dump_viewport_gdi(view, hwnd)
+        })
+    } else {
+        crate::paint::dump_viewport_gdi(view, hwnd)
+    };
+    let (wide, high, rgba) = match readback {
+        Ok(result) => result,
+        Err(e) => {
+            eprintln!("riviv: dump-viewport failed: {e}");
+            std::process::exit(2);
+        }
+    };
+    if let Err(e) = crate::paint::save_rgba_png(Path::new(path), wide, high, rgba) {
+        eprintln!("riviv: dump-viewport write {} failed: {e}", path.display());
+        std::process::exit(2);
+    }
+}
+
+/// The D2D dump arm: render once more into the target (no Present — a
+/// never-shown window dumps identically, the readback is independent of
+/// the display pipeline) and read back through a CPU-readable bitmap.
+/// ONE state borrow across the call: field-disjoint borrows feed the
+/// stack the plan and the master bytes (gpu mutable, image shared).
+fn dump_via_gpu(hwnd: HWND, view: HWND) -> Result<(u32, u32, Vec<u8>), String> {
+    let mut client = RECT::default();
+    // SAFETY: read-only rect query on our own child.
+    let _ = unsafe { GetClientRect(view, &mut client) };
+    let cw = (client.right - client.left).max(0) as u32;
+    let ch = (client.bottom - client.top).max(0) as u32;
+    // SAFETY: one state borrow; the D2D commands pump nothing (the
+    // paint-borrow contract, PR #10 P1).
+    let Some(state) = (unsafe { state_of(hwnd) }) else {
+        return Err("window state is gone".into());
+    };
+    let bg = if state.fullscreen {
+        state.config.fullscreen_bg()
+    } else {
+        state.config.windowed_bg()
+    };
+    let frame_gen = state.frame_gen;
+    // The plan and the master bytes BEFORE the mutable gpu borrow
+    // (draw_plan/fit_policy read the whole state; the results are plain
+    // data plus a shared borrow of the image field — disjoint from gpu).
+    let prepared = state.image.as_ref().map(|image| {
+        let master = image.surface().master();
+        (
+            crate::gpu::draw_plan(
+                state,
+                cw as i32,
+                ch as i32,
+                master.width as i32,
+                master.height as i32,
+            ),
+            frame_gen,
+            master.width,
+            master.height,
+            &master.pixels,
+        )
+    });
+    let Some(gpu) = state.gpu.as_mut() else {
+        return Err("no gpu stack".into());
+    };
+    match prepared {
+        Some((plan, frame_gen, wide, high, pixels)) => gpu.dump(
+            cw,
+            ch,
+            plan.bg,
+            Some((frame_gen, wide, high, pixels)),
+            Some(plan),
+        ),
+        None => gpu.dump(cw, ch, bg, None, None),
     }
 }
 
@@ -1881,6 +2348,9 @@ fn refresh_current(hwnd: HWND) {
         // The `_viv_clear` body: the frames die, the fd/title stay. The
         // animation marks and the view reset ride along (viv.c:1278-1288).
         state.image = None;
+        // #80 §5: the display pixels cleared — a D2D stack must not keep
+        // showing the old frame's upload.
+        state.frame_gen += 1;
         state.displayed_from = None;
         state.displayed_entry = None;
         state.displayed_file_bytes = None;
@@ -2276,6 +2746,9 @@ fn activate_last_flow(hwnd: HWND) {
         let mut image = cache.image;
         image.reanchor_at(now);
         state.image = Some(image);
+        // #80 §5: a new image took the display — the D2D upload refreshes
+        // at the next paint.
+        state.frame_gen += 1;
         state.displayed_from = None;
         reset_display_marks(hwnd, state, DisplayEdge::NewImage);
         // current_fd = last_fd + title (viv.c:14499-14501).
@@ -2395,6 +2868,8 @@ fn adopt_preload_flow(hwnd: HWND) {
                 state.session = None;
                 move_display_to_last(state);
                 state.image = None;
+                // #80 §5: the display cleared (the failed preload verdict).
+                state.frame_gen += 1;
                 state.displayed_from = None;
                 state.status_load_failed = true;
                 reset_display_marks(hwnd, state, DisplayEdge::Cleared);
@@ -2451,6 +2926,8 @@ fn adopt_parked_image(
     let mut image = image.map_frames(|f| Ok::<Surface, String>(Surface::from_master(f)))?;
     image.reanchor_at(now);
     state.image = Some(image);
+    // #80 §5: a new image took the display (the preload/last adoption).
+    state.frame_gen += 1;
     state.displayed_from = Some(session.id());
     reset_display_marks(hwnd, state, DisplayEdge::NewImage);
     if keep_session {
@@ -3613,10 +4090,11 @@ fn on_slideshow_timer(hwnd: HWND) {
             // The walk reached the list end. Exit exactly like File→Exit
             // (WM_DESTROY saves the config and quits the pump); the
             // WM_TIMER dispatch touches no state after this handler
-            // returns.
-            // SAFETY: legal on the owning thread; synchronously runs
-            // WM_DESTROY/WM_NCDESTROY with no borrow live.
-            let _ = unsafe { DestroyWindow(hwnd) };
+            // returns. on_close (not bare DestroyWindow) so an armed
+            // -dump-viewport still lands its PNG on THIS close path too
+            // (#80 pre-review 3-c: the slideshow tail used to bypass the
+            // dump).
+            on_close(hwnd);
         } else if !close_armed {
             nav_next(hwnd, false, false, false, false);
         }
@@ -3674,6 +4152,8 @@ fn blank_display(hwnd: HWND) {
             return;
         };
         state.image = None;
+        // #80 §5: the display cleared (`_viv_blank`).
+        state.frame_gen += 1;
         state.displayed_from = None;
         state.path = None;
         state.playlist.clear();
@@ -3851,6 +4331,9 @@ fn rotate_current(hwnd: HWND, counterclockwise: bool) {
             for frame in image.frames_mut() {
                 frame.rotate(!counterclockwise);
             }
+            // #80 §5: every frame's pixels changed orientation — the D2D
+            // upload (and the GDI face) re-derive at the next paint.
+            state.frame_gen += 1;
         }
         // `_viv_view_set(_viv_view_x,_viv_view_y,1)` (viv.c:7756): re-run
         // the size pass at the same view coordinates against the swapped
@@ -4070,6 +4553,16 @@ fn process_parsed_cl(hwnd: HWND, parsed: &cli::Parsed) {
         // SAFETY: the borrow spans one field store.
         if let Some(state) = unsafe { state_of(hwnd) } {
             state.close_after_slideshow = true;
+        }
+    }
+    // #80: `-dump-viewport <path>` arms the sticky dump intent the same
+    // way — at WM_CLOSE the viewport scene renders once and the PNG lands
+    // at the path. A single-instance handoff arms it in the FIRST
+    // instance (no special-casing; README-noted known edge).
+    if let Some(word) = &parsed.dump_viewport {
+        // SAFETY: the borrow spans one field store.
+        if let Some(state) = unsafe { state_of(hwnd) } {
+            state.dump_pending = Some(OsString::from_wide(word));
         }
     }
     if parsed.start_slideshow {
@@ -4405,6 +4898,18 @@ fn on_load_replies(hwnd: HWND) {
                 // it. A blank display displaces nothing (upstream's vacuous
                 // count compare empties the cache instead).
                 let is_first_frame = matches!(reply, LoadReply::FirstFrame { .. });
+                // #80 §5: the reply changes the DISPLAYED pixels when it
+                // replaces (FirstFrame) or appends (AdditionalFrame, only
+                // for the owning session) a frame, or clears the display
+                // (same-session FailedUser) — the D2D stack re-uploads at
+                // the next paint. A stray bump only re-uploads identical
+                // bytes; a MISSED bump leaves a stale frame on screen.
+                let bump_frame_gen = is_first_frame
+                    || displayed_before_reply
+                        && matches!(
+                            reply,
+                            LoadReply::AdditionalFrame { .. } | LoadReply::FailedUser(_)
+                        );
                 let displaced = if is_first_frame {
                     state.image.take()
                 } else {
@@ -4425,6 +4930,11 @@ fn on_load_replies(hwnd: HWND) {
                 // viv.c:2949, _viv_clear at 2951).
                 if is_first_frame {
                     move_displaced_to_last(state, displaced);
+                }
+                if bump_frame_gen {
+                    // #80 §5: the streamed/reply change landed on the
+                    // display — the D2D upload refreshes at the next paint.
+                    state.frame_gen += 1;
                 }
                 // The status bar's Loading/Failed flags follow the protocol
                 // facts (#5): the session ends at its terminal reply (taken so
@@ -4587,6 +5097,8 @@ fn on_load_replies(hwnd: HWND) {
                 state.preload = None;
                 state.session = None;
                 state.image = None;
+                // #80 §5: the display cleared (the failed-promotion arm).
+                state.frame_gen += 1;
                 state.displayed_from = None;
                 state.status_load_failed = true;
                 reset_display_marks(hwnd, state, DisplayEdge::Cleared);
@@ -4755,6 +5267,12 @@ fn on_animation_timer(hwnd: HWND) {
         nav_next(hwnd, false, true, false, false);
     }
     if repaint_frame {
+        // #80 §5: the timer moved the displayed frame — the D2D upload
+        // refreshes at the paint below.
+        // SAFETY: the borrow spans the one increment.
+        if let Some(state) = unsafe { state_of(hwnd) } {
+            state.frame_gen += 1;
+        }
         // The frame counter part ("n / m") tracks the displayed frame,
         // and the RGB under the cursor moves with it (upstream pairs the
         // force-resample with the status refresh in the timer body,
@@ -4799,7 +5317,15 @@ fn frame_command(hwnd: HWND, walk: impl Fn(&mut LoadedImage, u64) -> bool) {
     let walked = (unsafe { state_of(hwnd) }).and_then(|state| {
         state.animation_looped = false;
         state.animation_playing = false;
-        state.image.as_mut().map(|image| walk(image, now))
+        state.image.as_mut().map(|image| {
+            let moved = walk(image, now);
+            if moved {
+                // #80 §5: the displayed frame changed (step/prev/first/last)
+                // — the D2D upload refreshes at the next paint.
+                state.frame_gen += 1;
+            }
+            moved
+        })
     });
     // The unconditional pause is a prevent-sleep transition (viv.c:
     // 3929-3936) whether or not the walk moved.
@@ -4870,10 +5396,15 @@ fn animation_jump(hwnd: HWND, kind: JumpKind, backward: bool) {
     let walked = (unsafe { state_of(hwnd) }).and_then(|state| {
         let budget = kind.budget_ms(&state.config);
         let direction = if backward { -budget } else { budget };
-        state
-            .image
-            .as_mut()
-            .map(|image| image.frame_skip(now, direction))
+        state.image.as_mut().map(|image| {
+            let moved = image.frame_skip(now, direction);
+            if moved {
+                // #80 §5: the displayed frame changed (frame_skip) — the
+                // D2D upload refreshes at the next paint.
+                state.frame_gen += 1;
+            }
+            moved
+        })
     });
     if walked.unwrap_or(false) {
         refresh_status(hwnd);
@@ -5111,10 +5642,16 @@ fn pick_folder(hwnd: HWND, initial_dir: Option<&OsStr>) -> Option<OsString> {
 
 /// Help→About (upstream `VIV_ID_HELP_ABOUT` → the IDD_ABOUT resource
 /// dialog, viv.c:1696/9728-9800). riviv ships no dialog resources — a
-/// message box carries the same facts (README Differences).
+/// message box carries the same facts (README Differences). The renderer
+/// line (#80 design §8) names the EFFECTIVE backend — the ticket-evidence
+/// channel in the one dialog everyone can find.
 fn show_about(hwnd: HWND) {
+    // SAFETY: read-only backend read.
+    let backend = (unsafe { state_of(hwnd) })
+        .and_then(|state| state.gpu.as_ref().map(|gpu| gpu.backend))
+        .unwrap_or("gdi");
     let text = format!(
-        "riviv {}\n\nUnofficial Rust rewrite of voidtools void Image Viewer.\nUpstream (MIT): https://www.voidtools.com/voidimageviewer/\nSource: https://github.com/jaredshuai/riviv",
+        "riviv {}\n\nUnofficial Rust rewrite of voidtools void Image Viewer.\nUpstream (MIT): https://www.voidtools.com/voidimageviewer/\nSource: https://github.com/jaredshuai/riviv\nRenderer: {backend}",
         env!("CARGO_PKG_VERSION")
     );
     let text_wide = to_wide(&text);
@@ -5619,9 +6156,11 @@ fn on_command(hwnd: HWND, cmd: menu::Cmd) {
         menu::Cmd::FileExit => {
             // Upstream `_viv_exit` (viv.c:1883-1888) saves the config and
             // quits the pump; riviv's WM_DESTROY does both on the way out.
-            // SAFETY: legal on the owning thread; synchronously runs
-            // WM_DESTROY/WM_NCDESTROY with no borrow live.
-            let _ = unsafe { DestroyWindow(hwnd) };
+            // on_close (not bare DestroyWindow) so an armed -dump-viewport
+            // still lands its PNG on THIS close path too (#80 pre-review
+            // 3-c); without the switch armed on_close is exactly
+            // DestroyWindow.
+            on_close(hwnd);
         }
         // The Edit → clipboard family (#41; upstream viv.c:2335-2353, the
         // same order).
@@ -7186,6 +7725,13 @@ unsafe extern "system" fn wnd_proc(
             everything::send_random(hwnd);
             LRESULT(0)
         }
+        WM_CLOSE => {
+            // #80 design §9: the -dump-viewport intent renders the current
+            // viewport scene BEFORE the teardown; then the ordinary close
+            // (DestroyWindow → WM_DESTROY saves the ini → the pump quits).
+            on_close(hwnd);
+            LRESULT(0)
+        }
         WM_DESTROY => {
             // Settings go to disk on the way out (upstream `_viv_exit`'s
             // config_save_settings, viv.c:2577-2580; riviv saves at window
@@ -7738,6 +8284,15 @@ pub(crate) fn run() -> Result<(), String> {
         last_nav_prev: false,
         displayed_entry: None,
         virtual_display: false,
+        gpu: None,
+        gpu_kind: crate::config::RendererKind::Gdi,
+        frame_gen: 0,
+        gpu_gate_gen: 0,
+        gpu_gate_flashed: None,
+        gpu_failures: Vec::new(),
+        gpu_init_failed: false,
+        gpu_pending_fatal: false,
+        dump_pending: None,
     };
 
     // SAFETY: returns the module handle of this exe; no side effects.
@@ -7952,6 +8507,70 @@ pub(crate) fn run() -> Result<(), String> {
         state.viewport = view_hwnd;
     }
 
+    // The D2D stack (#80 design §3): built after the viewport child exists
+    // (the swapchain hangs on it) and before the window shows. Any failure
+    // is environmental (ADR 0002 D5): degrade to GDI with a one-shot flash
+    // and a stderr breadcrumb, never fatal.
+    // SAFETY: the read-only borrow ends inside the map.
+    let (request, view_target) = (unsafe { state_of(hwnd) })
+        .map(|state| (state.config.renderer, state.viewport))
+        .unwrap_or((RendererKind::Gdi, HWND::default()));
+    let mut init_error: Option<String> = None;
+    let built = if request.wants_d2d() {
+        match crate::gpu::create(view_target, hwnd, request) {
+            Ok((stack, effective)) => Some((stack, effective)),
+            Err(e) => {
+                init_error = Some(e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let mut flash: Option<String> = None;
+    // SAFETY: the borrow spans only the field stores.
+    if let Some(state) = unsafe { state_of(hwnd) } {
+        match built {
+            Some((stack, effective)) => {
+                state.gpu = Some(stack);
+                state.gpu_kind = effective;
+            }
+            None => {
+                // Only a FAILED D2D-family request degraded (acceptance
+                // round: an unconditional flash here fired on every default
+                // gdi launch — `built` is legitimately None for gdi — and
+                // the 3s temp text outranked the FNF/failed status verdicts
+                // (window.rs's temp-over-everything chain), breaking the
+                // default path's status parity). The gdi baseline stays
+                // silent; its evidence channel is the stderr breadcrumb.
+                state.gpu_init_failed = request.wants_d2d();
+                if request.wants_d2d() {
+                    flash = Some(format!(
+                        "renderer {} init failed — using gdi",
+                        request.to_ini()
+                    ));
+                }
+            }
+        }
+    }
+    if let Some(e) = init_error {
+        eprintln!(
+            "riviv: renderer {} init failed ({e}), falling back to gdi",
+            request.to_ini()
+        );
+    }
+    if let Some(text) = flash {
+        status_set_temp_text(hwnd, Some(text));
+    }
+    // The always-on stderr breadcrumb (#80 design §8): renderer=<request>
+    // backend=<effective> — the automation assertion channel and the
+    // stderr-redirected ticket evidence, zero UI parity risk.
+    // SAFETY: the read-only borrow ends inside and_then.
+    let backend = (unsafe { state_of(hwnd) })
+        .and_then(|state| state.gpu.as_ref().map(|gpu| gpu.backend))
+        .unwrap_or("gdi");
+    eprintln!("riviv: renderer={} backend={backend}", request.to_ini());
+
     // The on-top bit for a remembered mode (upstream `_viv_update_ontop`
     // at init, viv.c:5422 — mode 1 pins the window before it shows).
     update_ontop(hwnd);
@@ -8072,6 +8691,35 @@ pub(crate) fn run() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rebuilds_reissue_the_config_request_until_warp_is_pinned() {
+        // External review AI2 P2-3: an `auto` session that lost its
+        // hardware must re-run create's full hardware→WARP ladder on every
+        // rebuild — passing the EFFECTIVE kind would have latched it to
+        // GDI on the first hardware failure without ever trying WARP (the
+        // D5 "WARP is the permanent fallback" tier). Only an escalation to
+        // WARP (or a warp request) pins WARP.
+        assert_eq!(
+            rebuild_kind(RendererKind::Auto, RendererKind::D2d),
+            RendererKind::Auto,
+            "auto+hardware re-issues auto (create retries hw then warp)"
+        );
+        assert_eq!(
+            rebuild_kind(RendererKind::Auto, RendererKind::Warp),
+            RendererKind::Warp,
+            "the escalation pin outlives rebuilds"
+        );
+        assert_eq!(
+            rebuild_kind(RendererKind::D2d, RendererKind::D2d),
+            RendererKind::D2d,
+            "explicit d2d keeps its single-driver semantics (design §13-6)"
+        );
+        assert_eq!(
+            rebuild_kind(RendererKind::Warp, RendererKind::Warp),
+            RendererKind::Warp
+        );
+    }
 
     #[test]
     fn rapid_handoff_appends_when_something_is_loaded() {

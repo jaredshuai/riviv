@@ -37,6 +37,60 @@ pub(crate) const FILE_NAME: &str = "riviv.ini";
 /// The `%APPDATA%` subdirectory (upstream: "voidimageviewer").
 const APPDATA_DIR: &str = "riviv";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum RendererKind {
+    /// Hardware D2D → WARP → GDI: the transitional ladder (#80; #82 deletes
+    /// the GDI tier and makes the final failure fatal).
+    Auto,
+    /// Pure hardware D2D — an init failure drops straight to GDI, never
+    /// WARP: forcing hardware is a diagnostic/repro request, silently
+    /// swapping in the software rasterizer would defeat it (#80 design §2).
+    D2d,
+    /// Pure WARP — the golden/CI tier (cross-machine-deterministic pixels).
+    Warp,
+    /// The GDI path — today's behavior, byte-for-byte (#80's default; #81
+    /// flips the default to `auto`).
+    #[default]
+    Gdi,
+}
+
+impl RendererKind {
+    /// Parse one ini value (ASCII case-insensitive whole-word match of the
+    /// four literals, the `eq_switch` philosophy). `None` = unrecognized —
+    /// the caller falls back to the default with a stderr breadcrumb (a
+    /// hand-edited typo lands on the safe baseline, unlike the int keys'
+    /// garbage=0 semantics, #80 design §2).
+    pub(crate) fn parse_ini(value: &str) -> Option<RendererKind> {
+        if value.eq_ignore_ascii_case("auto") {
+            Some(RendererKind::Auto)
+        } else if value.eq_ignore_ascii_case("d2d") {
+            Some(RendererKind::D2d)
+        } else if value.eq_ignore_ascii_case("warp") {
+            Some(RendererKind::Warp)
+        } else if value.eq_ignore_ascii_case("gdi") {
+            Some(RendererKind::Gdi)
+        } else {
+            None
+        }
+    }
+
+    /// The canonical lowercase ini spelling (the save form).
+    pub(crate) fn to_ini(self) -> &'static str {
+        match self {
+            RendererKind::Auto => "auto",
+            RendererKind::D2d => "d2d",
+            RendererKind::Warp => "warp",
+            RendererKind::Gdi => "gdi",
+        }
+    }
+
+    /// Whether the request wants a D2D stack at all (`gdi` excludes it —
+    /// the GDI path must have no GpuStack in existence, #80 design §2).
+    pub(crate) fn wants_d2d(self) -> bool {
+        !matches!(self, RendererKind::Gdi)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Config {
     // Field order and defaults mirror config.c:35-100 one line each.
@@ -106,6 +160,11 @@ pub(crate) struct Config {
     /// at every image change like upstream's `_viv_clear`, 1 = carry the
     /// level/1:1/pan onto the next image.
     pub(crate) keep_zoom: i32,
+    /// riviv-authored key (#80; upstream has no such setting): which paint
+    /// backend the viewport uses — `auto | d2d | warp | gdi` (a STRING key;
+    /// missing or unrecognized falls back to the `gdi` baseline). See
+    /// [`RendererKind`] for the semantics.
+    pub(crate) renderer: RendererKind,
     /// The per-command keyboard bindings (#25; upstream keeps these OUTSIDE
     /// the `config_*` int globals in `_viv_key_list`, but loads/saves them
     /// through the same ini pass — riding inside `Config` gives them the
@@ -178,6 +237,7 @@ impl Default for Config {
             title_bar_format: 1,
             add_command_line_timeout: 500,
             keep_zoom: 0,
+            renderer: RendererKind::Gdi,
             keys: KeyMap::default(),
         }
     }
@@ -354,6 +414,21 @@ impl Config {
         apply_byte!(title_bar_format = "title_bar_format");
         apply_int!(add_command_line_timeout = "add_command_line_timeout");
         apply_byte!(keep_zoom = "keep_zoom");
+        // The renderer is a STRING key (riviv-authored, #80): an
+        // unrecognized value is a user typo — it falls to the safe `gdi`
+        // baseline (design §2) in BOTH overlay passes, never the int keys'
+        // garbage=0 "keep current" shape: a hand-edited appdata file
+        // carrying garbage must not silently resurrect the exe-dir value
+        // (pre-review: the overlay used to keep it).
+        if let Some(value) = pairs.get("renderer") {
+            match RendererKind::parse_ini(value) {
+                Some(kind) => self.renderer = kind,
+                None => {
+                    eprintln!("riviv: unrecognized renderer value {value:?}, using gdi");
+                    self.renderer = RendererKind::Gdi;
+                }
+            }
+        }
         if root {
             apply_byte!(appdata = "appdata");
         }
@@ -380,7 +455,7 @@ impl Config {
         if root && self.appdata != 0 {
             return vec![("appdata".to_string(), i(self.appdata))];
         }
-        let int_pairs: [(&str, String); 61] = [
+        let int_pairs: [(&str, String); 62] = [
             ("x", i(self.x)),
             ("y", i(self.y)),
             ("wide", i(self.wide)),
@@ -465,6 +540,8 @@ impl Config {
             // riviv-authored keys sit at the table's tail (#68) — the
             // upstream block above keeps its exact key-for-key order.
             ("keep_zoom", i(self.keep_zoom)),
+            // #80 appends the renderer STRING key after keep_zoom.
+            ("renderer", self.renderer.to_ini().to_string()),
         ];
         let mut pairs: Vec<(String, String)> = int_pairs
             .iter()
@@ -590,17 +667,22 @@ mod tests {
             pixel_info: 1,
             shuffle: 1,
             keep_zoom: 1,
+            renderer: RendererKind::Warp,
             ..Config::default()
         };
         let text = ini::serialize(SECTION, &c.to_pairs(false));
         let back = parse_apply(&text, true);
         assert_eq!(back, c, "every save key must be a load key");
-        // 61 int keys + one *_keys line per command in Cmd::ALL order —
+        // 61 int keys + the riviv-authored keep_zoom (#68) + the renderer
+        // string key (#80) + one *_keys line per command in Cmd::ALL order —
         // 92 bound, the rest empty (#42 adds the shell septet: three
         // bound, four empty; #43 adds the file-management octet: Del /
-        // Shift+Del / F2 bound, five empty; #68 appends the riviv-authored
-        // keep_zoom int key).
-        assert_eq!(c.to_pairs(false).len(), 182, "the save table + keep_zoom");
+        // Shift+Del / F2 bound, five empty).
+        assert_eq!(
+            c.to_pairs(false).len(),
+            183,
+            "the save table + keep_zoom + renderer"
+        );
     }
 
     #[test]
@@ -650,7 +732,7 @@ mod tests {
         let c = Config::default();
         assert_eq!(
             c.to_pairs(true).len(),
-            182,
+            183,
             "active store writes the full table"
         );
         let c = Config {
@@ -698,5 +780,76 @@ mod tests {
             p.with_extension("ini.tmp"),
             PathBuf::from(r"C:\dir\riviv.ini.tmp")
         );
+    }
+
+    // ---- the renderer key (#80) ----
+
+    #[test]
+    fn renderer_key_round_trips_all_four_values() {
+        // The four literals save as the canonical lowercase spellings and
+        // read back identically (ASCII case-insensitive on load).
+        for kind in [
+            RendererKind::Auto,
+            RendererKind::D2d,
+            RendererKind::Warp,
+            RendererKind::Gdi,
+        ] {
+            let c = Config {
+                renderer: kind,
+                ..Config::default()
+            };
+            let text = ini::serialize(SECTION, &c.to_pairs(false));
+            let back = parse_apply(&text, true);
+            assert_eq!(
+                back.renderer,
+                kind,
+                "renderer={} round-trips",
+                kind.to_ini()
+            );
+        }
+        // Hand-written mixed-case values resolve to the same kinds.
+        let c = parse_apply("[riviv]\nrenderer=D2D\n", true);
+        assert_eq!(c.renderer, RendererKind::D2d);
+        let c = parse_apply("[riviv]\nrenderer=Auto\n", true);
+        assert_eq!(c.renderer, RendererKind::Auto);
+    }
+
+    #[test]
+    fn missing_renderer_key_defaults_to_gdi() {
+        // No key at all: the safe baseline stands (the M6 default; #81
+        // flips it to auto).
+        let c = parse_apply("[riviv]\n", true);
+        assert_eq!(c.renderer, RendererKind::Gdi);
+    }
+
+    #[test]
+    fn unrecognized_renderer_value_falls_back_to_gdi() {
+        // A hand-edited typo keeps the default (string keys never inherit
+        // the int keys' garbage=0 semantics) — and stays gdi across a
+        // round-trip (the fallback is what gets saved).
+        let c = parse_apply("[riviv]\nrenderer=frobnicate\n", true);
+        assert_eq!(c.renderer, RendererKind::Gdi);
+        let text = ini::serialize(SECTION, &c.to_pairs(false));
+        let back = parse_apply(&text, true);
+        assert_eq!(back.renderer, RendererKind::Gdi);
+    }
+
+    #[test]
+    fn unrecognized_overlay_renderer_resets_to_gdi_not_the_root_value() {
+        // The two-file overlay (pre-review P3-2): an appdata file carrying
+        // garbage over an exe-dir `renderer=warp` must land on the gdi
+        // baseline — a present-but-invalid value is a typo, not a missing
+        // key, and must not silently resurrect the earlier file's choice.
+        let mut c = Config::default();
+        c.apply_section(&ini::parse("[riviv]\nrenderer=warp\n", SECTION), true);
+        assert_eq!(c.renderer, RendererKind::Warp);
+        c.apply_section(&ini::parse("[riviv]\nrenderer=nope\n", SECTION), false);
+        assert_eq!(c.renderer, RendererKind::Gdi);
+        // A MISSING key in the overlay keeps the root value (the ordinary
+        // overlay semantic, untouched).
+        let mut c = Config::default();
+        c.apply_section(&ini::parse("[riviv]\nrenderer=warp\n", SECTION), true);
+        c.apply_section(&ini::parse("[riviv]\n", SECTION), false);
+        assert_eq!(c.renderer, RendererKind::Warp);
     }
 }

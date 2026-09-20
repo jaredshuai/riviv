@@ -21,6 +21,14 @@ image = { version = "0.25", default-features = false, features = [
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Globalization",
+    # D2D/D3D/DXGI 视口栈(#80);Direct2D_Common + Dxgi_Common 是
+    # CreateBitmap/CreateBitmapFromDxgiSurface 的 cfg 前置
+    "Win32_Graphics_Direct2D",
+    "Win32_Graphics_Direct2D_Common",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Gdi",
     "Win32_Storage_FileSystem",
     "Win32_System_Com",

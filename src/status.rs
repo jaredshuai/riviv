@@ -76,6 +76,10 @@ pub(crate) struct StatusSnapshot {
     /// Byte size of the displayed file, if known (skipped when 0/unknown,
     /// viv.c:11152).
     pub(crate) file_bytes: Option<u64>,
+    /// The effective D2D backend label riding the dimension part (#80:
+    /// `Some("d2d/hw")` / `Some("d2d/warp")` while a D2D stack renders,
+    /// `None` on the gdi baseline — no suffix, byte-identical to upstream).
+    pub(crate) backend: Option<&'static str>,
     /// Main-window client width — the part edges are laid out against it.
     pub(crate) client_wide: i32,
 }
@@ -268,7 +272,12 @@ pub(crate) fn update(hwnd: HWND, snapshot: &StatusSnapshot) {
         None => String::new(),
     };
     let dimension_text = match snapshot.dimensions {
-        Some((wide, high)) => status_dimension_text(Some(wide), Some(high), snapshot.file_bytes),
+        Some((wide, high)) => status_dimension_text(
+            Some(wide),
+            Some(high),
+            snapshot.file_bytes,
+            snapshot.backend,
+        ),
         None => String::new(),
     };
 
