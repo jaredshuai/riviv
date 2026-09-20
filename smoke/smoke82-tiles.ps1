@@ -58,6 +58,31 @@
 #      still bounded (not growing with the frame count).
 #   S6 record-only: renderer=gdi banner at fit passes the same shape/band/
 #      ramp assertions (the GDI arm is untouched by #82).
+#   S2b-d hard-edge probe (R3 P2-1): a flat mid-grey 900x600 with 1-px
+#      full-height black columns ON a tile boundary (source x = 256) and
+#      MID-TILE (source x = 300): the dip screen positions must hit the
+#      expected columns in BOTH dumps and be the SAME in both - the smooth
+#      ramp's ~0.38/col step hides a dropped/duplicated boundary column
+#      inside the S2b-b/c tolerances; a 1-column fault moves or erases one
+#      of these dips.
+#   S7 evidence purity (R3 P2-6): no D2D-scenario stderr may contain
+#      "trying the gdi channel" (the dump's silent fallback would
+#      substitute GDI evidence for D2D evidence), across every captured
+#      d2d/warp run; and the S2a/S2b/S2b-d tiled runs assert tiles>0 in
+#      the CLOSE stats line - it prints after the close dump re-planned
+#      with the same -tile, so it is the dump-side tiling proof.
+#   S8 long-animation churn (design section 3) on the stripe family: ONE d2d
+#      instance, 16777217x1 giant with -tile 256, 1:1 -> best-fit -> 1:1
+#      (WM_COMMAND 45/46/45), then close: uploads>0, evictions>=0, and
+#      gpu/peak_gpu stay <= cap after the churn.
+#   S9 pressure: -tile 4 on the 900x600 ramp at a fit-capped viewport
+#      tiles the whole master in ONE frame: 225x150 = 33750 tiles x
+#      (4+2*32)^2x4 B = 18496 B = ~624 MB forced demand vs the 256 MiB
+#      cap - the forced plan is admitted, so the LRU must evict while
+#      keeping gpu/peak_gpu <= cap: evictions>0. (A gen-churn variant
+#      measured evictions=0: generation purges are not capacity evictions.)
+#   The S5c budget sweep runs at the END so it covers the stats lines of
+#      EVERY scenario, not just S1..S5.
 param([string]$Exe = 'D:\codespace\riviv\target\release\riviv.exe')
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Drawing
@@ -118,6 +143,22 @@ public class S82 {
                     raw[o + x * 4] = v; raw[o + x * 4 + 1] = v; raw[o + x * 4 + 2] = v;
                     raw[o + x * 4 + 3] = 255;
                 }
+            }
+        }
+        PngFromRaw(path, w, h, raw);
+    }
+    // Flat mid-grey field with two 1-px full-height BLACK columns at
+    // explicit source columns (the S2b-d hard-edge probe: one column on a
+    // -tile 256 grid boundary, one mid-tile). Never white, never magenta.
+    public static void WriteHardEdge(string path, int w, int h, int colA, int colB) {
+        byte[] raw = new byte[(w * 4 + 1) * h];
+        for (int y = 0; y < h; y++) {
+            raw[y * (w * 4 + 1)] = 0;
+            int o = y * (w * 4 + 1) + 1;
+            for (int x = 0; x < w; x++) {
+                byte v = (byte)((x == colA || x == colB) ? 0 : 128);
+                raw[o + x * 4] = v; raw[o + x * 4 + 1] = v; raw[o + x * 4 + 2] = v;
+                raw[o + x * 4 + 3] = 255;
             }
         }
         PngFromRaw(path, w, h, raw);
@@ -268,6 +309,30 @@ public class S82 {
             return o;
         }
     }
+    // Dark-dip detector for the hard-edge probe: along one row, group the
+    // columns whose luminance is below thresh into consecutive runs and
+    // return {runCount, argmin(run1), argmin(run2)} with the argmins
+    // relative to l (-1 when that run does not exist).
+    public static int[] DarkDips(string path, int y, int l, int w, int thresh) {
+        using (Bitmap bmp = new Bitmap(path)) {
+            List<int> mins = new List<int>();
+            bool inRun = false;
+            int best = -1;
+            long bestV = long.MaxValue;
+            for (int x = 0; x < w; x++) {
+                Color c = bmp.GetPixel(l + x, y);
+                long lum = (long)(0.299 * c.R + 0.587 * c.G + 0.114 * c.B);
+                if (lum < thresh) {
+                    if (!inRun) { inRun = true; best = -1; bestV = long.MaxValue; }
+                    if (lum < bestV) { bestV = lum; best = x; }
+                } else {
+                    if (inRun) { mins.Add(best); inRun = false; }
+                }
+            }
+            if (inRun) { mins.Add(best); }
+            return new int[] { mins.Count, mins.Count > 0 ? mins[0] : -1, mins.Count > 1 ? mins[1] : -1 };
+        }
+    }
 }
 '@) -ReferencedAssemblies @('System.Drawing')
 
@@ -396,6 +461,12 @@ function Calibrate-View($main, $tw, $th) {
 # for the S5 sweep.
 $StatsPattern = 'riviv: tiles level=(\d+) tiles=(\d+) base=(\d+) gpu=(\d+) peak_gpu=(\d+) inflight=(\d+) peak_inflight=(\d+) uploads=(\d+) evictions=(\d+) mip_builds=(\d+) source=(\d+) display=(\d+) cap=(\d+)'
 $script:StatsSeen = New-Object System.Collections.ArrayList
+# Every d2d/warp scenario's stderr, tagged (S7 scans them for the dump's
+# silent "trying the gdi channel" fallback - the gdi-arm S6 is excluded).
+$script:D2dErrs = New-Object System.Collections.ArrayList
+function Note-D2dErr($err, $tag) {
+    [void]$script:D2dErrs.Add(@{ Tag = $tag; Err = $err })
+}
 function Parse-Stats($err, $tag) {
     $found = $null
     foreach ($mm in [regex]::Matches($err, $StatsPattern)) {
@@ -575,6 +646,8 @@ function Banner-Strip-Checks($dumpPath, $viewW) {
 $WM_CLOSE = 0x0010
 $WM_COMMAND = 0x0111
 $CMD_ONE2ONE = 45      # menu.rs Cmd::ViewOneToOne.id()
+$CMD_BESTFIT = 46      # menu.rs Cmd::ViewBestFit.id()
+$CMD_ROTATE90 = 23     # menu.rs Cmd::EditRotate90.id()
 $one2one = { param($m) [void][S82]::PostMessage($m, $WM_COMMAND, [IntPtr]$CMD_ONE2ONE, [IntPtr]::Zero) }
 
 # View targets (physical px, 200% DPI dev machine - the measured facts'
@@ -604,7 +677,9 @@ $banner = Join-Path $Stage 'banner82.png'
 [S82]::WriteBanner($banner, 40000, 256, 18000, 22000)
 $giant = Join-Path $Stage 'giant82.png'
 [S82]::WriteWidePngGrad($giant, 16777217, 1)
-Check 'S0 fixtures built (grad900 + 40000x256 banner + 16777217x1 giant)' ((Test-Path $grad900) -and (Test-Path $banner) -and (Test-Path $giant)) 'a fixture PNG is missing'
+$hardedge900 = Join-Path $Stage 'hardedge900.png'
+[S82]::WriteHardEdge($hardedge900, 900, 600, 256, 300)
+Check 'S0 fixtures built (grad900 + 40000x256 banner + 16777217x1 giant + hardedge900)' ((Test-Path $grad900) -and (Test-Path $banner) -and (Test-Path $giant) -and (Test-Path $hardedge900)) 'a fixture PNG is missing'
 
 # ---------------------------------------------------------------------------
 # S1 + S2a: the tall window (view exactly 1200x900 -> fit caps at 100%).
@@ -616,11 +691,13 @@ Check 'S0 fixtures built (grad900 + 40000x256 banner + 16777217x1 giant)' ((Test
 $tallIni = Scene-Ini 'd2d' ($TallW + 40) ($TallH + 160) $true
 $a1 = Run-Scene $tallIni $grad900 's1-tiled.png' 's1-tiled.err' '-tile 256' $TallW $TallH $one2one 12000
 $st1 = Parse-Stats $a1.Err 'S1-tiled'
+Note-D2dErr $a1.Err 'S1-tiled'
 Check 'S1a -tile 256 run clean (adopted, exit 0, dump exists)' (($a1.Code -eq 0) -and $a1.Adopted -and (Test-Path $a1.Out)) ("exit=$($a1.Code) adopted=$($a1.Adopted) view=$($a1.Vs[0])x$($a1.Vs[1]) stderr=[$($a1.Err.Trim())]")
 Check 'S1b d2d breadcrumb "riviv: d2d max_bitmap=<n> tile cap=<n>" present' (($a1.Err -match 'riviv: d2d max_bitmap=\d+ tile cap=\d+')) ("stderr=[$($a1.Err.Trim())]")
 Check 'S1c -tile 256 stats line: level=0, tiles>0, uploads>0' (($st1 -ne $null) -and ($st1.Level -eq 0) -and ($st1.Tiles -gt 0) -and ($st1.Uploads -gt 0)) (Stats-Detail $st1)
 $b1 = Run-Scene $tallIni $grad900 's1-untiled.png' 's1-untiled.err' '' $TallW $TallH $one2one 12000
 $st1b = Parse-Stats $b1.Err 'S1-untiled'
+Note-D2dErr $b1.Err 'S1-untiled'
 Check 'S1d run WITHOUT -tile prints no stats line and no gate line' (($st1b -eq $null) -and (-not $b1.Err.Contains('exceeds the D2D max bitmap'))) ("statsSeen=$($st1b -ne $null) exit=$($b1.Code) stderr=[$($b1.Err.Trim())]")
 if (($st1 -eq $null) -or (-not (Test-Path $a1.Out)) -or (-not (Test-Path $b1.Out))) {
     Skip-Scenario 'S2a 1:1 byte-identity + ramp samples' 'the S1 run pair did not produce both dumps; see S1a/S1d evidence'
@@ -656,6 +733,10 @@ if (($st1 -eq $null) -or (-not (Test-Path $a1.Out)) -or (-not (Test-Path $b1.Out
     }
     if ($smpDetail -eq '') { $smpDetail = 'all 6 ramp samples within +-2 of the source formula' }
     Check 'S2a-3 ramp content present and correct (6 samples, +-2/channel)' $smpOk $smpDetail
+    # R3 P2-6: S1c's tiles>0 proves the PAINT tiled; this close stats line
+    # prints AFTER the WM_CLOSE dump re-planned with the same -tile, so
+    # tiles>0 here is the DUMP-side tiling proof.
+    Check 'S2a-4 tiled dump re-planned with tiles at close (close stats tiles>0)' (($st1 -ne $null) -and ($st1.Tiles -gt 0)) (Stats-Detail $st1)
 }
 Kill-Riviv
 Reset-Ini ''
@@ -672,12 +753,18 @@ $slimIni = Scene-Ini 'd2d' ($SlimW + 40) ($SlimH + 160) $true
 $b2 = Run-Scene $slimIni $grad900 's2b-untiled.png' 's2b-untiled.err' '' $SlimW $SlimH $null 12000
 $t2 = Run-Scene $slimIni $grad900 's2b-tiled.png' 's2b-tiled.err' '-tile 256' $SlimW $SlimH $null 12000
 [void](Parse-Stats $b2.Err 'S2b-untiled')
-[void](Parse-Stats $t2.Err 'S2b-tiled')
+$st2t = Parse-Stats $t2.Err 'S2b-tiled'
+Note-D2dErr $b2.Err 'S2b-untiled'
+Note-D2dErr $t2.Err 'S2b-tiled'
 $s2bRan = ($b2.Code -eq 0) -and ($t2.Code -eq 0) -and (Test-Path $b2.Out) -and (Test-Path $t2.Out)
 Check 'S2b-a both fit dumps ran clean (exit 0, files exist)' $s2bRan ("untiled exit=$($b2.Code) tiled exit=$($t2.Code) views=$($b2.Vs[0])x$($b2.Vs[1])/$($t2.Vs[0])x$($t2.Vs[1])")
 if ($s2bRan) {
     $ps2 = [S82]::PairStats($t2.Out, $b2.Out)
     Check 'S2b-b fractional scale: whole-frame maxDelta <= 1' (($ps2[0] -ge 0) -and ($ps2[0] -le 1)) ("max=$($ps2[0]) diffPx=$($ps2[1]) of $($ps2[2])x$($ps2[3]) (measured reference: max=1 on ~9.5% of pixels)")
+    # R3 P2-6: the dump re-plans with the same -tile at WM_CLOSE (before
+    # the stats line prints) - tiles>0 here is the DUMP-side tiling proof
+    # for this scene; S1c only proved the live paint.
+    Check 'S2b-b2 ramp tiled dump re-planned with tiles at close (close stats tiles>0)' (($st2t -ne $null) -and ($st2t.Tiles -gt 0)) (Stats-Detail $st2t)
     $eu2 = [S82]::RectEdges($b2.Out, 255, 0, 255)
     $rw2 = $eu2[2] - $eu2[0] + 1
     $rh2 = $eu2[3] - $eu2[1] + 1
@@ -702,6 +789,52 @@ Kill-Riviv
 Reset-Ini ''
 
 # ---------------------------------------------------------------------------
+# S2b-d (R3 P2-1): the hard-edge probe. The smooth ramp's ~0.38/col step
+# hides a dropped or duplicated column at a tile boundary inside the
+# S2b-b/c tolerances, so this fixture puts a 1-px full-height BLACK column
+# ON a -tile 256 grid boundary (source x = 256; a device-fitting master
+# tiles at level 0, so the grid edges are source x = 256, 512, ...) and a
+# second one MID-TILE (source x = 300), on a flat mid-grey field. The two
+# dips' screen columns must sit at the expected projection positions in
+# BOTH dumps and be the SAME in both: both draws share the global i64
+# projection, so a dropped/duplicated boundary column moves or erases the
+# tiled dip while the untiled one stays put.
+# ---------------------------------------------------------------------------
+$slimIni2 = Scene-Ini 'd2d' ($SlimW + 40) ($SlimH + 160) $true
+$bdu = Run-Scene $slimIni2 $hardedge900 's2bd-untiled.png' 's2bd-untiled.err' '' $SlimW $SlimH $null 12000
+$bdt = Run-Scene $slimIni2 $hardedge900 's2bd-tiled.png' 's2bd-tiled.err' '-tile 256' $SlimW $SlimH $null 12000
+[void](Parse-Stats $bdu.Err 'S2b-d-untiled')
+$stdbd = Parse-Stats $bdt.Err 'S2b-d-tiled'
+Note-D2dErr $bdu.Err 'S2b-d-untiled'
+Note-D2dErr $bdt.Err 'S2b-d-tiled'
+$bdRan = ($bdu.Code -eq 0) -and ($bdt.Code -eq 0) -and (Test-Path $bdu.Out) -and (Test-Path $bdt.Out)
+Check 'S2b-d hard-edge runs clean + tiled dump re-planned with tiles (close stats tiles>0)' ($bdRan -and ($stdbd -ne $null) -and ($stdbd.Tiles -gt 0)) ("untiled exit=$($bdu.Code) tiled exit=$($bdt.Code) statsTiled=" + (Stats-Detail $stdbd))
+if ($bdRan) {
+    $eud = [S82]::RectEdges($bdu.Out, 255, 0, 255)
+    $rwd = $eud[2] - $eud[0] + 1
+    $rhd = $eud[3] - $eud[1] + 1
+    $edd = [S82]::RectEdges($bdt.Out, 255, 0, 255)
+    $rwt = $edd[2] - $edd[0] + 1
+    $rht = $edd[3] - $edd[1] + 1
+    $rowd = $eud[1] + [int]($rhd / 2)
+    $rowt = $edd[1] + [int]($rht / 2)
+    $du = [S82]::DarkDips($bdu.Out, $rowd, $eud[0], $rwd, 100)
+    $dt = [S82]::DarkDips($bdt.Out, $rowt, $edd[0], $rwt, 100)
+    # Expected dip columns: the shared projection dest = l + src*rectW/900.
+    $expA = [math]::Floor(256 * $rwd / 900)
+    $expB = [math]::Floor(300 * $rwd / 900)
+    $bdOk = (($rwt -eq $rwd) -and ($du[0] -eq 2) -and ($dt[0] -eq 2) -and
+        ([math]::Abs($du[1] - $expA) -le 2) -and ([math]::Abs($du[2] - $expB) -le 2) -and
+        ($dt[1] -eq $du[1]) -and ($dt[2] -eq $du[2]))
+    Check 'S2b-d hard-edge: 2 dark columns at the expected screen columns in BOTH dumps, tiled == untiled exactly (no dropped/duplicated boundary column)' $bdOk ("untiledDips=$($du[0]) at [$($du[1]),$($du[2])] tiledDips=$($dt[0]) at [$($dt[1]),$($dt[2])] expected=[$expA,$expB] rect=$rwd x $rhd rows=$rowd/$rowt (thresh 100)")
+    Write-Host ('  S2b-d evidence: untiledDips=' + $du[0] + ' at [' + $du[1] + ',' + $du[2] + '] tiledDips=' + $dt[0] + ' at [' + $dt[1] + ',' + $dt[2] + '] expected=[' + $expA + ',' + $expB + '] srcCols=[256 boundary,300 mid-tile] rect=' + $rwd + 'x' + $rhd)
+} else {
+    Skip-Scenario 'S2b-d hard-edge dip comparisons' 'a dump channel failed; see the S2b-d runs-clean detail'
+}
+Kill-Riviv
+Reset-Ini ''
+
+# ---------------------------------------------------------------------------
 # S3: the hardware giant. 40000x256 banner (renderer=d2d): fit -> the
 # overview path; 1:1 (WM_COMMAND 45) -> the tile path. The old gate line
 # must never appear.
@@ -709,6 +842,7 @@ Reset-Ini ''
 $stripIni = Scene-Ini 'd2d' ($StripW + 40) ($StripH + 160) $false
 $f3 = Run-Scene $stripIni $banner 's3-fit.png' 's3-fit.err' '' $StripW $StripH $null 30000
 $st3f = Parse-Stats $f3.Err 'S3-fit'
+Note-D2dErr $f3.Err 'S3-fit'
 Check 'S3a fit run clean (adopted, exit 0, dump exists)' (($f3.Code -eq 0) -and $f3.Adopted -and (Test-Path $f3.Out)) ("exit=$($f3.Code) adopted=$($f3.Adopted) view=$($f3.Vs[0])x$($f3.Vs[1]) stderr=[$($f3.Err.Trim())]")
 Check 'S3b fit: NO old gate line (the D2D stack is not torn down)' (-not $f3.Err.Contains('exceeds the D2D max bitmap')) ("stderr=[$($f3.Err.Trim())]")
 Check 'S3c fit stats: level>=1, tiles=0, base>0, mip_builds>=1 (overview path)' (($st3f -ne $null) -and ($st3f.Level -ge 1) -and ($st3f.Tiles -eq 0) -and ($st3f.Base -gt 0) -and ($st3f.MipBuilds -ge 1)) (Stats-Detail $st3f)
@@ -726,6 +860,7 @@ Kill-Riviv
 Reset-Ini ''
 $o3 = Run-Scene $stripIni $banner 's3-one2one.png' 's3-1to1.err' '' $StripW $StripH $one2one 30000
 $st3o = Parse-Stats $o3.Err 'S3-1to1'
+Note-D2dErr $o3.Err 'S3-1to1'
 Check 'S3g 1:1 run clean (adopted, exit 0, dump exists)' (($o3.Code -eq 0) -and $o3.Adopted -and (Test-Path $o3.Out)) ("exit=$($o3.Code) adopted=$($o3.Adopted) stderr=[$($o3.Err.Trim())]")
 Check 'S3h 1:1: NO old gate line' (-not $o3.Err.Contains('exceeds the D2D max bitmap')) ("stderr=[$($o3.Err.Trim())]")
 Check 'S3i 1:1 stats: level=0, tiles>0, base=0, uploads>=1 (tile path)' (($st3o -ne $null) -and ($st3o.Level -eq 0) -and ($st3o.Tiles -gt 0) -and ($st3o.Base -eq 0) -and ($st3o.Uploads -ge 1)) (Stats-Detail $st3o)
@@ -755,6 +890,7 @@ Reset-Ini ''
 # ---------------------------------------------------------------------------
 $w4 = Run-Scene (Scene-Ini 'warp' ($StripW + 40) ($StripH + 160) $false) $giant 's4-warp.png' 's4-warp.err' '' $null $null $null 90000
 $st4 = Parse-Stats $w4.Err 'S4-warp'
+Note-D2dErr $w4.Err 'S4-warp'
 $bcMax4 = ''
 if ($w4.Err -match 'riviv: d2d max_bitmap=(\d+) tile cap=(\d+)') { $bcMax4 = 'max_bitmap=' + $Matches[1] + ' cap=' + $Matches[2] }
 Check 'S4a warp giant run clean (adopted, exit 0, dump exists)' (($w4.Code -eq 0) -and $w4.Adopted -and (Test-Path $w4.Out)) ("exit=$($w4.Code) adopted=$($w4.Adopted) view=$($w4.Vs[0])x$($w4.Vs[1]) stderr=[$($w4.Err.Trim())]")
@@ -835,11 +971,13 @@ function Strip-Evidence($dumpPath) {
 }
 $w4g = Run-Scene (Scene-Ini 'warp' ($StripW + 40) ($StripH + 160) $false) $giant 's4g-warp-1to1.png' 's4g.err' '' $null $null $one2one 90000
 $st4g = Parse-Stats $w4g.Err 'S4g-warp-1to1-record'
+Note-D2dErr $w4g.Err 'S4g-warp-1to1-record'
 Write-Host ('  S4g evidence (record-only) warp giant at 1:1: exit=' + $w4g.Code + ' dump=' + (Strip-Evidence $w4g.Out) + ' stats=' + (Stats-Detail $st4g))
 Kill-Riviv
 Reset-Ini ''
 $w4h = Run-Scene (Scene-Ini 'd2d' ($StripW + 40) ($StripH + 160) $false) $giant 's4h-hw-fit.png' 's4h.err' '' $null $null $null 90000
 $st4h = Parse-Stats $w4h.Err 'S4h-hw-fit-record'
+Note-D2dErr $w4h.Err 'S4h-hw-fit-record'
 Write-Host ('  S4h evidence (record-only) hardware giant at fit: exit=' + $w4h.Code + ' dump=' + (Strip-Evidence $w4h.Out) + ' stats=' + (Stats-Detail $st4h))
 Kill-Riviv
 Reset-Ini ''
@@ -851,24 +989,19 @@ Reset-Ini ''
 # ---------------------------------------------------------------------------
 $p5a = Run-Scene $stripIni $banner 's5-p1.png' 's5-p1.err' '-tile 256' $StripW $StripH $one2one 30000
 $st5a = Parse-Stats $p5a.Err 'S5-p1'
+Note-D2dErr $p5a.Err 'S5-p1'
 Kill-Riviv
 Reset-Ini ''
 $p5b = Run-Scene $stripIni $banner 's5-p2.png' 's5-p2.err' '-tile 256' $StripW $StripH $one2one 30000
 $st5b = Parse-Stats $p5b.Err 'S5-p2'
+Note-D2dErr $p5b.Err 'S5-p2'
 Kill-Riviv
 Reset-Ini ''
 Check 'S5a repeated-paint instance 1: uploads>0, gpu<=cap, peak_gpu<=cap' (($st5a -ne $null) -and ($st5a.Uploads -gt 0) -and ($st5a.Gpu -le $st5a.Cap) -and ($st5a.PeakGpu -le $st5a.Cap)) ("exit=$($p5a.Code) " + (Stats-Detail $st5a))
 Check 'S5b repeated-paint instance 2: uploads>0, gpu<=cap, peak_gpu<=cap (bounded, not growing)' (($st5b -ne $null) -and ($st5b.Uploads -gt 0) -and ($st5b.Gpu -le $st5b.Cap) -and ($st5b.PeakGpu -le $st5b.Cap)) ("exit=$($p5b.Code) " + (Stats-Detail $st5b))
-$viol5 = New-Object System.Collections.Generic.List[string]
-foreach ($s in $script:StatsSeen) {
-    if (($s.Gpu -gt $s.Cap) -or ($s.PeakGpu -gt $s.Cap)) {
-        [void]$viol5.Add(($s.Tag + ': gpu=' + $s.Gpu + ' peak_gpu=' + $s.PeakGpu + ' cap=' + $s.Cap))
-    }
-}
-$lines5 = ''
-foreach ($s in $script:StatsSeen) { $lines5 += ('    ' + $s.Tag + ': ' + (Stats-Detail $s) + "`r`n") }
-Write-Host ("  S5 evidence - every stats line captured this run ($($script:StatsSeen.Count)):`r`n$lines5")
-Check 'S5c EVERY captured stats line satisfies gpu<=cap and peak_gpu<=cap (>=6 lines seen)' (($viol5.Count -eq 0) -and ($script:StatsSeen.Count -ge 6)) ("lines=$($script:StatsSeen.Count) violations=[$($viol5 -join '; ')]")
+# The S5c budget sweep moved below S9: running it as the LAST assertion
+# covers the stats lines of EVERY scenario (S8/S9 included), which is
+# strictly stronger than the old S1..S5-only sweep.
 
 # ---------------------------------------------------------------------------
 # S6: record-only. renderer=gdi with the banner at fit: the GDI giant
@@ -890,6 +1023,86 @@ if (Test-Path $g6.Out) {
 if ($gchk -ne $null) { Write-Host ('  S6 gdi evidence: ' + $gchk.Detail + ' | ' + $gStatsNote) }
 Kill-Riviv
 Reset-Ini ''
+
+# ---------------------------------------------------------------------------
+# S8: the long-animation churn on the stripe family (design section 3's "long
+# animation" scenario). ONE d2d instance: adopt the 16777217x1 giant with
+# -tile 256, then 1:1 -> best-fit -> 1:1 (WM_COMMAND 45/46/45), then close.
+# Each zoom change repaints through a different plan shape (level-0 tiles
+# vs the level-14 overview), so the final close stats line must show a real
+# upload history with resident bytes still bounded.
+# ---------------------------------------------------------------------------
+$churnCmds = { param($m)
+    [void][S82]::PostMessage($m, $WM_COMMAND, [IntPtr]$CMD_ONE2ONE, [IntPtr]::Zero)
+    Start-Sleep -Milliseconds 600
+    [void][S82]::PostMessage($m, $WM_COMMAND, [IntPtr]$CMD_BESTFIT, [IntPtr]::Zero)
+    Start-Sleep -Milliseconds 600
+    [void][S82]::PostMessage($m, $WM_COMMAND, [IntPtr]$CMD_ONE2ONE, [IntPtr]::Zero)
+}
+$c8 = Run-Scene (Scene-Ini 'd2d' ($StripW + 40) ($StripH + 160) $false) $giant 's8-churn.png' 's8-churn.err' '-tile 256' $null $null $churnCmds 90000
+Note-D2dErr $c8.Err 'S8-churn'
+$st8 = Parse-Stats $c8.Err 'S8-churn'
+Check 'S8 stripe churn runs clean (adopted, exit 0, dump exists)' (($c8.Code -eq 0) -and $c8.Adopted -and (Test-Path $c8.Out)) ("exit=$($c8.Code) adopted=$($c8.Adopted) stderr=[$($c8.Err.Trim())]")
+Check 'S8a churn: uploads>0 and evictions>=0 after 1:1->fit->1:1' (($st8 -ne $null) -and ($st8.Uploads -gt 0) -and ($st8.Evictions -ge 0)) (Stats-Detail $st8)
+Check 'S8b churn: gpu<=cap and peak_gpu<=cap after the churn' (($st8 -ne $null) -and ($st8.Gpu -le $st8.Cap) -and ($st8.PeakGpu -le $st8.Cap)) (Stats-Detail $st8)
+Kill-Riviv
+Reset-Ini ''
+
+# ---------------------------------------------------------------------------
+# S9: the pressure Check - force LRU evictions cheaply in ONE frame. With
+# -tile 4 on the 900x600 ramp at a fit-capped (1:1) viewport, the whole
+# master is the visible preimage: ceil(900/4) x ceil(600/4) = 225 x 150 =
+# 33,750 tiles, each (4+2*32)^2*4 = 18,496 bytes (halo 32, FILTER_HALO_
+# NATIVE), so the forced plan's fresh demand is ~624 MB - far above the
+# 256 MiB cap. The ladder ADMITS a forced plan regardless of its budget
+# (the -tile diagnostic must stay usable on small images), so the draw
+# pushes ~624 MB through the LRU: after ~14.5k admissions the cache is
+# full and every further tile must evict - evictions>0, while the LRU
+# keeps resident (hence gpu/peak_gpu) <= cap. A gen-churn variant (-tile 8
+# + rotate, 2 x 175.7 MB) measured evictions=0: the generation change
+# purges dead entries without counting capacity evictions, so the
+# over-cap forced frame is the honest pressure.
+# ---------------------------------------------------------------------------
+$p9 = Run-Scene (Scene-Ini 'd2d' ($TallW + 40) ($TallH + 160) $true) $grad900 's9-pressure.png' 's9-pressure.err' '-tile 4' $TallW $TallH $null 12000
+Note-D2dErr $p9.Err 'S9-pressure'
+$st9 = Parse-Stats $p9.Err 'S9-pressure'
+Check 'S9 pressure runs clean (adopted, exit 0, dump exists)' (($p9.Code -eq 0) -and $p9.Adopted -and (Test-Path $p9.Out)) ("exit=$($p9.Code) adopted=$($p9.Adopted) stderr=[$($p9.Err.Trim())]")
+Check 'S9a pressure: evictions>0 and uploads>0 (33750 tiles x 18496B = ~624MB forced demand vs 268435456 cap)' (($st9 -ne $null) -and ($st9.Evictions -gt 0) -and ($st9.Uploads -gt 0)) (Stats-Detail $st9)
+Check 'S9b pressure: gpu<=cap and peak_gpu<=cap under eviction pressure' (($st9 -ne $null) -and ($st9.Gpu -le $st9.Cap) -and ($st9.PeakGpu -le $st9.Cap)) (Stats-Detail $st9)
+Kill-Riviv
+Reset-Ini ''
+
+# ---------------------------------------------------------------------------
+# S7 (R3 P2-6): evidence purity. The D2D dump's failure arm silently falls
+# back to the GDI channel ("riviv: d2d dump failed (...); trying the gdi
+# channel") - if that fired, every dump assertion above would be GDI
+# evidence wearing a D2D label. Assert no captured d2d/warp stderr
+# contains it. Runs last so it covers S8/S9 too.
+# ---------------------------------------------------------------------------
+$fallback7 = New-Object System.Collections.Generic.List[string]
+foreach ($de in $script:D2dErrs) {
+    if (($de.Err -ne $null) -and $de.Err.Contains('trying the gdi channel')) {
+        [void]$fallback7.Add($de.Tag)
+    }
+}
+Check 'S7 no D2D scenario fell back to the gdi dump channel ("trying the gdi channel" absent everywhere)' (($fallback7.Count -eq 0) -and ($script:D2dErrs.Count -ge 12)) ("d2dStderrs=$($script:D2dErrs.Count) fallbacks=[$($fallback7 -join ',')]")
+
+# ---------------------------------------------------------------------------
+# S5c (relocated): the budget sweep over EVERY stats line captured anywhere
+# in the run - S1, S2b, S2b-d, S3, S4, S4g/S4h, S5, S8, S9 - must satisfy
+# gpu<=cap and peak_gpu<=cap. 12 lines are expected (the untiled runs print
+# none); fewer means a tiled/mip scenario lost its evidence channel.
+# ---------------------------------------------------------------------------
+$viol5 = New-Object System.Collections.Generic.List[string]
+foreach ($s in $script:StatsSeen) {
+    if (($s.Gpu -gt $s.Cap) -or ($s.PeakGpu -gt $s.Cap)) {
+        [void]$viol5.Add(($s.Tag + ': gpu=' + $s.Gpu + ' peak_gpu=' + $s.PeakGpu + ' cap=' + $s.Cap))
+    }
+}
+$lines5 = ''
+foreach ($s in $script:StatsSeen) { $lines5 += ('    ' + $s.Tag + ': ' + (Stats-Detail $s) + "`r`n") }
+Write-Host ("  S5 evidence - every stats line captured this run ($($script:StatsSeen.Count)):`r`n$lines5")
+Check 'S5c EVERY captured stats line satisfies gpu<=cap and peak_gpu<=cap (>=12 lines seen)' (($viol5.Count -eq 0) -and ($script:StatsSeen.Count -ge 12)) ("lines=$($script:StatsSeen.Count) violations=[$($viol5 -join '; ')]")
 
 # ---------------------------------------------------------------------------
 # Teardown: the staged ini must never outlive the run; keep the stage dir
