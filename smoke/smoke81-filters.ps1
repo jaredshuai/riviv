@@ -950,8 +950,9 @@ Kill-Riviv
 Reset-Ini ''
 
 # Extreme giant 16777217x1 horizontal gradient. The gdi run asserts the
-# CONTENT of the >=32768 giant branch; the warp run asserts the gate line
-# plus the same content (smoke80 S5 upgraded with a content assertion).
+# CONTENT of the >=32768 giant branch; since #82 the warp run asserts the
+# OPPOSITE of the old gate: the D2D arm draws it itself (no gate line, no
+# gdi fallback), with the stats line naming the form (S4j/S4j2).
 $giantExtra = @('shrink_blit_mode=1')
 $ggr = Run-Scene 'gdi' 0 $giantExtra $giantPng 's4-giant-gdi.png' 's4-giant-gdi.err' $null $null $null 90000
 $ggOk = ($ggr.Code -eq 0) -and (Test-Path $ggr.Out)
@@ -1005,7 +1006,7 @@ if ($gStatsSeen) {
     $gStatsTiles = [int]$Matches[2]
 }
 $gForm = $gStatsSeen -and (($gStatsLevel -ge 1) -or ($gStatsTiles -ge 1))
-$gOk = $gwOk -and (-not $gerr.Contains('exceeds the D2D max bitmap')) -and (-not $gerr.Contains('rendering it via gdi'))
+$gOk = $gwOk -and ($gerr -match 'backend=d2d') -and (-not $gerr.Contains('exceeds the D2D max bitmap')) -and (-not $gerr.Contains('rendering it via gdi')) -and (-not $gerr.Contains('trying the gdi channel'))
 Check 'S4j-giant-warp drawn by the d2d arm itself (no gate line, no gdi fallback, exit 0)' $gOk ("exit=$($gwr.Code) out=$(Test-Path $gwr.Out) $gMaxLine stderr=[$($gerr.Trim())]")
 Check 'S4j2-giant-warp stats line names the giant form (level>=1 or tiles>=1)' $gForm "seen=$gStatsSeen level=$gStatsLevel tiles=$gStatsTiles"
 

@@ -5,6 +5,37 @@
 入库)。回归矩阵的其余脚本目前仍散落在 `%TEMP%\riviv-test\`(未纳入版本控
 制),待 #80「后台进程显示闸」重访时再评估批量入库。
 
+## smoke82-tiles.ps1(#82 巨图 overview + LRU tile + VRAM 字节预算)
+
+```powershell
+powershell -NoProfile -File smokesmoke82-tiles.ps1 [-Exe <path>]
+```
+
+场景(46 检查;全部 D2D 断言附带「breadcrumb 在场」前置,防空 stderr 假绿):
+
+- **S0** 夹具:900×600 渐变(内容公式可复算)、40000×256 带红带 banner、
+  16777217×1 手写宽条、900×600 硬边(两条 1px 全高黑列:源 x=256 恰在
+  `-tile 256` 网格边界、x=300 在块内)。
+- **S1** `-tile` 诊断面:带参跑打统计行(level=0/tiles>0/uploads>0),无参跑
+  无统计行(普通帧)。
+- **S2 零接缝核心**:S2a 真 1:1(视口精确 1200×900 + WM_COMMAND 45)tiled
+  vs untiled **整文件哈希相等** + 斜坡内容公式 ±2;S2b 缩小档 maxDelta≤1 +
+  边界阶跃 tiled≤untiled+1(实测参考 0.299 vs 0.299);S2b-d 硬边黑列屏幕
+  位置两 dump **逐值相等**(丢列/重列会移位或消失);S2b-e 硬边整帧
+  maxDelta≤21(**高对比档在案数首次有断言看守**)。
+- **S3** 硬件巨图 40000×256:fit→overview(level≥1/tiles=0/base>0/
+  mip_builds≥1,红带 438..535 对理论 ±0);1:1→tile(level=0/tiles>0/
+  base=0/uploads≥1,红带铺满)。
+- **S4** WARP 2^24+1:overview 路径 + 统计行解析(gpu≤cap)+ dump 按夹具
+  公式复算(±3)。
+- **S5** 预算:每条捕获统计行 gpu/peak_gpu≤cap(≥12 行)。
+- **S6**(记录项)`renderer=gdi` banner 走 GDI 巨图支(本票未删的逃生舱)。
+- **S7** 证据纯度:15 条 D2D stderr 全扫,禁 `trying the gdi channel`。
+- **S8** 单实例变焦 churn(1:1→fit→1:1):uploads>0 且 gpu/peak≤cap。
+- **S9** 真压力:`-tile 4` 强制 33750 块 ≈624 MB 对 268 MB cap →
+  evictions>0、peak 距 cap 10 KB(**强制诊断帧有意允许半覆盖**,脚本内
+  注明;自然路径的不半覆盖由单测钉)。
+
 ## smoke81-filters.ps1(#81 滤波映射全表 + mip 退役 + 默认 auto)
 
 驱动 #81 的三面:D2D shrink Linear 档 HIGH_QUALITY_CUBIC、GDI 臂 face 直绘
@@ -25,7 +56,8 @@ powershell -NoProfile -File smoke\smoke81-filters.ps1 [-Exe <path>] [-Regolden]
 - **S3(L2)**:mag=1 LINEAR 平滑区 MAE≤2;shrink=1 CUBIC vs HALFTONE 真实
   差异记录;shrink=0 整数比 2× warp(NEAREST)/gdi(COLORONCOLOR)**字节相等**。
 - **S4 巨图**:banner 40000×256 双臂内容断言(warp 上传无 gate);极端
-  16777217×1 gdi+warp(warp 侧断 gate 行+GDI 通道内容);边界 census
+  16777217×1 gdi+warp(自 #82 起 warp 侧断言与旧 gate 相反:D2D 自绘、无
+  gate 行、无 gdi 交接,统计行报形态 S4j/S4j2);边界 census
   4,000,000/2^22/2^23/6,291,456×1(2^22 起走 relief 两级路径,接缝扫描;
   6,291,456 = 非 2 幂倍数点,钉 relief_divisor 离开 2 幂格点)。
 - **S5** exit-2:dump 到不存在目录→exit 2+stderr。
@@ -56,9 +88,10 @@ powershell -ExecutionPolicy Bypass -File smoke\smoke80-d2d.ps1 -Exe <other build
   handle captured while the process is alive: PS 5.1 `Start-Process
   -PassThru` objects lose `.Handle`/`.ExitCode` once the process exits.
 - Fixtures are built in-script: the giant-frame PNG (S5) is hand-written at
-  2^24+1 px wide because GDI+ refuses >65535 AND the gate threshold is a
+  2^24+1 px wide because GDI+ refuses >65535 AND the device bound is a
   runtime `GetMaximumBitmapSize()` query - 16385 is NOT giant on machines
-  where WARP reports 2^23 (measured value on the dev machine). The GIF (S6)
+  where WARP reports 2^23 (measured value on the dev machine; since #82 the
+  bound routes the frame to the overview/tile path, it no longer gates). The GIF (S6)
   is hand-built (2 frames, 10 s delays, uncompressed-LZW recipe) because
   this .NET's GDI+ `Encoder` lacks `FrameDelay`.
 - Summary line `SMOKE80 RESULT: PASS=N FAIL=M SKIP=K`; `FAIL > 0` exits 1,
@@ -74,7 +107,7 @@ powershell -ExecutionPolicy Bypass -File smoke\smoke80-d2d.ps1 -Exe <other build
 | S2 | warp dump channel: adopted image + WM_CLOSE -> PNG on disk, exit 0, dims == view client rect | |
 | S3a-S3f | L0: the same 1:1 scene dumped through warp AND gdi | file bytes equal; non-white bbox == source rect at source size; every bbox pixel RGBA == source; both arms pixel-exact |
 | S4a-S4c | resize chain: after SetWindowPos the dump dims follow the NEW viewport while the 1:1 bbox stays the source size | swapchain ResizeBuffers + target rebuild |
-| S5a-S5c | giant gate: `exceeds the D2D max bitmap ... rendering it via gdi` stderr line after the startup breadcrumb; process alive; dump still succeeds, exit 0 | GDI fallback channel (paint gate tears the stack down) |
+| S5a-S5d | giant path (#82 contract): NO gate line, NO gdi hand-off, NO gdi dump fallback; process alive; dump succeeds out of the D2D channel, exit 0; close-time stats line names the form (level>=1 or tiles>=1) | the D2D arm draws giants itself (overview level or tiles) — the #80 gate is retired |
 | S6a-S6d | animation re-upload: dumps before/after `AnimationFrameStep` (cmd 100) differ; frame 0 = red, frame 1 = blue at 1:1 | frame_gen bump re-uploads |
 | S7a-S7b | rotation re-upload: after `EditRotate90` (cmd 23) the bbox swaps 120x80 -> 80x120 and the content equals the source rotated 90 CW | rotate bumps frame_gen |
 | S8a | minimized-start warp instance dumps the image (content-checked) at WM_CLOSE | the D2D dump renders from the CPU master inside the dump call - no Present, no WM_PAINT dependency |

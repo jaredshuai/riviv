@@ -698,7 +698,7 @@ Check 'S1c -tile 256 stats line: level=0, tiles>0, uploads>0' (($st1 -ne $null) 
 $b1 = Run-Scene $tallIni $grad900 's1-untiled.png' 's1-untiled.err' '' $TallW $TallH $one2one 12000
 $st1b = Parse-Stats $b1.Err 'S1-untiled'
 Note-D2dErr $b1.Err 'S1-untiled'
-Check 'S1d run WITHOUT -tile prints no stats line and no gate line' (($st1b -eq $null) -and (-not $b1.Err.Contains('exceeds the D2D max bitmap'))) ("statsSeen=$($st1b -ne $null) exit=$($b1.Code) stderr=[$($b1.Err.Trim())]")
+Check 'S1d run WITHOUT -tile prints no stats line and no gate line (breadcrumb present)' (($st1b -eq $null) -and ($b1.Err -match 'backend=d2d') -and (-not $b1.Err.Contains('exceeds the D2D max bitmap'))) ("statsSeen=$($st1b -ne $null) exit=$($b1.Code) stderr=[$($b1.Err.Trim())]")
 if (($st1 -eq $null) -or (-not (Test-Path $a1.Out)) -or (-not (Test-Path $b1.Out))) {
     Skip-Scenario 'S2a 1:1 byte-identity + ramp samples' 'the S1 run pair did not produce both dumps; see S1a/S1d evidence'
 } else {
@@ -779,7 +779,7 @@ if ($s2bRan) {
         $st2 = Max-Step-Near $lt2 $bnds2 2
         $gu2 = Max-Step-All $lu2
         $gt2 = Max-Step-All $lt2
-        Check 'S2b-c seam scan: tiled boundary step <= untiled step + 1' (($st2[0] -ge 0) -and ($st2[0] -le ($su2[0] + 1.0))) ("bounds=[$($bnds2 -join ',')] tiledMaxStep={0} untiledMaxStep={1} globalTiled={2:N2} globalUntiled={3:N2} (measured reference: 1 vs 1)" -f $st2[0], $su2[0], $gt2, $gu2)
+        Check 'S2b-c seam scan: tiled boundary step <= untiled step + 1' (($st2[0] -ge 0) -and ($st2[0] -le ($su2[0] + 1.0))) ("bounds=[$($bnds2 -join ',')] tiledMaxStep={0} untiledMaxStep={1} globalTiled={2:N2} globalUntiled={3:N2} (measured reference: 0.299 vs 0.299)" -f $st2[0], $su2[0], $gt2, $gu2)
         Write-Host ('  S2b evidence: maxDelta=' + $ps2[0] + ' diffPx=' + $ps2[1] + ' of ' + $ps2[2] + 'x' + $ps2[3] + ' rect=' + $rw2 + 'x' + $rh2 + ' bounds=[' + ($bnds2 -join ',') + '] boundaryStepTiled=' + $st2[0] + ' boundaryStepUntiled=' + $su2[0] + ' globalRowStepTiled=' + $gt2 + ' globalRowStepUntiled=' + $gu2)
     }
 } else {
@@ -828,6 +828,12 @@ if ($bdRan) {
         ($dt[1] -eq $du[1]) -and ($dt[2] -eq $du[2]))
     Check 'S2b-d hard-edge: 2 dark columns at the expected screen columns in BOTH dumps, tiled == untiled exactly (no dropped/duplicated boundary column)' $bdOk ("untiledDips=$($du[0]) at [$($du[1]),$($du[2])] tiledDips=$($dt[0]) at [$($dt[1]),$($dt[2])] expected=[$expA,$expB] rect=$rwd x $rhd rows=$rowd/$rowt (thresh 100)")
     Write-Host ('  S2b-d evidence: untiledDips=' + $du[0] + ' at [' + $du[1] + ',' + $du[2] + '] tiledDips=' + $dt[0] + ' at [' + $dt[1] + ',' + $dt[2] + '] expected=[' + $expA + ',' + $expB + '] srcCols=[256 boundary,300 mid-tile] rect=' + $rwd + 'x' + $rhd)
+    # The high-contrast BOUND (external review AI2 P2-2): the recorded
+    # content-edge figure (<= 21 per channel, README/ADR) finally has an
+    # assertion watching it - on THIS hard-edge pair, which is the content
+    # class the number was measured on.
+    $psd = [S82]::PairStats($bdt.Out, $bdu.Out)
+    Check 'S2b-e hard-edge whole-frame maxDelta <= 21 (the recorded high-contrast bound)' (($psd[0] -ge 0) -and ($psd[0] -le 21)) ("max=$($psd[0]) diffPx=$($psd[1]) of $($psd[2])x$($psd[3]) (README/ADR recorded bound: 21)")
 } else {
     Skip-Scenario 'S2b-d hard-edge dip comparisons' 'a dump channel failed; see the S2b-d runs-clean detail'
 }
@@ -844,7 +850,7 @@ $f3 = Run-Scene $stripIni $banner 's3-fit.png' 's3-fit.err' '' $StripW $StripH $
 $st3f = Parse-Stats $f3.Err 'S3-fit'
 Note-D2dErr $f3.Err 'S3-fit'
 Check 'S3a fit run clean (adopted, exit 0, dump exists)' (($f3.Code -eq 0) -and $f3.Adopted -and (Test-Path $f3.Out)) ("exit=$($f3.Code) adopted=$($f3.Adopted) view=$($f3.Vs[0])x$($f3.Vs[1]) stderr=[$($f3.Err.Trim())]")
-Check 'S3b fit: NO old gate line (the D2D stack is not torn down)' (-not $f3.Err.Contains('exceeds the D2D max bitmap')) ("stderr=[$($f3.Err.Trim())]")
+Check 'S3b fit: NO old gate line (breadcrumb present)' (($f3.Err -match 'backend=d2d') -and (-not $f3.Err.Contains('exceeds the D2D max bitmap'))) ("stderr=[$($f3.Err.Trim())]")
 Check 'S3c fit stats: level>=1, tiles=0, base>0, mip_builds>=1 (overview path)' (($st3f -ne $null) -and ($st3f.Level -ge 1) -and ($st3f.Tiles -eq 0) -and ($st3f.Base -gt 0) -and ($st3f.MipBuilds -ge 1)) (Stats-Detail $st3f)
 $fchk = $null
 if (Test-Path $f3.Out) {
@@ -862,7 +868,7 @@ $o3 = Run-Scene $stripIni $banner 's3-one2one.png' 's3-1to1.err' '' $StripW $Str
 $st3o = Parse-Stats $o3.Err 'S3-1to1'
 Note-D2dErr $o3.Err 'S3-1to1'
 Check 'S3g 1:1 run clean (adopted, exit 0, dump exists)' (($o3.Code -eq 0) -and $o3.Adopted -and (Test-Path $o3.Out)) ("exit=$($o3.Code) adopted=$($o3.Adopted) stderr=[$($o3.Err.Trim())]")
-Check 'S3h 1:1: NO old gate line' (-not $o3.Err.Contains('exceeds the D2D max bitmap')) ("stderr=[$($o3.Err.Trim())]")
+Check 'S3h 1:1: NO old gate line (breadcrumb present)' (($o3.Err -match 'backend=d2d') -and (-not $o3.Err.Contains('exceeds the D2D max bitmap'))) ("stderr=[$($o3.Err.Trim())]")
 Check 'S3i 1:1 stats: level=0, tiles>0, base=0, uploads>=1 (tile path)' (($st3o -ne $null) -and ($st3o.Level -eq 0) -and ($st3o.Tiles -gt 0) -and ($st3o.Base -eq 0) -and ($st3o.Uploads -ge 1)) (Stats-Detail $st3o)
 $redOk3 = $false
 $redDet3 = 'no dump'
@@ -894,7 +900,7 @@ Note-D2dErr $w4.Err 'S4-warp'
 $bcMax4 = ''
 if ($w4.Err -match 'riviv: d2d max_bitmap=(\d+) tile cap=(\d+)') { $bcMax4 = 'max_bitmap=' + $Matches[1] + ' cap=' + $Matches[2] }
 Check 'S4a warp giant run clean (adopted, exit 0, dump exists)' (($w4.Code -eq 0) -and $w4.Adopted -and (Test-Path $w4.Out)) ("exit=$($w4.Code) adopted=$($w4.Adopted) view=$($w4.Vs[0])x$($w4.Vs[1]) stderr=[$($w4.Err.Trim())]")
-Check 'S4b warp giant: NO old gate line' (-not $w4.Err.Contains('exceeds the D2D max bitmap')) ("stderr=[$($w4.Err.Trim())]")
+Check 'S4b warp giant: NO old gate line (breadcrumb present)' (($w4.Err -match 'backend=d2d/warp') -and (-not $w4.Err.Contains('exceeds the D2D max bitmap'))) ("stderr=[$($w4.Err.Trim())]")
 Check 'S4c warp giant breadcrumb present (riviv: d2d max_bitmap=...)' ($bcMax4 -ne '') ("bc=[$bcMax4] stderr=[$($w4.Err.Trim())]")
 Check 'S4d warp giant stats: mip_builds>=1, tiles=0, base>0, level>=1' (($st4 -ne $null) -and ($st4.MipBuilds -ge 1) -and ($st4.Tiles -eq 0) -and ($st4.Base -gt 0) -and ($st4.Level -ge 1)) (Stats-Detail $st4)
 Check 'S4e warp giant gpu <= cap' (($st4 -ne $null) -and ($st4.Gpu -le $st4.Cap)) (Stats-Detail $st4)
@@ -1043,7 +1049,7 @@ $c8 = Run-Scene (Scene-Ini 'd2d' ($StripW + 40) ($StripH + 160) $false) $giant '
 Note-D2dErr $c8.Err 'S8-churn'
 $st8 = Parse-Stats $c8.Err 'S8-churn'
 Check 'S8 stripe churn runs clean (adopted, exit 0, dump exists)' (($c8.Code -eq 0) -and $c8.Adopted -and (Test-Path $c8.Out)) ("exit=$($c8.Code) adopted=$($c8.Adopted) stderr=[$($c8.Err.Trim())]")
-Check 'S8a churn: uploads>0 and evictions>=0 after 1:1->fit->1:1' (($st8 -ne $null) -and ($st8.Uploads -gt 0) -and ($st8.Evictions -ge 0)) (Stats-Detail $st8)
+Check 'S8a churn: uploads>0 after 1:1->fit->1:1' (($st8 -ne $null) -and ($st8.Uploads -gt 0)) (Stats-Detail $st8)
 Check 'S8b churn: gpu<=cap and peak_gpu<=cap after the churn' (($st8 -ne $null) -and ($st8.Gpu -le $st8.Cap) -and ($st8.PeakGpu -le $st8.Cap)) (Stats-Detail $st8)
 Kill-Riviv
 Reset-Ini ''

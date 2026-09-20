@@ -26,9 +26,10 @@
 //! rect would realign the filter taps (viv.c:4253-4257).
 //!
 //! #80 splits the scene from the WM_PAINT bracket: [`render_scene`] draws
-//! blit + strips onto ANY DC — the GDI dump channel and the giant-frame
-//! degrade pass reuse it verbatim, while the D2D arm (`gpu.rs`) consumes
-//! the same [`scene_rect`] math against the master's full-size bitmap.
+//! blit + strips onto ANY DC — the GDI dump channel reuses it verbatim
+//! (the #80-era giant-frame degrade pass was deleted with #82's gate),
+//! while the D2D arm (`gpu.rs`) consumes the same [`scene_rect`] math
+//! against the master's full-size bitmap.
 
 use std::ffi::c_void;
 use std::mem::size_of;

@@ -107,7 +107,11 @@ pub(crate) fn downscale_box(src: &[u8], image_w: i32, image_h: i32, level: u32) 
 /// frame budget the master itself lives in.
 pub(crate) const LEVEL_CACHE_BYTES: u64 = 128 << 20;
 
-/// The CPU cache behind [`crate::gpu::LevelSource`]'s deeper levels (#82):
+/// The CPU cache behind [`crate::gpu::LevelSource`]'s deeper levels (#82).
+/// Contract: the PRODUCTION caller serves level 0 straight from the master
+/// (`MasterLevels::level` short-circuits it) — the cache accepts any level
+/// (its tests use 0 as a cheap entry), but routing a real frame's level 0
+/// through it would copy the master for nothing:
 /// a giant's overview level is a full source pass, so it is built once per
 /// (frame, level) and kept until the LRU's byte cap pushes it out. The
 /// master itself is never copied — level 0 is served straight from the

@@ -24,9 +24,10 @@
 #      source size; every bbox pixel equals the source pixels.
 #   S4 resize chain (warp): window resized -> dump follows the new viewport
 #      size while the 1:1 bbox stays the source size.
-#   S5 giant-image gate: a 16385-wide frame -> stderr gate line after the
-#      d2d/warp startup breadcrumb, process alive, dump still succeeds
-#      (GDI fallback channel).
+#   S5 giant-image path (#82 contract, replacing the retired #80 gate):
+#      a 2^24+1-wide frame -> NO gate line, NO gdi hand-off, process alive,
+#      dump succeeds out of the D2D channel, and the close-time stats line
+#      names the giant form (level>=1 or tiles>=1).
 #   S6 animation re-upload: 2-frame GIF, AnimationFrameStep between two
 #      dump instances -> dump content follows the frame.
 #   S7 rotation re-upload: EditRotate90 between two dump instances -> dump2
@@ -619,7 +620,7 @@ if ($pngOk5) {
     $dims5 = "$($q5.W)x$($q5.H)"
     $sizeOk5 = ($q5.W -eq $vs5[0]) -and ($q5.H -eq $vs5[1])
 }
-Check 'S5a the D2D arm draws the giant itself (no gate line, no gdi hand-off)' ((-not $err.Contains('exceeds the D2D max bitmap')) -and (-not $err.Contains('rendering it via gdi'))) ("$maxLine stderr=[$($err.Trim())]")
+Check 'S5a the D2D arm draws the giant itself (no gate line, no gdi hand-off, no gdi dump fallback)' (($err -match 'backend=d2d') -and (-not $err.Contains('exceeds the D2D max bitmap')) -and (-not $err.Contains('rendering it via gdi')) -and (-not $err.Contains('trying the gdi channel'))) ("$maxLine stderr=[$($err.Trim())]")
 Check 'S5b process stayed alive with the giant frame' ($alive5 -and $adopted5) "alive=$alive5 adopted=$adopted5"
 Check 'S5c dump succeeds out of the D2D channel (exit 0, viewport-sized)' (($code5 -eq 0) -and $pngOk5 -and $sizeOk5) ("exit=$code5 png=$pngOk5 dims=$dims5 viewport=$($vs5[0])x$($vs5[1])")
 Check 'S5d the stats line names the giant form (level>=1 or tiles>=1)' $form5 "seen=$statsSeen level=$statsLevel tiles=$statsTiles"

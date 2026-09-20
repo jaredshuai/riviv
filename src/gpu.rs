@@ -9,7 +9,9 @@
 //! BeginPaint → BeginDraw → Clear → DrawBitmap → EndDraw → Present(0,0)
 //! → EndPaint. The 1:1 five-piece (ADR 0002 D6) is enforced here: unit
 //! mode PIXELS set once at build, NO SetTransform call anywhere in the
-//! arm (identity audit — grep-provable), exact i32 rects, every surface
+//! arm (identity audit — grep-provable), exact i32 rects (the giant tile
+//! path's DRAWN rects are sub-pixel f32 by design — see tile.rs; the CLIPS
+//! stay integer), every surface
 //! `B8G8R8A8_UNORM` (never `_SRGB`), and the per-draw interpolation mode
 //! from [`d2d_interp_mode`].
 //!
@@ -901,6 +903,16 @@ impl GpuStack {
                         }
                     }
                 }
+                // Post-pass verification (external review AI2, P2-1 side-note):
+                // a tile uploaded EARLIER in this frame can still have been
+                // evicted by a later insert on the forced-diagnostic path —
+                // count those too, so the evidence line does not underreport
+                // the holes the draw will actually show.
+                let resident_now = tiles
+                    .iter()
+                    .filter(|q| self.tiles.iter().any(|(k, _)| *k == q.key))
+                    .count();
+                missing += tiles.len() - resident_now;
                 if missing > 0 {
                     eprintln!(
                         "riviv: {missing} of {} tiles are not resident this frame{}",
