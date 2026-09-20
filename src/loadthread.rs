@@ -86,10 +86,10 @@ pub(crate) const STDIN_NAME: &str = "stdin:";
 
 /// One queued decode request; crossing the channel requires `Send`
 /// (PixelFrame and the Arcs are, HWND via the wrapper above). `env`
-/// carries the request-time decode inputs (`DecodeEnv` — the render
-/// viewport, composite background, and the icm snapshot; upstream
-/// stashes the same values at request time, viv.c:1557-1558 + the
-/// decode-time composite).
+/// carries the request-time decode inputs (`DecodeEnv` — the composite
+/// background and the icm snapshot; upstream stashes a render viewport
+/// too for its mip pre-generation, viv.c:1557-1558, which died with the
+/// #81 mip retirement + the decode-time composite).
 struct Job {
     source: LoadSource,
     env: DecodeEnv,

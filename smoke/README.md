@@ -5,6 +5,34 @@
 入库)。回归矩阵的其余脚本目前仍散落在 `%TEMP%\riviv-test\`(未纳入版本控
 制),待 #80「后台进程显示闸」重访时再评估批量入库。
 
+## smoke81-filters.ps1(#81 滤波映射全表 + mip 退役 + 默认 auto)
+
+驱动 #81 的三面:D2D shrink Linear 档 HIGH_QUALITY_CUBIC、GDI 臂 face 直绘
+(mip 链退役后的巨图 relief 路径)、`renderer` 默认翻 auto。运行:
+
+```powershell
+powershell -NoProfile -File smoke\smoke81-filters.ps1 [-Exe <path>] [-Regolden]
+```
+
+场景(67 检查;golden 冻结于 `smoke/golden81/`,GDI 臂生成,票面原文):
+
+- **S1** 默认翻:missing key→`renderer=auto backend=`;frobnicate→
+  `unrecognized`+`using auto`;`renderer=gdi` 逃生键。
+- **S2(L1)** 整数放大 2×/3×/4×:`fill_window=1`+子窗精确 k× 校准
+  (SetWindowPos 循环);warp/gdi dump 文件字节+解码像素双等,且与
+  `src[x/k,y/k]` 复制模型逐像素等;magenta 边距场景边界 ±0px;四 golden
+  字节比对(`-Regolden` 重冻结,**失败场次拒写**——预审 3 P3-2)。
+- **S3(L2)**:mag=1 LINEAR 平滑区 MAE≤2;shrink=1 CUBIC vs HALFTONE 真实
+  差异记录;shrink=0 整数比 2× warp(NEAREST)/gdi(COLORONCOLOR)**字节相等**。
+- **S4 巨图**:banner 40000×256 双臂内容断言(warp 上传无 gate);极端
+  16777217×1 gdi+warp(warp 侧断 gate 行+GDI 通道内容);边界 census
+  4,000,000/2^22/2^23×1(2^22 起走 relief 两级路径,接缝扫描)。
+- **S5** exit-2:dump 到不存在目录→exit 2+stderr。
+- **S6** 帧时间基线(记录档,数字存档见 issue #81)。
+
+S4 的 WriteWidePngGrad 手写 PNG 配方沿 smoke80 的 WriteWidePng(>65535 宽
+GDI+ 拒建),渐变列用于内容断言。
+
 ## smoke80-d2d.ps1 (#80 D2D renderer + -dump-viewport)
 
 Drives the #80 renderer stack (`renderer = auto|d2d|warp|gdi`) and the
@@ -40,8 +68,8 @@ powershell -ExecutionPolicy Bypass -File smoke\smoke80-d2d.ps1 -Exe <other build
 | Scenario | Assertion | Notes |
 | --- | --- | --- |
 | S1a (gdi/d2d/warp/auto) | stderr breadcrumb `riviv: renderer=<req> backend=<eff>` per ini value | d2d/auto expect `d2d/hw` where hardware D3D11 exists; `warp` expects `d2d/warp` |
-| S1b | `renderer=frobnicate` -> `renderer=gdi backend=gdi` + `unrecognized renderer value` hint | invalid string value falls back to gdi |
-| S1c | missing key -> `renderer=gdi backend=gdi` | the default |
+| S1b | `renderer=frobnicate` -> `renderer=auto backend=` + `unrecognized renderer value` + `using auto` hints | invalid string value falls back to the default (auto since #81; gdi pre-#81) |
+| S1c | missing key -> `renderer=auto backend=` | the default (auto since #81; gdi pre-#81) |
 | S2 | warp dump channel: adopted image + WM_CLOSE -> PNG on disk, exit 0, dims == view client rect | |
 | S3a-S3f | L0: the same 1:1 scene dumped through warp AND gdi | file bytes equal; non-white bbox == source rect at source size; every bbox pixel RGBA == source; both arms pixel-exact |
 | S4a-S4c | resize chain: after SetWindowPos the dump dims follow the NEW viewport while the 1:1 bbox stays the source size | swapchain ResizeBuffers + target rebuild |

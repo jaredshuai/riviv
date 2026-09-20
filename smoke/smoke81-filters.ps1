@@ -45,11 +45,11 @@
 #      sane. 16777217x1 gradient giant via the hand-written PNG writer:
 #      renderer=gdi content (1px strip, gradient survived) plus one warp
 #      run asserting the gate line + the same content. Boundary census on
-#      the #81 stitch trigger (source extent 2^22): 4000000x1 (below ->
+#      the #81 relief trigger (source extent 2^22): 4000000x1 (below ->
 #      single full-rect path must still render), 4194304x1 (= 2^22, the
-#      first sliced width) and 8388608x1 (= 2^23, the previously-black
+#      first relief width) and 8388608x1 (= 2^23, the previously-black
 #      width), renderer=gdi, each with the extreme-giant content
-#      assertions; the two sliced widths also get a seam scan over the
+#      assertions; the two relief widths also get a seam scan over the
 #      strip's row: max adjacent-column |delta mean| <= 3*median + 2.
 #   S5 dump failure: -dump-viewport into a missing directory -> exit 2,
 #      stderr says so, no modal hang.
@@ -782,11 +782,19 @@ if ($padOk) {
     }
 }
 if ($Regolden) {
-    foreach ($key in @('k2', 'k3', 'k4', 'pad')) {
-        $src = $dumps[$key]
-        if (($src -ne $null) -and (Test-Path $src)) { Copy-Item $src (Join-Path $GoldenDir ('s2-' + $key + '-gdi.png')) -Force }
+    # Review pre-3 P3-2: never bless a run that failed - a regressed build
+    # must not overwrite the frozen goldens (the same run's independent
+    # anchors - warp==gdi bytes and the src[x/k,y/k] replication model -
+    # narrow but do not close that hole).
+    if ($script:fail -gt 0) {
+        Write-Output ('GOLDENS: regolden REFUSED - run has ' + $script:fail + ' failing check(s); fix before freezing new goldens')
+    } else {
+        foreach ($key in @('k2', 'k3', 'k4', 'pad')) {
+            $src = $dumps[$key]
+            if (($src -ne $null) -and (Test-Path $src)) { Copy-Item $src (Join-Path $GoldenDir ('s2-' + $key + '-gdi.png')) -Force }
+        }
+        Write-Output 'GOLDENS: (re)written from this run (-Regolden)'
     }
-    Write-Output 'GOLDENS: (re)written from this run (-Regolden)'
 }
 Kill-Riviv
 Reset-Ini ''
@@ -1010,14 +1018,15 @@ Kill-Riviv
 Reset-Ini ''
 
 # ---------------------------------------------------------------------------
-# S4 boundary census: the #81 stitch trigger at 2^22. The gdi shrink arm
-# cuts a source extent >= STRETCH_SOURCE_STITCH_TRIGGER (2^22) into 2^21
-# source slices (stitch::stitch_tiles_sized), keeping the 32768..2^22 band
-# on the single full-rect StretchBlt. Three widths at height 1 straddle the
+# S4 boundary census: the #81 giant-relief trigger at 2^22. The gdi shrink
+# arm draws a source extent >= STRETCH_SOURCE_STITCH_TRIGGER (2^22) through
+# the transient relief intermediate (512px HALFTONE slices build a ~2^21
+# DIB, one full-rect blit from it), keeping the 32768..2^22 band on the
+# single full-rect StretchBlt. Three widths at height 1 straddle the
 # boundary; each runs renderer=gdi fit-dump with the same content
 # assertions as the 16777217x1 extreme giant above (strip spans the
 # viewport width, left/right quarter mean luminance differ >= 40, no run
-# of >= 8 consecutive all-black/all-white columns) and the two sliced
+# of >= 8 consecutive all-black/all-white columns) and the two relief
 # widths add a seam scan: over the strip's row, max adjacent-column
 # |delta mean| <= 3*median + 2 (numbers recorded in the detail).
 # ---------------------------------------------------------------------------
@@ -1069,12 +1078,12 @@ function Giant-Checks($q, $viewW) {
 }
 $giantCensus = @(
     @{ N = 'm'; W = 4000000; Png = $giant4mPng; Seam = $false },  # below the 2^22 trigger: single full-rect path must still render
-    @{ N = 'n'; W = 4194304; Png = $giant4nPng; Seam = $true },   # exactly 2^22: the first sliced width
+    @{ N = 'n'; W = 4194304; Png = $giant4nPng; Seam = $true },   # exactly 2^22: the first relief width
     @{ N = 'p'; W = 8388608; Png = $giant4pPng; Seam = $true }    # 2^23: the width that rendered black before the stitch fix
 )
 foreach ($cw in $giantCensus) {
     $tag = 'S4' + $cw.N
-    if ($cw.Seam) { $pathTxt = 'sliced(2^21)' } else { $pathTxt = 'single-full-rect' }
+    if ($cw.Seam) { $pathTxt = 'relief(two-stage)' } else { $pathTxt = 'single-full-rect' }
     $crr = Run-Scene 'gdi' 0 $giantExtra $cw.Png ('s4-census-' + $cw.N + '-gdi.png') ('s4-census-' + $cw.N + '-gdi.err') $null $null $null 90000
     $crOk = ($crr.Code -eq 0) -and (Test-Path $crr.Out)
     Check ($tag + '-census-' + $cw.W + '-gdi ran clean (exit 0, dump exists, no gate on the gdi arm)') ($crOk -and (-not $crr.Err.Contains('exceeds the D2D max bitmap'))) ("exit=$($crr.Code) stderr=[$($crr.Err.Trim())]")
@@ -1086,7 +1095,7 @@ foreach ($cw in $giantCensus) {
         Check ($tag + '-census-' + $cw.W + '-gdi gradient survived (quarter means differ >= 40, no extreme run >= 8)') (($ck.Diff -ge 40) -and ($ck.MaxRun -lt 8)) ('leftMean={0:N1} rightMean={1:N1} diff={2:N1} maxExtremeRun={3}' -f $ck.Lq, $ck.Rq, $ck.Diff, $ck.MaxRun)
         if ($cw.Seam) {
             $seamBound = 3 * $ck.MedianDelta + 2
-            Check ($tag + '-census-' + $cw.W + '-gdi sliced-path seam scan (max |dmean| <= 3*median + 2)') ($ck.MaxDelta -le $seamBound) ('medianDelta={0:N4} maxDelta={1:N4} bound={2:N4}' -f $ck.MedianDelta, $ck.MaxDelta, $seamBound)
+            Check ($tag + '-census-' + $cw.W + '-gdi relief-path seam scan (max |dmean| <= 3*median + 2)') ($ck.MaxDelta -le $seamBound) ('medianDelta={0:N4} maxDelta={1:N4} bound={2:N4}' -f $ck.MedianDelta, $ck.MaxDelta, $seamBound)
         }
     }
     Write-Output ('  ' + $tag + ' census evidence: width=' + $cw.W + ' path=' + $pathTxt + ' strip=' + $ck.Bw + 'x' + $ck.Bh + ' leftMean=' + ('{0:N2}' -f $ck.Lq) + ' rightMean=' + ('{0:N2}' -f $ck.Rq) + ' maxExtremeRun=' + $ck.MaxRun + ' medianDelta=' + ('{0:N4}' -f $ck.MedianDelta) + ' maxDelta=' + ('{0:N4}' -f $ck.MaxDelta))

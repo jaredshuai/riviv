@@ -187,147 +187,145 @@ pub(crate) fn render_scene(hdc: HDC, owner: HWND, client: RECT, paint_clip: RECT
                         } else {
                             let _ = SetStretchBltMode(hdc, COLORONCOLOR);
                         }
-                        if mw >= STRETCH_SOURCE_STITCH_TRIGGER
-                            || mh >= STRETCH_SOURCE_STITCH_TRIGGER
-                        {
-                            // Extreme-source regime (#81's fix for the
-                            // giant-panorama black image): a face at/past
-                            // 2^22 on either axis cannot be stretched
-                            // directly (single full-rect calls AND wide
-                            // slice calls silently fail past 2^23-wide
-                            // faces — the #81 smoke census; only 512-px
-                            // slices read such faces, upstream's own
-                            // generation tiling). Primary path: a transient
-                            // relief intermediate built from the face in
-                            // 512-px HALFTONE slices, then ONE full-rect
-                            // blit from it (all its extents sit in the
-                            // proven-good band). The stretch mode set
-                            // above applies to that final blit.
-                            match crate::surface::build_giant_relief(src_dc, mw, mh) {
-                                Some(relief) => {
-                                    // Fail-soft like the branches below.
-                                    let _ = StretchBlt(
-                                        hdc,
-                                        dx,
-                                        dy,
-                                        rw,
-                                        rh,
-                                        Some(relief.memdc),
-                                        0,
-                                        0,
-                                        relief.wide,
-                                        relief.high,
-                                        SRCCOPY,
-                                    );
-                                }
-                                None => {
-                                    // Relief allocation failed — degrade to
-                                    // 2^21 sliced blits from the face
-                                    // itself: correct through the trigger
-                                    // band (proven to 6.29M-wide faces),
-                                    // best-effort beyond (per-slice phase,
-                                    // and past-2^23 faces lose the wide
-                                    // slices to the same API failure — a
-                                    // sick-GDI degrade, never a fatal).
-                                    let whole = crate::zoom::BlitRect {
-                                        dx,
-                                        dy,
-                                        dw: rw,
-                                        dh: rh,
-                                        sx: 0,
-                                        sy: 0,
-                                        sw: mw,
-                                        sh: mh,
-                                    };
-                                    for tile in crate::stitch::stitch_tiles_sized(
-                                        STRETCH_SOURCE_SLICE,
-                                        whole,
-                                        (client.left, client.top, cw, ch),
-                                    ) {
-                                        let _ = StretchBlt(
-                                            hdc,
-                                            tile.dx,
-                                            tile.dy,
-                                            tile.dw,
-                                            tile.dh,
-                                            Some(src_dc),
-                                            tile.sx,
-                                            tile.sy,
-                                            tile.sw,
-                                            tile.sh,
-                                            SRCCOPY,
-                                        );
-                                    }
-                                }
-                            }
-                        } else if mw >= STRETCH_EXTENT_LIMIT
-                            || mh >= STRETCH_EXTENT_LIMIT
-                            || rw >= STRETCH_EXTENT_LIMIT
-                            || rh >= STRETCH_EXTENT_LIMIT
-                        {
-                            // Giant extents (a mid-zoom shrink whose source
-                            // is ≥32768 but inside the single-blit band —
-                            // upstream's own no-mip shape, the tall-narrow
-                            // quirk cases): one full-rect StretchBlt behind
-                            // a simple clip region — upstream's halftone
-                            // pattern (viv.c:4264-4283). The rect must NOT
-                            // be cut (filter alignment), and GDI walks a
-                            // complex clip region slowly, so the DC gets a
-                            // single-rect region instead: the update paint
-                            // rect intersected with the viewport.
-                            let l = paint_clip.left.max(client.left);
-                            let t = paint_clip.top.max(client.top);
-                            let r = paint_clip.right.min(client.right);
-                            let b = paint_clip.bottom.min(client.bottom);
-                            if r > l && b > t {
-                                let clip_rgn = CreateRectRgn(l, t, r, b);
-                                if !clip_rgn.is_invalid() {
-                                    // Upstream blits only when the clip took
-                                    // (SelectClipRgn != ERROR, viv.c:4271) and
-                                    // always restores the region afterwards
-                                    // (viv.c:4361) — the reset below runs on
-                                    // every path out of this block so the
-                                    // letterbox fill is never clipped away.
-                                    if SelectClipRgn(hdc, Some(clip_rgn)).0 != ERROR {
+                        match shrink_regime(mw, mh, rw, rh) {
+                            ShrinkRegime::Relief => {
+                                // Extreme-source regime (#81's fix for the
+                                // giant-panorama black image): a face at/past
+                                // 2^22 on either axis cannot be stretched
+                                // directly (single full-rect calls AND wide
+                                // slice calls silently fail past 2^23-wide
+                                // faces — the #81 smoke census; only 512-px
+                                // slices read such faces, upstream's own
+                                // generation tiling). Primary path: a transient
+                                // relief intermediate built from the face in
+                                // 512-px HALFTONE slices, then ONE full-rect
+                                // blit from it (all its extents sit in the
+                                // proven-good band). The stretch mode set
+                                // above applies to that final blit.
+                                match crate::surface::build_giant_relief(src_dc, mw, mh) {
+                                    Some(relief) => {
+                                        // Fail-soft like the branches below.
                                         let _ = StretchBlt(
                                             hdc,
                                             dx,
                                             dy,
                                             rw,
                                             rh,
-                                            Some(src_dc),
+                                            Some(relief.memdc),
                                             0,
                                             0,
-                                            mw,
-                                            mh,
+                                            relief.wide,
+                                            relief.high,
                                             SRCCOPY,
                                         );
                                     }
-                                    SelectClipRgn(hdc, None);
-                                    let _ = DeleteObject(HGDIOBJ(clip_rgn.0));
+                                    None => {
+                                        // Relief allocation failed — degrade to
+                                        // 2^21 sliced blits from the face
+                                        // itself: correct through the trigger
+                                        // band (proven to 6.29M-wide faces),
+                                        // best-effort beyond (per-slice phase,
+                                        // and past-2^23 faces lose the wide
+                                        // slices to the same API failure — a
+                                        // sick-GDI degrade, never a fatal).
+                                        let whole = crate::zoom::BlitRect {
+                                            dx,
+                                            dy,
+                                            dw: rw,
+                                            dh: rh,
+                                            sx: 0,
+                                            sy: 0,
+                                            sw: mw,
+                                            sh: mh,
+                                        };
+                                        for tile in crate::stitch::stitch_tiles_sized(
+                                            STRETCH_SOURCE_SLICE,
+                                            whole,
+                                            (client.left, client.top, cw, ch),
+                                        ) {
+                                            let _ = StretchBlt(
+                                                hdc,
+                                                tile.dx,
+                                                tile.dy,
+                                                tile.dw,
+                                                tile.dh,
+                                                Some(src_dc),
+                                                tile.sx,
+                                                tile.sy,
+                                                tile.sw,
+                                                tile.sh,
+                                                SRCCOPY,
+                                            );
+                                        }
+                                    }
                                 }
                             }
-                        } else {
-                            // Fail-soft by design: upstream viv.c:4278 also
-                            // continues past a failed StretchBlt (debug_printf
-                            // only) — one bad frame must not kill the window.
-                            // The full rect is stretched on purpose: GDI
-                            // honors the DC clip for shrinks (viv.c:4056-4062),
-                            // and cutting the rect would realign the HALFTONE
-                            // filter taps.
-                            let _ = StretchBlt(
-                                hdc,
-                                dx,
-                                dy,
-                                rw,
-                                rh,
-                                Some(src_dc),
-                                0,
-                                0,
-                                mw,
-                                mh,
-                                SRCCOPY,
-                            );
+                            ShrinkRegime::GiantClip => {
+                                // Giant extents (a mid-zoom shrink whose source
+                                // is ≥32768 but inside the single-blit band —
+                                // upstream's own no-mip shape, the tall-narrow
+                                // quirk cases): one full-rect StretchBlt behind
+                                // a simple clip region — upstream's halftone
+                                // pattern (viv.c:4264-4283). The rect must NOT
+                                // be cut (filter alignment), and GDI walks a
+                                // complex clip region slowly, so the DC gets a
+                                // single-rect region instead: the update paint
+                                // rect intersected with the viewport.
+                                let l = paint_clip.left.max(client.left);
+                                let t = paint_clip.top.max(client.top);
+                                let r = paint_clip.right.min(client.right);
+                                let b = paint_clip.bottom.min(client.bottom);
+                                if r > l && b > t {
+                                    let clip_rgn = CreateRectRgn(l, t, r, b);
+                                    if !clip_rgn.is_invalid() {
+                                        // Upstream blits only when the clip took
+                                        // (SelectClipRgn != ERROR, viv.c:4271) and
+                                        // always restores the region afterwards
+                                        // (viv.c:4361) — the reset below runs on
+                                        // every path out of this block so the
+                                        // letterbox fill is never clipped away.
+                                        if SelectClipRgn(hdc, Some(clip_rgn)).0 != ERROR {
+                                            let _ = StretchBlt(
+                                                hdc,
+                                                dx,
+                                                dy,
+                                                rw,
+                                                rh,
+                                                Some(src_dc),
+                                                0,
+                                                0,
+                                                mw,
+                                                mh,
+                                                SRCCOPY,
+                                            );
+                                        }
+                                        SelectClipRgn(hdc, None);
+                                        let _ = DeleteObject(HGDIOBJ(clip_rgn.0));
+                                    }
+                                }
+                            }
+                            ShrinkRegime::Plain => {
+                                // Fail-soft by design: upstream viv.c:4278 also
+                                // continues past a failed StretchBlt (debug_printf
+                                // only) — one bad frame must not kill the window.
+                                // The full rect is stretched on purpose: GDI
+                                // honors the DC clip for shrinks (viv.c:4056-4062),
+                                // and cutting the rect would realign the HALFTONE
+                                // filter taps.
+                                let _ = StretchBlt(
+                                    hdc,
+                                    dx,
+                                    dy,
+                                    rw,
+                                    rh,
+                                    Some(src_dc),
+                                    0,
+                                    0,
+                                    mw,
+                                    mh,
+                                    SRCCOPY,
+                                );
+                            }
                         }
                     } else {
                         // Magnify path (viv.c:4215-4227): COLORONCOLOR by
@@ -440,6 +438,40 @@ pub(crate) fn scene_rect(
     let dx = crate::panscan::center_term(cw, panscan.pos_x) - rw / 2 - view.view_x;
     let dy = crate::panscan::center_term(ch, panscan.pos_y) - rh / 2 - view.view_y;
     (dx, dy, rw, rh)
+}
+
+/// Which of the three shrink-arm regimes a blit takes (the #81 census
+/// map — pure so the regime boundaries stay under the test net; the
+/// smoke census pins them end-to-end). Selection is by SOURCE extent
+/// first: a face at/past [`STRETCH_SOURCE_STITCH_TRIGGER`] cannot be
+/// stretched directly at all, so it takes the relief regardless of dest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShrinkRegime {
+    /// One plain full-rect StretchBlt (all extents under 32768).
+    Plain,
+    /// Source ≥32768 but inside the single-blit band (or a giant DEST
+    /// extent): one full-rect StretchBlt behind the update-rect clip
+    /// region — upstream's own no-mip shape (viv.c:4264-4283).
+    GiantClip,
+    /// Source extent ≥ [`STRETCH_SOURCE_STITCH_TRIGGER`]: the transient
+    /// relief intermediate (512-px HALFTONE slices build a ~2^21 DIB, the
+    /// scene's one blit runs from it; sliced blits only as the
+    /// allocation-failure degrade).
+    Relief,
+}
+
+pub(crate) fn shrink_regime(mw: i32, mh: i32, rw: i32, rh: i32) -> ShrinkRegime {
+    if mw >= STRETCH_SOURCE_STITCH_TRIGGER || mh >= STRETCH_SOURCE_STITCH_TRIGGER {
+        ShrinkRegime::Relief
+    } else if mw >= STRETCH_EXTENT_LIMIT
+        || mh >= STRETCH_EXTENT_LIMIT
+        || rw >= STRETCH_EXTENT_LIMIT
+        || rh >= STRETCH_EXTENT_LIMIT
+    {
+        ShrinkRegime::GiantClip
+    } else {
+        ShrinkRegime::Plain
+    }
 }
 
 /// The off-WM_PAINT GDI frame (#80): the giant-frame gate's degrade pass —
@@ -773,6 +805,51 @@ mod tests {
         assert_eq!(
             scene_rect(&view, FitPolicy::WITHOUT_FILL, 1000, 700, 300, 300),
             (850, 200, 300, 300)
+        );
+    }
+
+    // ---- shrink_regime (the #81 census map's boundaries) ----
+
+    use crate::stitch::{STRETCH_EXTENT_LIMIT, STRETCH_SOURCE_STITCH_TRIGGER};
+
+    #[test]
+    fn the_regime_boundaries_pin_to_the_census_points() {
+        // Plain everywhere under 32768 (both source and dest axes).
+        assert_eq!(
+            shrink_regime(32767, 32767, 32767, 32767),
+            ShrinkRegime::Plain
+        );
+        assert_eq!(shrink_regime(40000, 256, 1000, 6), ShrinkRegime::GiantClip);
+        // The trigger's exact edge: 2^22-1 stays in the clip band, 2^22
+        // flips to the relief — on EITHER axis, independently of dest.
+        assert_eq!(
+            shrink_regime(STRETCH_SOURCE_STITCH_TRIGGER - 1, 100, 500, 500),
+            ShrinkRegime::GiantClip,
+            "one under the trigger is still single-blit (a >=32768 source)"
+        );
+        assert_eq!(
+            shrink_regime(STRETCH_SOURCE_STITCH_TRIGGER, 100, 500, 500),
+            ShrinkRegime::Relief
+        );
+        assert_eq!(
+            shrink_regime(100, STRETCH_SOURCE_STITCH_TRIGGER, 500, 500),
+            ShrinkRegime::Relief,
+            "the height axis triggers the relief on a narrow tower"
+        );
+        // Relief outranks a giant dest too (source is checked first).
+        assert_eq!(
+            shrink_regime(
+                STRETCH_SOURCE_STITCH_TRIGGER * 2,
+                100,
+                STRETCH_EXTENT_LIMIT,
+                10
+            ),
+            ShrinkRegime::Relief
+        );
+        // A giant DEST extent with a small source takes the clip band.
+        assert_eq!(
+            shrink_regime(100, 100, STRETCH_EXTENT_LIMIT, 10),
+            ShrinkRegime::GiantClip
         );
     }
 }
