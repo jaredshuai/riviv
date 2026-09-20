@@ -391,19 +391,18 @@ pub(crate) struct WindowState {
     /// mode — design §7).
     pub(crate) gpu_kind: crate::config::RendererKind,
     /// Bumped at every display-pixel change (#80 design §5): the D2D
-    /// upload compares (gen, w, h) against the resident bitmap and
+    /// upload compares (gen, level, w, h) against the resident bitmap and
     /// re-uploads on mismatch. Pure bookkeeping on the GDI arm.
     pub(crate) frame_gen: u64,
-    /// The frame_gen the giant-frame gate fired at (#80 design §5): a
-    /// stack rebuild is due only when a NEW image has since bumped the
-    /// counter — same-image paints must not churn the device stack.
-    pub(crate) gpu_gate_gen: u64,
-    /// The last shape the giant-frame gate flashed for (sorted dims;
-    /// #80 pre-review 3-b): the status notice is one-shot per DISTINCT
-    /// oversized image, so the gen-bump churn pathology (a giant animation
-    /// rebuilding the stack every frame) cannot park the temp text
-    /// permanently over the status verdict chain.
-    pub(crate) gpu_gate_flashed: Option<(u32, u32)>,
+    /// The CPU mip levels behind the D2D arm's giant path (#82): the
+    /// overview/tile sources a frame too large to upload whole is cut
+    /// from. Empty until a giant asks for one; cleared with the frame.
+    pub(crate) levels: crate::mip::LevelCache,
+    /// `-tile <edge>` (#82, diagnostic): force the tiled draw with this
+    /// grid edge, bypassing the single-bitmap shortcut — the smoke's
+    /// "tiled vs untiled, same image, same transform" comparison channel.
+    /// Never persisted; `None` = the natural level/tile decision.
+    pub(crate) tile_edge: Option<i32>,
     /// One-way latch: the stack creation failed for environment reasons —
     /// no auto rebuild attempts (each would just fail again; design §7's
     /// initialization tier).
@@ -1097,9 +1096,11 @@ unsafe extern "system" fn view_proc(
 // ---------------------------------------------------------------------------
 
 /// The WM_PAINT router (view_proc's arm): the D2D stack alive →
-/// [`crate::gpu::paint_d2d`], otherwise the unchanged GDI arm
-/// ([`paint`]). The giant-frame gate tears the stack down here and
-/// re-renders the frame through GDI; device losses feed the ladder.
+/// [`crate::gpu::paint_d2d`], otherwise the GDI arm ([`paint`]). Device
+/// losses feed the ladder. Since #82 an oversized frame is no longer a
+/// reason to leave the stack: the D2D arm draws giants itself (an
+/// overview level, or tiles), so this router never tears the stack down
+/// for one.
 fn paint_view(view: HWND, owner: HWND) {
     gpu_rebuild_if_due(view, owner);
     // SAFETY: the read-only borrow ends inside is_some_and.
@@ -1109,9 +1110,6 @@ fn paint_view(view: HWND, owner: HWND) {
     } else {
         match crate::gpu::paint_d2d(view, owner) {
             crate::gpu::PaintOutcome::Painted => {}
-            crate::gpu::PaintOutcome::GiantFrame { wide, high, max } => {
-                gpu_giant_frame(view, owner, wide, high, max);
-            }
             crate::gpu::PaintOutcome::DeviceLost => gpu_runtime_failure(owner),
             crate::gpu::PaintOutcome::Unrecoverable { hr } => {
                 gpu_session_degrade(view, owner, hr);
@@ -1152,21 +1150,19 @@ fn gpu_session_degrade(view: HWND, owner: HWND, hr: i32) {
 }
 
 /// Rebuild the D2D stack when a stack-less paint is due to return to D2D
-/// (#80 design §5's giant-gate reversal): the gate tears the stack down
-/// for ONE oversized image; the next NEW image (frame_gen moved past
-/// `gpu_gate_gen`) rebuilds with the stored effective kind. Same-image
-/// paints never rebuild (no per-paint device churn), and an init failure
-/// latches `gpu_init_failed` so a broken environment never retries.
+/// (#80 design §5, widened by #82): the stack is gone only after a device
+/// loss that could not rebuild, a session degrade, or an env-init failure
+/// — every one of those either latches `gpu_init_failed` (so a broken
+/// environment never retries) or leaves the session wanting D2D, and a
+/// session that IS on GDI by config never asks. Since #82 there is no
+/// per-image gate involved: the giant path draws inside the stack, so
+/// this is a plain "the stack is missing and we want one" rebuild.
 fn gpu_rebuild_if_due(view: HWND, owner: HWND) {
     // SAFETY: the borrow spans the gate check and the (non-pumping) COM
     // creation; nothing here dispatches messages, so no second state_of
     // borrow can alias this one.
     if let Some(state) = unsafe { state_of(owner) } {
-        if state.gpu.is_some()
-            || state.gpu_init_failed
-            || !state.config.renderer.wants_d2d()
-            || state.gpu_gate_gen == state.frame_gen
-        {
+        if state.gpu.is_some() || state.gpu_init_failed || !state.config.renderer.wants_d2d() {
             return;
         }
         let kind = rebuild_kind(state.config.renderer, state.gpu_kind);
@@ -1204,39 +1200,6 @@ fn rebuild_kind(config_kind: RendererKind, gpu_kind: RendererKind) -> RendererKi
     } else {
         config_kind
     }
-}
-
-/// The giant-image gate's teardown (#80 design §5): the frame cannot be a
-/// D2D bitmap, so the stack dies and THIS frame renders through GDI (the
-/// flip interop ban forbids GDI on the swapchain's HWND, so a same-HWND
-/// hybrid is not an option). The status flash is one-shot per DISTINCT
-/// oversized image (sorted dims — a rotate of the same giant frame swaps
-/// them): the gen-bump churn pathology (a giant ANIMATION rebuilding the
-/// stack per frame, pre-review 3-b) would otherwise re-flash every cycle
-/// and the 3 s temp text would sit permanently over the status verdict
-/// chain. The stderr breadcrumb still fires on every teardown (the
-/// evidence channel has no masking problem); the next new image rebuilds
-/// via gpu_rebuild_if_due.
-fn gpu_giant_frame(view: HWND, owner: HWND, wide: u32, high: u32, max: u32) {
-    // Sorted so a rotated giant frame is still "the same image".
-    let shape = (wide.min(high), wide.max(high));
-    let mut flash = false;
-    // SAFETY: the borrow spans the teardown and the flag stores only —
-    // paint_degraded below re-borrows, so it runs after this block.
-    if let Some(state) = unsafe { state_of(owner) } {
-        state.gpu = None;
-        state.gpu_gate_gen = state.frame_gen;
-        flash = state.gpu_gate_flashed != Some(shape);
-        state.gpu_gate_flashed = Some(shape);
-    }
-    eprintln!("riviv: frame {wide}x{high} exceeds the D2D max bitmap {max}; rendering it via gdi");
-    if flash {
-        status_set_temp_text(
-            owner,
-            Some("frame too large for d2d — using gdi".to_string()),
-        );
-    }
-    crate::paint::paint_degraded(view, owner);
 }
 
 /// The runtime failure ladder (design §7): one EndDraw/Present/resize
@@ -1409,6 +1372,16 @@ fn on_close(hwnd: HWND) {
     if let Some(path) = dump {
         dump_viewport_now(hwnd, path.as_os_str());
     }
+    // The #82 budget evidence line: the byte ledger plus the last frame's
+    // level/tile count, printed only when the tile path (or a forced edge)
+    // actually ran — an ordinary session's stderr stays clean.
+    // SAFETY: the borrow spans the line's construction only.
+    if let Some(line) = (unsafe { state_of(hwnd) })
+        .and_then(|state| state.gpu.as_ref())
+        .and_then(|gpu| gpu.stats_line())
+    {
+        eprintln!("{line}");
+    }
     // SAFETY: no borrow is live; DestroyWindow synchronously runs
     // WM_DESTROY/WM_NCDESTROY on the owning thread.
     unsafe {
@@ -1417,9 +1390,9 @@ fn on_close(hwnd: HWND) {
 }
 
 /// The dump half of WM_CLOSE: render with whichever stack is live, write
-/// the PNG. The D2D arm's failure (device gone, giant frame) falls back
-/// to the GDI memory-DC channel — a memory DC never draws to the
-/// flip-owned HWND, so the fallback is legal in both arms.
+/// the PNG. The D2D arm's failure (device gone, a refused level build)
+/// falls back to the GDI memory-DC channel — a memory DC never draws to
+/// the flip-owned HWND, so the fallback is legal in both arms.
 fn dump_viewport_now(hwnd: HWND, path: &OsStr) {
     if path.is_empty() {
         eprintln!("riviv: -dump-viewport needs a path");
@@ -1454,7 +1427,8 @@ fn dump_viewport_now(hwnd: HWND, path: &OsStr) {
 /// never-shown window dumps identically, the readback is independent of
 /// the display pipeline) and read back through a CPU-readable bitmap.
 /// ONE state borrow across the call: field-disjoint borrows feed the
-/// stack the plan and the master bytes (gpu mutable, image shared).
+/// stack the plan and the CPU level source (gpu mutable, image shared,
+/// levels mutable).
 fn dump_via_gpu(hwnd: HWND, view: HWND) -> Result<(u32, u32, Vec<u8>), String> {
     let mut client = RECT::default();
     // SAFETY: read-only rect query on our own child.
@@ -1472,9 +1446,10 @@ fn dump_via_gpu(hwnd: HWND, view: HWND) -> Result<(u32, u32, Vec<u8>), String> {
         state.config.windowed_bg()
     };
     let frame_gen = state.frame_gen;
-    // The plan and the master bytes BEFORE the mutable gpu borrow
-    // (draw_plan/fit_policy read the whole state; the results are plain
-    // data plus a shared borrow of the image field — disjoint from gpu).
+    let tile_edge = state.tile_edge;
+    // The plan and the master BEFORE the mutable borrows (draw_plan/
+    // fit_policy read the whole state; the results are plain data plus a
+    // shared borrow of the image field).
     let prepared = state.image.as_ref().map(|image| {
         let master = image.surface().master();
         (
@@ -1488,21 +1463,52 @@ fn dump_via_gpu(hwnd: HWND, view: HWND) -> Result<(u32, u32, Vec<u8>), String> {
             frame_gen,
             master.width,
             master.height,
-            &master.pixels,
+            master,
         )
     });
+    // Field-disjoint from `gpu` (and from the image borrow inside
+    // `prepared`): the CPU level cache the stack uploads from.
+    let levels = &mut state.levels;
     let Some(gpu) = state.gpu.as_mut() else {
         return Err("no gpu stack".into());
     };
     match prepared {
-        Some((plan, frame_gen, wide, high, pixels)) => gpu.dump(
-            cw,
-            ch,
-            plan.bg,
-            Some((frame_gen, wide, high, pixels)),
-            Some(plan),
-        ),
-        None => gpu.dump(cw, ch, bg, None, None),
+        Some((plan, frame_gen, wide, high, master)) => {
+            let mut src = crate::gpu::MasterLevels {
+                master: Some(master),
+                cache: levels,
+                frame_gen,
+            };
+            gpu.dump(
+                crate::gpu::DumpRequest {
+                    cw,
+                    ch,
+                    bg: plan.bg,
+                    frame: Some((frame_gen, wide, high)),
+                    plan: Some(plan),
+                },
+                crate::gpu::Diagnostics { tile_edge },
+                &mut src,
+            )
+        }
+        None => {
+            let mut src = crate::gpu::MasterLevels {
+                master: None,
+                cache: levels,
+                frame_gen,
+            };
+            gpu.dump(
+                crate::gpu::DumpRequest {
+                    cw,
+                    ch,
+                    bg,
+                    frame: None,
+                    plan: None,
+                },
+                crate::gpu::Diagnostics { tile_edge },
+                &mut src,
+            )
+        }
     }
 }
 
@@ -4524,6 +4530,14 @@ fn process_parsed_cl(hwnd: HWND, parsed: &cli::Parsed) {
         if let Some(state) = unsafe { state_of(hwnd) } {
             state.dump_pending = Some(OsString::from_wide(word));
         }
+    }
+    // #82: `-tile <edge>` arms the forced tile grid — for a session that
+    // already built its stack (a single-instance handoff), the value takes
+    // effect on the next rebuild; the startup path sets it before create().
+    // 0/absent clears it.
+    // SAFETY: the borrow spans one field store.
+    if let Some(state) = unsafe { state_of(hwnd) } {
+        state.tile_edge = parsed.tile_edge.filter(|edge| *edge > 0);
     }
     if parsed.start_slideshow {
         slideshow_start(hwnd);
@@ -8222,8 +8236,8 @@ pub(crate) fn run() -> Result<(), String> {
         gpu: None,
         gpu_kind: crate::config::RendererKind::Gdi,
         frame_gen: 0,
-        gpu_gate_gen: 0,
-        gpu_gate_flashed: None,
+        levels: crate::mip::LevelCache::new(crate::mip::LEVEL_CACHE_BYTES),
+        tile_edge: None,
         gpu_failures: Vec::new(),
         gpu_init_failed: false,
         gpu_pending_fatal: false,
@@ -8442,10 +8456,8 @@ pub(crate) fn run() -> Result<(), String> {
         state.viewport = view_hwnd;
     }
 
-    // The D2D stack (#80 design §3): built after the viewport child exists
-    // (the swapchain hangs on it) and before the window shows. Any failure
-    // is environmental (ADR 0002 D5): degrade to GDI with a one-shot flash
-    // and a stderr breadcrumb, never fatal.
+    // The startup renderer request (#80 design §3's stack): read before
+    // the show, so the first paint already has a stack.
     // SAFETY: the read-only borrow ends inside the map.
     let (request, view_target) = (unsafe { state_of(hwnd) })
         .map(|state| (state.config.renderer, state.viewport))

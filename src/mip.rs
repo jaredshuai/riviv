@@ -2,14 +2,16 @@
 //! size math, viv.c:14146-14300).
 //!
 //! Since #81 (ADR 0002 D7 — mip retirement for regular sizes) the runtime
-//! NEVER calls these functions: the GDI arm draws shrinks from the single
-//! full-resolution face and the D2D arm samples the full master. The
-//! quirk parity below is deliberately DROPPED, not kept: level selection
-//! is no longer an observable behavior, so replicating the quirk would be
-//! deliberately worse output (recorded in README Differences). The
-//! functions and their counterexample tests stay as the math regression
-//! net for #82's giant-image tiering, which the #82 ticket explicitly
-//! reuses.
+//! NEVER calls [`select_mip_level`]: the GDI arm draws shrinks from the
+//! single full-resolution face and the D2D arm samples the full master.
+//! The quirk parity below is deliberately DROPPED, not kept: level
+//! selection is no longer an observable behavior, so replicating the quirk
+//! would be deliberately worse output (recorded in README Differences).
+//! The function and its counterexample tests stay as the historical
+//! record; #82's giant tiering uses [`mip_size`] (via
+//! `tile::detail_level`) and [`downscale_box`], NOT this quirk-parity
+//! loop — a giant must descend to the deepest level that still covers the
+//! render, which is a different rule (see `tile::detail_level`).
 //!
 //! Levels are numbered from 0 = the original frame; level k has size
 //! `((w+1) >> k, (h+1) >> k)` computed from the ORIGINAL dimensions each
@@ -35,7 +37,7 @@
 /// Size of mipmap `level` for an `image_wide x image_high` frame. Level 0
 /// is the frame itself. Each dimension rounds `(dim+1)/2^k` down and clamps
 /// at 1 (viv.c:14158-14169/14264-14275).
-#[allow(dead_code)] // runtime callers died with #81; #82's tiering reuses this
+#[allow(dead_code)] // the historical record + counterexample net (see the module doc)
 pub(crate) fn mip_size(image_w: i32, image_h: i32, level: u32) -> (i32, i32) {
     if level == 0 {
         return (image_w.max(1), image_h.max(1));
@@ -43,6 +45,146 @@ pub(crate) fn mip_size(image_w: i32, image_h: i32, level: u32) -> (i32, i32) {
     let w = ((image_w + 1) >> level.min(31)).max(1);
     let h = ((image_h + 1) >> level.min(31)).max(1);
     (w, h)
+}
+
+/// Box-downsample a top-down, tightly packed BGRA buffer to `level`
+/// ([`mip_size`]'s dimensions) — the CPU side of the #82 overview: a
+/// giant's frame that cannot be a single device bitmap still needs *some*
+/// uploadable source for its shrunken form, and that source is a
+/// prefiltered box average of the master.
+///
+/// One pass from the ORIGINAL dimensions (never by halving a previous
+/// level — the `(w+1)>>k` from-original rule [`mip_size`] implements), so
+/// a deep level costs one source read, not k.
+///
+/// Block edges are integer `floor(x*dim/level_dim)` boundaries, which
+/// partition the source exactly: every source pixel lands in exactly one
+/// block (the tiles-cover-everything property the seam standard leans on),
+/// with fractional-boundary area weighting deliberately not attempted —
+/// upstream's own generation was a GDI HALFTONE StretchBlt, i.e. also a
+/// resampler's approximation, and the #82 contract for the overview is
+/// "uniform, prefiltered, no aliasing stripes", not "area-exact".
+///
+/// The master is opaque by construction (`composite_over_background_*`
+/// forces alpha 255), so a straight 4-byte average is the correct
+/// non-premultiplied filter — no channel needs special treatment, and the
+/// alpha byte averages back to 255 on its own.
+#[allow(dead_code)] // reached through LevelCache::get_or_build
+pub(crate) fn downscale_box(src: &[u8], image_w: i32, image_h: i32, level: u32) -> Vec<u8> {
+    let (dest_w, dest_h) = mip_size(image_w, image_h, level);
+    debug_assert_eq!(src.len(), image_w as usize * image_h as usize * 4);
+    let (sw, sh) = (image_w.max(1) as usize, image_h.max(1) as usize);
+    let mut out = vec![0u8; dest_w as usize * dest_h as usize * 4];
+    for dy in 0..dest_h as usize {
+        let y0 = dy * sh / dest_h as usize;
+        let y1 = ((dy + 1) * sh / dest_h as usize).max(y0 + 1).min(sh);
+        for dx in 0..dest_w as usize {
+            let x0 = dx * sw / dest_w as usize;
+            let x1 = ((dx + 1) * sw / dest_w as usize).max(x0 + 1).min(sw);
+            let mut sum = [0u32; 4];
+            let mut count = 0u32;
+            for y in y0..y1 {
+                let row = y * sw * 4;
+                for x in x0..x1 {
+                    let px = row + x * 4;
+                    for (c, s) in sum.iter_mut().zip(&src[px..px + 4]) {
+                        *c += u32::from(*s);
+                    }
+                    count += 1;
+                }
+            }
+            let out_px = (dy * dest_w as usize + dx) * 4;
+            for (c, s) in out[out_px..out_px + 4].iter_mut().zip(sum) {
+                *c = (s / count) as u8;
+            }
+        }
+    }
+    out
+}
+
+/// The CPU cap for cached mip levels (#82): a giant's overview levels are
+/// bounded by ~4× the render dimensions each, so a handful of zoom steps'
+/// worth costs tens of MB — far under this, and small next to the 512 MB
+/// frame budget the master itself lives in.
+pub(crate) const LEVEL_CACHE_BYTES: u64 = 128 << 20;
+
+/// The CPU cache behind [`crate::gpu::LevelSource`]'s deeper levels (#82):
+/// a giant's overview level is a full source pass, so it is built once per
+/// (frame, level) and kept until the LRU's byte cap pushes it out. The
+/// master itself is never copied — level 0 is served straight from the
+/// frame (the caller's `LevelSource` handles that).
+#[derive(Debug)]
+pub(crate) struct LevelCache {
+    /// The frame generation the entries belong to; a new generation clears
+    /// them (the build reads that frame's pixels).
+    frame_gen: u64,
+    /// Up to a handful of levels, coldest evicted first — the same pure
+    /// LRU policy the tile cache uses.
+    lru: crate::tile::Lru<u32>,
+    entries: Vec<(u32, Vec<u8>)>,
+    /// Levels built since the last clear (the ledger's `mip_builds`).
+    pub(crate) builds: u64,
+}
+
+impl LevelCache {
+    pub(crate) fn new(cap: u64) -> Self {
+        Self {
+            frame_gen: u64::MAX,
+            lru: crate::tile::Lru::new(cap),
+            entries: Vec::new(),
+            builds: 0,
+        }
+    }
+
+    /// Drop every level (a new frame generation, or a caller that wants
+    /// the CPU bytes back).
+    pub(crate) fn clear(&mut self) {
+        self.lru.clear();
+        self.entries.clear();
+    }
+
+    /// The CPU bytes held (the ledger's `cpu_source` half).
+    pub(crate) fn bytes(&self) -> u64 {
+        self.lru.total_bytes()
+    }
+
+    /// `level` of `image_w x image_h`, built from `src` on first use.
+    /// `None` when the level's bytes exceed the whole cap (the caller then
+    /// degrades — refusing is the honest answer; the ladder's coarser
+    /// levels are the intended response and they are 4× smaller each
+    /// step).
+    pub(crate) fn get_or_build(
+        &mut self,
+        level: u32,
+        image_w: u32,
+        image_h: u32,
+        frame_gen: u64,
+        src: &[u8],
+    ) -> Option<(u32, u32, &[u8])> {
+        if self.frame_gen != frame_gen {
+            self.clear();
+            self.frame_gen = frame_gen;
+            self.builds = 0;
+        }
+        let (wide, high) = mip_size(image_w as i32, image_h as i32, level);
+        if let Some(idx) = self.entries.iter().position(|(l, _)| *l == level) {
+            self.lru.touch(&level);
+            let (_, data) = &self.entries[idx];
+            return Some((wide as u32, high as u32, data));
+        }
+        let bytes = wide as u64 * high as u64 * 4;
+        if bytes > self.lru.cap() {
+            return None;
+        }
+        let data = downscale_box(src, image_w as i32, image_h as i32, level);
+        for evicted in self.lru.insert(level, bytes) {
+            self.entries.retain(|(l, _)| *l != evicted);
+        }
+        self.entries.push((level, data));
+        self.builds += 1;
+        let (_, data) = self.entries.last()?;
+        Some((wide as u32, high as u32, data))
+    }
 }
 
 /// The deepest mipmap level worth rendering `render_wide x render_high`
@@ -54,7 +196,7 @@ pub(crate) fn mip_size(image_w: i32, image_h: i32, level: u32) -> (i32, i32) {
 /// would no longer fit the render; generation fills levels 1..=level on
 /// demand (the chain caches them for the frame's lifetime, freed on frame
 /// replacement like upstream's `_viv_mipmap_free`, viv.c:1252-1258).
-#[allow(dead_code)] // runtime callers died with #81; #82's tiering reuses this
+#[allow(dead_code)] // the historical record + counterexample net (see the module doc)
 pub(crate) fn select_mip_level(image_w: i32, image_h: i32, render_w: i32, render_h: i32) -> u32 {
     // Level 1's size and the early returns, viv.c:14158-14190.
     let (mip_w, mip_h) = mip_size(image_w, image_h, 1);
@@ -198,5 +340,110 @@ mod tests {
         let fit_render_w = vw; // 40000x256 fit into 2000x1200 → 2000x12
         let fine = select_mip_level(40000, 256, fit_render_w, 12);
         assert!(coarse >= fine);
+    }
+
+    // ---- downscale_box (#82's overview source) ----
+
+    /// One opaque pixel of `v` at (x, y) on a black, opaque `w x h` BGRA
+    /// canvas — the probe shape the block-partition assertions read back.
+    fn canvas(w: usize, h: usize, spot: Option<(usize, usize, u8)>) -> Vec<u8> {
+        let mut v = vec![0u8; w * h * 4];
+        for px in v.chunks_mut(4) {
+            px[3] = 255;
+        }
+        if let Some((x, y, val)) = spot {
+            let i = (y * w + x) * 4;
+            v[i] = val;
+            v[i + 1] = val;
+            v[i + 2] = val;
+        }
+        v
+    }
+
+    #[test]
+    fn box_downscale_averages_each_two_by_two_block_of_level_one() {
+        // 4x4 -> level 1 (2x2): the single lit pixel is averaged over its
+        // own 2x2 block only (255/4 = 63) — the block boundaries partition
+        // the source, so no neighbour block sees any of it.
+        let src = canvas(4, 4, Some((0, 0, 255)));
+        let out = downscale_box(&src, 4, 4, 1);
+        assert_eq!(out.len(), 2 * 2 * 4);
+        assert_eq!(&out[0..3], &[63, 63, 63]);
+        assert_eq!(&out[4..7], &[0, 0, 0]);
+        assert_eq!(&out[8..11], &[0, 0, 0]);
+        assert_eq!(&out[12..15], &[0, 0, 0]);
+        // Diagonal blocks are untouched: the lit pixel's block is the top
+        // LEFT one only.
+        let src = canvas(4, 4, Some((3, 3, 200)));
+        let out = downscale_box(&src, 4, 4, 1);
+        assert_eq!(&out[12..15], &[50, 50, 50]);
+        assert_eq!(&out[0..3], &[0, 0, 0]);
+    }
+
+    #[test]
+    fn box_downscale_leaves_a_uniform_opaque_source_uniform() {
+        // The composite invariant (alpha 255 everywhere) survives every
+        // level: a flat grey stays that grey at every depth, alpha and all.
+        let src = canvas(8, 8, None);
+        let mut src = src;
+        for px in src.chunks_mut(4) {
+            px[0] = 40;
+            px[1] = 40;
+            px[2] = 40;
+        }
+        for level in 0..=3 {
+            let out = downscale_box(&src, 8, 8, level);
+            assert!(!out.is_empty());
+            for px in out.chunks(4) {
+                assert_eq!(px, [40, 40, 40, 255], "level {level} drifted");
+            }
+        }
+    }
+
+    #[test]
+    fn box_downscale_covers_the_odd_tail_dimension() {
+        // 5x1 -> level 1 is (5+1)>>1 = 3 wide: blocks are [0,1), [1,3),
+        // [3,5) — the tail block is wider, never dropped. The lit pixel at
+        // x=4 lands in the LAST block (2 px -> 255/2 = 127), x=2's block
+        // spans 1..3.
+        let mut src = canvas(5, 1, None);
+        src[4 * 4] = 250;
+        src[4 * 4 + 1] = 250;
+        src[4 * 4 + 2] = 250;
+        let out = downscale_box(&src, 5, 1, 1);
+        assert_eq!(out.len(), 3 * 4);
+        assert_eq!(&out[8..11], &[125, 125, 125]);
+        assert_eq!(&out[0..3], &[0, 0, 0]);
+        assert_eq!(&out[4..7], &[0, 0, 0]);
+    }
+
+    #[test]
+    fn box_downscale_at_level_zero_is_the_source_itself() {
+        // Level 0's dimensions are the image's, so every block is one pixel
+        // — the identity the #82 level picker relies on for the plain path.
+        let src = canvas(3, 2, Some((1, 1, 77)));
+        assert_eq!(downscale_box(&src, 3, 2, 0), src);
+    }
+
+    #[test]
+    fn box_downscale_of_a_deep_level_is_one_source_pass() {
+        // 40000x256 -> level 4 (2500x16) with ONE lit source pixel: its
+        // block is 16x16 = 256 pixels, so the average is 255/256 = 0 — a
+        // single bright pixel is diluted by its own block, which is what a
+        // box prefilter is for (and the reason a deep shrink needs no
+        // aliasing stripes).
+        let (w, h) = (40000usize, 256usize);
+        let mut src = canvas(w, h, None);
+        src[0] = 255;
+        src[1] = 255;
+        src[2] = 255;
+        let out = downscale_box(&src, w as i32, h as i32, 4);
+        assert_eq!(out.len(), 2500 * 16 * 4);
+        assert_eq!(&out[0..3], &[0, 0, 0]);
+        // The SAME source at level 0 is the identity — the lit pixel is
+        // still exactly 255 there (levels are independent reads of the
+        // original, never a halving of a previous level).
+        let identity = downscale_box(&src, w as i32, h as i32, 0);
+        assert_eq!(&identity[0..3], &[255, 255, 255]);
     }
 }

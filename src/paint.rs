@@ -38,8 +38,8 @@ use windows::Win32::Foundation::{COLORREF, GetLastError, HWND, RECT};
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BeginPaint, BitBlt, COLORONCOLOR, CreateCompatibleDC,
     CreateDIBSection, CreateRectRgn, CreateSolidBrush, DIB_RGB_COLORS, DeleteDC, DeleteObject,
-    ERROR, EndPaint, FillRect, GetDC, HALFTONE, HDC, HGDIOBJ, PAINTSTRUCT, ReleaseDC, SRCCOPY,
-    SelectClipRgn, SelectObject, SetStretchBltMode, StretchBlt,
+    ERROR, EndPaint, FillRect, HALFTONE, HDC, HGDIOBJ, PAINTSTRUCT, SRCCOPY, SelectClipRgn,
+    SelectObject, SetStretchBltMode, StretchBlt,
 };
 use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 
@@ -499,43 +499,15 @@ pub(crate) fn shrink_regime(mw: i32, mh: i32, rw: i32, rh: i32) -> ShrinkRegime 
     }
 }
 
-/// The off-WM_PAINT GDI frame (#80): the giant-frame gate's degrade pass —
-/// the D2D arm began (and validated) the paint, so a second BeginPaint
-/// would hand back an empty-clip DC; the scene draws through GetDC
-/// instead. Fires the #76 paint handshake like `paint` does: this IS the
-/// adoption render when the adoptee is a giant frame.
-pub(crate) fn paint_degraded(view: HWND, owner: HWND) {
-    // SAFETY: GetDC/ReleaseDC bracket the scene draw on the child's DC;
-    // the handshake borrow runs after the draw with none live, and nothing
-    // here pumps messages.
-    unsafe {
-        let hdc = GetDC(Some(view));
-        if hdc.is_invalid() {
-            // Already inside this function's outer unsafe block. Degrade
-            // quietly with a breadcrumb — one lost frame must not fatal.
-            let gle = GetLastError().0;
-            eprintln!("riviv: degrade-frame GetDC failed (GLE={gle})");
-            return;
-        }
-        let mut client = RECT::default();
-        let _ = GetClientRect(view, &mut client);
-        render_scene(hdc, owner, client, client);
-        let _ = ReleaseDC(Some(view), hdc);
-        if let Some(signal) = state_of(owner).and_then(|s| s.paint_signal.take()) {
-            let (lock, cvar) = &*signal;
-            *lock.lock().unwrap() = true;
-            cvar.notify_all();
-        }
-    }
-}
-
 /// The GDI dump channel (#80 design §9): render the current scene into a
 /// fresh 32bpp top-down DIB section on a memory DC and hand the pixels
 /// back as RGBA (the PNG writer's input). Never touches the screen — the
 /// flip-model GDI interop ban is per-HWND, and a memory DC never draws to
 /// the one the swapchain owns. Errors are plain strings: the WM_CLOSE dump
 /// path reports on stderr and exits 2 (the automation channel's loud, no
-/// modal — ADR 0001's user-level tier).
+/// modal — ADR 0001's user-level tier). Since #82 this is the dump's
+/// FALLBACK (the D2D arm dumps giants itself, through its tiles); it still
+/// serves the GDI arm, a stack-less session and a dead stack.
 pub(crate) fn dump_viewport_gdi(view: HWND, owner: HWND) -> Result<(u32, u32, Vec<u8>), String> {
     let mut client = RECT::default();
     // SAFETY: read-only rect query on our own child; a failed read leaves
