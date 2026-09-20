@@ -8449,7 +8449,11 @@ pub(crate) fn run() -> Result<(), String> {
     // SAFETY: the read-only borrow ends inside the map.
     let (request, view_target) = (unsafe { state_of(hwnd) })
         .map(|state| (state.config.renderer, state.viewport))
-        .unwrap_or((RendererKind::Gdi, HWND::default()));
+        // The fallback mirrors the config default (auto since #81); the
+        // path is unreachable in practice (state missing = the window is
+        // going away) and either value ends at the same environmental
+        // degrade below.
+        .unwrap_or((RendererKind::Auto, HWND::default()));
     let mut init_error: Option<String> = None;
     let built = if request.wants_d2d() {
         match crate::gpu::create(view_target, hwnd, request) {

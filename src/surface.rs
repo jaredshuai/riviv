@@ -32,15 +32,16 @@ use windows::Win32::Graphics::Gdi::{
 
 use crate::pixels::{PixelFrame, rotate_bgra_90_cw, rotate_bgra_270_cw};
 
-/// Build a top-down 32bpp DIB section holding a memcpy of `pixels`
-/// (`width * height * 4` BGRA bytes) — the GDI derivation of the CPU
-/// master (#76). Errors are plain system-level messages (GDI allocation
-/// failures only); callers DEGRADE — `ensure_face` blanks the frame at
-/// paint (never a fatal; ADR 0002 D5) and the clipboard copy bails — the
-/// fail-loud reply mapping died with the worker-side GDI it described.
-/// The returned bitmap is bare
-/// (selected into no DC); the caller owns it.
-pub(crate) fn create_bgra_dib(width: i32, height: i32, pixels: &[u8]) -> Result<HBITMAP, String> {
+/// Create a bare top-down 32bpp BGRA DIB section of `width x height` and
+/// hand back the handle plus its bit pointer — the GDI allocation
+/// primitive both the face (#76) and the #81 giant relief build on.
+/// (selected into no DC); the caller owns both. The caller must write or
+/// zero `width * height * 4` bytes through `bits` before reading the
+/// section (the section's initial contents are not guaranteed).
+pub(crate) fn create_bgra_dib_raw(
+    width: i32,
+    height: i32,
+) -> Result<(HBITMAP, *mut c_void), String> {
     let info = BITMAPINFO {
         bmiHeader: BITMAPINFOHEADER {
             biSize: size_of::<BITMAPINFOHEADER>() as u32,
@@ -64,9 +65,22 @@ pub(crate) fn create_bgra_dib(width: i32, height: i32, pixels: &[u8]) -> Result<
         let _ = unsafe { DeleteObject(HGDIOBJ(bitmap.0)) };
         return Err("CreateDIBSection returned NULL bits".into());
     }
+    Ok((bitmap, bits))
+}
+
+/// [`create_bgra_dib_raw`] + one memcpy of `pixels` into the fresh
+/// section. Errors are plain system-level messages (GDI allocation
+/// failures only); callers DEGRADE — `ensure_face` blanks the frame at
+/// paint (never a fatal; ADR 0002 D5) and the clipboard copy bails — the
+/// fail-loud reply mapping died with the worker-side GDI it described. The
+/// returned bitmap is bare
+/// (selected into no DC); the caller owns it.
+pub(crate) fn create_bgra_dib(width: i32, height: i32, pixels: &[u8]) -> Result<HBITMAP, String> {
+    let (bitmap, bits) = create_bgra_dib_raw(width, height)?;
     debug_assert_eq!(pixels.len(), width as usize * height as usize * 4);
-    // SAFETY: `bits` points to exactly width*height*4 writable bytes of the
-    // freshly created section; `pixels` holds the same count (asserted above).
+    // SAFETY: `bits` points at exactly width*height*4 writable bytes of
+    // the freshly created section; `pixels` holds the same count
+    // (asserted above).
     unsafe {
         std::ptr::copy_nonoverlapping(
             pixels.as_ptr(),
@@ -171,12 +185,18 @@ fn relief_axis(dim: i32, k: i32) -> i32 {
 /// `STRETCH_SOURCE_STITCH_TRIGGER / 2` — inside the band a single
 /// full-rect blit is proven to render from. Dimension precondition: the
 /// loader's 512 MB frame cap bounds each axis ≤ 2^27 px, so the walk's
-/// `dim + k - 1` cannot overflow and k stays ≤ 64. Every failure cleans
-/// up what it took and returns `None` (the caller degrades to sliced
+/// `dim + k - 1` cannot overflow and k stays ≤ 64. Every failure leaves a
+/// stderr breadcrumb and returns `None` (the caller degrades to sliced
 /// blits — the paint-path doctrine, never a fatal inside the state
-/// borrow). Runs on the UI thread; per-call objects only.
+/// borrow; the face-build-failure convention, PR #84 N2: a degrade with
+/// zero on-screen trace is undiagnosable from a user report). Runs on
+/// the UI thread; per-call objects only.
 pub(crate) fn build_giant_relief(src_dc: HDC, mw: i32, mh: i32) -> Option<GiantRelief> {
+    let degrading = |why: &str| {
+        eprintln!("giant-relief build failed, degrading to sliced blits: {why}");
+    };
     if src_dc.is_invalid() || mw <= 0 || mh <= 0 {
+        degrading("invalid source DC or dimensions");
         return None;
     }
     debug_assert!(
@@ -187,16 +207,32 @@ pub(crate) fn build_giant_relief(src_dc: HDC, mw: i32, mh: i32) -> Option<GiantR
     let k = relief_divisor(mw.max(mh), target);
     let wide = relief_axis(mw, k);
     let high = relief_axis(mh, k);
-    // The zero-fill is deliberate (review pre-2 P3-1, declined): a DIB
-    // section's initial contents are not guaranteed, and a failed
-    // generation slice must degrade to deterministic black, not to
-    // whatever the page cache held.
-    let zeros = vec![0u8; wide as usize * high as usize * 4];
-    let bitmap = create_bgra_dib(wide, high, &zeros).ok()?;
+    // The raw DIB + in-place zero, NOT a zeroed Vec copied in (external
+    // review AI1 P2-3): a Vec alloc would abort the process on
+    // allocation failure — exactly the case the sliced-blit degrade
+    // branch exists for — and double the transient footprint; zeroing
+    // the section's own bits keeps the failure a clean `Err` and one
+    // pass. The zero-fill itself is deliberate (review pre-2 P3-1): a
+    // failed generation slice must degrade to deterministic black, not
+    // to whatever the page cache held.
+    let len = wide as usize * high as usize * 4;
+    let (bitmap, bits) = match create_bgra_dib_raw(wide, high) {
+        Ok(v) => v,
+        Err(msg) => {
+            degrading(&msg);
+            return None;
+        }
+    };
+    // SAFETY: `bits` points at exactly `len` writable bytes of the fresh
+    // section (32bpp, top-down, tightly packed — the header above).
+    unsafe {
+        std::ptr::write_bytes(bits.cast::<u8>(), 0, len);
+    }
     // SAFETY: None gives a screen-compatible DC owned by this thread for
     // the relief's lifetime.
     let memdc = unsafe { CreateCompatibleDC(None) };
     if memdc.is_invalid() {
+        degrading("CreateCompatibleDC failed");
         // SAFETY: the DIB is owned and selected nowhere — plain
         // DeleteObject is the correct teardown.
         unsafe {
@@ -208,6 +244,7 @@ pub(crate) fn build_giant_relief(src_dc: HDC, mw: i32, mh: i32) -> Option<GiantR
     // here stays owned by the DC (never deleted by us).
     let stock = unsafe { SelectObject(memdc, HGDIOBJ(bitmap.0)) };
     if stock.is_invalid() {
+        degrading("SelectObject failed");
         // SAFETY: selection failed, so the DC still holds its stock 1x1
         // bitmap — plain DeleteDC is correct; the DIB drops below.
         unsafe {

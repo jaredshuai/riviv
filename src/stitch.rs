@@ -56,6 +56,15 @@ pub(crate) const STRETCH_EXTENT_LIMIT: i32 = 32768;
 /// census-proven full-rect point (4,000,000): the (4M, 2^22) band is
 /// interpolated by construction — one point short of a full proof, noted
 /// for #82's census to close.
+///
+/// Reachable envelope + per-paint cost (external review AI1 P2-4): the
+/// loader's 512 MB frame cap bounds a triggering frame to max axis ≥ 2^22
+/// with total area ≤ 2^27 px — a width-triggered face needs aspect ratio
+/// ≥ 131072:1 (4,194,304×32 is about the largest real shape), so in
+/// practice only synthetic stripes hit the relief. Each such paint pays
+/// one raw DIB + in-place zero of the relief plus ⌈mw/512⌉×⌈mh/512⌉
+/// HALFTONE slice blits and one final blit (a 2^23×1 face = 16,385
+/// slices) — the layer the retired mip chain's caching used to absorb.
 pub(crate) const STRETCH_SOURCE_STITCH_TRIGGER: i32 = 1 << 22; // 4,194,304
 
 /// The source slice edge of the sliced-blit DEGRADE path (the fallback

@@ -633,7 +633,9 @@ $giant4nPng = Join-Path $Stage 'giant4n.png'
 [S81]::WriteWidePngGrad($giant4nPng, 4194304, 1)
 $giant4pPng = Join-Path $Stage 'giant4p.png'
 [S81]::WriteWidePngGrad($giant4pPng, 8388608, 1)
-Check 'S0 fixtures built' ((Test-Path $png96) -and (Test-Path $pngPad) -and (Test-Path $pngGrad) -and (Test-Path $png640) -and (Test-Path $png800) -and (Test-Path $pngBanner) -and (Test-Path $giantPng) -and (Test-Path $giant4mPng) -and (Test-Path $giant4nPng) -and (Test-Path $giant4pPng)) 'a fixture PNG is missing'
+$giant6mPng = Join-Path $Stage 'giant6m.png'
+[S81]::WriteWidePngGrad($giant6mPng, 6291456, 1)
+Check 'S0 fixtures built' ((Test-Path $png96) -and (Test-Path $pngPad) -and (Test-Path $pngGrad) -and (Test-Path $png640) -and (Test-Path $png800) -and (Test-Path $pngBanner) -and (Test-Path $giantPng) -and (Test-Path $giant4mPng) -and (Test-Path $giant4nPng) -and (Test-Path $giant4pPng) -and (Test-Path $giant6mPng)) 'a fixture PNG is missing'
 
 # ---------------------------------------------------------------------------
 # S1: the default renderer flip (#81): missing key AND unrecognized value
@@ -1079,7 +1081,8 @@ function Giant-Checks($q, $viewW) {
 $giantCensus = @(
     @{ N = 'm'; W = 4000000; Png = $giant4mPng; Seam = $false },  # below the 2^22 trigger: single full-rect path must still render
     @{ N = 'n'; W = 4194304; Png = $giant4nPng; Seam = $true },   # exactly 2^22: the first relief width
-    @{ N = 'p'; W = 8388608; Png = $giant4pPng; Seam = $true }    # 2^23: the width that rendered black before the stitch fix
+    @{ N = 'p'; W = 8388608; Png = $giant4pPng; Seam = $true },   # 2^23: the width that rendered black before the relief fix
+    @{ N = 'q'; W = 6291456; Png = $giant6mPng; Seam = $true }    # 3*2^21, a NON-power-of-two multiple: k=4 -> 1,572,864 relief (pins relief_divisor off the power-of-2 grid; external review AI1 P3-8)
 )
 foreach ($cw in $giantCensus) {
     $tag = 'S4' + $cw.N
@@ -1128,7 +1131,11 @@ $s6scenes = @(
     @{ Name = 'o2o-800x600'; Img = $png800; Fill = 0; Extra = $null; TW = $null; TH = $null; Cmds = $one2one },
     @{ Name = 'mag2-96x64'; Img = $png96; Fill = 1; Extra = (@('mag_filter=0') + $BgMagenta); TW = 256; TH = 128; Cmds = $null },
     @{ Name = 'shrink2-640x480'; Img = $png640; Fill = 0; Extra = @('shrink_blit_mode=1'); TW = 320; TH = 240; Cmds = $null },
-    @{ Name = 'bannerfit-40000x256'; Img = $pngBanner; Fill = 0; Extra = @('shrink_blit_mode=1'); TW = $null; TH = $null; Cmds = $null }
+    @{ Name = 'bannerfit-40000x256'; Img = $pngBanner; Fill = 0; Extra = @('shrink_blit_mode=1'); TW = $null; TH = $null; Cmds = $null },
+    # The relief path itself (external review AI1 P2-4): a >=2^22 fit dump
+    # pays the per-paint relief build (raw DIB + in-place zero + the 512px
+    # HALFTONE slice blits) - the only per-paint machine #81 adds.
+    @{ Name = 'relieffit-16777217x1'; Img = $giantPng; Fill = 0; Extra = @('shrink_blit_mode=1'); TW = $null; TH = $null; Cmds = $null }
 )
 foreach ($sc in $s6scenes) {
     foreach ($rnd in @('warp', 'gdi')) {

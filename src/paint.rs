@@ -836,7 +836,13 @@ mod tests {
             ShrinkRegime::Relief,
             "the height axis triggers the relief on a narrow tower"
         );
-        // Relief outranks a giant dest too (source is checked first).
+        // Relief outranks a giant dest too (source is checked first): a
+        // ≥2^22 source makes the single full-rect StretchBlt fail AT THE
+        // FACE level (the census — the call shape the GiantClip branch
+        // exists to run cannot succeed on such a source), so there IS no
+        // GiantClip option for it; the relief's own final blit is
+        // dest-bounded by the viewport like any other (external review
+        // AI1 P3-7).
         assert_eq!(
             shrink_regime(
                 STRETCH_SOURCE_STITCH_TRIGGER * 2,
