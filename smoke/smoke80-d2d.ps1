@@ -574,14 +574,17 @@ Kill-Riviv
 Reset-Ini ''
 
 # ---------------------------------------------------------------------------
-# S5: the giant-image gate. A frame wider than the device's runtime
-# GetMaximumBitmapSize must trip the gate (stderr "exceeds the D2D max
-# bitmap"), leave the process alive, and still dump through the GDI
-# fallback with exit 0. The width is 2^24+1: it exceeds the D3D11/WARP
-# texture cap (16384, the ticket's "typical") AND the larger WARP value
-# (2^23) measured on this dev machine via the same stderr line - the gate
-# threshold is a runtime query (design section 3-6), never a constant.
-# GDI+ cannot create bitmaps past 65535, so the PNG is hand-written.
+# S5: the giant-image path. #80 tore the D2D stack down for a frame wider
+# than the device's runtime GetMaximumBitmapSize and rendered it through
+# GDI; #82 replaced that with the stack's OWN giant path (an overview level
+# or tiles), so this scenario now asserts the NEW contract: no gate line,
+# no GDI hand-off, the process alive, the dump still succeeding - out of
+# the D2D channel this time - and the close-time stats line naming the
+# form. The width is 2^24+1: it exceeds the D3D11/WARP texture cap
+# (16384, the ticket's "typical") AND the larger WARP value (2^23) measured
+# on this dev machine via the startup breadcrumb - the bound is a runtime
+# query (design section 3-6), never a constant. GDI+ cannot create bitmaps
+# past 65535, so the PNG is hand-written.
 # ---------------------------------------------------------------------------
 $GIANT_W = 16777217
 $giant = Join-Path $Stage 'giant.png'
@@ -592,18 +595,22 @@ if (Test-Path $out5) { Remove-Item $out5 -Force }
 $p = Start-Riv ("`"$giant`" -dump-viewport `"$out5`"") 's5.err' $false
 $main = Wait-Main $p
 $adopted5 = Wait-Title $p 'giant' 30000
-$gateSeen = Wait-Until { (Read-Err 's5.err') -match 'exceeds the D2D max bitmap' } 15000
-Start-Sleep -Milliseconds 500
+Start-Sleep -Milliseconds 1500
 $alive5 = -not $p.HasExited
 $view = View-Of $main
 $vs5 = View-Size $view
 $code5 = Close-Main $p $main
 $err = Read-Err 's5.err'
-$iBc = $err.IndexOf('renderer=warp backend=')
-$iGate = $err.IndexOf('exceeds the D2D max bitmap')
-$order5 = ($iBc -ge 0) -and ($iGate -ge 0) -and ($iBc -lt $iGate)
-$maxLine = '(no gate line)'
-if ($err -match 'exceeds the D2D max bitmap (\d+)') { $maxLine = "device max=" + $Matches[1] }
+$maxLine = '(no max breadcrumb)'
+if ($err -match 'max_bitmap=(\d+)') { $maxLine = "device max=" + $Matches[1] }
+$statsLevel = -1
+$statsTiles = -1
+$statsSeen = $err -match 'riviv: tiles level=(\d+) tiles=(\d+) base=(\d+)'
+if ($statsSeen) {
+    $statsLevel = [int]$Matches[1]
+    $statsTiles = [int]$Matches[2]
+}
+$form5 = $statsSeen -and (($statsLevel -ge 1) -or ($statsTiles -ge 1))
 $pngOk5 = Test-Path $out5
 $sizeOk5 = $false
 $dims5 = '(none)'
@@ -612,11 +619,13 @@ if ($pngOk5) {
     $dims5 = "$($q5.W)x$($q5.H)"
     $sizeOk5 = ($q5.W -eq $vs5[0]) -and ($q5.H -eq $vs5[1])
 }
-Check 'S5a gate line present, after the d2d/warp breadcrumb' ($order5 -and $err.Contains('rendering it via gdi')) ("breadcrumbIdx=$iBc gateIdx=$iGate seen=$gateSeen $maxLine stderr=[$($err.Trim())]")
+Check 'S5a the D2D arm draws the giant itself (no gate line, no gdi hand-off)' ((-not $err.Contains('exceeds the D2D max bitmap')) -and (-not $err.Contains('rendering it via gdi'))) ("$maxLine stderr=[$($err.Trim())]")
 Check 'S5b process stayed alive with the giant frame' ($alive5 -and $adopted5) "alive=$alive5 adopted=$adopted5"
-Check 'S5c dump still succeeds through the GDI channel (exit 0)' (($code5 -eq 0) -and $pngOk5 -and $sizeOk5) ("exit=$code5 png=$pngOk5 dims=$dims5 viewport=$($vs5[0])x$($vs5[1])")
+Check 'S5c dump succeeds out of the D2D channel (exit 0, viewport-sized)' (($code5 -eq 0) -and $pngOk5 -and $sizeOk5) ("exit=$code5 png=$pngOk5 dims=$dims5 viewport=$($vs5[0])x$($vs5[1])")
+Check 'S5d the stats line names the giant form (level>=1 or tiles>=1)' $form5 "seen=$statsSeen level=$statsLevel tiles=$statsTiles"
 Kill-Riviv
 Reset-Ini ''
+
 
 # ---------------------------------------------------------------------------
 # S6: animation frame re-upload - the dump follows AnimationFrameStep.

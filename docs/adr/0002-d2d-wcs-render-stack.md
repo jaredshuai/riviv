@@ -52,6 +52,14 @@ DXGI flip 的 GDI 互操作禁令是 **per-HWND**(官方原文 "Use flip model i
 
 > **#81 落地后记(2026-09-20,外部评审 AI1 P3-6)**:上段的 `MIP_GDI_OBJECT_BUDGET` 与链式预算已随 #81 删除(#82 的字节记账从零起算,不再以对象计数为起点);实现期 census 发现 GDI StretchBlt 的失败随 **face 宽度**而非单次调用 extent(4M 宽 face 可整矩形直绘、6.29M 宽 face 上 2^21 分片可绘、≥2^23 宽 face 仅 512px 分片可读——即上游 mip 生成历来依赖的形状),故 #81 为 GDI 臂 ≥2^22 源加了**临时 GiantRelief 中介**(每 paint 建一次 ~2^21 DIB、512px HALFTONE 分片生成、单 blit 出图;无链无缓存)作为 #82 D2D tiling 接管前的过渡——#82 设计 tile/预算时以本后记与 issue #81 的 census 数据(issuecomment-5748005538/5748006943)为准,勿再引用已删除的预算机制。
 
+> **#82 落地后记(2026-09-20)**:巨图形态按上段落地,但**删除项拆分出去了**——上段「删除判据写死」的三条里,golden 未冻结、RDP/Hyper-V 的 auto 初始化无证据、发布周期未到(三条均于开工日核实),故 #82 只做巨图 + 预算 + 冻结前置,删除独立为 **#90**(与用户确认后拆分,见 issue #82 design comment 5749353703 与实测后记 5749498238)。落地形态与三条实测结论:
+>
+> 1. **源级 + 形态的每帧选择**(`tile::detail_level` / `tile::plan_frame`):级位图能装下设备(`GetMaximumBitmapSize()`)就单张直绘(级 0 = 原路径逐字节不变;级 ≥1 = overview,由 `mip::downscale_box` 从原图一遍箱式降采样,块边界取整数 `floor(x*dim/level_dim)` → 覆盖每个源像素);装不下就把**可见 dest 的原像**切成 1024px 网格 tile(halo 32 源像素 + 裁剪到逻辑内部区;枚举按可见区窗口化 → 巨图 1:1 的 GPU 驻留 O(视口))。一帧的 tile 超过字节预算时**深化级**(更浅的级 tile 更少更小),至 1×1 必落单张——压力降级整帧均匀,不做半覆盖。
+> 2. **接缝口径是实测的,不是推理的**(本机 2026-09-20,`-dump-viewport` 逐像素对照):**1:1 分块与整张逐字节相等(0/803,016)**;fractional 缩放(滤波档)**每通道差 ≤1**、约 10% 像素,且**边界 ±2 列内最大列间阶跃与整张对照相同 = 零接缝**。两条因此写进实现:tile 的**绘制**矩形必须亚像素(`src_to_dest_f`:f64 投影单次 f32 舍入;第一版取整使每块等效 scale 漂移 → 全画面 ±1),**裁切**矩形必须整数(共享源坐标 → 逐位相同的边界 → 精确分区);halo 从 8 提到 **32**(8 时 0.65× 缩放的抽头伸出块外被 clamp,实测边界列 maxΔ=37 → 32 后 21,平滑场本底不变)。故「零容差」在本实现的准确表述 = **1:1 逐字节 + 滤波档 ≤±1 且无结构接缝**,不可写成「分块与整张逐字节相等」。
+> 3. **预算换轨完成**:字节四类账本(cpu_source / cpu_display / inflight / gpu_resident)+ `IDXGIAdapter3::QueryVideoMemoryInfo(LOCAL)` 真值(adapter 非 Adapter3 或查询失败退自设上限),cap = `Budget/4` 夹到 [16 MiB, 256 MiB](集显 LOCAL 段是系统内存 → 靠夹取而非直接采用);压力阶梯 = LRU 驱逐 → 深化级 → 单张 overview,**不落 GDI**。close 时一行统计(stderr)是冒烟的预算证据通道。
+>
+> 遗留交 #90:`GiantRelief` 与 GDI 巨图支(`STRETCH_SOURCE_STITCH_TRIGGER`/`SLICE`)、mag 臂 ≥2^22 的未验证带(#81 遗留,本票未碰)、golden 冻结后的删除本体。
+
 ### D8. 时序与线程(#80)
 
 D2D/D3D 对象只在 UI 线程(factory SINGLE_THREADED;D3D11 不加 SINGLETHREADED flag);worker 只产内存帧。**保持 invalidate→WM_PAINT 消息驱动**,不搞 Present 渲染循环(看图器 99% 静态);WM_PAINT 内:BeginPaint(忽略 rcPaint 整视口重绘)→ BeginDraw → Clear(bg)(letterbox 由 Clear 替代,「先 blit 后填」的防闪顺序及其整类 bug 归零)→ DrawBitmap → EndDraw(**HRESULT 必查**,设备丢失唯一上报点)→ Present(交互/动画 `Present(0,0)` 防 vsync 阻塞拖拽;OCCLUDED 停渲染轮询恢复)→ EndPaint。WM_SIZE:`SetTarget(None)`+释放全部引用→`ResizeBuffers`→重建→同步重绘一次。`MakeWindowAssociation(DXGI_MWA_NO_ALT_ENTER)` 必加。设备依赖对象收敛进一个 GpuStack struct 一起生一起死。
@@ -65,6 +73,8 @@ D2D/D3D 对象只在 UI 线程(factory SINGLE_THREADED;D3D11 不加 SINGLETHREAD
 分级:L0 字节精确(1:1+identity 颜色,dump 断言)/ L1 与 GDI golden 字节一致(整数倍 Nearest 放大、边界)/ L2 视觉等价(线性档 MAE+无接缝)/ L3 色彩不变量(纯 Rust 单测,离线解析期望值)。**主入口=进程内回读 dump**(`CPU_READ` bitmap→CopyFromRenderTarget→Map→PNG;GDI 栈同通道从 master 实现,两栈 golden 互比),**勿以 PrintWindow 为 D3D 内容契约**(默认 flag 不捕获 flip;`PW_RENDERFULLCONTENT` 行为先 spike 三环境);golden 语料固定 WARP 生成跨机器确定;RGB 状态栏读出升级为断言通道(master 直读)。冒烟脚本存量手段(BitBlt 抓 DC/GetPixel 采样)在 D2D 视口上失效——采集入口随 #80 换,断言逻辑尽量保留。
 
 > **#81 落地后记(2026-09-20)**:上段「golden 语料固定 WARP 生成」在 #81 落地为 **GDI 臂生成**(票面原文「GDI 栈生成→冻结入仓」,`smoke/golden81/`)——L1 正确性由比 golden 更硬的独立 oracle 承担(整数放大 dump 与 `src[x/k,y/k]` 复制模型逐像素相等,与生成臂无关),golden 只做跨 build 漂移检测,且每轮冒烟同时断言 warp==gdi 逐字节(warp-vs-golden 传递成立)。#82 冻结语料时择一而定,并更新本后记。
+
+> **#82 落地后记(2026-09-20)**:上段「#82 冻结语料时择一而定」**未在本票定案**——冻结语料唯一的用途是 #90 的删除前置(删除前必须有一份 GDI 栈产出的语料,否则删了 GDI 就没有生成臂了),而删除判据的三条在开工日两条无证据,故冻结随删除一起**移交 #90**(#90 依赖 #82 + 发布周期 + RDP/Hyper-V 实测留档,见该票)。本票自带的接缝/正确性证据不是 golden 而是**同构建内的对照**(tiled vs untiled、巨图 fit/1:1 的内容断言、边界阶跃对照),这些不依赖语料冻结;`smoke/golden81/` 继续作为跨 build 漂移的既有参考。
 
 ### 非目标(M6 明确不做)
 
