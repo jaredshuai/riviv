@@ -128,6 +128,7 @@ mod status;
 mod stitch;
 mod surface;
 mod text;
+mod tile;
 mod toolbar;
 mod window;
 mod zoom;

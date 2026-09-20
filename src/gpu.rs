@@ -9,7 +9,9 @@
 //! BeginPaint → BeginDraw → Clear → DrawBitmap → EndDraw → Present(0,0)
 //! → EndPaint. The 1:1 five-piece (ADR 0002 D6) is enforced here: unit
 //! mode PIXELS set once at build, NO SetTransform call anywhere in the
-//! arm (identity audit — grep-provable), exact i32 rects, every surface
+//! arm (identity audit — grep-provable), exact i32 rects (the giant tile
+//! path's DRAWN rects are sub-pixel f32 by design — see tile.rs; the CLIPS
+//! stay integer), every surface
 //! `B8G8R8A8_UNORM` (never `_SRGB`), and the per-draw interpolation mode
 //! from [`d2d_interp_mode`].
 //!
@@ -44,9 +46,10 @@ use windows::Win32::Graphics::Dxgi::Common::{
 };
 use windows::Win32::Graphics::Dxgi::{
     DXGI_ERROR_DEVICE_REMOVED, DXGI_ERROR_DEVICE_RESET, DXGI_ERROR_DRIVER_INTERNAL_ERROR,
-    DXGI_MWA_NO_ALT_ENTER, DXGI_PRESENT, DXGI_SCALING_NONE, DXGI_SWAP_CHAIN_DESC1,
-    DXGI_SWAP_CHAIN_FLAG, DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_USAGE_RENDER_TARGET_OUTPUT,
-    IDXGIDevice, IDXGIFactory2, IDXGISurface, IDXGISwapChain1,
+    DXGI_MEMORY_SEGMENT_GROUP_LOCAL, DXGI_MWA_NO_ALT_ENTER, DXGI_PRESENT,
+    DXGI_QUERY_VIDEO_MEMORY_INFO, DXGI_SCALING_NONE, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG,
+    DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIAdapter3, IDXGIDevice,
+    IDXGIFactory2, IDXGISurface, IDXGISwapChain1,
 };
 use windows::Win32::Graphics::Gdi::ValidateRect;
 use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, PAINTSTRUCT};
@@ -129,11 +132,81 @@ pub(crate) fn d2d_interp_mode(
     }
 }
 
-/// The giant-image gate (design §5): a frame neither axis of which fits
-/// under the device's maximum bitmap size cannot upload — the caller tears
-/// the stack down and renders through GDI until a new image arrives.
-pub(crate) fn frame_exceeds_max_bitmap(wide: u32, high: u32, max_bitmap: u32) -> bool {
-    wide > max_bitmap || high > max_bitmap
+/// The per-level CPU source a frame's uploads read from: level 0 is the
+/// master itself (no copy), deeper levels are the [`crate::mip::LevelCache`]
+/// box-downscales. `gpu.rs` never owns CPU pixels — the window state does,
+/// and hands them in per paint (so a device rebuild re-uploads without a
+/// re-decode, and a new image drops the levels with its frame).
+pub(crate) trait LevelSource {
+    /// The (width, height, BGRA bytes) of `level`, building it on demand
+    /// (and caching it). `None` = refused (over the CPU budget).
+    fn level(&mut self, level: u32) -> Option<(u32, u32, &[u8])>;
+
+    /// The CPU bytes this source is holding right now — the ledger's
+    /// `cpu_source` class.
+    fn cpu_bytes(&self) -> u64;
+
+    /// Rebind to the frame generation about to draw, dropping any cached
+    /// level of a previous frame (see [`crate::mip::LevelCache::rebind`]).
+    fn rebind(&mut self, frame_gen: u64);
+
+    /// Levels built so far (each is a full source pass) — the ledger's
+    /// `mip_builds`, and the evidence line's proof that a giant's overview
+    /// was really computed.
+    fn level_builds(&self) -> u64;
+
+    /// The CPU bytes held by display DERIVATIONS outside this stack (the
+    /// GDI face's DIB) — the ledger's `cpu_display` class. The D2D arm
+    /// never reads it, but it is real memory in the same process.
+    fn display_bytes(&self) -> u64;
+}
+
+/// The master + level cache pair the window state hands the D2D arm
+/// ([`LevelSource`] over `Surface::master()` and `WindowState::levels`).
+/// A window with no image yet has `master: None`; the frame is blank then,
+/// so only the level cache's bytes are countable.
+pub(crate) struct MasterLevels<'a> {
+    pub(crate) master: Option<&'a crate::pixels::PixelFrame>,
+    pub(crate) cache: &'a mut crate::mip::LevelCache,
+    /// The generation the cache's levels belong to (a new frame clears
+    /// them: they were built from the previous frame's pixels).
+    pub(crate) frame_gen: u64,
+    /// The derived-CPU-copy bytes outside this stack (the GDI face's DIB),
+    /// read by the caller from the surface it owns.
+    pub(crate) display_bytes: u64,
+}
+
+impl LevelSource for MasterLevels<'_> {
+    fn level(&mut self, level: u32) -> Option<(u32, u32, &[u8])> {
+        let master = self.master?;
+        if level == 0 {
+            return Some((master.width, master.height, &master.pixels));
+        }
+        self.cache.get_or_build(
+            level,
+            master.width,
+            master.height,
+            self.frame_gen,
+            &master.pixels,
+        )
+    }
+
+    fn cpu_bytes(&self) -> u64 {
+        self.master.map_or(0, |m| m.pixels.len() as u64) + self.cache.bytes()
+    }
+
+    fn level_builds(&self) -> u64 {
+        self.cache.builds
+    }
+
+    fn display_bytes(&self) -> u64 {
+        self.display_bytes
+    }
+
+    fn rebind(&mut self, frame_gen: u64) {
+        self.frame_gen = frame_gen;
+        self.cache.rebind(frame_gen);
+    }
 }
 
 /// The letterbox background as a D2D color: u8/255 into the UNORM pipeline
@@ -155,6 +228,28 @@ pub(crate) fn backend_label(hardware: bool) -> &'static str {
     if hardware { "d2d/hw" } else { "d2d/warp" }
 }
 
+/// The per-paint diagnostics the window state hands the stack (#82's
+/// `-tile`): synced on every paint, so a stack built before the switch was
+/// applied (a single-instance handoff) still honors it, and clearing it
+/// (absent / 0) restores the natural level/tile decision.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct Diagnostics {
+    /// Force the tiled path with this grid edge in px, bypassing the
+    /// single-bitmap shortcut — the smoke's tiled-vs-untiled channel.
+    pub(crate) tile_edge: Option<i32>,
+}
+
+/// One dump request: the viewport, its background, and the frame to render
+/// (with the plan it was measured for). `frame: None` = the blank
+/// letterbox dump.
+pub(crate) struct DumpRequest {
+    pub(crate) cw: u32,
+    pub(crate) ch: u32,
+    pub(crate) bg: [u8; 3],
+    pub(crate) frame: Option<(u64, u32, u32)>,
+    pub(crate) plan: Option<DrawPlan>,
+}
+
 /// Everything one D2D frame draws with, gathered from the window state by
 /// the caller ([`paint_d2d`] builds it from its own borrow; the dump path
 /// receives it pre-built because it runs under the caller's borrow).
@@ -165,6 +260,10 @@ pub(crate) struct DrawPlan {
     pub(crate) dy: i32,
     pub(crate) rw: i32,
     pub(crate) rh: i32,
+    /// The viewport the frame is drawn into — the giant path's tiling
+    /// window ([`tile::visible_dest`] intersects the scene rect with it).
+    pub(crate) cw: i32,
+    pub(crate) ch: i32,
     pub(crate) interp: D2D1_INTERPOLATION_MODE,
 }
 
@@ -202,6 +301,8 @@ pub(crate) fn draw_plan(
         dy,
         rw,
         rh,
+        cw,
+        ch,
         interp: d2d_interp_mode(
             one_to_one_render(rw, rh, sw, sh),
             state.config.shrink_blit_mode == 1,
@@ -216,10 +317,6 @@ pub(crate) fn draw_plan(
 pub(crate) enum PaintOutcome {
     /// Rendered (or blank-letterboxed) and presented.
     Painted,
-    /// The displayed frame exceeds the device's maximum bitmap size — the
-    /// caller tears the stack down (giant-image gate) and re-renders this
-    /// frame through GDI.
-    GiantFrame { wide: u32, high: u32, max: u32 },
     /// EndDraw or Present reported DEVICE LOSS — the failure ladder decides
     /// (rebuild same kind → 3-in-10s escalate to WARP → deferred fatal).
     DeviceLost,
@@ -266,6 +363,11 @@ pub(crate) struct GpuStack {
     target: Option<ID2D1Image>,
     bitmap: Option<ID2D1Bitmap>,
     context: ID2D1DeviceContext,
+    /// The context's render-target base, cached because
+    /// `PushAxisAlignedClip`/`PopAxisAlignedClip` live there (the device
+    /// context inherits them but windows-rs 0.62 generates them on the base
+    /// only) — one QI at creation instead of one per tile.
+    render_target: ID2D1RenderTarget,
     swapchain: IDXGISwapChain1,
     d2d_device: ID2D1Device,
     dxgi_device: IDXGIDevice,
@@ -274,16 +376,72 @@ pub(crate) struct GpuStack {
     /// The effective backend label (About line / status suffix / stderr).
     pub(crate) backend: &'static str,
     /// The largest single bitmap this device can create (runtime query —
-    /// never the hardcoded 16384, design §3-6). The giant-image gate reads
-    /// it per paint.
+    /// never the hardcoded 16384, design §3-6). The giant path reads it
+    /// per paint: a level whose dimensions fit is drawn as ONE bitmap, a
+    /// larger one is tiled (#82).
     max_bitmap: u32,
-    /// The (frame_gen, w, h) triple resident in `bitmap`; a paint whose
-    /// triple differs re-uploads from the master (no re-decode, design §5).
-    uploaded: Option<(u64, u32, u32)>,
+    /// The (frame_gen, level, w, h) quartet resident in `bitmap`; a paint
+    /// whose quartet differs re-uploads from the CPU level source (no
+    /// re-decode, design §5).
+    uploaded: Option<(u64, u32, u32, u32)>,
+    /// The frame generation the tile cache belongs to: a new generation
+    /// (a new image, a rotate, an edit) drops every tile — they can never
+    /// be drawn again.
+    tile_gen: Option<u64>,
+    /// The resident tiles' bitmaps, keyed like the LRU beside them.
+    tiles: Vec<(crate::tile::TileKey, ID2D1Bitmap)>,
+    /// The tile LRU's policy state (bytes, recency; the objects live in
+    /// `tiles`) — the same pure [`crate::tile::Lru`] the plan math uses.
+    tile_lru: crate::tile::Lru<crate::tile::TileKey>,
+    /// The GPU-resident cap derived from `QueryVideoMemoryInfo` at build
+    /// ([`crate::tile::budget_cap`]).
+    cap_bytes: u64,
+    /// `-tile <edge>` (diagnostic): force the tiled path with this grid
+    /// edge, bypassing the single-bitmap shortcut — the smoke's
+    /// tiled-vs-untiled comparison channel.
+    forced_edge: Option<i32>,
+    /// The frame's prepared draw list (built by [`GpuStack::prepare`],
+    /// consumed by the scene pass) and the levels the stats line reports.
+    scene: Scene,
+    /// The byte ledger (ticket's 分类记账) — observable at close.
+    pub(crate) ledger: crate::tile::MemLedger,
     // NOTE: the device-loss timestamps do NOT live on the stack — the
     // ladder rebuilds the stack on every loss, and history dying with it
     // would make the 3-in-10s escalation unreachable. They sit on the
     // window state (`gpu_failures`), surviving rebuilds (design §7).
+}
+
+/// The frame's prepared draw list: what the scene pass draws after `Clear`.
+#[derive(Debug, Default)]
+enum Scene {
+    /// Nothing (a degenerate frame): the clear IS the frame.
+    #[default]
+    Clear,
+    /// One bitmap of `level` over the whole scene rect (level 0 = the plain
+    /// #80/#81 path, level ≥ 1 = a giant's prefiltered overview).
+    Base { level: u32, w: u32, h: u32 },
+    /// The giant path: haloed tiles, each clipped to its logical interior.
+    Tiles {
+        level: u32,
+        quads: Vec<crate::tile::TileRequest>,
+    },
+}
+
+/// The driver's video-memory budget for this process — DXGI's
+/// `QueryVideoMemoryInfo` on the LOCAL segment, which is what the driver
+/// reserves for us specifically (not the adapter's total VRAM). `None`
+/// when the adapter is not an `IDXGIAdapter3` (pre-1709 or a wrapper) or
+/// the query fails: the caller then runs on [`crate::tile::SELF_CAP_BYTES`].
+/// A missing budget costs a conservative cap, never a renderer.
+fn video_memory_budget(dxgi_device: &IDXGIDevice) -> Option<u64> {
+    // SAFETY: read-only parent query on the live adapter.
+    let adapter = unsafe { dxgi_device.GetAdapter() }.ok()?;
+    let adapter3: IDXGIAdapter3 = adapter.cast().ok()?;
+    let mut info = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+    // SAFETY: node 0 always exists on an adapter D3D11 handed us; the out
+    // struct is a valid local.
+    unsafe { adapter3.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut info) }.ok()?;
+    Some(info.Budget)
 }
 
 /// The bitmap properties all three UNORM surfaces share (the 1:1
@@ -419,13 +577,29 @@ pub(crate) fn create(
         context.SetPrimitiveBlend(D2D1_PRIMITIVE_BLEND_COPY);
         context.SetTarget(Some(&target));
     }
-    // 6. The giant-image gate's bound: runtime query (design §3-6).
+    // 6. The giant path's bound: runtime query (design §3-6), plus the
+    //    video-memory budget the tile LRU's cap derives from (#82).
     // SAFETY: pure size query on the live context.
     let max_bitmap = unsafe { context.GetMaximumBitmapSize() };
+    // The clip primitives live on the render-target base (see the struct
+    // field's note) — one QI here, none per tile.
+    let render_target: ID2D1RenderTarget = context
+        .cast()
+        .map_err(|e| format!("cast context to ID2D1RenderTarget failed: {e}"))?;
+    let budget = video_memory_budget(&dxgi_device);
+    let cap_bytes = crate::tile::budget_cap(budget);
+    eprintln!(
+        "riviv: d2d max_bitmap={max_bitmap} tile cap={cap_bytes} (dxgi budget={})",
+        match budget {
+            Some(b) => b.to_string(),
+            None => "unavailable".to_string(),
+        }
+    );
     let stack = GpuStack {
         target: Some(target),
         bitmap: None,
         context,
+        render_target,
         swapchain,
         d2d_device,
         dxgi_device,
@@ -434,6 +608,18 @@ pub(crate) fn create(
         backend: backend_label(effective != RendererKind::Warp),
         max_bitmap,
         uploaded: None,
+        tile_gen: None,
+        tiles: Vec::new(),
+        tile_lru: crate::tile::Lru::new(cap_bytes),
+        cap_bytes,
+        // The `-tile` diagnostic arrives at paint time (apply_diagnostics),
+        // not here: the window state owns it and syncs it per paint.
+        forced_edge: None,
+        scene: Scene::Clear,
+        ledger: crate::tile::MemLedger {
+            cap: cap_bytes,
+            ..crate::tile::MemLedger::default()
+        },
     };
     Ok((stack, effective))
 }
@@ -471,18 +657,21 @@ fn create_d3d_device(warp: bool) -> Result<ID3D11Device, String> {
 }
 
 impl GpuStack {
-    /// (Re)create the frame bitmap when the displayed (gen, w, h) differs
-    /// from the resident one — the master's bytes upload in the same step
-    /// (one CreateBitmap with source data, no intermediate surface, design
-    /// §5). The pitch is the master invariant width*4 (pixels.rs).
-    fn ensure_upload(
+    /// (Re)create the base bitmap when the displayed `(gen, level, w, h)`
+    /// differs from the resident one — the CPU level's bytes upload in the
+    /// same step (one CreateBitmap with source data, no intermediate
+    /// surface, design §5). The pitch is the tightly-packed invariant
+    /// `width * 4` (pixels.rs). Level 0 is the master; level ≥ 1 is a
+    /// giant's prefiltered overview.
+    fn ensure_base(
         &mut self,
         frame_gen: u64,
+        level: u32,
         wide: u32,
         high: u32,
         pixels: &[u8],
     ) -> Result<(), String> {
-        if self.uploaded == Some((frame_gen, wide, high)) {
+        if self.uploaded == Some((frame_gen, level, wide, high)) {
             return Ok(());
         }
         // Drop the old bitmap first: the context holds no other reference
@@ -494,8 +683,8 @@ impl GpuStack {
             .ok_or_else(|| format!("frame {wide}x{high} pitch overflows"))?;
         debug_assert_eq!(pixels.len(), wide as usize * high as usize * 4);
         // SAFETY: `pixels` holds exactly wide*high*4 readable bytes (the
-        // master invariant, tightly packed top-down) and outlives this
-        // synchronous copy; the properties struct is a valid stack
+        // master/level invariant, tightly packed top-down) and outlives
+        // this synchronous copy; the properties struct is a valid stack
         // temporary.
         let bitmap = unsafe {
             self.context.CreateBitmap(
@@ -516,7 +705,262 @@ impl GpuStack {
             .map_err(|e| format!("cast frame bitmap to ID2D1Bitmap failed: {e}"))?;
         drop(bitmap); // the base-interface reference keeps the object alive
         self.bitmap = Some(bitmap_base);
-        self.uploaded = Some((frame_gen, wide, high));
+        self.uploaded = Some((frame_gen, level, wide, high));
+        Ok(())
+    }
+
+    /// Copy one tile's haloed source rectangle out of the level's tightly
+    /// packed CPU pixels into a tight staging buffer and upload it. The
+    /// staging copy is the `in-flight` byte class; it is released before
+    /// this returns (its peak is what the ledger keeps).
+    fn upload_tile(
+        &mut self,
+        quad: &crate::tile::TileRequest,
+        level_pixels: &[u8],
+        level_w: u32,
+        level_h: u32,
+    ) -> Result<ID2D1Bitmap, String> {
+        let wide = quad.src.w as u32;
+        let high = quad.src.h as u32;
+        if wide == 0 || high == 0 {
+            return Err("a zero-area tile has no bitmap".into());
+        }
+        let row_bytes = wide as usize * 4;
+        let pitch = level_w as usize * 4;
+        if quad.src.right() as u32 > level_w || quad.src.bottom() as u32 > level_h {
+            return Err(format!(
+                "tile source {:?} escapes the {level_w}x{level_h} level",
+                quad.src
+            ));
+        }
+        let mut staging = vec![0u8; row_bytes * high as usize];
+        for row in 0..high as usize {
+            let src_off = (quad.src.y as usize + row) * pitch + quad.src.x as usize * 4;
+            let dst_off = row * row_bytes;
+            let Some(src_row) = level_pixels.get(src_off..src_off + row_bytes) else {
+                return Err(format!("tile source row {row} is outside the level buffer"));
+            };
+            staging[dst_off..dst_off + row_bytes].copy_from_slice(src_row);
+        }
+        self.ledger.note_inflight(staging.len() as u64);
+        // SAFETY: `staging` holds exactly wide*high*4 readable bytes (filled
+        // row by row above) and outlives this synchronous copy; the
+        // properties struct is a valid stack temporary.
+        let bitmap = match unsafe {
+            self.context.CreateBitmap(
+                D2D_SIZE_U {
+                    width: wide,
+                    height: high,
+                },
+                Some(staging.as_ptr().cast()),
+                row_bytes as u32,
+                &bitmap_properties(D2D1_BITMAP_OPTIONS_NONE),
+            )
+        } {
+            Ok(bitmap) => bitmap,
+            Err(e) => {
+                // The staging buffer dies with this call either way; the
+                // ledger must not keep counting it (external review AI1
+                // P2-4: a failed creation used to leave `inflight` stuck at
+                // the staging size for the rest of the session).
+                self.ledger.note_inflight(0);
+                return Err(format!("D2D tile CreateBitmap({wide}x{high}) failed: {e}"));
+            }
+        };
+        // Dropped here, not at the end of the function: the staging buffer
+        // is dead the moment the (synchronous) copy returned.
+        drop(staging);
+        self.ledger.note_inflight(0);
+        let bitmap_base: ID2D1Bitmap = bitmap
+            .cast()
+            .map_err(|e| format!("cast tile bitmap to ID2D1Bitmap failed: {e}"))?;
+        drop(bitmap);
+        Ok(bitmap_base)
+    }
+
+    /// Build this frame's draw list: pick the level/form ([`tile::plan_frame`]),
+    /// upload whatever is missing (the base bitmap, or the tiles that are
+    /// not resident), and record the ledger. Runs BEFORE BeginDraw: every
+    /// device-side allocation happens here, so the scene pass itself is
+    /// only draw commands.
+    ///
+    /// `forced_edge` is the `-tile` diagnostic, synced from the window
+    /// state per paint — so it also reaches a stack built before the
+    /// switch was applied (a single-instance handoff), and `None`/0 always
+    /// means the natural level/tile decision.
+    pub(crate) fn prepare(
+        &mut self,
+        frame_gen: u64,
+        master: (u32, u32),
+        plan: &DrawPlan,
+        diag: Diagnostics,
+        src: &mut dyn LevelSource,
+    ) -> Result<(), String> {
+        self.forced_edge = diag.tile_edge.filter(|edge| *edge > 0);
+        // Reset first, assign on success: an Err exit below (a refused
+        // level, a failed base upload) must not leave the PREVIOUS frame's
+        // scene in the close-time stats line (external review AI3 P3).
+        self.scene = Scene::Clear;
+        // A new frame generation invalidates every tile and every cached
+        // CPU level (their pixels can never be drawn again).
+        src.rebind(frame_gen);
+        if self.tile_gen != Some(frame_gen) {
+            for key in self.tile_lru.clear() {
+                self.tiles.retain(|(k, _)| *k != key);
+            }
+            self.tile_gen = Some(frame_gen);
+        }
+        let dest = crate::tile::Rect::new(plan.dx, plan.dy, plan.rw, plan.rh);
+        let viewport = crate::tile::Rect::new(0, 0, plan.cw, plan.ch);
+        let frame_plan = {
+            crate::tile::plan_frame(
+                frame_gen,
+                crate::tile::FrameGeometry {
+                    master: (master.0 as i32, master.1 as i32),
+                    render: (plan.rw, plan.rh),
+                    dest,
+                    viewport,
+                },
+                self.max_bitmap,
+                self.cap_bytes,
+                // The CPU level budget: the level bitmap is materialized
+                // before upload, so a level the cache would refuse must
+                // deepen here instead of blanking the frame later.
+                crate::mip::LEVEL_CACHE_BYTES,
+                self.forced_edge, // synced from the window state per paint
+            )
+        };
+        match frame_plan {
+            crate::tile::FramePlan::Blank => {
+                // A stale base bitmap must not stay device-resident behind a
+                // frame that does not draw it (the ledger reports tiles only).
+                self.bitmap = None;
+                self.uploaded = None;
+                self.scene = Scene::Clear;
+            }
+            crate::tile::FramePlan::Base { level } => {
+                let (wide, high, pixels) = src
+                    .level(level)
+                    .ok_or_else(|| format!("level {level} source is unavailable"))?;
+                self.ensure_base(frame_gen, level, wide, high, pixels)?;
+                // The overview bitmap counts against the same cap the tile
+                // LRU fills: a giant panned at 1:1 (LRU near cap) then
+                // zoomed out to fit would otherwise report — and hold —
+                // cap + overview. Trim the LRU to the remaining headroom
+                // so `gpu <= cap` holds on this transition too (external
+                // review AI3 P2-2; the S5c sweep asserts the strict bound).
+                let base = crate::tile::bgra_bytes(i64::from(wide) * i64::from(high));
+                if level > 0 {
+                    for key in self.tile_lru.trim_to(self.cap_bytes.saturating_sub(base)) {
+                        self.tiles.retain(|(k, _)| *k != key);
+                        self.ledger.tile_evictions += 1;
+                    }
+                }
+                self.scene = Scene::Base {
+                    level,
+                    w: wide,
+                    h: high,
+                };
+            }
+            crate::tile::FramePlan::Tiles { level, tiles } => {
+                // Same for the tiled form: the tiles ARE the source here, and a
+                // level bitmap left from an earlier zoom would inflate real VRAM
+                // without showing up in `gpu_resident`.
+                self.bitmap = None;
+                self.uploaded = None;
+                let (level_w, level_h, pixels) = src
+                    .level(level)
+                    .ok_or_else(|| format!("level {level} tile source is unavailable"))?;
+                let mut last_error: Option<String> = None;
+                // Pass 1: mark every already-resident tile of THIS frame hot
+                // before any insert can evict — an insert then only reclaims
+                // NON-frame (cold) entries. Without this, panning towards
+                // decreasing tile indices could insert new tiles whose
+                // eviction of the not-yet-touched still-visible ones left
+                // letterbox holes mid-image (external review AI1 P2-1: the
+                // plan's `frame_bytes <= cap` guarantee is only sound with
+                // this recency fixup; the forced `-tile` diagnostic bypasses
+                // the guarantee and may partially cover by design).
+                for quad in &tiles {
+                    self.tile_lru.touch(&quad.key);
+                }
+                // Pass 2: upload what is missing.
+                for quad in &tiles {
+                    if self.tile_lru.touch(&quad.key) {
+                        continue;
+                    }
+                    match self.upload_tile(quad, pixels, level_w, level_h) {
+                        Ok(bitmap) => {
+                            let bytes = quad.bytes();
+                            for key in self.tile_lru.insert(quad.key, bytes) {
+                                self.tiles.retain(|(k, _)| *k != key);
+                                self.ledger.tile_evictions += 1;
+                            }
+                            if self.tile_lru.contains(&quad.key) {
+                                self.tiles.push((quad.key, bitmap));
+                                self.ledger.tile_uploads += 1;
+                            } else {
+                                // Refused: a single tile larger than the
+                                // whole cap. Its column shows the cleared
+                                // background this frame (the fallback the
+                                // ticket's ladder is meant to keep rare) â
+                                // the post-pass verification below counts it.
+                            }
+                        }
+                        Err(e) => {
+                            // The per-tile detail goes to the summary line
+                            // below: a persistent failure would otherwise print
+                            // once per tile per paint (animations included).
+                            last_error = Some(e);
+                        }
+                    }
+                }
+                // Post-pass verification (external review AI2, P2-1 side-note):
+                // a tile uploaded EARLIER in this frame can still have been
+                // evicted by a later insert on the forced-diagnostic path —
+                // count those too, so the evidence line does not underreport
+                // the holes the draw will actually show.
+                let resident_now = tiles
+                    .iter()
+                    .filter(|q| self.tiles.iter().any(|(k, _)| *k == q.key))
+                    .count();
+                // The post-pass count is the ground truth: it covers upload
+                // failures, refusals, AND same-frame evictions uniformly
+                // (external review AI3 P3: the per-tile increments used to
+                // double-count with it).
+                let missing = tiles.len() - resident_now;
+                if missing > 0 {
+                    eprintln!(
+                        "riviv: {missing} of {} tiles are not resident this frame{}",
+                        tiles.len(),
+                        match &last_error {
+                            Some(e) => format!(" (last error: {e})"),
+                            None => String::new(),
+                        }
+                    );
+                }
+                self.scene = Scene::Tiles {
+                    level,
+                    quads: tiles,
+                };
+            }
+        }
+        self.ledger.cpu_source = src.cpu_bytes();
+        self.ledger.cpu_display = src.display_bytes();
+        self.ledger.mip_builds = src.level_builds();
+        // The base class counts the CURRENT plan's level bitmap: a tiled
+        // frame holds no base (the tiles ARE the source), while an overview
+        // frame's cost is exactly that bitmap — reading `uploaded` instead
+        // would report a stale level from an earlier frame of the session.
+        self.ledger.gpu_base = match &self.scene {
+            Scene::Base { level, w, h } if *level > 0 => {
+                crate::tile::bgra_bytes(*w as i64 * *h as i64)
+            }
+            _ => 0,
+        };
+        self.ledger
+            .note_gpu(self.ledger.gpu_base + self.tile_lru.total_bytes());
+        self.ledger.cap = self.cap_bytes;
         Ok(())
     }
 
@@ -527,18 +971,20 @@ impl GpuStack {
     /// One BeginDraw→Clear[→DrawBitmap]→EndDraw pass — the ONE scene body
     /// the present paths and the dump share (external review AI2: the dump
     /// used to duplicate the sequence, so a paint-path drift would have
-    /// been invisible to the L0 channel). `plan = None` is the blank
-    /// letterbox pass (the degenerate-image arm and the upload-failure
-    /// degrade). The EndDraw HRESULT is the sole error channel
-    /// (BeginDraw/DrawBitmap report nothing themselves).
+    /// been invisible to the L0 channel). The EndDraw HRESULT is the sole
+    /// error channel (BeginDraw/DrawBitmap report nothing themselves).
     fn draw_pass(
         &mut self,
         bg: [u8; 3],
         plan: Option<&DrawPlan>,
     ) -> Result<(), windows::core::Error> {
-        // SAFETY: the context and (when the plan draws) the uploaded bitmap
-        // are live; every rectangle/parameter outlives the calls; nothing
-        // pumps.
+        // SAFETY: the context and (when the scene draws) the uploaded
+        // bitmaps are live (the stack holds them; `prepare` only ever
+        // replaces a bitmap while no draw is running); every
+        // rectangle/parameter outlives the calls; nothing pumps. The tile
+        // loop's `PushAxisAlignedClip`/`PopAxisAlignedClip` calls are
+        // paired one-for-one inside it, so the context never reaches
+        // `EndDraw` with a clip still on the stack (D2D rejects that).
         unsafe {
             self.context.BeginDraw();
             let color = bg_color_f(bg);
@@ -546,12 +992,7 @@ impl GpuStack {
             if let Some(plan) = plan
                 && plan.rw > 0
                 && plan.rh > 0
-                && let Some(bitmap) = self.bitmap.as_ref()
             {
-                let (mw, mh) = match self.uploaded {
-                    Some((_, w, h)) => (w, h),
-                    None => (0, 0),
-                };
                 // i32 → f32 is exact in this range (the integer-rect
                 // five-piece clause keeps the values small).
                 let dest = D2D_RECT_F {
@@ -560,16 +1001,82 @@ impl GpuStack {
                     right: (plan.dx + plan.rw) as f32,
                     bottom: (plan.dy + plan.rh) as f32,
                 };
-                let src = D2D_RECT_F {
-                    left: 0.0,
-                    top: 0.0,
-                    right: mw as f32,
-                    bottom: mh as f32,
-                };
-                // Full source rect, no perspective: the dest rect carries
-                // the whole view math (unit PIXELS + identity transform).
-                self.context
-                    .DrawBitmap(bitmap, Some(&dest), 1.0, plan.interp, Some(&src), None);
+                match &self.scene {
+                    Scene::Clear => {}
+                    Scene::Base { w, h, .. } => {
+                        if let Some(bitmap) = self.bitmap.as_ref() {
+                            let src = D2D_RECT_F {
+                                left: 0.0,
+                                top: 0.0,
+                                right: *w as f32,
+                                bottom: *h as f32,
+                            };
+                            // Full source rect, no perspective: the dest
+                            // rect carries the whole view math (unit PIXELS
+                            // + identity transform).
+                            self.context.DrawBitmap(
+                                bitmap,
+                                Some(&dest),
+                                1.0,
+                                plan.interp,
+                                Some(&src),
+                                None,
+                            );
+                        }
+                    }
+                    Scene::Tiles { quads, .. } => {
+                        for quad in quads {
+                            let Some(bitmap) = self
+                                .tiles
+                                .iter()
+                                .find(|(key, _)| *key == quad.key)
+                                .map(|(_, bitmap)| bitmap)
+                            else {
+                                continue; // not resident: the clear stands
+                            };
+                            let clip = D2D_RECT_F {
+                                left: quad.clip.x as f32,
+                                top: quad.clip.y as f32,
+                                right: quad.clip.right() as f32,
+                                bottom: quad.clip.bottom() as f32,
+                            };
+                            // ALIASED: a half-covered clip edge pixel would
+                            // blend with the neighbour tile's write and
+                            // break the exact partition.
+                            self.render_target
+                                .PushAxisAlignedClip(&clip, D2D1_ANTIALIAS_MODE_ALIASED);
+                            // Sub-pixel, never truncated: the resampler derives
+                            // its scale/offset from these edges, and an integer
+                            // rect would drift the phase per tile (the ±1 shading
+                            // difference the plan math measures).
+                            let tile_dest = D2D_RECT_F {
+                                left: quad.dest.x,
+                                top: quad.dest.y,
+                                right: quad.dest.right(),
+                                bottom: quad.dest.bottom(),
+                            };
+                            let tile_src = D2D_RECT_F {
+                                left: 0.0,
+                                top: 0.0,
+                                right: quad.src.w as f32,
+                                bottom: quad.src.h as f32,
+                            };
+                            // The haloed source maps through the SAME
+                            // global projection as the untiled draw, so the
+                            // resampler's phase matches; the clip hides the
+                            // halo's edge-clamped samples.
+                            self.context.DrawBitmap(
+                                bitmap,
+                                Some(&tile_dest),
+                                1.0,
+                                plan.interp,
+                                Some(&tile_src),
+                                None,
+                            );
+                            self.render_target.PopAxisAlignedClip();
+                        }
+                    }
+                }
             }
             self.context.EndDraw(None, None)
         }
@@ -589,6 +1096,24 @@ impl GpuStack {
             eprintln!("riviv: EndDraw failed ({e}) — degrading the session to gdi");
             PaintOutcome::Unrecoverable { hr: hr.0 }
         }
+    }
+
+    /// The #82 evidence line for the close path: the byte ledger plus this
+    /// frame's level/tile count — `None` when the tile path never ran (an
+    /// ordinary session's stderr stays clean).
+    pub(crate) fn stats_line(&self) -> Option<String> {
+        if self.ledger.tile_uploads == 0
+            && self.ledger.mip_builds == 0
+            && self.forced_edge.is_none()
+        {
+            return None;
+        }
+        let (level, tiles) = match &self.scene {
+            Scene::Tiles { level, quads } => (*level, quads.len()),
+            Scene::Base { level, .. } => (*level, 0),
+            Scene::Clear => (0, 0),
+        };
+        Some(self.ledger.stats_line(level, tiles))
     }
 
     /// One blank-letterbox frame: the scene pass plus Present.
@@ -667,16 +1192,25 @@ impl GpuStack {
     /// target — no Present, so a never-shown window dumps identically —
     /// then copy the target into a CPU-readable staging bitmap, Map it and
     /// hand the RGBA bytes back. Runs under the caller's window-state
-    /// borrow: the plan and the master bytes arrive as parameters, this
-    /// method never re-enters state_of.
+    /// borrow: the plan and the frame arrive as parameters, this method
+    /// never re-enters state_of. Since #82 the giant path renders THROUGH
+    /// here too (tiles), so the dump channel covers the whole domain — the
+    /// GDI fallback stays for a dead/absent stack only.
     pub(crate) fn dump(
         &mut self,
-        cw: u32,
-        ch: u32,
-        bg: [u8; 3],
-        frame: Option<(u64, u32, u32, &[u8])>,
-        plan: Option<DrawPlan>,
+        req: DumpRequest,
+        diag: Diagnostics,
+        src: &mut dyn LevelSource,
     ) -> Result<(u32, u32, Vec<u8>), String> {
+        let DumpRequest {
+            cw,
+            ch,
+            bg,
+            frame,
+            plan,
+        } = req;
+        self.forced_edge = diag.tile_edge.filter(|edge| *edge > 0);
+        self.scene = Scene::Clear;
         if cw == 0 || ch == 0 {
             return Err(format!("viewport is {cw}x{ch} — nothing to dump"));
         }
@@ -694,14 +1228,14 @@ impl GpuStack {
                 desc.Width, desc.Height
             ));
         }
-        if let Some((frame_gen, wide, high, pixels)) = frame {
-            if frame_exceeds_max_bitmap(wide, high, self.max_bitmap) {
-                return Err(format!(
-                    "frame {wide}x{high} exceeds the D2D max bitmap {}",
-                    self.max_bitmap
-                ));
+        // A frame (and its plan — they arrive together) prepares the draw
+        // list through the same ladder the paint uses; nothing at all means
+        // the blank letterbox dump.
+        match (frame, plan) {
+            (Some((frame_gen, wide, high)), Some(plan)) => {
+                self.prepare(frame_gen, (wide, high), &plan, diag, src)?;
             }
-            self.ensure_upload(frame_gen, wide, high, pixels)?;
+            _ => self.scene = Scene::Clear,
         }
         // The SAME scene pass the present paths run (external review AI2:
         // a duplicated sequence here would let paint-path drift go
@@ -711,6 +1245,26 @@ impl GpuStack {
             .map_err(|e| format!("dump EndDraw failed: {e}"))?;
         // The readback staging bitmap: CPU_READ | CANNOT_DRAW, viewport
         // sized, the same UNORM format (design §9).
+        // The readback plus the two decoded copies below are this call's
+        // in-flight buffers: the ledger's inflight class covers them, and the
+        // peak is what survives the call.
+        self.ledger
+            .note_inflight((cw as u64 * ch as u64 * 4).saturating_mul(2));
+        // The readback tail runs as one unit so the in-flight accounting is
+        // restored on EVERY exit: the six failure paths between here and
+        // the old success-path reset used to strand the staging bytes in
+        // the ledger (external review AI3 P2-1 - the same defect AI1 P2-4
+        // fixed in upload_tile, not synced to this arm), and the dump runs
+        // at WM_CLOSE, exactly when the stats line is about to be read.
+        let read = self.dump_readback(cw, ch);
+        self.ledger.note_inflight(0);
+        read
+    }
+
+    /// The dump's readback tail: staging bitmap, copy, map, rows, unmap,
+    /// the BGRA-to-RGBA decode. Every `?` here is a caller-side in-flight
+    /// reset away from leaking the accounting (see `dump`).
+    fn dump_readback(&mut self, cw: u32, ch: u32) -> Result<(u32, u32, Vec<u8>), String> {
         // SAFETY: the context is live; the properties struct outlives the
         // call; the bitmap is created bare (never set as the target).
         let readback = unsafe {
@@ -842,8 +1396,8 @@ fn present(swapchain: &IDXGISwapChain1) -> PaintOutcome {
 
 /// The D2D paint (design §4, ADR 0002 D8 verbatim): IsIconic early-exit →
 /// BeginPaint (rcPaint ignored — a flip back buffer is discarded, the
-/// whole viewport redraws; failure is the GDI arm's fatal) → the giant
-/// gate → upload-if-stale → BeginDraw/Clear/DrawBitmap/EndDraw/Present →
+/// whole viewport redraws; failure is the GDI arm's fatal) → `prepare`
+/// (the plan + its uploads) → BeginDraw/Clear/DrawBitmap/EndDraw/Present →
 /// EndPaint → the #76 paint handshake (the render stack's health is
 /// irrelevant to the decode worker's first-frame wait). Device losses
 /// return as [`PaintOutcome::DeviceLost`] for the router's ladder; nothing
@@ -912,26 +1466,6 @@ pub(crate) fn paint_d2d(view: HWND, owner: HWND) -> PaintOutcome {
             let master = img.surface().master();
             (master.width, master.height)
         });
-        // The defensive fallback is u32::MAX, NOT 0: a zero floor would
-        // push every frame through the giant gate (external review AI2).
-        // Unreachable in practice — paint_d2d only runs with a live stack.
-        let max_bitmap = state
-            .gpu
-            .as_ref()
-            .map(|gpu| gpu.max_bitmap)
-            .unwrap_or(u32::MAX);
-        if let Some((mw, mh)) = dims
-            && frame_exceeds_max_bitmap(mw, mh, max_bitmap)
-        {
-            // The giant-image gate (design §5): this frame paints through
-            // GDI; the router tears the stack down after this borrow ends.
-            let _ = EndPaint(view, &ps);
-            return PaintOutcome::GiantFrame {
-                wide: mw,
-                high: mh,
-                max: max_bitmap,
-            };
-        }
         // The plan reads the whole state — computed before the mutable gpu
         // borrow (plain data, the borrow ends here).
         let plan = dims.map(|(mw, mh)| (draw_plan(state, cw, ch, mw as i32, mh as i32), mw, mh));
@@ -942,8 +1476,19 @@ pub(crate) fn paint_d2d(view: HWND, owner: HWND) -> PaintOutcome {
         };
         let outcome = match (&plan, state.image.as_ref()) {
             (Some((plan, mw, mh)), Some(image)) => {
-                let master = image.surface().master();
-                match gpu.ensure_upload(frame_gen, *mw, *mh, &master.pixels) {
+                // The CPU level source (master + mip cache) — a disjoint
+                // field borrow from `gpu`; the window state owns the
+                // pixels, the stack only uploads them (#82).
+                let mut levels = MasterLevels {
+                    master: Some(image.surface().master()),
+                    cache: &mut state.levels,
+                    frame_gen,
+                    display_bytes: image.surface().face_bytes(),
+                };
+                let diag = crate::gpu::Diagnostics {
+                    tile_edge: state.tile_edge,
+                };
+                match gpu.prepare(frame_gen, (*mw, *mh), plan, diag, &mut levels) {
                     Ok(()) => gpu.draw_frame(plan),
                     Err(e) => {
                         // Upload trouble: blank this frame (the previous
@@ -1127,15 +1672,25 @@ mod tests {
         );
     }
 
-    // ---- the giant-image gate (design §5) ----
+    // ---- the giant path's device bound (design §5, #82) ----
+    //
+    // #80's gate (a frame past `GetMaximumBitmapSize` tears the stack down
+    // and renders through GDI) is GONE: the D2D arm draws giants itself,
+    // as a level bitmap or as tiles. The device bound is now a plan input
+    // — `tile::plan_frame`'s `max_bitmap` argument — and its behavior is
+    // pinned by tile.rs's level tests (a level at/past the max tiles, one
+    // under it is a single bitmap). What remains worth pinning here is the
+    // budget the stack derives from it:
 
     #[test]
-    fn the_giant_gate_admits_the_max_and_blocks_one_past_it() {
-        // 16384 is the typical GetMaximumBitmapSize: it uploads, 16385 does
-        // not — on either axis, independently.
-        assert!(!frame_exceeds_max_bitmap(16384, 16384, 16384));
-        assert!(frame_exceeds_max_bitmap(16385, 100, 16384));
-        assert!(frame_exceeds_max_bitmap(100, 16385, 16384));
+    fn the_stack_cap_comes_from_the_driver_budget_with_our_own_ceiling() {
+        use crate::tile::{SELF_CAP_BYTES, budget_cap};
+        // The stack stores whatever `budget_cap` decided; a huge driver
+        // budget must not become an unbounded tile cache, and a tiny one
+        // must not starve the viewport.
+        assert_eq!(budget_cap(None), SELF_CAP_BYTES);
+        assert_eq!(budget_cap(Some(u64::MAX)), SELF_CAP_BYTES);
+        assert!(budget_cap(Some(0)) >= crate::tile::MIN_CAP_BYTES);
     }
 
     // ---- the background color roundtrip (design §4's byte-exact argument) ----

@@ -14,10 +14,10 @@
 //!
 //! This module is the pure math. Its original GDI-shell consumer was mip
 //! generation in `surface.rs`, deleted with the #81 mip retirement
-//! (ADR 0002 D7); the partition math survives because #82's giant-image
-//! tiling explicitly reuses it — and #81's own paint path already reuses
-//! the sized variant twice for the extreme-source regime: since #81
-//! shrink sources are the full-resolution face, a source extent past
+//! (ADR 0002 D7); the partition math survives for the GDI arm's extreme
+//! source regime and as the frozen reference for #82's D2D tiling: #81's
+//! paint reuses the sized variant twice — since #81 shrink sources are the
+//! full-resolution face, a source extent past
 //! [`STRETCH_SOURCE_STITCH_TRIGGER`] cannot be stretched in one call (the
 //! giant-panorama black image), so paint builds a transient relief
 //! intermediate through 512-px slices (upstream's own generation tiling)
@@ -26,6 +26,13 @@
 //! (viv.c:4264-4283, the HALFTONE path must NOT be cut — filter
 //! alignment, viv.c:4253-4257) and magnify is viewport-clipped before
 //! blitting (#7's `clip_blit`).
+//!
+//! #82's tiling (`crate::tile`) shares this module's projection identity —
+//! `tile::src_to_dest` is the same `dest_origin + src * dest_extent /
+//! src_extent` i64 form, which is what makes adjacent tiles share their
+//! edges — but it is a separate implementation on purpose: it windows the
+//! enumeration to the visible preimage and carries a halo plus an interior
+//! clip, neither of which a StretchBlt-chain decomposition needs.
 
 use crate::zoom::BlitRect;
 
@@ -54,8 +61,11 @@ pub(crate) const STRETCH_EXTENT_LIMIT: i32 = 32768;
 /// path meets them head-on, so paint builds a transient relief
 /// intermediate instead. The trigger sits 4.7% past the last
 /// census-proven full-rect point (4,000,000): the (4M, 2^22) band is
-/// interpolated by construction — one point short of a full proof, noted
-/// for #82's census to close.
+/// interpolated by construction — one point short of a full proof, whose
+/// closing was DEFERRED out of #82: this constant is now the GDI arm's
+/// alone (the D2D arm tiles giants and never calls StretchBlt), so the
+/// band only matters for `renderer=gdi` sessions, and #90 (the GDI
+/// render-path removal) retires the constant with the arm.
 ///
 /// Reachable envelope + per-paint cost (external review AI1 P2-4): the
 /// loader's 512 MB frame cap bounds a triggering frame to max axis ≥ 2^22
@@ -182,10 +192,13 @@ pub(crate) fn stitch_tiles_sized(
     tiles
 }
 
-/// Upstream's fixed 512-px tiling — the [`stitch_tiles_sized`] call the
-/// #82 tiling will make (`#allow` until then; the tests keep the math
-/// pinned meanwhile).
-#[allow(dead_code)] // #82's tiling reuses it
+/// Upstream's fixed 512-px tiling. Kept as the partition math's historical
+/// entry point (the tests below pin it byte for byte against
+/// [`stitch_tiles_sized`]); #82's D2D tiling reuses the *projection
+/// discipline* — one destination edge per shared source coordinate — but
+/// windows the enumeration to the visible preimage (`tile::tile_requests`),
+/// which this whole-rect decomposition does not do, so it has no caller.
+#[allow(dead_code)] // the delegation identity's regression net
 pub(crate) fn stitch_tiles(blit: BlitRect, clip: (i32, i32, i32, i32)) -> Vec<BlitRect> {
     stitch_tiles_sized(STITCH_TILE_SIZE, blit, clip)
 }

@@ -950,8 +950,9 @@ Kill-Riviv
 Reset-Ini ''
 
 # Extreme giant 16777217x1 horizontal gradient. The gdi run asserts the
-# CONTENT of the >=32768 giant branch; the warp run asserts the gate line
-# plus the same content (smoke80 S5 upgraded with a content assertion).
+# CONTENT of the >=32768 giant branch; since #82 the warp run asserts the
+# OPPOSITE of the old gate: the D2D arm draws it itself (no gate line, no
+# gdi fallback), with the stats line naming the form (S4j/S4j2).
 $giantExtra = @('shrink_blit_mode=1')
 $ggr = Run-Scene 'gdi' 0 $giantExtra $giantPng 's4-giant-gdi.png' 's4-giant-gdi.err' $null $null $null 90000
 $ggOk = ($ggr.Code -eq 0) -and (Test-Path $ggr.Out)
@@ -991,12 +992,24 @@ Reset-Ini ''
 $gwr = Run-Scene 'warp' 0 $giantExtra $giantPng 's4-giant-warp.png' 's4-giant-warp.err' $null $null $null 90000
 $gwOk = ($gwr.Code -eq 0) -and (Test-Path $gwr.Out)
 $gerr = $gwr.Err
-$iBc = $gerr.IndexOf('renderer=warp backend=')
-$iGate = $gerr.IndexOf('exceeds the D2D max bitmap')
-$gOrder = ($iBc -ge 0) -and ($iGate -gt $iBc) -and $gerr.Contains('rendering it via gdi')
 $gMaxLine = ''
-if ($gerr -match 'exceeds the D2D max bitmap (\d+)') { $gMaxLine = 'device max=' + $Matches[1] }
-Check 'S4j-giant-warp gate line present after the breadcrumb, fell back to gdi' $gOrder ("order=$gOrder $gMaxLine stderr=[$($gerr.Trim())]")
+if ($gerr -match 'max_bitmap=(\d+)') { $gMaxLine = 'device max=' + $Matches[1] }
+# #82: the giant no longer trips a gate and no longer falls back to GDI - the
+# D2D arm draws it itself (an overview level, or tiles). The old assertion
+# (gate line + 'rendering it via gdi') is what #82 removed; what replaces it
+# is the close-time stats line naming the form, plus the dump succeeding.
+$gStatsLevel = -1
+$gStatsTiles = -1
+$gStatsSeen = $gerr -match 'riviv: tiles level=(\d+) tiles=(\d+) base=(\d+)'
+if ($gStatsSeen) {
+    $gStatsLevel = [int]$Matches[1]
+    $gStatsTiles = [int]$Matches[2]
+}
+$gForm = $gStatsSeen -and (($gStatsLevel -ge 1) -or ($gStatsTiles -ge 1))
+$gOk = $gwOk -and ($gerr -match 'backend=d2d') -and (-not $gerr.Contains('exceeds the D2D max bitmap')) -and (-not $gerr.Contains('rendering it via gdi')) -and (-not $gerr.Contains('trying the gdi channel'))
+Check 'S4j-giant-warp drawn by the d2d arm itself (no gate line, no gdi fallback, exit 0)' $gOk ("exit=$($gwr.Code) out=$(Test-Path $gwr.Out) $gMaxLine stderr=[$($gerr.Trim())]")
+Check 'S4j2-giant-warp stats line names the giant form (level>=1 or tiles>=1)' $gForm "seen=$gStatsSeen level=$gStatsLevel tiles=$gStatsTiles"
+
 if ($gwOk) {
     $q = [Px]::Load($gwr.Out)
     $bb = [Px]::BBox($q.B, $q.W, $q.H)

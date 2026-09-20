@@ -220,6 +220,11 @@ pub(crate) struct Parsed {
     /// parse (a single-instance handoff arms it in the FIRST instance — no
     /// special-casing, README-noted), never persisted.
     pub dump_viewport: Option<Vec<u16>>,
+    /// `-tile <edge>` (#82): the forced tile-grid edge in px for the D2D
+    /// arm's giant path — a DIAGNOSTIC (the smoke's tiled-vs-untiled
+    /// channel), so it bypasses the single-bitmap shortcut and never
+    /// persists. 0 or a dangling switch = the natural decision.
+    pub tile_edge: Option<i32>,
     pub start_fullscreen: bool,
     pub start_window: bool,
     pub start_maximized: bool,
@@ -276,6 +281,14 @@ pub(crate) fn parse(cl: &[u16], is_add: bool, has_current: bool) -> Parsed {
                 // the empty tail word — the consumer fails the dump with
                 // exit 2, exactly like a dangling /x parses as 0.
                 out.dump_viewport = Some(param(&mut i));
+            } else if eq_switch(arm, "tile") {
+                // #82 (riviv-authored diagnostic, like -dump-viewport): the
+                // NEXT word is the grid edge in pixels; anything that does
+                // not parse is 0 = the natural decision (no usage box — a
+                // diagnostic must not turn a typo into a modal).
+                let word = param(&mut i);
+                let text = String::from_utf16_lossy(&word);
+                out.tile_edge = Some(text.trim().parse::<i32>().unwrap_or(0));
             } else if eq_switch(arm, "fullscreen") {
                 out.start_fullscreen = true;
                 out.start_window = false;
@@ -812,6 +825,53 @@ mod tests {
         );
         assert!(p.start_slideshow);
         assert_eq!(s(p.dump_viewport.as_deref().unwrap()), "b.png");
+    }
+
+    // ---- the -tile switch (#82, diagnostic) ----
+
+    #[test]
+    fn tile_takes_its_edge_and_never_touches_the_file_words() {
+        for cl in [
+            "exe a.png -tile 512",
+            "exe a.png /tile 512",
+            "exe a.png -TILE 512",
+        ] {
+            let p = parse(&w(cl), false, false);
+            assert_eq!(p.tile_edge, Some(512), "{cl}");
+            assert_eq!(p.file_count, 1, "{cl} must not eat the image word");
+            assert!(p.unknown.is_empty(), "{cl}");
+        }
+        // A leading file word still wins the open target.
+        let p = parse(&w("exe a.png -tile 256 b.png"), false, false);
+        assert_eq!(p.tile_edge, Some(256));
+        assert_eq!(s(p.single.as_deref().unwrap()), "a.png");
+    }
+
+    #[test]
+    fn tile_without_a_usable_edge_is_the_natural_decision() {
+        // The diagnostic never pops the usage box: a dangling switch, a
+        // non-number and a zero all mean "decide from the frame".
+        assert_eq!(
+            parse(&w("exe a.png -tile"), false, false).tile_edge,
+            Some(0)
+        );
+        assert_eq!(
+            parse(&w("exe a.png -tile wide"), false, false).tile_edge,
+            Some(0)
+        );
+        assert_eq!(
+            parse(&w("exe a.png -tile 0"), false, false).tile_edge,
+            Some(0)
+        );
+        assert!(
+            parse(&w("exe a.png -tile 512"), false, false)
+                .unknown
+                .is_empty(),
+            "the switch is known"
+        );
+        // Absent = None (not Some(0)): the distinction the stack's
+        // forced_edge reads.
+        assert_eq!(parse(&w("exe a.png"), false, false).tile_edge, None);
     }
 
     // ---- the clipboard: pseudo-filename (#66) ----
