@@ -340,21 +340,29 @@ pub(crate) fn render_scene(hdc: HDC, owner: HWND, client: RECT, paint_clip: RECT
                         // extents stay viewport-bounded, so no stitching here.
                         //
                         // KNOWN GAP, deliberately documented not fixed
-                        // (external review AI2 P3; README Differences): the
-                        // relief regime only guards the SHRINK arm above. A
+                        // (external review AI2 P3 + AI3's mechanism
+                        // correction; README Differences): the relief
+                        // regime only guards the SHRINK arm above. A
                         // ≥2^22-axis face CAN legally reach this arm (the
                         // preset curve renders up to 16x the source, so
                         // rw ≥ mw is reachable even though no viewport is
-                        // that wide), and the cut's SOURCE sub-rect then
-                        // spans ~mw/zoom px — over the trigger for zooms
-                        // below ~4x on such faces, where the census says
-                        // wide blits from ≥2^23 faces fail (black region;
-                        // upstream's own no-mip magnify shares the failure
-                        // shape). Envelope: extreme-aspect stripes only
+                        // that wide), and the two mag tiers expose
+                        // differently: `mag_filter=1` (HALFTONE) blits
+                        // the FULL uncut rect — the whole ≥2^22 face in
+                        // one call, exactly the census-proven failing
+                        // shape → deterministic black; `mag_filter=0`
+                        // (the default) cuts to the viewport, and the
+                        // cut's source sub-rect is viewport-bounded
+                        // (`clip_blit` maps it as w2·mw/rw = w2/zoom —
+                        // a few thousand px, never near the trigger), so
+                        // it sits in the UNVERIFIED census band on ≥2^23
+                        // faces (proven good ≤512-px slices, proven bad
+                        // at 2^21; ~3K-px reads untested) and may render
+                        // or black. Envelope: extreme-aspect stripes only
                         // (the 512 MB cap bounds these shapes); the whole
                         // giant path is replaced by #82's tiling, and
-                        // mapping the cut's source coords through the
-                        // relief divisor is that ticket's geometry.
+                        // routing the mag arm through the relief is that
+                        // ticket's geometry.
                         // `mag_filter` Linear = HALFTONE magnified WITHOUT the
                         // clip cut: cutting realigns the filter taps, so the
                         // full rect stretches behind GDI's own clipping
@@ -857,9 +865,13 @@ mod tests {
         // ≥2^22 source makes the single full-rect StretchBlt fail AT THE
         // FACE level (the census — the call shape the GiantClip branch
         // exists to run cannot succeed on such a source), so there IS no
-        // GiantClip option for it; the relief's own final blit is
-        // dest-bounded by the viewport like any other (external review
-        // AI1 P3-7).
+        // GiantClip option for it. What is lost at this corner is only
+        // GiantClip's clip-region mitigation: the relief's final blit
+        // passes the FULL rw×rh unclipped, and a giant dest extent is
+        // reachable here (panscan pushes renders ~3x the preset curve, so
+        // rw ≥ 32768 with rw < mw fits) — GDI then walks the whole dest
+        // extent per paint, a perf-only cost (external review AI3: the
+        // earlier "dest-bounded by the viewport" claim here was wrong).
         assert_eq!(
             shrink_regime(
                 STRETCH_SOURCE_STITCH_TRIGGER * 2,

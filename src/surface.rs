@@ -196,7 +196,10 @@ pub(crate) fn build_giant_relief(src_dc: HDC, mw: i32, mh: i32) -> Option<GiantR
         eprintln!("giant-relief build failed, degrading to sliced blits: {why}");
     };
     if src_dc.is_invalid() || mw <= 0 || mh <= 0 {
-        degrading("invalid source DC or dimensions");
+        // SILENT, unlike the allocation failures below (external review
+        // AI3 P3): an invalid DC means the face build failed, whose own
+        // breadcrumb fired ONCE under the `face_stuck` latch — repeating
+        // it here would spam every WM_PAINT of the blank frame.
         return None;
     }
     debug_assert!(

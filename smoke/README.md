@@ -14,7 +14,7 @@
 powershell -NoProfile -File smoke\smoke81-filters.ps1 [-Exe <path>] [-Regolden]
 ```
 
-场景(67 检查;golden 冻结于 `smoke/golden81/`,GDI 臂生成,票面原文):
+场景(71 检查;golden 冻结于 `smoke/golden81/`,GDI 臂生成,票面原文):
 
 - **S1** 默认翻:missing key→`renderer=auto backend=`;frobnicate→
   `unrecognized`+`using auto`;`renderer=gdi` 逃生键。
@@ -26,7 +26,8 @@ powershell -NoProfile -File smoke\smoke81-filters.ps1 [-Exe <path>] [-Regolden]
   差异记录;shrink=0 整数比 2× warp(NEAREST)/gdi(COLORONCOLOR)**字节相等**。
 - **S4 巨图**:banner 40000×256 双臂内容断言(warp 上传无 gate);极端
   16777217×1 gdi+warp(warp 侧断 gate 行+GDI 通道内容);边界 census
-  4,000,000/2^22/2^23×1(2^22 起走 relief 两级路径,接缝扫描)。
+  4,000,000/2^22/2^23/6,291,456×1(2^22 起走 relief 两级路径,接缝扫描;
+  6,291,456 = 非 2 幂倍数点,钉 relief_divisor 离开 2 幂格点)。
 - **S5** exit-2:dump 到不存在目录→exit 2+stderr。
 - **S6** 帧时间基线(记录档,数字存档见 issue #81)。
 
