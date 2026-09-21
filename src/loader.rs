@@ -37,15 +37,17 @@ use crate::surface::Surface;
 /// what the UI does with that failure). Matches the single-image
 /// allocation cap the decoder limits already enforce. The `stdin:` read
 /// caps its raw stream at the same bound (#65). Counts the decoded
-/// (master) bytes — unchanged by #76, whose GDI derivations sit outside
-/// this budget.
+/// (master) bytes — the only frame memory there is since #90 removed the
+/// GDI face derivation (#76's on-demand DIBs used to sit outside this
+/// budget; the D2D uploads copy out of the master without a standing CPU
+/// twin).
 pub(crate) const MAX_TOTAL_FRAME_BYTES: usize = 512 * 1024 * 1024;
 
-/// Frame-count budget: every displayed frame's GDI face costs two GDI
-/// objects (DC + DIB, built on the UI thread at the frame's FIRST
-/// paint since #76 — only displayed frames ever materialize one) and the
-/// default per-process GDI limit is 10000, so 4096 frames keeps roughly
-/// 1800 objects of headroom for the window itself.
+/// Frame-count budget: a hostile file can pack an unbounded COUNT of tiny
+/// frames under the byte cap, so the stream stops at 4096 frames
+/// regardless of size (each displayed frame holds its full CPU master in
+/// the UI state until the image swaps). The pre-#90 rationale — GDI
+/// object exhaustion from one DC + DIB per face — died with the GDI arm.
 const MAX_FRAMES: usize = 4096;
 
 // ---------------------------------------------------------------------------
@@ -56,8 +58,10 @@ const MAX_FRAMES: usize = 4096;
 /// `_VIV_REPLY_LOAD_IMAGE_*`, viv.c:310-313). Generic over the frame
 /// payload: the worker sends pure memory frames (`PixelFrame`, the
 /// default — #76: no GDI object crosses the thread boundary); the UI
-/// maps them to GDI-deriving `Surface`s before applying, so the state
-/// machine is unit-testable without GDI.
+/// maps them into `Surface`s (the master's UI-thread holder; an
+/// infallible move since #90 removed the GDI face derivation) before
+/// applying, so the state machine is unit-testable without any UI
+/// dependency.
 #[derive(Debug, PartialEq)]
 pub(crate) enum LoadReply<F = PixelFrame> {
     /// The first decoded frame — the UI swaps the display to it (old image
@@ -74,9 +78,11 @@ pub(crate) enum LoadReply<F = PixelFrame> {
     /// upstream's "Failed to load image." (#5). The message itself is a
     /// diagnostic detail — carried for the M2 debug-log channel.
     FailedUser(#[allow(dead_code)] String),
-    /// System-level failure (GDI exhaustion): fail loud on the UI thread
-    /// (ADR 0001) — the reply exists so the modal box never runs on the
-    /// worker thread.
+    /// System-level failure: fail loud on the UI thread (ADR 0001) —
+    /// the reply exists so the modal box never runs on the worker
+    /// thread. (Its historical producer, GDI-object exhaustion at the
+    /// face conversion, died with the GDI arm in #90; the variant stays
+    /// as the protocol's terminal error class.)
     FatalSystem(String),
 }
 
@@ -176,9 +182,10 @@ const CLIPBOARD_SHOWN_NAME: &str = "clipboard";
 /// stream exactly like a still decode: first frame, then Complete; no
 /// interruption points (the parse is a single pass). Every payload
 /// problem is user-level (keep old image, no dialog, no exit — ADR
-/// 0001); since #76 the frame itself is pure memory, so the decode side
-/// has no system-level failure class left (the UI's GDI derivation
-/// still fails loud through `map_reply_frame`).
+/// 0001); since #76 the frame itself is pure memory, and since #90 the
+/// UI-side conversion (`Surface::from_master`) is an infallible
+/// ownership move — the decode side has no system-level failure class
+/// left.
 pub(crate) fn decode_dib_to_sink(payload: &[u8], env: DecodeEnv, sink: &mut dyn FnMut(LoadReply)) {
     let outcome = (|| -> Result<(), Stop> {
         let dib = crate::dib::parse_dib(payload, env.background, MAX_TOTAL_FRAME_BYTES)
@@ -489,9 +496,11 @@ fn sink_static<D: ImageDecoder>(
 }
 
 /// Convert a reply's frame payload — the UI thread maps worker memory
-/// frames into GDI-deriving Surfaces (memory DCs belong to their
-/// creating thread), with a conversion failure surfacing as the
-/// system-level FatalSystem reply (GDI exhaustion, ADR 0001).
+/// frames into Surfaces. Since #90 removed the GDI face derivation the
+/// production conversion (`Surface::from_master`) is an infallible
+/// ownership move; the Err→FatalSystem arm remains the generic contract
+/// of the protocol's terminal error class (kept for the state machine's
+/// test net, ADR 0001).
 pub(crate) fn map_reply_frame<E, F>(
     reply: LoadReply<E>,
     convert: impl Fn(E) -> Result<F, String>,
@@ -672,18 +681,10 @@ impl<F> LoadedImage<F> {
     }
 
     /// The frame currently displayed (frame 0 until the timer advances).
-    /// Production paint goes through `surface_mut` (the on-demand GDI
-    /// face, #76); the immutable read serves the clipboard image blit
-    /// (#41) and tests.
+    /// Serves the clipboard image copy (#41), the D2D uploads' master read
+    /// and the tests.
     pub(crate) fn surface(&self) -> &F {
         &self.frames[self.position]
-    }
-
-    /// Mutable access to the displayed frame's surface — paint builds the
-    /// frame's GDI face through this (#76, on demand since the #81 mip
-    /// retirement left nothing else to extend).
-    pub(crate) fn surface_mut(&mut self) -> &mut F {
-        &mut self.frames[self.position]
     }
 
     /// Every loaded frame, mutably — #43's rotate pass touches them all
@@ -1436,10 +1437,10 @@ mod tests {
         );
         let img = image.unwrap();
         let err = img
-            .map_frames(|_| Err::<u32, _>("gdi exhausted".to_string()))
+            .map_frames(|_| Err::<u32, _>("conversion failed".to_string()))
             .err()
             .expect("the mapping must fail");
-        assert_eq!(err, "gdi exhausted");
+        assert_eq!(err, "conversion failed");
     }
 
     #[test]

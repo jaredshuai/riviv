@@ -39,28 +39,29 @@ const APPDATA_DIR: &str = "riviv";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum RendererKind {
-    /// Hardware D2D → WARP → GDI: the transitional ladder and the #81
-    /// default (ADR 0002 D5; #82 deletes the GDI tier and makes the final
-    /// failure fatal).
+    /// Hardware D2D → WARP → fatal: the failure chain and the default
+    /// (#90 removed the GDI tier below WARP and made the terminal verdict
+    /// fatal; ADR 0002 D5).
     #[default]
     Auto,
-    /// Pure hardware D2D — an init failure drops straight to GDI, never
-    /// WARP: forcing hardware is a diagnostic/repro request, silently
-    /// swapping in the software rasterizer would defeat it (#80 design §2).
+    /// Pure hardware D2D — an init failure fatals, never WARP: forcing
+    /// hardware is a diagnostic/repro request, silently swapping in the
+    /// software rasterizer would defeat it (#80 design §2).
     D2d,
     /// Pure WARP — the golden/CI tier (cross-machine-deterministic pixels).
     Warp,
-    /// The GDI path — the pre-#80 byte-for-byte baseline; an explicit
-    /// escape key now that #81 made `auto` the default.
-    Gdi,
 }
 
 impl RendererKind {
     /// Parse one ini value (ASCII case-insensitive whole-word match of the
-    /// four literals, the `eq_switch` philosophy). `None` = unrecognized —
+    /// three literals, the `eq_switch` philosophy). `None` = unrecognized —
     /// the caller falls back to the default with a stderr breadcrumb (a
     /// hand-edited typo lands on the safe baseline, unlike the int keys'
-    /// garbage=0 semantics, #80 design §2).
+    /// garbage=0 semantics, #80 design §2). The fourth era word, `gdi`,
+    /// never reaches here: the LOAD path maps it to `Auto` with a
+    /// migration note (see [`Config::apply_section`]) — a legal word whose
+    /// arm was removed, not a typo. This function stays pure (no
+    /// printing).
     pub(crate) fn parse_ini(value: &str) -> Option<RendererKind> {
         if value.eq_ignore_ascii_case("auto") {
             Some(RendererKind::Auto)
@@ -68,27 +69,20 @@ impl RendererKind {
             Some(RendererKind::D2d)
         } else if value.eq_ignore_ascii_case("warp") {
             Some(RendererKind::Warp)
-        } else if value.eq_ignore_ascii_case("gdi") {
-            Some(RendererKind::Gdi)
         } else {
             None
         }
     }
 
-    /// The canonical lowercase ini spelling (the save form).
+    /// The canonical lowercase ini spelling (the save form). Three values:
+    /// a save never writes `gdi` again (#90 removed the arm; old files
+    /// migrate on load).
     pub(crate) fn to_ini(self) -> &'static str {
         match self {
             RendererKind::Auto => "auto",
             RendererKind::D2d => "d2d",
             RendererKind::Warp => "warp",
-            RendererKind::Gdi => "gdi",
         }
-    }
-
-    /// Whether the request wants a D2D stack at all (`gdi` excludes it —
-    /// the GDI path must have no GpuStack in existence, #80 design §2).
-    pub(crate) fn wants_d2d(self) -> bool {
-        !matches!(self, RendererKind::Gdi)
     }
 }
 
@@ -162,9 +156,10 @@ pub(crate) struct Config {
     /// level/1:1/pan onto the next image.
     pub(crate) keep_zoom: i32,
     /// riviv-authored key (#80; upstream has no such setting): which paint
-    /// backend the viewport uses — `auto | d2d | warp | gdi` (a STRING key;
-    /// missing or unrecognized falls back to the `auto` default). See
-    /// [`RendererKind`] for the semantics.
+    /// backend the viewport uses — `auto | d2d | warp` (a STRING key;
+    /// missing or unrecognized falls back to the `auto` default; a legacy
+    /// `gdi` value from the two-stack era maps to `auto` with a migration
+    /// note on load). See [`RendererKind`] for the semantics.
     pub(crate) renderer: RendererKind,
     /// The per-command keyboard bindings (#25; upstream keeps these OUTSIDE
     /// the `config_*` int globals in `_viv_key_list`, but loads/saves them
@@ -421,13 +416,21 @@ impl Config {
         // never the int keys' garbage=0 "keep current" shape: a
         // hand-edited appdata file carrying garbage must not silently
         // resurrect the exe-dir value (pre-review: the overlay used to
-        // keep it).
+        // keep it). The era word `gdi` (#80–#89 saves wrote it) is
+        // NOT unrecognized: #90 removed the arm, so the load maps it to
+        // `auto` with a one-line migration note — the plain fallback's
+        // "unrecognized" wording would misreport a legal word as a typo.
         if let Some(value) = pairs.get("renderer") {
-            match RendererKind::parse_ini(value) {
-                Some(kind) => self.renderer = kind,
-                None => {
-                    eprintln!("riviv: unrecognized renderer value {value:?}, using auto");
-                    self.renderer = RendererKind::Auto;
+            if value.eq_ignore_ascii_case("gdi") {
+                eprintln!("riviv: renderer=gdi was removed, using auto");
+                self.renderer = RendererKind::Auto;
+            } else {
+                match RendererKind::parse_ini(value) {
+                    Some(kind) => self.renderer = kind,
+                    None => {
+                        eprintln!("riviv: unrecognized renderer value {value:?}, using auto");
+                        self.renderer = RendererKind::Auto;
+                    }
                 }
             }
         }
@@ -787,15 +790,12 @@ mod tests {
     // ---- the renderer key (#80) ----
 
     #[test]
-    fn renderer_key_round_trips_all_four_values() {
-        // The four literals save as the canonical lowercase spellings and
-        // read back identically (ASCII case-insensitive on load).
-        for kind in [
-            RendererKind::Auto,
-            RendererKind::D2d,
-            RendererKind::Warp,
-            RendererKind::Gdi,
-        ] {
+    fn renderer_key_round_trips_all_three_values() {
+        // The three literals save as the canonical lowercase spellings and
+        // read back identically (ASCII case-insensitive on load). The era
+        // word `gdi` is NOT part of the save table anymore (#90): it has
+        // its own migration test below.
+        for kind in [RendererKind::Auto, RendererKind::D2d, RendererKind::Warp] {
             let c = Config {
                 renderer: kind,
                 ..Config::default()
@@ -817,9 +817,40 @@ mod tests {
     }
 
     #[test]
+    fn renderer_gdi_loads_as_auto_with_the_migration_note() {
+        // #90 removed the gdi arm; an ini carrying `renderer=gdi` (a legal
+        // value the #80-era saves wrote) maps to `auto` on load — through
+        // the dedicated migration arm, not the "unrecognized value"
+        // fallback that would misreport a legal word as a typo. The
+        // mapping result is asserted here; the stderr note itself is not
+        // captured.
+        let c = parse_apply("[riviv]\nrenderer=gdi\n", true);
+        assert_eq!(c.renderer, RendererKind::Auto, "gdi migrates to auto");
+        // Case-insensitive, like every other renderer word.
+        let c = parse_apply("[riviv]\nrenderer=GDI\n", true);
+        assert_eq!(c.renderer, RendererKind::Auto);
+        // The migration applies in the overlay pass too: an appdata `gdi`
+        // over a root `warp` lands on auto (the file's word is
+        // authoritative and its arm is gone).
+        let mut c = Config::default();
+        c.apply_section(&ini::parse("[riviv]\nrenderer=warp\n", SECTION), true);
+        assert_eq!(c.renderer, RendererKind::Warp);
+        c.apply_section(&ini::parse("[riviv]\nrenderer=gdi\n", SECTION), false);
+        assert_eq!(c.renderer, RendererKind::Auto);
+        // The migration never round-trips back: a save writes `auto`,
+        // never `gdi` again.
+        let text = ini::serialize(SECTION, &c.to_pairs(false));
+        assert!(
+            text.contains("renderer=auto"),
+            "the save table writes the migrated value: {text}"
+        );
+        assert!(!text.contains("renderer=gdi"), "{text}");
+    }
+
+    #[test]
     fn missing_renderer_key_defaults_to_auto() {
-        // No key at all: the #81 default stands (hardware → WARP → GDI,
-        // the transitional ladder).
+        // No key at all: the default stands (hardware → WARP → fatal,
+        // the #90 failure chain).
         let c = parse_apply("[riviv]\n", true);
         assert_eq!(c.renderer, RendererKind::Auto);
         let d = Config::default();
