@@ -1,0 +1,40 @@
+# CI 三道门:与 .githooks/pre-commit 及 AGENTS.md「验证与构建命令」一致
+#   1. cargo fmt --check
+#   2. cargo clippy --all-targets -- -D warnings
+#   3. cargo test(纯逻辑,无 GUI/窗口依赖,CI 无交互会话可跑)
+# 冒烟套件(GUI 弹真窗口)不进 CI——设计决定,见 #93;本地冒烟纪律不变,CI 是 master 的权威门。
+# 工具链:stable;若日后引入 rust-toolchain.toml,此步骤应改为以文件为准(#93 票面在案)。
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+# 同一 ref 的新运行取代旧运行;master 上的权威门不被取消
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
+jobs:
+  gates:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt --check
+        run: cargo fmt --check
+
+      - name: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test
