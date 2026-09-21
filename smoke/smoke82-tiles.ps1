@@ -1075,11 +1075,13 @@ Kill-Riviv
 Reset-Ini ''
 
 # ---------------------------------------------------------------------------
-# S7 (R3 P2-6): evidence purity. The D2D dump's failure arm silently falls
-# back to the GDI channel ("riviv: d2d dump failed (...); trying the gdi
-# channel") - if that fired, every dump assertion above would be GDI
-# evidence wearing a D2D label. Assert no captured d2d/warp stderr
-# contains it. Runs last so it covers S8/S9 too.
+# S7 (R3 P2-6): evidence purity. Through #89 the D2D dump's failure arm
+# silently fell back to the GDI channel ("riviv: d2d dump failed (...);
+# trying the gdi channel") - had that fired, every dump assertion above
+# would have been GDI evidence wearing a D2D label. #90 deleted the arm,
+# so the string can never legitimately reappear - this stays as a
+# tripwire. Assert no captured d2d/warp stderr contains it. Runs last so
+# it covers S8/S9 too.
 # ---------------------------------------------------------------------------
 $fallback7 = New-Object System.Collections.Generic.List[string]
 foreach ($de in $script:D2dErrs) {

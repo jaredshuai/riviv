@@ -175,7 +175,9 @@ pub(crate) fn thousands_grouped(n: u64) -> String {
 /// shown when no image is displayed. `backend` (#80) appends the effective
 /// D2D backend as a suffix (` d2d/hw` / ` d2d/warp`) — the suffix is part
 /// of the measured width (the caller measures the composed string);
-/// `None` (the gdi baseline) keeps the text byte-identical to upstream.
+/// `None` (through #89 the gdi baseline; since #90 the transient no-stack
+/// window before a deferred fatal — see window.rs's backend plumbing)
+/// keeps the text byte-identical to upstream.
 pub(crate) fn status_dimension_text(
     wide: Option<i32>,
     high: Option<i32>,
@@ -504,8 +506,8 @@ mod tests {
     #[test]
     fn dimension_text_pairs_size_with_grouped_kilobytes() {
         // viv.c:11132-11181: plain W x H, size ceiled to KB, KB grouped.
-        // The gdi baseline passes no backend — the text is upstream's
-        // byte-for-byte.
+        // No backend (the pre-#90 gdi baseline; now the transient
+        // no-stack window) — the text is upstream's byte-for-byte.
         assert_eq!(
             status_dimension_text(Some(1920), Some(1080), Some(1_263_616), None),
             "1920 x 1080 (1,234 KB)"
@@ -525,7 +527,8 @@ mod tests {
     #[test]
     fn dimension_text_appends_the_d2d_backend_suffix() {
         // #80: the effective D2D backend rides the dimension part (the
-        // "which renderer was live" ticket evidence); gdi shows nothing.
+        // "which renderer was live" ticket evidence); a None backend
+        // shows nothing (no stack — the pre-#90 gdi baseline).
         assert_eq!(
             status_dimension_text(Some(640), Some(480), None, Some("d2d/hw")),
             "640 x 480 d2d/hw"

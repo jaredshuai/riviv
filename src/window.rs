@@ -422,6 +422,14 @@ pub(crate) struct WindowState {
     /// way; this keeps the pump window as quiet as the old
     /// `gpu_init_failed` latch kept the degrade era.
     pub(crate) gpu_terminal: bool,
+    /// WHY the fatal verdict fired (external review AI1 P3-6): the latch
+    /// sites carry a diagnosis (the HRESULT, the create error) that the
+    /// old one-line hardcoded modal never showed — ADR 0001 wants the
+    /// system-level failure reported WITH its context. Taken by
+    /// paint_view's tail together with the flag; `None` falls back to
+    /// the generic ladder line (accurate only for the WARP-exhausted
+    /// verdict, where it is set).
+    pub(crate) gpu_fatal_reason: Option<String>,
     /// The `-dump-viewport` path (#80 design §9): the sticky render-and-
     /// write intent consumed at WM_CLOSE, before the window dies.
     pub(crate) dump_pending: Option<OsString>,
@@ -1137,6 +1145,9 @@ fn paint_view(view: HWND, owner: HWND) {
                 state.gpu = None;
                 state.gpu_pending_fatal = true;
                 state.gpu_terminal = true;
+                state.gpu_fatal_reason = Some(format!(
+                    "unrecoverable renderer error ({hr:#010x}) — no fallback renderer left"
+                ));
             }
             eprintln!(
                 "riviv: unrecoverable renderer error ({hr:#010x}) - no fallback renderer left"
@@ -1150,12 +1161,24 @@ fn paint_view(view: HWND, owner: HWND) {
         }
     }
     // The ladder's final tier defers its fatal to HERE: the paint's state
-    // borrows are gone, so the modal may pump (design §7).
-    // SAFETY: the borrow spans the flag take only.
-    let fatal_now = (unsafe { state_of(owner) })
-        .is_some_and(|state| std::mem::take(&mut state.gpu_pending_fatal));
+    // borrows are gone, so the modal may pump (design §7). The reason
+    // rides along (AI1 P3-6): each latch site recorded its diagnosis —
+    // the modal shows it instead of a generic line that would be false
+    // for the non-ladder paths (a `d2d`-tier rebuild failure never tried
+    // WARP; an Unrecoverable verdict never walked the ladder).
+    // SAFETY: the borrow spans the flag/reason take only.
+    let (fatal_now, fatal_reason) = (unsafe { state_of(owner) })
+        .map(|state| {
+            (
+                std::mem::take(&mut state.gpu_pending_fatal),
+                state.gpu_fatal_reason.take(),
+            )
+        })
+        .unwrap_or((false, None));
     if fatal_now {
-        fatal("the D2D renderer keeps failing (WARP included) — giving up");
+        let reason = fatal_reason
+            .unwrap_or_else(|| "the D2D renderer keeps failing (WARP included) — giving up".into());
+        fatal(&reason);
     }
 }
 
@@ -1202,6 +1225,9 @@ fn gpu_rebuild_if_due(view: HWND, owner: HWND) {
                 // same WM_PAINT).
                 state.gpu_pending_fatal = true;
                 state.gpu_terminal = true;
+                state.gpu_fatal_reason = Some(format!(
+                    "renderer rebuild failed ({e}) — no fallback renderer left"
+                ));
                 eprintln!("riviv: renderer rebuild failed ({e}) - no fallback renderer left");
             }
         }
@@ -1272,6 +1298,11 @@ fn gpu_runtime_failure(owner: HWND) {
                 state.gpu = None;
                 state.gpu_pending_fatal = true;
                 state.gpu_terminal = true;
+                // The generic ladder line is ACCURATE here (and only here):
+                // the Fatal verdict requires the session to already be on
+                // WARP, so "WARP included" is true on this path.
+                state.gpu_fatal_reason =
+                    Some("the D2D renderer keeps failing (WARP included) — giving up".into());
                 fatal_view = Some(state.viewport);
                 (RendererKind::Warp, true)
             }
@@ -1307,6 +1338,9 @@ fn gpu_runtime_failure(owner: HWND) {
                     // frame while the deferred modal is pending.
                     state.gpu_pending_fatal = true;
                     state.gpu_terminal = true;
+                    state.gpu_fatal_reason = Some(format!(
+                        "renderer rebuild failed ({e}) — no fallback renderer left"
+                    ));
                     eprintln!("riviv: renderer rebuild failed ({e}) - no fallback renderer left");
                     degraded_view = Some(view);
                 }
@@ -8255,6 +8289,7 @@ pub(crate) fn run() -> Result<(), String> {
         gpu_failures: Vec::new(),
         gpu_pending_fatal: false,
         gpu_terminal: false,
+        gpu_fatal_reason: None,
         dump_pending: None,
     };
 

@@ -691,7 +691,7 @@ Check 'S0 fixtures built' ((Test-Path $png96) -and (Test-Path $pngPad) -and (Tes
 
 # ---------------------------------------------------------------------------
 # S1: the default renderer flip (#81): missing key AND unrecognized value
-# both land on auto; gdi stays the escape hatch.
+# both land on auto; the legacy `gdi` word MIGRATES to auto (#90, S1c).
 # ---------------------------------------------------------------------------
 Reset-Ini "[riviv]`r`nx=40`r`ny=40`r`nwide=800`r`nhigh=600`r`n"
 $p = Start-Riv '' 's1-missing.err'
@@ -1137,6 +1137,7 @@ foreach ($sc in $s10scenes) {
     if ((-not $ranOk) -or (-not (Test-Path $golden))) {
         if (-not (Test-Path $golden)) { Skip-Scenario ('S10b ' + $sc.Name + ' golden byte-compare') 'golden90 file missing (broken checkout)' }
         Kill-Riviv
+        Start-Sleep -Milliseconds 500   # settle before the next fixture rewrite (see the loop-end note)
         Reset-Ini ''
         continue
     }
@@ -1163,10 +1164,15 @@ foreach ($sc in $s10scenes) {
         }
         Check ('S10b ' + $sc.Name + ' warp dump byte-identical to the frozen golden90 reference') $false ("bytes differ, pixelDiffs=$pxDiff$diag")
     }
+    # The rot90 shell verb may finish writing the fixture AFTER the
+    # process exit - settle INSIDE the loop, before the next iteration
+    # rewrites the fixture path (AI1 P3-7: the poison window is the
+    # cross-scene handoff s4->s5, not the loop's end; the first freeze
+    # was poisoned exactly there).
+    Start-Sleep -Milliseconds 500
     Kill-Riviv
     Reset-Ini ''
 }
-Start-Sleep -Milliseconds 500   # the rot90 shell verb may finish writing after exit; settle before reusing the fixture path
 # Hardware arm: record-only unless ALL five dumps byte-match the goldens.
 $g90AutoMatches = 0
 $g90AutoDetail = ''
@@ -1191,6 +1197,7 @@ foreach ($sc in $s10scenes) {
         }
     }
     $g90AutoDetail += (' ' + $sc.Name + '=' + $verdict)
+    Start-Sleep -Milliseconds 500   # same cross-scene settle as the warp loop
     Kill-Riviv
     Reset-Ini ''
 }

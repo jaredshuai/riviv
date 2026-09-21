@@ -1,0 +1,129 @@
+=== comment IC_kwDOUNMV0M8AAAABVsOg-Q by jaredshuai at 2026-09-20T15:08:00Z ===
+**补充判据(来自 #82 PR #91 的外部评审 AI2 P2-3,2026-09-20)**:自 #82 起 D2D 臂的巨图失败链**已经**是 D2D-only——旧 #80 门的「拆栈落 GDI 交接」随门退役,prepare 失败 = 该帧 letterbox(不拆栈、不切 GDI),tile 缺图 = 局部背景色。且 tile 路径在 WARP 上几乎不可达(WARP `GetMaximumBitmapSize()`=2^23),实证覆盖目前是「硬件 + 本机」单臂。因此本票删除前的环境矩阵(RDP / Hyper-V / WARP)不只是「auto 初始化成功」的举证,也是**巨图路径在异环境下的唯一实证机会**;建议矩阵中加一档巨图场景(≥16385 宽图 fit + 1:1)。
+
+
+=== comment IC_kwDOUNMV0M8AAAABVvwa9Q by jaredshuai at 2026-09-21T01:42:44Z ===
+## 判据裁定(2026-09-21,开工前与用户确认)
+
+依 #82 拆分时的同款纪律,删除判据三条在开工前逐条核实并与用户确认处置:
+
+| 判据 | 开工日核实状态 | 处置(用户裁定 2026-09-21) |
+|---|---|---|
+| golden 冻结 | 未做(ADR 0002 D10 #82 后记:随删除移交本票) | 本票第一件工作:删除前用 GDI 栈生成语料入仓 |
+| 一个稳定发布周期 | ✗ 仓库从未发布过任何 release(`gh release list` 为空);auto 默认 2026-09-20(f600868)才翻 | **改判等价证据**:单用户、无 release 流程的仓,该判据按字面永不可满足。等价组合 = ① auto 默认自 f600868 起 master 实际使用 + ② 本票环境矩阵(物理 GPU / WARP / RDP / Hyper-V)全绿留档 + ③ golden 冻结——三条合起来承担「auto 在真实使用中未被证明有问题」的证明责任 |
+| RDP/Hyper-V 的 auto 初始化实测 | ✗ 仓库零证据;本机 Hyper-V 功能已启用(vmms 运行中)但 VM 管理需管理员提权(当前 `Get-VM` 被拒)、RDP 需用户会话 | **我备脚本、用户实测**:本票产出 RDP/Hyper-V 一键 QA 脚本 + 清单,用户在方便时实测、结果贴回本票留档;**矩阵绿了才 merge**(merge 门) |
+
+环境矩阵按判据补充评论(issuecomment-5750628601)加**巨图场景档**:≥16385 宽图 fit + 1:1——这是 tile 路径在异环境下的唯一实证机会(WARP 本机 max=2^23,tile 路径几乎不可达)。
+
+
+=== comment IC_kwDOUNMV0M8AAAABVvzEKQ by jaredshuai at 2026-09-21T01:49:33Z ===
+## 设计(#90:GDI 渲染主线删除)
+
+前置:判据裁定见 [issuecomment-5754329845](https://github.com/jaredshuai/riviv/issues/90#issuecomment-5754329845)(golden 冻结 = 本票首件工作;发布周期改判等价证据;RDP/Hyper-V = 我备脚本用户实测,**矩阵绿了才 merge**)。以下全部基于 master `ce62437` 的逐文件勘察(2026-09-21)。
+
+### 1. 删除面(census,逐符号)
+
+| 文件 | 删 | 留 |
+|---|---|---|
+| `src/surface.rs` | `Face`/`ensure_face`/`with_face_source`/`face_stuck`/`face_bytes`(cpu_display 记账桩)、`GiantRelief`+`build_giant_relief`+`relief_divisor`/`relief_axis`+4 测试、`Surface::rotate` 内 face 失效两行 | `create_bgra_dib_raw`/`create_bgra_dib`(clipboard CF_BITMAP 唯一消费者,src/clipboard.rs:265)、`Surface{master}`+`from_master`/`master()`/`width`/`height`/`rotate`(CPU 真源容器不变)、文档头改写 |
+| `src/paint.rs` | `paint()`(GDI WM_PAINT 括号)、`render_scene`、`letterbox_strips`+5 测试、`dump_viewport_gdi`、`ShrinkRegime`/`shrink_regime`+regime 测试、`STRETCH_*` 引用 | `scene_rect`+测试(D2D 唯一几何源)、`save_rgba_png`(所有 dump 的 PNG 尾) |
+| `src/stitch.rs` | **整文件删除**(含测试)。票面「tiling 仍在用」经核为**过时**:tile.rs 自有纯数学(`Rect::haloed`/`visible_dest`/窗口化枚举),对 stitch 的唯一引用是 tile.rs:243 一句文档注释(改写之) | —— |
+| `src/zoom.rs` | `BlitRect`+`clip_blit` 及其测试(**实现期复核**:消费者仅 paint.rs 两处 GDI 臂 + stitch.rs;zoom.rs 内部如有自用则留) | 其余全部 |
+| `src/gpu.rs` | `LevelSource::display_bytes`/`MasterLevels.display_bytes`、`PaintOutcome::Unrecoverable` 的 GDI 语义(见 §3)、stderr 文案里全部 "gdi" 措辞 | 栈本体、tiling、预算、dump 通道全部 |
+| `src/tile.rs` | `MemLedger.cpu_display` 字段(stats 行 13→12 字段,smoke 断言同步) | 其余全部(Lru/plan/budget 原样) |
+| `src/window.rs` | `paint_view` 的 `!has_gpu → paint()` GDI 臂、`gpu_session_degrade`、`gpu_rebuild_if_due` 的 `gpu_init_failed`/`wants_d2d` 门、init 的降级闪现+`backend=gdi` 兜底标签、`dump_viewport_now` 的 GDI 回退与无栈臂 | 路由骨架、ladder、`rebuild_kind` |
+| `src/config.rs` | `RendererKind::Gdi` 变体、`wants_d2d()` | `Auto`/`D2d`/`Warp` 三值、parse/save 及测试改写(见 §4) |
+
+**不删**(票面既定 + 复核确认):chrome 的 GDI(状态栏/工具栏/菜单/对话框/剪贴板 `CF_BITMAP`+`CF_DIB` 面,`dib.rs` 纯解析不涉渲染)、`mip.rs`(`LevelCache`/`downscale_box` 为 #82 分级在役,gpu.rs `MasterLevels` 消费)、`tile.rs` 全部、`-tile` 诊断开关。
+
+### 2. 失败链重写(票面「写死」的落地)
+
+- **init**:`gpu::create` 失败(auto 已含 hw→warp 两臂错误串;`d2d`/`warp` 单驱动诊断同理)→ `fatal()`(带诊断串)。原来的 latch+状态栏闪现+「session 留在 gdi」语义整体消失;ADR 0001 分类从用户级升系统级,**ADR 0002 D7 已预告,本票补 ADR 后记**。
+- **运行时非丢失确定性错误**(现 `Unrecoverable`:EndDraw/Present 的非 loss HRESULT)→ **延迟 fatal**(`gpu_pending_fatal` + `gpu=None` + invalidate,paint_view 尾部开火)——不再降级会话。
+- **rebuild 失败**(ladder 的 create 再失败)→ 同上延迟 fatal。
+- **`gpu_init_failed` 语义终结**:字段删除;防「pending-fatal 窗口内先 rebuild」由 `paint_view` 重排保证(先查 `gpu_pending_fatal` 再考虑 rebuild,或等价 latch——实现期定,测试钉住)。
+- **#82 移交项②落地**:`paint_d2d` 的 prepare `Err` 臂(现仅 blank+逐帧 stderr)加**连续失败计数**:连续 3 次 prepare 失败 → 视同 `DeviceLost` 进既有 ladder(rebuild 同种 → 3-in-10s 升 WARP → WARP 再 3 次 fatal)。计数器在 GpuStack、成功即清零;dump 路径不经此(一次性)。这使「driver 持续 CreateBitmap 失败但不掉设备」从永久空白+每帧重试变成有界升级,#82 PR #91 AI3 处置表「录+移交:与 #90 失败链重构一起做」兑现。
+
+### 3. 迁移面:ini 的 `renderer=gdi`
+
+#80 期 ini 显式存过 `renderer=gdi`(保存恒写当时值,ADR 0002 D5 后记)。处置:**config 加载时 `gdi` 一律映射 `auto` + stderr 一行迁移注记**(`riviv: renderer=gdi was removed, using auto`)——不用「unrecognized value」的既有兜底(那是误导:该词合法、只是臂没了)。`to_ini` 永不再写 gdi;round-trip 测试改为「gdi → auto + 注记」断言。逐字面澄清:**键保留解析**(四词词表收窄为三词+一个迁移映射),不删除键本身。
+
+### 4. golden 冻结(判据③,删除前首件工作)
+
+- **臂**:当前 master(ce62437,GDI 臂在役)`renderer=gdi` + `-dump-viewport`,smoke80 既定 harness 几何。生成脚本是 %TEMP% 一次性件,**不入仓**。
+- **语料域 = 双臂已证字节相等的 NEAREST 域**(smoke81 S2 已钉 warp==gdi 逐字节):1:1 精确、整数倍放大 k=2/k=3(mag_filter=0)、带 letterbox(两档底色)、旋转 90° 后 1:1。**滤波档不入 golden**(GDI HALFTONE ≠ D2D CUBIC,差异已在案;该域维持同构建内 A/B 断言)。命名 `smoke/golden90/`(**票面「golden82」系 #82 开工前文本,ADR D10 后记已裁定冻结随本票走,名从本票**)。
+- **入仓后的消费者**:删除 PR 自身(D2D dump vs golden90 逐字节 = 删除未改变输出的跨臂 oracle)+ 今后所有跨 build 漂移检测。golden81 继续服役(warp/hw 臂对照同一套冻结参考)。
+
+### 5. 环境矩阵 QA 脚本(判据②补证,merge 门)
+
+交付 `%TEMP%\riviv-envqa.ps1`(**纯 ASCII**,记忆在案:PS1 中文注释坏 PS5.1 param 绑定)+ 简明清单,供你在 **RDP 会话内**与 **Hyper-V VM 内**各跑一次:
+
+- 自包含:纯 PowerShell 生成 BMP fixture(24bpp;巨图档 16385×64,判据补充评论 issuecomment-5750628601 点名的 ≥16385 宽 fit + 1:1)。
+- 场景:auto 常图 fit / auto 1:1 / **巨图 fit + 1:1**(断言 stderr `tiles level=` 统计行出现 + dump 非退化)/ d2d 与 warp 显式档。
+- 断言口径 = **内容级,非字节级**(异环境驱动差异不保证字节;断言:stderr `renderer=auto backend=d2d/*` 且无 init failed、exit 0、dump 的非底色 bbox = 期望矩形、非全黑/全白)。
+- 产物:`riviv-envqa.log` 贴回本票即留档。
+- **双阶段**:master release exe(现在即可跑,证明 auto 默认可靠性)+ PR 分支 exe(merge 前再跑,证明删除后同环境仍绿)。两份日志齐 = 矩阵判据闭合。
+
+### 6. 冒烟改写(smoke 子代理照此)
+
+- `smoke80`:S1 renderer 键组改三词+gdi→auto 迁移注记断言;S3/S8 的 gdi 双臂对照改单臂(D2D dump vs golden90/golden81 冻结参考);S5a 禁词保留。
+- `smoke81`:S1c gdi 逃生舱断言改「gdi→auto 迁移」;S2 各 k 的 gdi 臂删、warp/hw vs golden 对照留;golden judge 指针不变(golden81 冻结件仍在仓)。
+- `smoke82`:S6(gdi 巨图记录项)整段退役;头注释同步。
+- 新增失败链断言:单测层(config gdi→auto、prepare 连续失败升级计数、stats 行 12 字段)+ grep 式审计(unsafe 残留面)。**「故意坏环境」的 init-fatal 冒烟经核不可自动化**(无可注入的 D3D 失败钩子,不为此加测试后门),由 §5 环境矩阵人工面覆盖,README 记为已知验证边界。
+- 冒烟前例行:`Get-Process riviv` + exe 目录 staged ini 预检/收尾清理(记忆在案)。
+
+### 7. README / ADR
+
+README:Status 行、Roadmap M6 勾选、Differences 渲染栈段落**合并改写**(双栈 A/B、逃生舱、gdi 语义整段作废;新增:失败链 fatal 语义、`renderer=gdi` 迁移、mag ≥2^22 KNOWN GAP 随 GDI 臂消失、巨图失败链 D2D-only 的最终形态)。ADR 0002:D7/D10 补 #90 后记(删除落地 + 失败链终结形态 + golden90 冻结在案)。
+
+### 8. #82 移交项四件处置(PR #91 处置表逐条)
+
+| 项 | 处置 |
+|---|---|
+| O(n²) find/retain | **本票做**(「顺手」在案):`tiles: Vec<(TileKey, Bitmap)>` → `HashMap<TileKey, Bitmap>`(TileKey 加 Hash),驱逐/查找/清退 O(1);S9 诊断帧 ~2×10⁸ 比较/帧消除 |
+| 连续上传失败升级 | **本票做**(§2 的 prepare 计数进 ladder) |
+| Tiles↔Base base 重传 | **维持 #82 裁定不动作**(账目诚实换重传,已在案) |
+| `Lru::set_cap` 再采样钩子 | **维持在案不动作**(钩子存在,驱动压力口径已注明) |
+
+### 9. 顺序与门
+
+1. golden90 冻结入仓(独立 commit,先于任何删除)→ 2. 实现删除+失败链+HashMap(子代理,单 PR)→ 3. fmt/clippy/test + 冒烟改写 → 4. README/ADR → 5. 三子代理预审 → 6. 外部评审(请求交你跑)→ 7. 处置 → 8. **你跑 §5 双阶段环境矩阵贴回** → 9. merge + QA 清单 + 记忆收官。
+
+CI 基建(无 .github/)建议**独立小票**挂 M7,不捆进本 PR(删除 PR 保持可审);如你想现在建,说一声我在本票外加。
+
+**非目标**:chrome GDI(永久保留)、WARP 主动探测、驱动黑名单(ADR 0002 非目标沿用)。
+
+
+=== comment IC_kwDOUNMV0M8AAAABVv_K_A by jaredshuai at 2026-09-21T02:20:52Z ===
+## 环境矩阵 QA 脚本交付(判据②补证线,2026-09-21)
+
+**给用户**:一键脚本与清单已就位,随时可跑 master 基线轮(不依赖 #90 PR 进度):
+
+- 脚本:`%TEMP%\riviv-envqa.ps1`(纯 ASCII,自包含:自建 fixture、隔离 stage、自动清理;用 `-Exe` 指向 exe,`-Tag rdp` / `-Tag vm` 区分环境)
+- 清单:`%TEMP%\riviv-envqa-README.md`(RDP 与 Hyper-V 的跑法、两轮口径、判绿标准)
+- 产物:`%TEMP%\riviv-envqa-<tag>.log` —— **全文贴回本票**即留档;日志自带 SESSIONNAME(RDP 会话显示 `RDP-Tcp#N`)与适配器名单,证明跑在目标环境
+
+断言口径 = 内容级(auto 初始化成功 + 常图 fit/1:1 的 bbox 断言 + **巨图 16385×32 的 fit 与 1:1**,判据补充评论点名的场景档);显式 warp/d2d 档 record-only。跨机器字节一致不是契约,故无哈希断言。
+
+**脚本自身已在开发机验证**(2026-09-21,master ce62437 exe,物理 GPU `d2d/hw`):
+
+```
+=== SUMMARY pass=7 fail=0 rec=5 ===
+(全日志:%TEMP%\riviv-envqa-selftest.log;Q3 巨图 fit → tiles level=5 mip_builds=2;
+ Q4 巨图 1:1 → level=0 tiles=2 [Intel hw max_bitmap=16384 < 16385,分块路径真实触发])
+```
+
+开发机基线轮因此视为已完成(物理 GPU 一档);**尚缺:RDP 轮 + Hyper-V 轮(各 master/PR 两遍)——merge 门**。PR 轮的 exe 路径在 PR 开出后补充在此。
+
+黄金冻结同步完成:master `5996944` 入仓 `smoke/golden90/` 5 帧(1:1 洋红/整数放大 k2 k3/旋转 90°+1:1/1:1 默认白底),冻结时逐帧验证 gdi dump == warp dump 原始字节相等;rot90 帧的插曲——EditRotate90 的 shell 动词会改写磁盘文件(#43 既定行为),单 fixture 双臂互污,改为每臂独立新 fixture 后通过(根因以 SHA 证据定位,非渲染分叉)。
+
+
+=== comment IC_kwDOUNMV0M8AAAABVzMZpA by jaredshuai at 2026-09-21T08:59:47Z ===
+## 实现完成,验证留档(PR #92)
+
+- **分支**:`feat/90-gdi-removal`(rebase 于 master `be5097b`):`561346e` 删除实现 + `144df42` 冒烟改写与 README/ADR。
+- **冻结语料插曲(已闭环)**:首轮冻结的 s5 白底帧被共享 fixture 污染(s4 两次 shell rotate 改写磁盘文件→rot180 内容)——bbox 对称免疫、双臂同读污染文件使 gdi==warp 字节 oracle 免疫,**smoke S10 的内容模型对照抓获**(dump vs 直立 HashSource 模型 5828 px 差、vs rot180 模型 0 px;warp 与硬件 dump 彼此字节相等→非渲染回归);master `be5097b` 以干净 fixture 重冻(GDI 臂、每臂新造 fixture、模型对照 0 差)。教训入 ADR D10 后记。
+- **验证(本会话亲证)**:fmt/clippy 绿;`cargo test` **556/0**(576−27+7);smoke80 **27/0/0**、smoke81 **54/0/0**(S10 五帧 warp 逐字节 + 硬件臂 5/5 对齐升级为硬断言)、smoke82 **43/0/0**;golden81 全 match;三套件 iniCleaned=True。
+- **merge 门不变**:待 RDP/Hyper-V 四份环境矩阵日志(脚本见评论 5754571516)。
+
+
