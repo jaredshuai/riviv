@@ -1159,7 +1159,7 @@ foreach ($sc in $s10scenes) {
         $goldenRot = [Px]::MatchesWhiteHashModel($qg2.B, $qg2.W, $qg2.H, $true)
         $diag = ''
         if ($dumpUpright -and $goldenRot) {
-            $diag = ' DIAGNOSIS: dump == fresh-HashSource model AND golden == rot180(fixture) model - the GOLDEN was frozen from a 180-degree-rotated on-disk fixture (freeze-harness shared-fixture artifact); the renderer is correct, regolden s5'
+            $diag = ' DIAGNOSIS: dump == fresh-HashSource model AND golden == rot180(fixture) model - the GOLDEN was frozen from a 180-degree-rotated on-disk fixture (freeze-harness shared-fixture artifact); the renderer is correct, regolden the mismatching scene'
         }
         Check ('S10b ' + $sc.Name + ' warp dump byte-identical to the frozen golden90 reference') $false ("bytes differ, pixelDiffs=$pxDiff$diag")
     }

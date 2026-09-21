@@ -8,7 +8,7 @@
 ## smoke82-tiles.ps1(#82 巨图 overview + LRU tile + VRAM 字节预算)
 
 ```powershell
-powershell -NoProfile -File smokesmoke82-tiles.ps1 [-Exe <path>]
+powershell -NoProfile -File smoke\smoke82-tiles.ps1 [-Exe <path>]
 ```
 
 场景(43 检查;全部 D2D 断言附带「breadcrumb 在场」前置,防空 stderr 假绿;
@@ -49,7 +49,7 @@ auto。#90 删除 GDI 渲染主线后,原 warp-vs-gdi 双臂对照全部改判:�
 powershell -NoProfile -File smoke\smoke81-filters.ps1 [-Exe <path>] [-Regolden] [-Regolden90]
 ```
 
-场景(53 检查;golden81 冻结于 `smoke/golden81/`,golden90 见下段):
+场景(54 检查;golden81 冻结于 `smoke/golden81/`,golden90 见下段):
 
 - **S1** renderer 键:missing key→`renderer=auto backend=`;frobnicate→
   `unrecognized`+`using auto`;`renderer=gdi`→**#90 迁移断言**:exit 0,
@@ -83,11 +83,16 @@ golden** = 「删除未改变输出」的跨臂 oracle:S10 对 5 场景各跑 wa
 言;同场景再跑 `renderer=auto`(硬件)一枪,5/5 全中则升级为硬断言,有差异
 则保持记录档(报告字节差数,不强行绿)。**rot90 场景的 EditRotate90 走
 shell 动词会改写磁盘上的夹具文件**,所以 S10 每一枪前都重新生成夹具
-(HashSource+SaveRgba)——跨枪共用一个夹具会毒化第二枪。`-Regolden90` 从
-warp 臂重冻结(同样失败场次拒写)。**已知在案缺陷**:s5-one2one 冻结时
-夹具被此前的 rotate 动词转了 180°(freeze 脚本共享夹具路径的残留),故
-S10b-s5 对现行构建 FAIL 且详情自带诊断(dump == 正立模型、golden == rot180
-模型→重新冻结 s5 即可,渲染器无错);硬件臂同判(4/5,s5 同源)。
+(HashSource+SaveRgba)——跨枪共用一个夹具会毒化第二枪。**历史(已闭环)**
+:s5-one2one 首轮冻结时夹具被更早场景的两次 rotate 动词转了 180°(freeze
+脚本共享夹具路径的残留;bbox 对称免疫、双臂同读污染文件使字节 oracle 免疫),
+master `be5097b` 以干净夹具重冻后 S10b-s5 通过、硬件臂 5/5 升级为硬断言。
+S10 的 rot180 自诊断分支保留为**未来冻结事故的守卫**(dump == 正立模型、
+golden == rot180 模型→该帧语料被污染、重新冻结即可,渲染器无错)。
+`-Regolden90` 从 warp 臂重冻结(失败场次拒写;文件名保留 `-gdi` 后缀 =
+语料身份,GDI 生成臂已亡、重冻内容自 warp——诚实记录在此)。`-Regolden`
+(golden81)的失败门只盖到 S2 段尾,S3/S4/S10 后失败仍可能改写 golden81
+——已知局限在案,勿在非绿跑上带此开关。
 
 S4 的 WriteWidePngGrad 手写 PNG 配方沿 smoke80 的 WriteWidePng(>65535 宽
 GDI+ 拒建),渐变列用于内容断言。
