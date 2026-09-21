@@ -15,32 +15,37 @@
 # FIFO order; the sleeps are belt-and-braces).
 #
 # Scenarios (S9 manual items are listed in the smoke report, not here):
-#   S1 renderer key: gdi/d2d/warp/auto/frobnicate/missing -> the stderr
-#      breadcrumb "riviv: renderer=<req> backend=<eff>".
+#   S1 renderer key: d2d/warp/auto round-trip; gdi -> the #90 migration
+#      (exit 0, "riviv: renderer=gdi was removed, using auto" AND
+#      "riviv: renderer=auto backend=d2d/" on stderr, never "backend=gdi");
+#      frobnicate/missing -> the stderr breadcrumb
+#      "riviv: renderer=<req> backend=<eff>".
 #   S2 dump channel sanity (warp): adopted image + WM_CLOSE -> PNG on disk,
 #      viewport-sized, exit code 0.
-#   S3 L0 byte-exactness (core): the same 1:1 scene dumped through warp and
-#      gdi -> identical file bytes; the non-white bbox is the source rect at
-#      source size; every bbox pixel equals the source pixels.
+#   S3 L0 byte-exactness (core, #90 form): the golden90 1:1 scene dumped
+#      through warp must byte-equal the frozen GDI-arm reference
+#      smoke/golden90/s1-one2one-gdi.png (frozen at 5996944 where
+#      warp == gdi was proven byte-identical); the calibrated viewport is
+#      exactly 256x192, the letterbox margins pure magenta, and the image
+#      box the 96x64 source at (80,64), pixel-exact.
 #   S4 resize chain (warp): window resized -> dump follows the new viewport
 #      size while the 1:1 bbox stays the source size.
 #   S5 giant-image path (#82 contract, replacing the retired #80 gate):
-#      a 2^24+1-wide frame -> NO gate line, NO gdi hand-off, process alive,
-#      dump succeeds out of the D2D channel, and the close-time stats line
-#      names the giant form (level>=1 or tiles>=1).
+#      a 2^24+1-wide frame -> NO gate line, NO gdi hand-off, NO
+#      backend=gdi, process alive, dump succeeds out of the D2D channel,
+#      and the close-time stats line names the giant form (level>=1 or
+#      tiles>=1).
 #   S6 animation re-upload: 2-frame GIF, AnimationFrameStep between two
 #      dump instances -> dump content follows the frame.
 #   S7 rotation re-upload: EditRotate90 between two dump instances -> dump2
 #      is dump1's content rotated 90 degrees clockwise.
-#   S8 background display gate (warp vs gdi): an instance started
+#   S8 background display gate (warp): an instance started
 #      minimized (-WindowStyle Minimized; Windows activates the iconic
 #      window - recorded) and un-minimized with SW_SHOWNOACTIVATE dumps
 #      the image fine under warp: the D2D dump renders from the CPU
 #      master inside the dump call itself (no Present, no WM_PAINT
-#      dependency). The gdi twin is SKIP by design: per the #80 design
-#      note the GDI render evidence rides the pre-existing background-
-#      paint gate (master-identical, smoke78 SKIP semantics), so it is
-#      not a #80 assertion; we still record what it did.
+#      dependency). The former gdi twin is retired with the arm (#90);
+#      the warp twin's coverage is what remains.
 param([string]$Exe = 'D:\codespace\riviv\target\release\riviv.exe')
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Drawing
@@ -58,6 +63,7 @@ public class S80 {
     [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr FindWindowExW(IntPtr parent, IntPtr after, string cls, string title);
     [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr hwnd, uint msg, IntPtr wp, IntPtr lp);
     [DllImport("user32.dll")] public static extern bool GetClientRect(IntPtr hwnd, out RECT r);
+    [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hwnd, out RECT r);
     [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hwnd, IntPtr after, int x, int y, int w, int h, uint flags);
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hwnd, int cmd);
     [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hwnd);
@@ -269,6 +275,33 @@ public static class Px {
         for (int i = 0; i < n; i++) if (a[i * 4 + 3] != b[i * 4 + 3]) diff++;
         return diff;
     }
+    // Deterministic varied-color pattern with a 1px black border ring -
+    // the #90 golden90 fixture recipe (identical to smoke81's Px.HashSource
+    // so the frozen corpus is reproducible from either harness).
+    public static byte[] HashSource(int w, int h) {
+        byte[] a = new byte[w * h * 4];
+        for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) {
+            int i = (y * w + x) * 4;
+            if (x == 0 || y == 0 || x == w - 1 || y == h - 1) { a[i] = 0; a[i + 1] = 0; a[i + 2] = 0; }
+            else {
+                a[i] = (byte)((x * 7 + y * 13 + 11) & 255);
+                a[i + 1] = (byte)((x * 11 + y * 5 + 29) & 255);
+                a[i + 2] = (byte)((x * 3 + y * 17 + 101) & 255);
+            }
+            a[i + 3] = 255;
+        }
+        return a;
+    }
+    // Count pixels in a region whose RGB differs from the given background
+    // (the letterbox-margin purity check, same recipe as smoke81).
+    public static long CountNotBg(byte[] bgra, int bw, int l, int t, int w, int h, int r, int g, int b) {
+        long n = 0;
+        for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) {
+            int di = ((t + y) * bw + (l + x)) * 4;
+            if (bgra[di + 2] != r || bgra[di + 1] != g || bgra[di] != b) n++;
+        }
+        return n;
+    }
     // Clockwise rotation of an RGBA buffer: (w, h) in, (h, w) out.
     public static byte[] RotateCw(byte[] rgba, int w, int h) {
         byte[] o = new byte[rgba.Length];
@@ -407,7 +440,6 @@ Kill-Riviv
 # ---------------------------------------------------------------------------
 $bc = 'riviv: renderer='
 $s1vals = @(
-    @('gdi', 'riviv: renderer=gdi backend=gdi'),
     @('d2d', 'riviv: renderer=d2d backend=d2d/hw'),
     @('warp', 'riviv: renderer=warp backend=d2d/warp'),
     @('auto', 'riviv: renderer=auto backend=d2d/hw')
@@ -423,6 +455,17 @@ foreach ($c in $s1vals) {
     $hasBc = ($null -ne $err) -and $err.Contains($want)
     Check ("S1a-$val breadcrumb '$want'") ($winOk -and ($code -eq 0) -and $hasBc) ("exit=$code win=$winOk stderr=[$($err.Trim())]")
 }
+# #90 migration: renderer=gdi is a legal old value whose arm is gone - the
+# loader maps it to auto with a dedicated stderr note (NOT the
+# "unrecognized value" fallback, which would mislead), and backend=gdi can
+# never appear again.
+Reset-Ini "[riviv]`r`nrenderer=gdi`r`n"
+$p = Start-Riv '' 's1-gdi.err' $false
+$main = Wait-Main $p
+$winOk = ($main -ne [IntPtr]::Zero)
+$code = Close-Main $p $main
+$err = Read-Err 's1-gdi.err'
+Check 'S1a-gdi migration: exit 0, removed note + auto backend line, never backend=gdi' ($winOk -and ($code -eq 0) -and $err.Contains('riviv: renderer=gdi was removed, using auto') -and $err.Contains('riviv: renderer=auto backend=d2d/') -and (-not $err.Contains('backend=gdi'))) ("exit=$code win=$winOk stderr=[$($err.Trim())]")
 Reset-Ini "[riviv]`r`nrenderer=frobnicate`r`n"
 $p = Start-Riv '' 's1-frob.err' $false
 $main = Wait-Main $p
@@ -467,8 +510,13 @@ Kill-Riviv
 Reset-Ini ''
 
 # ---------------------------------------------------------------------------
-# S3 (core): the 1:1 scene dumped through warp and gdi is byte-identical
-# and pixel-exact against the source.
+# S3 (core, #90 form): the golden90 1:1 scene against the frozen GDI-arm
+# reference. The GDI arm is gone, so the byte-exact oracle is
+# smoke/golden90/s1-one2one-gdi.png (frozen at 5996944, where the scene's
+# warp dump == its gdi dump was proven byte-identical): the warp dump must
+# reproduce it byte for byte. The calibrated viewport is exactly 256x192,
+# the letterbox margins pure magenta, and the image box the 96x64 source
+# at (80,64), pixel-exact. The quad fixture below stays for S4.
 # ---------------------------------------------------------------------------
 $SRCW = 300
 $SRCH = 200
@@ -476,60 +524,91 @@ $src3 = [Px]::Source($SRCW, $SRCH)
 $png3 = Join-Path $Stage 'quad.png'
 [Px]::SaveRgba($png3, $src3, $SRCW, $SRCH)
 
-function Run-Dump($renderer, $img, $outName, $errName, $cmds) {
-    Reset-Ini ($baseIni + "renderer=$renderer`r`n")
+# Calibrate the main window until the riviv_view child's client rect is
+# EXACTLY tw x th (chrome and the status bar are integer pixels, so the
+# delta walk converges; same recipe as smoke81). Returns the achieved size.
+function Calibrate-View($main, $tw, $th) {
+    $script:calView = View-Of $main
+    for ($i = 0; $i -lt 5; $i++) {
+        $script:calVs = View-Size $script:calView
+        if (($script:calVs[0] -eq $tw) -and ($script:calVs[1] -eq $th)) { return $script:calVs }
+        $wr = New-Object S80+RECT
+        [void][S80]::GetWindowRect($main, [ref]$wr)
+        $nw = ($wr.R - $wr.L) + ($tw - $script:calVs[0])
+        $nh = ($wr.B - $wr.T) + ($th - $script:calVs[1])
+        [void][S80]::SetWindowPos($main, [IntPtr]::Zero, 0, 0, $nw, $nh, 0x0006)  # SWP_NOMOVE|SWP_NOZORDER
+        $script:calTw = $tw
+        $script:calTh = $th
+        $null = Wait-Until { $v = (View-Size $script:calView); ($v[0] -eq $script:calTw) -and ($v[1] -eq $script:calTh) } 3000
+    }
+    return (View-Size (View-Of $main))
+}
+
+# One adopt -> (calibrate) -> (commands) -> WM_CLOSE dump instance. tw/th
+# calibrate the riviv_view child to EXACTLY that size (byte-compare scenes
+# need exact geometry); iniExtra lines are appended before the renderer key.
+function Run-Dump($renderer, $img, $outName, $errName, $cmds, $tw, $th, $iniExtra) {
+    if ($tw -ne $null) { $initW = $tw + 40; $initH = $th + 120 } else { $initW = 1000; $initH = 700 }
+    $iniText = "[riviv]`r`nx=60`r`ny=60`r`nwide=$initW`r`nhigh=$initH`r`nauto_zoom=0`r`nicm=0`r`n"
+    if ($iniExtra) { foreach ($ln in $iniExtra) { $iniText += ($ln + "`r`n") } }
+    $iniText += "renderer=$renderer`r`n"
+    Reset-Ini $iniText
     $out = Join-Path $Stage $outName
     if (Test-Path $out) { Remove-Item $out -Force }
     $p = Start-Riv ("`"$img`" -dump-viewport `"$out`"") $errName $false
     $main = Wait-Main $p
     $adopted = Wait-Title $p ([IO.Path]::GetFileNameWithoutExtension($img)) 12000
-    Start-Sleep -Milliseconds 400
-    if ($cmds) { & $cmds $main }
-    Start-Sleep -Milliseconds 400
-    $view = View-Of $main
-    $vs = View-Size $view
+    $vs = @(0, 0)
+    if ($main -ne [IntPtr]::Zero) {
+        if ($tw -ne $null) { $vs = Calibrate-View $main $tw $th }
+        else { $vs = View-Size (View-Of $main) }
+        if ($cmds) { & $cmds $main }
+        Start-Sleep -Milliseconds 400
+    }
     $code = Close-Main $p $main
     return @{ Out = $out; Code = $code; Vs = $vs; Adopted = $adopted; Main = $main; Err = (Read-Err $errName) }
 }
 $one2one = { param($m) [void][S80]::PostMessage($m, $WM_COMMAND, [IntPtr]$CMD_ONE2ONE, [IntPtr]::Zero) }
-$w3 = Run-Dump 'warp' $png3 's3-warp.png' 's3-warp.err' $one2one
-$g3 = Run-Dump 'gdi' $png3 's3-gdi.png' 's3-gdi.err' $one2one
-$bothOk = ($w3.Code -eq 0) -and ($g3.Code -eq 0) -and (Test-Path $w3.Out) -and (Test-Path $g3.Out)
-Check 'S3a both dumps ran clean (exit 0, files exist)' $bothOk ("warp exit=$($w3.Code) gdi exit=$($g3.Code) warpPng=$(Test-Path $w3.Out) gdiPng=$(Test-Path $g3.Out)")
-if ($bothOk) {
-    $bw3 = [IO.File]::ReadAllBytes($w3.Out)
-    $bg3 = [IO.File]::ReadAllBytes($g3.Out)
-    $eq3 = [Px]::BytesEqual($bw3, $bg3)
-    $alphaNote = ''
-    if (-not $eq3) {
-        $qa3 = [Px]::Load($w3.Out)
-        $qb3 = [Px]::Load($g3.Out)
-        $alphaNote = (' alphaDiffPixels=' + [Px]::AlphaDiff($qa3.B, $qb3.B) + ' (RGB compared below; an alpha-only letterbox difference means the GDI dump leaves the DIB-zeroed alpha 0 while the D2D Clear writes 255 - adjudication finding)')
+$Golden90Dir = Join-Path $PSScriptRoot 'golden90'
+$golden3 = Join-Path $Golden90Dir 's1-one2one-gdi.png'
+$src96 = [Px]::HashSource(96, 64)
+$png96 = Join-Path $Stage 'hash96.png'
+[Px]::SaveRgba($png96, $src96, 96, 64)
+$g90Extras = @('fill_window=1', 'mag_filter=0', 'shrink_blit_mode=0',
+    'windowed_background_color_r=255', 'windowed_background_color_g=0', 'windowed_background_color_b=255')
+$w3 = Run-Dump 'warp' $png96 's3-warp.png' 's3-warp.err' $one2one 256 192 $g90Extras
+$ranOk3 = ($w3.Code -eq 0) -and (Test-Path $w3.Out)
+Check 'S3a warp dump ran clean (exit 0, file exists)' $ranOk3 ("warp exit=$($w3.Code) warpPng=$(Test-Path $w3.Out)")
+$goldenOk3 = Test-Path $golden3
+if (-not $goldenOk3) {
+    Check 'S3b golden90 corpus present (committed at the #90 freeze)' $false ('missing: ' + $golden3)
+}
+if ($ranOk3) {
+    if ($goldenOk3) {
+        $bw3 = [IO.File]::ReadAllBytes($w3.Out)
+        $bg3 = [IO.File]::ReadAllBytes($golden3)
+        $eq3 = [Px]::BytesEqual($bw3, $bg3)
+        Check 'S3b warp dump byte-identical to the frozen golden90 s1-one2one reference (the gdi-arm oracle)' $eq3 ("bytes $($bw3.Length) vs $($bg3.Length)")
+    } else {
+        Skip-Scenario 'S3b golden byte-compare' 'golden90 file missing (broken checkout)'
     }
-    Check 'S3b warp and gdi dumps byte-identical' $eq3 ("bytes $($bw3.Length) vs $($bg3.Length)" + $alphaNote)
     $q3 = [Px]::Load($w3.Out)
-    $sizeOk3 = ($q3.W -eq $w3.Vs[0]) -and ($q3.H -eq $w3.Vs[1])
-    Check 'S3c warp dump is viewport-sized' $sizeOk3 ("dump=$($q3.W)x$($q3.H) viewport=$($w3.Vs[0])x$($w3.Vs[1])")
-    $bb3 = [Px]::BBox($q3.B, $q3.W, $q3.H)
-    $bwid3 = $bb3[2] - $bb3[0] + 1
-    $bhei3 = $bb3[3] - $bb3[1] + 1
-    $bboxOk3 = ($bwid3 -eq $SRCW) -and ($bhei3 -eq $SRCH)
-    Check 'S3d non-white bbox == source rect at source size' $bboxOk3 ("bbox l=$($bb3[0]) t=$($bb3[1]) ${bwid3}x${bhei3} want=${SRCW}x${SRCH}")
-    $mism3 = '(bbox failed)'
-    if ($bboxOk3) { $mism3 = [Px]::CompareRegion($q3.B, $q3.W, $bb3[0], $bb3[1], $src3, $SRCW, 0) }
-    Check 'S3e every warp bbox pixel == source (RGBA, exact)' ($mism3 -eq $null) "$mism3"
-    $qg3 = [Px]::Load($g3.Out)
-    $bbg3 = [Px]::BBox($qg3.B, $qg3.W, $qg3.H)
-    $gwid3 = $bbg3[2] - $bbg3[0] + 1
-    $ghei3 = $bbg3[3] - $bbg3[1] + 1
-    $gOk3 = (($gwid3 -eq $SRCW) -and ($ghei3 -eq $SRCH))
-    $gm3 = '(bbox failed)'
-    if ($gOk3) { $gm3 = [Px]::CompareRegion($qg3.B, $qg3.W, $bbg3[0], $bbg3[1], $src3, $SRCW, 0) }
-    Check 'S3f gdi dump pixel-exact too (both arms, not just one)' (($gOk3 -and ($gm3 -eq $null))) "bbox=$gwid3 x $ghei3 first-mismatch=$gm3"
+    $sizeOk3 = ($q3.W -eq 256) -and ($q3.H -eq 192)
+    Check 'S3c warp dump is the calibrated 256x192 viewport' $sizeOk3 ("dump=$($q3.W)x$($q3.H) viewport=$($w3.Vs[0])x$($w3.Vs[1])")
+    $strips3 = @(@(0, 0, 80, 192), @(176, 0, 80, 192), @(80, 0, 96, 64), @(80, 128, 96, 64))
+    $margOk3 = $true
+    $margDet3 = ''
+    foreach ($s in $strips3) {
+        $bad = [Px]::CountNotBg($q3.B, $q3.W, $s[0], $s[1], $s[2], $s[3], 255, 0, 255)
+        if ($bad -ne 0) { $margOk3 = $false; $margDet3 += " rect($($s[0]),$($s[1]),$($s[2]),$($s[3]))nonbg=$bad" }
+    }
+    if ($margDet3 -eq '') { $margDet3 = 'all margin strips pure magenta' }
+    Check 'S3d letterbox margins pure magenta' $margOk3 $margDet3
+    $mism3 = [Px]::CompareRegion($q3.B, $q3.W, 80, 64, $src96, 96, 0)
+    Check 'S3e image box at (80,64) pixel-exact vs the 96x64 source (RGBA)' ($mism3 -eq $null) "$mism3"
 } else {
-    Skip-Scenario 'S3b-f pixel comparisons' 'a dump channel failed; see S3a detail and stderr captures'
+    Skip-Scenario 'S3b-S3e golden/pixel comparisons' 'the warp dump channel failed; see S3a detail and stderr captures'
     Write-Output ("S3 warp stderr: " + ($w3.Err.Trim()))
-    Write-Output ("S3 gdi stderr: " + ($g3.Err.Trim()))
 }
 Kill-Riviv
 Reset-Ini ''
@@ -620,7 +699,7 @@ if ($pngOk5) {
     $dims5 = "$($q5.W)x$($q5.H)"
     $sizeOk5 = ($q5.W -eq $vs5[0]) -and ($q5.H -eq $vs5[1])
 }
-Check 'S5a the D2D arm draws the giant itself (no gate line, no gdi hand-off, no gdi dump fallback)' (($err -match 'backend=d2d') -and (-not $err.Contains('exceeds the D2D max bitmap')) -and (-not $err.Contains('rendering it via gdi')) -and (-not $err.Contains('trying the gdi channel'))) ("$maxLine stderr=[$($err.Trim())]")
+Check 'S5a the D2D arm draws the giant itself (no gate line, no gdi hand-off, no gdi dump fallback, no backend=gdi)' (($err -match 'backend=d2d') -and (-not $err.Contains('exceeds the D2D max bitmap')) -and (-not $err.Contains('rendering it via gdi')) -and (-not $err.Contains('trying the gdi channel')) -and (-not $err.Contains('backend=gdi'))) ("$maxLine stderr=[$($err.Trim())]")
 Check 'S5b process stayed alive with the giant frame' ($alive5 -and $adopted5) "alive=$alive5 adopted=$adopted5"
 Check 'S5c dump succeeds out of the D2D channel (exit 0, viewport-sized)' (($code5 -eq 0) -and $pngOk5 -and $sizeOk5) ("exit=$code5 png=$pngOk5 dims=$dims5 viewport=$($vs5[0])x$($vs5[1])")
 Check 'S5d the stats line names the giant form (level>=1 or tiles>=1)' $form5 "seen=$statsSeen level=$statsLevel tiles=$statsTiles"
@@ -734,9 +813,8 @@ Reset-Ini ''
 # ---------------------------------------------------------------------------
 # S8: the background display gate. Warp: a never-foregrounded instance dumps
 # at WM_CLOSE (the D2D dump renders from the CPU master, no Present, no
-# WM_PAINT dependency). Gdi twin: SKIP per the #80 design note (the GDI
-# render evidence rides the pre-existing background-paint gate,
-# master-identical, smoke78 SKIP semantics) - we still record what it did.
+# WM_PAINT dependency). The former gdi twin is retired with the arm (#90) -
+# renderer=gdi maps to auto now, so there is no second arm to record.
 # ---------------------------------------------------------------------------
 function Run-Background($renderer, $outName, $errName) {
     Reset-Ini ($baseIni + "renderer=$renderer`r`n")
@@ -782,9 +860,6 @@ $r8w = Run-Background 'warp' 's8-warp.png' 's8-warp.err'
 $note8w = "adopted=$($r8w.Adopted) iconicAtStart=$($r8w.Iconic0) viewWhileIconic=$($r8w.Vs0[0])x$($r8w.Vs0[1]) fgHeldByRiviv=$(-not $r8w.NeverFg) exit=$($r8w.Code) png=$($r8w.Png) dims=$($r8w.Dims) viewport=$($r8w.Vs[0])x$($r8w.Vs[1]) imageContentOk=$($r8w.ContentOk)"
 Write-Output ('  S8a evidence: ' + $note8w)
 Check 'S8a warp: minimized-start instance dumps the image at WM_CLOSE (dump path needs no display pipeline)' (($r8w.Code -eq 0) -and $r8w.Png -and $r8w.SizeOk -and $r8w.ContentOk) $note8w
-$r8g = Run-Background 'gdi' 's8-gdi.png' 's8-gdi.err'
-$note8g = "observed: adopted=$($r8g.Adopted) exit=$($r8g.Code) png=$($r8g.Png) dims=$($r8g.Dims) viewport=$($r8g.Vs[0])x$($r8g.Vs[1]) imageContentOk=$($r8g.ContentOk) fgHeldByRiviv=$(-not $r8g.NeverFg)"
-Skip-Scenario 'S8b gdi twin (background gate; master-identical, not a #80 assertion)' $note8g
 Kill-Riviv
 Reset-Ini ''
 

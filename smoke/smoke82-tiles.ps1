@@ -16,10 +16,11 @@
 #
 # The observable surface (#82): startup breadcrumb
 #   riviv: d2d max_bitmap=<n> tile cap=<n> (dxgi budget=<n|unavailable>)
-# close-time stats line (only when the giant path ran)
+# close-time stats line (only when the giant path ran; 12 fields since #90
+# removed the gdi-only display= accounting field)
 #   riviv: tiles level=<L> tiles=<n> base=<bytes> gpu=<bytes> peak_gpu=<bytes>
 #     inflight=<bytes> peak_inflight=<bytes> uploads=<n> evictions=<n>
-#     mip_builds=<n> source=<bytes> display=<bytes> cap=<bytes>
+#     mip_builds=<n> source=<bytes> cap=<bytes>
 # and the -tile <edge> diagnostic (forces the tile grid edge, in DRAWN-LEVEL
 # pixels, and bypasses the single-bitmap shortcut). The OLD gate
 # ("exceeds the D2D max bitmap ... rendering it via gdi") is gone: asserted
@@ -56,8 +57,10 @@
 #      run satisfies gpu<=cap and peak_gpu<=cap; two more 1:1 banner
 #      instances with -tile 256 each show uploads>0 with resident bytes
 #      still bounded (not growing with the frame count).
-#   S6 record-only: renderer=gdi banner at fit passes the same shape/band/
-#      ramp assertions (the GDI arm is untouched by #82).
+#   S6 RETIRED with the GDI render arm (#90): the renderer=gdi banner
+#      record-only run is gone (renderer=gdi now maps to auto with a
+#      migration note on stderr). The number stays reserved so S7/S8/S9
+#      keep theirs.
 #   S2b-d hard-edge probe (R3 P2-1): a flat mid-grey 900x600 with 1-px
 #      full-height black columns ON a tile boundary (source x = 256) and
 #      MID-TILE (source x = 300): the dip screen positions must hit the
@@ -459,10 +462,11 @@ function Calibrate-View($main, $tw, $th) {
 # The #82 close-time stats line, parsed and recorded. Returns the first
 # match as a hashtable (or $null); every match lands in $script:StatsSeen
 # for the S5 sweep.
-$StatsPattern = 'riviv: tiles level=(\d+) tiles=(\d+) base=(\d+) gpu=(\d+) peak_gpu=(\d+) inflight=(\d+) peak_inflight=(\d+) uploads=(\d+) evictions=(\d+) mip_builds=(\d+) source=(\d+) display=(\d+) cap=(\d+)'
+$StatsPattern = 'riviv: tiles level=(\d+) tiles=(\d+) base=(\d+) gpu=(\d+) peak_gpu=(\d+) inflight=(\d+) peak_inflight=(\d+) uploads=(\d+) evictions=(\d+) mip_builds=(\d+) source=(\d+) cap=(\d+)'
 $script:StatsSeen = New-Object System.Collections.ArrayList
 # Every d2d/warp scenario's stderr, tagged (S7 scans them for the dump's
-# silent "trying the gdi channel" fallback - the gdi-arm S6 is excluded).
+# silent "trying the gdi channel" fallback - a negative guard that stays
+# after #90: it must never fire again).
 $script:D2dErrs = New-Object System.Collections.ArrayList
 function Note-D2dErr($err, $tag) {
     [void]$script:D2dErrs.Add(@{ Tag = $tag; Err = $err })
@@ -480,7 +484,7 @@ function Parse-Stats($err, $tag) {
             Uploads = [int]$mm.Groups[8].Value
             Evictions = [int]$mm.Groups[9].Value
             MipBuilds = [int]$mm.Groups[10].Value
-            Cap = [long]$mm.Groups[13].Value
+            Cap = [long]$mm.Groups[12].Value
             Line = $mm.Value
         }
         [void]$script:StatsSeen.Add($h)
@@ -1010,25 +1014,11 @@ Check 'S5b repeated-paint instance 2: uploads>0, gpu<=cap, peak_gpu<=cap (bounde
 # strictly stronger than the old S1..S5-only sweep.
 
 # ---------------------------------------------------------------------------
-# S6: record-only. renderer=gdi with the banner at fit: the GDI giant
-# relief still draws the same content (the GDI arm is untouched by #82).
+# S6 is RETIRED with the GDI render arm (#90): the renderer=gdi banner
+# record-only run (same shape/band/ramp assertions on the GDI giant relief)
+# cannot run anymore - renderer=gdi maps to auto, and the relief path the
+# section exercised no longer exists. The number stays reserved.
 # ---------------------------------------------------------------------------
-$g6 = Run-Scene (Scene-Ini 'gdi' ($StripW + 40) ($StripH + 160) $false) $banner 's6-gdi.png' 's6-gdi.err' '' $StripW $StripH $null 30000
-[void](Parse-Stats $g6.Err 'S6-gdi-record-only')
-$gchk = $null
-$gStatsNote = 'no stats line (expected: the gdi arm has no gpu stack)'
-if ($g6.Err -match 'riviv: tiles level=') { $gStatsNote = 'UNEXPECTED stats line on the gdi arm: ' + $g6.Err.Trim() }
-Check 'S6a gdi banner run clean (adopted, exit 0, dump exists)' (($g6.Code -eq 0) -and $g6.Adopted -and (Test-Path $g6.Out)) ("exit=$($g6.Code) adopted=$($g6.Adopted) stderr=[$($g6.Err.Trim())]")
-if (Test-Path $g6.Out) {
-    $gchk = Banner-Strip-Checks $g6.Out $g6.Vs[0]
-    Check 'S6b gdi red band at the expected columns (+-10)' $gchk.RedOk ($gchk.Detail + " | $gStatsNote")
-    Check 'S6c gdi surrounding row is a ramp, not black' $gchk.RampOk $gchk.Detail
-} else {
-    Skip-Scenario 'S6b/S6c gdi strip assertions' 'no gdi dump on disk'
-}
-if ($gchk -ne $null) { Write-Host ('  S6 gdi evidence: ' + $gchk.Detail + ' | ' + $gStatsNote) }
-Kill-Riviv
-Reset-Ini ''
 
 # ---------------------------------------------------------------------------
 # S8: the long-animation churn on the stripe family (design section 3's "long
