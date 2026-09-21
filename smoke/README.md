@@ -2,8 +2,15 @@
 
 本目录存放**随仓库入库**的冒烟测试脚本(GUI 无法自动验收,见 AGENTS.md 的冒烟
 测试纪律)。先例:`installer/smoke26-assoc.ps1`(#26 关联/安装冒烟,PR 处置时
-入库)。回归矩阵的其余脚本目前仍散落在 `%TEMP%\riviv-test\`(未纳入版本控
-制),待 #80「后台进程显示闸」重访时再评估批量入库。
+入库)。回归矩阵的其余脚本仍散落在 `%TEMP%\riviv-test\`(未纳入版本控制);
+**#94 裁决(2026-09-21)**:smoke9 timing 族(timing/timing2/firstframe/ab
+四套)判 **wontfix 退役**——它们是 #9 mip 决策期的一次性 A/B 设计评估工具,
+对照臂指向已删除的旧 worktree(`riviv-nomip` / `riviv-master-ref`),作为
+回归门无对照可造(重建 #9 时代基线跑今天的 master,任何差异都不可归因),
+其保证已被库内 golden/oracle 断言(smoke80 S3、smoke81 S2、golden90 语料)
+更强地覆盖;「降级分片」故障注入判 **wontfix**——GDI 臂 512px 分片降级路径
+(#81)本无可测注入通道,且随 #90 GDI 删除而消亡。其余 %TEMP% 脚本维持
+不入库,不作为回归门。
 
 ## smoke82-tiles.ps1(#82 巨图 overview + LRU tile + VRAM 字节预算)
 
@@ -101,7 +108,7 @@ powershell -ExecutionPolicy Bypass -File smoke\smoke80-d2d.ps1 -Exe <other build
 
 | Scenario | Assertion | Notes |
 | --- | --- | --- |
-| S1a (gdi/d2d/warp/auto) | stderr breadcrumb `riviv: renderer=<req> backend=<eff>` per ini value | d2d/auto expect `d2d/hw` where hardware D3D11 exists; `warp` expects `d2d/warp` |
+| S1a (gdi/d2d/warp/auto) | stderr breadcrumb `riviv: renderer=<req> backend=<eff>` per ini value | #94: exact-string disjunctions of the documented driver ladder — `warp` -> `d2d/warp` everywhere; `d2d` -> `d2d/hw`, or on a no-hardware host `backend=gdi` WITH its `falling back to gdi` line (a failed d2d goes straight to gdi, never warp); `auto` -> `d2d/hw` or `d2d/warp` (its retry ladder). No SKIP: both host shapes keep every wrong-backend regression failing |
 | S1b | `renderer=frobnicate` -> `renderer=auto backend=` + `unrecognized renderer value` + `using auto` hints | invalid string value falls back to the default (auto since #81; gdi pre-#81) |
 | S1c | missing key -> `renderer=auto backend=` | the default (auto since #81; gdi pre-#81) |
 | S2 | warp dump channel: adopted image + WM_CLOSE -> PNG on disk, exit 0, dims == view client rect | |
@@ -110,7 +117,7 @@ powershell -ExecutionPolicy Bypass -File smoke\smoke80-d2d.ps1 -Exe <other build
 | S5a-S5d | giant path (#82 contract): NO gate line, NO gdi hand-off, NO gdi dump fallback; process alive; dump succeeds out of the D2D channel, exit 0; close-time stats line names the form (level>=1 or tiles>=1) | the D2D arm draws giants itself (overview level or tiles) — the #80 gate is retired |
 | S6a-S6d | animation re-upload: dumps before/after `AnimationFrameStep` (cmd 100) differ; frame 0 = red, frame 1 = blue at 1:1 | frame_gen bump re-uploads |
 | S7a-S7b | rotation re-upload: after `EditRotate90` (cmd 23) the bbox swaps 120x80 -> 80x120 and the content equals the source rotated 90 CW | rotate bumps frame_gen |
-| S8a | minimized-start warp instance dumps the image (content-checked) at WM_CLOSE | the D2D dump renders from the CPU master inside the dump call - no Present, no WM_PAINT dependency |
+| S8a | minimized-start warp instance (the 0x0 iconic viewport - the documented dump-refusal shape - is restored via SW_SHOWNOACTIVATE before the dump) dumps the image (content-checked) at WM_CLOSE | #94 naming clarification: NOT a pure iconic dump. The subject is the dump channel's independence from the display pipeline - no Present, no WM_PAINT; whether Windows' initial iconic activation handed the instance the foreground is host-dependent and stays recorded in the evidence note, not asserted (fgHeldByRiviv=True observed on the dev machine) |
 | S8b | gdi twin of S8 | SKIP by design (pre-existing background-paint gate, master-identical, smoke78 SKIP semantics); observed behavior recorded in the detail line |
 
 Adjudicated (2026-09-19, commit 028abf7): S3b's original failure was the
@@ -119,6 +126,22 @@ DIB-zeroed A=0 (GDI never writes the alpha byte; RGB was pixel-identical).
 The dump contract is now the fully opaque viewport BOTH arms render, and
 the gdi channel forces A=255 on readback - S3b asserts byte-identical
 files and passes.
+
+Adjudicated (2026-09-21, #94): S1a's `d2d/hw` expectations are now the
+exact-string disjunctions of the documented driver ladder (scene table
+above) - the former hard hw-only string false-FAILed correct behavior on
+no-hardware hosts (RDP/VM: an explicit `d2d` degrades to gdi with its
+init-failed stderr line, `auto` retries to warp), and a SKIP would have
+discarded the arms that stay assertable there; neither SKIP nor a hard
+string, the ladder itself is the assertion. S8a's label was clarified to
+say what it actually pins (a minimized-start + no-activate-restore dump,
+not a pure iconic dump; the foreground observation stays recorded - the
+dev machine's run showed fgHeldByRiviv=True). The smoke9
+timing family and the degradation-shard injection item are adjudicated in
+the intro section above (both wontfix, with reasons). Post-#90 note: the
+d2d->gdi arm of the S1a disjunction goes dead when #90 lands (a failed d2d
+init fataled instead of degrading) - drop the arm from Test-S1Arms at
+merge time; the auto->warp and d2d/hw arms stay.
 
 ## smoke79-dpi.ps1(#79 PerMonitorV2 DPI,专项)
 
