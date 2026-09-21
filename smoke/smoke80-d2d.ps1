@@ -292,6 +292,35 @@ function Check($name, $ok, $detail) {
 function Skip-Scenario($name, $why) {
     $script:skip++; Write-Output ('SKIP ' + $name + ' -- ' + $why)
 }
+# #94 adjudication (S1a): the backend expectations are the EXACT-STRING
+# disjunctions of the documented driver ladder (gpu.rs create), not one
+# hard hw string and not a SKIP. On a host without hardware D3D11 (the
+# envqa RDP/VM shapes) the legal outcomes are: auto -> d2d/warp (its
+# documented hw-then-warp retry), d2d -> the gdi fallback WITH its
+# init-failed stderr line (a failed d2d goes straight to gdi, never warp).
+# A SKIP would discard the arms that stay assertable on such hosts; a hard
+# hw-only string false-FAILs correct behavior there. Every wrong-backend
+# regression still fails on BOTH host shapes (e.g. d2d resolving to warp
+# matches neither arm; auto landing on gdi matches neither).
+function Test-S1Arms($val, $err) {
+    $arms = @{
+        gdi  = @(@('riviv: renderer=gdi backend=gdi'))
+        d2d  = @(@('riviv: renderer=d2d backend=d2d/hw'),
+                 @('riviv: renderer=d2d backend=gdi', 'falling back to gdi'))
+        warp = @(@('riviv: renderer=warp backend=d2d/warp'))
+        auto = @(@('riviv: renderer=auto backend=d2d/hw'),
+                 @('riviv: renderer=auto backend=d2d/warp'))
+    }
+    $disp = ($arms[$val] | ForEach-Object { $_ -join ' + ' }) -join ' OR '
+    if ($null -ne $err) {
+        foreach ($arm in $arms[$val]) {
+            $all = $true
+            foreach ($needle in $arm) { if (-not $err.Contains($needle)) { $all = $false } }
+            if ($all) { return @{ Ok = $true; Match = ($arm -join ' + '); Want = $disp } }
+        }
+    }
+    return @{ Ok = $false; Match = ''; Want = $disp }
+}
 function Wait-Until($sb, $ms) {
     $deadline = [DateTime]::UtcNow.AddMilliseconds($ms)
     while ([DateTime]::UtcNow -lt $deadline) {
@@ -413,15 +442,16 @@ $s1vals = @(
     @('auto', 'riviv: renderer=auto backend=d2d/hw')
 )
 foreach ($c in $s1vals) {
-    $val = $c[0]; $want = $c[1]
+    $val = $c[0]
     Reset-Ini ("[riviv]`r`nrenderer={0}`r`n" -f $val)
     $p = Start-Riv '' ("s1-$val.err") $false
     $main = Wait-Main $p
     $winOk = ($main -ne [IntPtr]::Zero)
     $code = Close-Main $p $main
     $err = Read-Err ("s1-$val.err")
-    $hasBc = ($null -ne $err) -and $err.Contains($want)
-    Check ("S1a-$val breadcrumb '$want'") ($winOk -and ($code -eq 0) -and $hasBc) ("exit=$code win=$winOk stderr=[$($err.Trim())]")
+    # #94: per-value disjunctive expectation (see Test-S1Arms above).
+    $s1 = Test-S1Arms $val $err
+    Check ("S1a-$val breadcrumb [" + $s1.Want + ']') ($winOk -and ($code -eq 0) -and $s1.Ok) ("exit=$code win=$winOk matched=[$($s1.Match)] stderr=[$($err.Trim())]")
 }
 Reset-Ini "[riviv]`r`nrenderer=frobnicate`r`n"
 $p = Start-Riv '' 's1-frob.err' $false
@@ -778,10 +808,19 @@ function Run-Background($renderer, $outName, $errName) {
     }
     return @{ Out = $out; Code = $code; Png = $pngOk; SizeOk = $sizeOk; ContentOk = $contentOk; Dims = $dims; Vs = $vs; Adopted = $adopted; Iconic0 = $iconic0; Vs0 = $vs0; NeverFg = $neverFg }
 }
+# #94 naming clarification: this is NOT a pure iconic dump. The instance
+# STARTS minimized; when the iconic viewport reads 0x0 (the documented
+# dump-refusal shape) Run-Background restores it with SW_SHOWNOACTIVATE so
+# geometry exists while the restore itself does not activate. The assertion
+# subject is the dump channel's independence from the display pipeline (no
+# Present, no WM_PAINT), not the iconic state itself. Whether Windows'
+# initial activation of the iconic window handed it the foreground is
+# host-dependent and stays recorded in the evidence note, not asserted
+# (fgHeldByRiviv=True observed on the dev machine, 2026-09-21).
 $r8w = Run-Background 'warp' 's8-warp.png' 's8-warp.err'
 $note8w = "adopted=$($r8w.Adopted) iconicAtStart=$($r8w.Iconic0) viewWhileIconic=$($r8w.Vs0[0])x$($r8w.Vs0[1]) fgHeldByRiviv=$(-not $r8w.NeverFg) exit=$($r8w.Code) png=$($r8w.Png) dims=$($r8w.Dims) viewport=$($r8w.Vs[0])x$($r8w.Vs[1]) imageContentOk=$($r8w.ContentOk)"
 Write-Output ('  S8a evidence: ' + $note8w)
-Check 'S8a warp: minimized-start instance dumps the image at WM_CLOSE (dump path needs no display pipeline)' (($r8w.Code -eq 0) -and $r8w.Png -and $r8w.SizeOk -and $r8w.ContentOk) $note8w
+Check 'S8a warp: minimized-start instance (iconic 0x0 viewport restored with SW_SHOWNOACTIVATE - not a pure iconic dump) dumps the image at WM_CLOSE - the dump path needs no display pipeline' (($r8w.Code -eq 0) -and $r8w.Png -and $r8w.SizeOk -and $r8w.ContentOk) $note8w
 $r8g = Run-Background 'gdi' 's8-gdi.png' 's8-gdi.err'
 $note8g = "observed: adopted=$($r8g.Adopted) exit=$($r8g.Code) png=$($r8g.Png) dims=$($r8g.Dims) viewport=$($r8g.Vs[0])x$($r8g.Vs[1]) imageContentOk=$($r8g.ContentOk) fgHeldByRiviv=$(-not $r8g.NeverFg)"
 Skip-Scenario 'S8b gdi twin (background gate; master-identical, not a #80 assertion)' $note8g
