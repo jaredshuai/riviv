@@ -5,7 +5,7 @@
 - 全量证据报告(数据源,命令+原始输出+探针源码):
   `%TEMP%\riviv-s0-avif\B-report.md`;语料 `test.avif`(64×64 四象限,
   ravif 0.13.0 经 image 0.25.10 纯 Rust 编码,13 ms / 364 B,
-  fyp brand=`avif` 实录)在 `%TEMP%\riviv-s0-avif\` 下,三路线共用。
+  ftyp brand=`avif` 实录)在 `%TEMP%\riviv-s0-avif\` 下,三路线共用。
 - 取舍原则(票面):单 exe、行为不随用户装机变、CI 三闸可复现 >
   解码速度 > 体积。
 
@@ -25,7 +25,7 @@ MIT 侧 oxideav 自认脚手架不成熟。AVIF 位深/gain map 与 HDR 语义�
 | 路线 | 关键事实(实测) | 体积代价 | CI 可复现 | 行为确定性 | 成熟度/许可 |
 |---|---|---|---|---|---|
 | **A. image `avif-native`**(dav1d,C) | 本机默认构建失败:pkg-config 缺失,dav1d-sys 0.8.3 **无 feature 面**,默认 pkg-config 找系统 dav1d≥1.3.0;源码编走 `SYSTEM_DEPS_DAV1D_BUILD_INTERNAL`(git clone dav1d 1.5.0 成功→死于无 meson;dav1d 需 nasm≥2.14;编完解析 .pc 仍要 pkg-config) | **N/A**(链不上) | 推导:GHA 需 `pip install meson`+`choco nasm pkgconfiglite`+构建期联网 clone;可做但依赖面最重 | 好(自带 C) | 最高:dav1d=业界标准,image 官方 feature,mp4parse demux 现成;MIT/BSD 系 |
-| **B. 系统 WIC**(HEIF+AV1) | 本机实测解码成功(64×64 四角像素全对,32bppBGR);WIC 无独立 AVIF decoder,走「Microsoft HEIF Decoder + AV1 MFT」;装机前提:AV1VideoExtension 2.0.30 + HEIFImageExtension 1.2.48(本机已装;扩展缺失分支本机未复现) | ≈ +0(系统 COM) | 高(纯 API);但 CI 测不了「用户没装扩展」的行为 | **最弱**:随装机变 | 系统组件;免费但装机率非 100% |
+| **B. 系统 WIC**(HEIF+AV1) | 本机实测解码成功(64×64 四角像素全对,32bppBGR);WIC 无独立 AVIF decoder,走「Microsoft HEIF Decoder + AV1 MFT」;装机前提:AV1VideoExtension 2.0.30 + HEIFImageExtension 1.2.48(本机已装;扩展缺失分支本机未复现) | ≈ +0(系统 COM) | 高(纯 API);但除非 CI 专门关掉扩展,测不到扩展缺失分支的行为 | **最弱**:随装机变 | 系统组件;免费但装机率非 100% |
 | **C. 纯 Rust**(rav1d 系) | rav1d 1.1.0(memorysafety,BSD-2)仅裸 OBU 的 unsafe C 风格 API、无容器 demux;**全链 zenavif 0.1.6 实测解码成功**(5 ms,四角全对,零外部工具);oxideav-avif 0.0.11(MIT)自认「orphan-rebuild scaffold 不成熟」 | ≈ +3.67 MiB(route-c.exe 原值;riviv 实际增量会小) | **最高**(cargo build 零外部依赖零网络) | 好(代码自带) | **rav1d-safe+zenavif = AGPL-3.0-only OR 商业双授 → 对 MIT 的 riviv 一票否决**;oxideav 不可依赖 |
 
 关键单点证据:
@@ -34,7 +34,7 @@ MIT 侧 oxideav 自认脚手架不成熟。AVIF 位深/gain map 与 HDR 语义�
 - B 成功原文:`CreateDecoderFromFilename(test.avif): OK` / `GetSize: 64x64`
   / 四角 BGRA 与源四象限一致;`MFTEnumEx` input=AV1 定向查询 `count=1 → AV1VideoExtension`。
 - C 成功原文:`DECODE_OK backend=zenavif(rav1d-safe) size=64x64 elapsed_ms=5`,四角 RGB 对;
-  许可字段:zenavid/rav1d-safe = `AGPL-3.0-only OR LicenseRef-Imazen-Commercial`(crates.io API)。
+  许可字段:zenavif 0.1.6(探针实测所用)与 rav1d-safe 系 = `AGPL-3.0-only OR LicenseRef-Imazen-Commercial`(crates.io API 元数据,后者取 0.6.0 最新版字段;探针实测链为 rav1d-safe 0.5.7)。
 
 ## 决策影响
 

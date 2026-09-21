@@ -36,13 +36,14 @@ riviv 基线 exe = 3,099,648 B(S1),full 档增量 ≈ 基线的 1.3 倍——
 LTO 合并),是近似上界。
 
 ### B. 同批样本双路线渲染分类(256px;分类由像素扫描+输出 PNG 双证,
-主会话另用 System.Drawing 独立复核 nonWhite 计数一致)
+主会话另用 System.Drawing 独立全扫复核——口径=全像素、任一通道<255
+计非白——与子代理报告分类一致)
 
 | 样本 | resvg full | D2D SVG | 说明 |
 |---|---|---|---|
 | sample1-icon(纯矢量图标) | ✅ 正确 | ✅ 正确 | D2D 需手动 world transform 才 fit(见 D) |
-| sample2-text(`<text>`) | ✅ 正确(nonWhite=158;**必须显式 `load_system_fonts()`**,默认空 fontdb) | ❌ **失败**(全白,nonWhite=0;子集无 text,元素静默丢弃) | 文字是真实 SVG 高频要素 |
-| sample3-filter(feGaussianBlur) | ✅ 模糊生效(非白 1638,扩散带 30+px) | ⚠️ **降级**(非白 162,形状在但零模糊 1px 硬边) | D2D 忽略 filter 属性 |
+| sample2-text(`<text>`) | ✅ 正确(nonWhite=2535@256×128;**必须显式 `load_system_fonts()`**,默认空 fontdb) | ❌ **失败**(全白 nonWhite=0;子集无 text,元素静默丢弃) | 文字是真实 SVG 高频要素 |
+| sample3-filter(feGaussianBlur) | ✅ 模糊生效(非白 30194,扩散带 30+px) | ⚠️ **降级**(非白 2527,形状在但零模糊 1px 硬边) | D2D 忽略 filter 属性 |
 | sample4-extref(本地外链 png) | 默认失败;显式 `resources_dir` 后 ✅ 棋盘 | ❌ 失败(IStream 解析,无资源目录概念,不可恢复) | resvg 可选恢复,D2D 无机制 |
 | sample5-hugeviewbox(10^5 viewBox) | ✅ 正确 | ✅ 正确 | 双方缩放几何正确 |
 

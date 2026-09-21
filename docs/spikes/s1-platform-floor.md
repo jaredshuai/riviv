@@ -12,8 +12,9 @@
 **min-OS = Windows 10 1607(build 14393)**,由唯一的 1607 级静态导入
 `user32.dll!GetDpiForSystem`(#79 chrome/对话框 DPI 源)钉死;次高地板仅到
 Win8.1(`shcore!GetProcessDpiAwareness`)与 Win8(`WaitOnAddress` 族、
-`D3D11CreateDevice`),**零 Win10-1703+/Win11-only 静态导入**;PMv2 效果
-(1703+)、ACM(Win11 22H2+)等一律运行时探测,属可选增强不抬地板。
+`ProcessPrng`),d2d1/d3d11 落在 Win7 系,**零 Win10-1703+/Win11-only
+静态导入**;PMv2 效果(1703+)、ACM(Win11 22H2+)等一律运行时探测,
+属可选增强不抬地板。
 
 ## 证据块
 
@@ -32,16 +33,19 @@ Win8.1(`shcore!GetProcessDpiAwareness`)与 Win8(`WaitOnAddress` 族、
 | **user32.dll** | **`GetDpiForSystem` → Win10 1607** ←绑定地板;其余 ≤Vista/Win7 | 窗口/DPI(#79) |
 | api-ms-win-shcore-scaling-l1-1-1.dll | `GetProcessDpiAwareness` → Win8.1 | PMv2 运行时自检(#79) |
 | api-ms-win-core-synch-l1-2-0.dll | `WaitOnAddress`/`WakeByAddress*` → Win8 | Rust std 同步原语 |
-| d3d11.dll | `D3D11CreateDevice` → Win8(WARP 兜底) | GPU 栈(#80) |
+| bcryptprimitives.dll | `ProcessPrng` → Win8(Rust 1.76+ 起使用,Win7 无此导出) | Rust std RNG |
+| d3d11.dll | `D3D11CreateDevice` → Win7+平台更新(D3D11 运行时与 WARP 均随 Win7 SP1 提供) | GPU 栈(#80) |
 | combase.dll | 仅 `CoTaskMemFree` → Win8 | COM 内存(co-task 分配族经 ole32) |
 | d2d1.dll | `D2D1CreateFactory` → Win7 SP1 | 渲染(#80) |
-| bcryptprimitives.dll | `ProcessPrng` → Win7 SP1 | Rust std RNG |
-| mscms.dll | WCS 变换 API → Vista | ICM(#77) |
+| mscms.dll | ICM2 变换 API(`OpenColorProfileW`/`TranslateBitmapBits` 族)→ Win2000(mscms.dll 自带;WCS 面 Vista+,本表未依赖) | ICM(#77) |
 | kernel32/ntdll/gdi32/advapi32 | ≤Vista | 核心/GDI chrome |
 | shell32/ole32/oleaut32/comctl32/comdlg32 | ≤Vista | shell 谓词/对话框/公共控件 |
 | VCRUNTIME140.dll + api-ms-win-crt-\*×6 | VS2015 运行时 + UCRT | MSVC CRT(见下注) |
 
 演算:全部 24 个 DLL 里版本最新的符号是 `GetDpiForSystem`(1607);
+次高地板仅到 Win8.1(`shcore!GetProcessDpiAwareness`)与
+Win8(`WaitOnAddress` 族、`bcryptprimitives!ProcessPrng`);
+d2d1/d3d11 落在 Win7 系。
 没有任何静态导入落在 1607 之后(1703 的 `GetDpiForWindow`/
 `GetSystemMetricsForDpi`、1809 的 `CreateDXGIFactory7`、Win11 的 ACM 系
 均未出现——版本敏感能力全部经 COM 接口 QI 探测获取,如 #82 的
@@ -66,8 +70,11 @@ Win8.1(`shcore!GetProcessDpiAwareness`)与 Win8(`WaitOnAddress` 族、
      (`ID2D1SvgDocument`)是 1703+ COM 能力,若采用必须 QI 探测 +
      无则降级(见 s-svg.md)。
    - AVIF:`avif-native`(dav1d)会引入 C 工具链与潜在 DLL,违反原则
-     ①;WIC 路线若真采用将新增 `windowscodecs.dll` 静态导入(须走
-     ADR + 本表复跑)——三方咨询已把 WIC 限定为「装机率探测,非依赖
+     ①;WIC 路线若真采用,解码本体经 COM 激活**零新增静态导入**
+     (route-b 探针 dumpbin 实证:仅 ole32/mfplat 等,无
+     windowscodecs.dll——WIC 工厂走 `CoCreateInstance`);若做
+     `MFTEnumEx` 探测则新增 `mfplat.dll` 静态导入(须走 ADR + 本表
+     复跑)——三方咨询已把 WIC 限定为「装机率探测,非依赖
      路径」,见 s-avif.md。
 
 ## 降级路径
