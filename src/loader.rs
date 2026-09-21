@@ -647,7 +647,9 @@ impl<F> LoadedImage<F> {
     /// Convert every frame through `convert` (pure-memory master ->
     /// Surface wrap on the UI thread when a parked image takes the display
     /// — the same worker-to-UI handoff the drain does per reply, batched
-    /// here for the adoption path; infallible since #76's lazy faces). The first failure aborts, dropping the remaining
+    /// here for the adoption path; infallible since #90 deleted the GDI
+    /// face derivation — the wrap is a plain ownership move, there is
+    /// nothing to fail). The first failure aborts, dropping the remaining
     /// frames; position and completeness survive the mapping.
     pub(crate) fn map_frames<G, E>(
         self,
@@ -1707,9 +1709,10 @@ mod tests {
     fn reply_frame_mapping_preserves_replies_and_wraps_conversion_failures() {
         // The generic mapping keeps protocol replies intact and turns a
         // conversion Err into the fail-loud reply — a protocol SHAPE kept
-        // for future callers; since #76's lazy faces the production convert
-        // (master -> Surface) is infallible, so this arm is unexercised in
-        // production (review PR #84 F2/F7).
+        // for future callers; since #90 deleted the face derivation the
+        // production convert (master -> Surface) is a plain ownership
+        // move, so this arm is unexercised in production (review PR #84
+        // F2/F7).
         let convert = |n: u32| -> Result<u32, String> {
             if n == 13 {
                 Err("CreateCompatibleDC failed".into())

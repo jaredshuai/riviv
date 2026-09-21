@@ -78,7 +78,9 @@ pub(crate) struct StatusSnapshot {
     pub(crate) file_bytes: Option<u64>,
     /// The effective D2D backend label riding the dimension part (#80:
     /// `Some("d2d/hw")` / `Some("d2d/warp")` while a D2D stack renders,
-    /// `None` on the gdi baseline — no suffix, byte-identical to upstream).
+    /// `None` with no stack — through #89 the gdi baseline; since #90 the
+    /// transient window before a deferred fatal — no suffix either way,
+    /// byte-identical to upstream).
     pub(crate) backend: Option<&'static str>,
     /// Main-window client width — the part edges are laid out against it.
     pub(crate) client_wide: i32,
