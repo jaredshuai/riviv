@@ -40,7 +40,7 @@ DXGI flip 的 GDI 互操作禁令是 **per-HWND**(官方原文 "Use flip model i
 
 `renderer = auto | d2d | warp | gdi`(默认 gdi,M6 末翻 auto);auto = 硬件 → WARP → (过渡期 GDI / 删除后 fatal)。WARP 是同一代码路径的枚举值,测试矩阵成本≈0;状态栏显示实际后端消灭「不可复现」类工单;不做驱动黑名单。失败三层(ADR 0001 的扩展):初始化失败=环境→温和降级;运行期 `D2DERR_RECREATE_TARGET`/`DEVICE_REMOVED`→从 master 重上传(不重解码);10s 内 3 次运行期失败→WARP;WARP 也败才 fatal。paint 路径内一律 degrade-not-fatal。**GDI 删除判据写死**(#82):auto 全环境初始化成功 + golden 冻结 + 一个稳定发布周期;不设无判据的「再保留一里程碑」。
 
-> **#81 落地后记(2026-09-20,外部评审 AI2)**:上段「默认 gdi,M6 末翻 auto」的翻默认已随 #81 落地——missing 键与未识别值双路均落 `auto`(详见 D7/D10 的同日后记与 README #81 条目)。迁移面注意:#80 保存的 ini 已显式写入 `renderer=gdi`(保存恒写当时值),这批 ini 升级后**保持 gdi**,翻默认只惠及无键/新建 ini。
+> **#81 落地后记(2026-09-20,外部评审 AI2)**:上段「默认 gdi,M6 末翻 auto」的翻默认已随 #81 落地——missing 键与未识别值双路均落 `auto`(详见 D7/D10 的同日后记与 README #81 条目)。迁移面注意:#80 保存的 ini 已显式写入 `renderer=gdi`(保存恒写当时值),这批 ini 升级后**保持 gdi**,翻默认只惠及无键/新建 ini。(#90 后记,外部评审 AI2 P3:本句「保持 gdi」的语义随 GDI 臂终结——`gdi` 值现于加载时迁移 `auto` 并留一行注记,见 D7 后记;终态 = 一切 ini 皆 D2D。)
 
 ### D6. 插值映射与 1:1 契约(#81)
 

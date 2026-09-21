@@ -115,19 +115,20 @@ pub(crate) fn failure_window(
 /// 3-in-10s → WARP → WARP failing 3-in-10s → deferred fatal).
 pub(crate) const PREPARE_ESCALATION_FAILURES: u32 = 3;
 
-/// The verdict after `consecutive_failures` prepare failures in a row:
-/// fewer than [`PREPARE_ESCALATION_FAILURES`] keeps blanking this frame
-/// (a single transient upload failure must not tear the stack down);
-/// reaching the threshold reports [`FailureVerdict::Escalate`] — the
-/// caller returns `PaintOutcome::DeviceLost` after the blank present, so
-/// the same ladder (and its 3-in-10s window on the window state) governs
-/// the escalation and the eventual fatal. Pure, like [`failure_window`].
-pub(crate) fn prepare_verdict(consecutive_failures: u32) -> FailureVerdict {
-    if consecutive_failures >= PREPARE_ESCALATION_FAILURES {
-        FailureVerdict::Escalate
-    } else {
-        FailureVerdict::None
-    }
+/// Whether `consecutive_failures` prepare failures in a row warrant
+/// feeding the device-loss ladder: fewer than
+/// [`PREPARE_ESCALATION_FAILURES`] keeps blanking this frame (a single
+/// transient upload failure must not tear the stack down); reaching the
+/// threshold makes the caller return `PaintOutcome::DeviceLost` after
+/// the blank present, so the same ladder (and its 3-in-10s window on the
+/// window state) governs the escalation and the eventual fatal. A plain
+/// bool, deliberately NOT `FailureVerdict` (external review AI2 P3): the
+/// enum's `Escalate` means "switch to WARP" in `failure_window`'s
+/// domain, while this call only says "report DeviceLost" — an enum
+/// reuse would invite a future caller to read WARP semantics into it.
+/// Pure, like [`failure_window`].
+pub(crate) fn prepare_escalates(consecutive_failures: u32) -> bool {
+    consecutive_failures >= PREPARE_ESCALATION_FAILURES
 }
 
 /// The #81 full filter table (ADR 0002 D6): a 1:1 render is NEAREST
@@ -334,7 +335,7 @@ pub(crate) enum PaintOutcome {
     /// EndDraw or Present reported DEVICE LOSS — the failure ladder decides
     /// (rebuild same kind → 3-in-10s escalate to WARP → deferred fatal).
     /// A prepare path that failed three times in a row reports this too
-    /// (see [`prepare_verdict`]): the ladder's rebuild/re-escalation is the
+    /// (see [`prepare_escalates`]): the ladder's rebuild/re-escalation is the
     /// bounded response to a driver that keeps refusing uploads.
     DeviceLost,
     /// A NON-loss failure the ladder cannot fix (a deterministic error:
@@ -424,7 +425,7 @@ pub(crate) struct GpuStack {
     /// The frame's prepared draw list (built by [`GpuStack::prepare`],
     /// consumed by the scene pass) and the levels the stats line reports.
     scene: Scene,
-    /// Consecutive `prepare` failures (the [`prepare_verdict`] ladder,
+    /// Consecutive `prepare` failures (the [`prepare_escalates`] gate,
     /// #90): cleared on every successful prepare, counted in the paint's
     /// `Err` arm — at [`PREPARE_ESCALATION_FAILURES`] the paint feeds
     /// `DeviceLost` into the failure ladder instead of blanking forever.
@@ -996,7 +997,7 @@ impl GpuStack {
         self.ledger.cap = self.cap_bytes;
         // A successful prepare clears the consecutive-failure count (the
         // escalation counts FAILURES IN A ROW — one good frame restarts
-        // it; see [`prepare_verdict`]).
+        // it; see [`prepare_escalates`]).
         self.prepare_failures = 0;
         Ok(())
     }
@@ -1563,7 +1564,7 @@ pub(crate) fn paint_d2d(view: HWND, owner: HWND) -> PaintOutcome {
                         // flowing the whole ladder is bounded at ~18).
                         gpu.prepare_failures += 1;
                         eprintln!("riviv: d2d frame upload failed, blanking this frame: {e}");
-                        if prepare_verdict(gpu.prepare_failures) == FailureVerdict::Escalate {
+                        if prepare_escalates(gpu.prepare_failures) {
                             eprintln!(
                                 "riviv: {} consecutive frame upload failures — feeding the device-loss ladder",
                                 gpu.prepare_failures
@@ -1686,14 +1687,14 @@ mod tests {
         assert_eq!(failures, vec![u32::MAX - 100, 300]);
     }
 
-    // ---- prepare_verdict (the #90 consecutive-upload-failure escalation) ----
+    // ---- prepare_escalates (the #90 consecutive-upload-failure gate) ----
 
     #[test]
     fn a_lone_prepare_failure_keeps_the_frame_blanked() {
         // One transient upload failure: keep the stack, blank this frame
-        // (the present still runs — only the verdict is None).
-        assert_eq!(prepare_verdict(0), FailureVerdict::None);
-        assert_eq!(prepare_verdict(1), FailureVerdict::None);
+        // (the present still runs — only the gate stays closed).
+        assert!(!prepare_escalates(0));
+        assert!(!prepare_escalates(1));
     }
 
     #[test]
@@ -1701,7 +1702,7 @@ mod tests {
         // The threshold is inclusive at three: two blanks still retry in
         // place (a driver hiccup spans a frame or two without tearing the
         // stack down).
-        assert_eq!(prepare_verdict(2), FailureVerdict::None);
+        assert!(!prepare_escalates(2));
     }
 
     #[test]
@@ -1710,20 +1711,19 @@ mod tests {
         // router's ladder rebuilds (same kind), and its existing 3-in-10s
         // window escalates to WARP and finally defers the fatal, so a
         // persistently failing CreateBitmap is bounded, not infinite.
-        assert_eq!(prepare_verdict(3), FailureVerdict::Escalate);
-        assert_eq!(prepare_verdict(10), FailureVerdict::Escalate);
+        assert!(prepare_escalates(3));
+        assert!(prepare_escalates(10));
         // The threshold constant itself is the contract the smoke greps.
         assert_eq!(PREPARE_ESCALATION_FAILURES, 3);
     }
 
     #[test]
-    fn prepare_verdict_never_reports_fatal_or_escalates_a_healthy_stack() {
-        // Escalation only ever feeds the LADDER (which owns the WARP
-        // switch and the fatal); the pure verdict itself has no opinion
-        // about the stack kind, and negative/healthy counts are None.
+    fn prepare_escalation_only_opens_at_the_threshold_not_before() {
+        // The gate only ever feeds the LADDER (which owns the WARP switch
+        // and the fatal); it has no opinion about the stack kind, and
+        // every count below the threshold stays closed.
         for n in 0..PREPARE_ESCALATION_FAILURES {
-            assert_ne!(prepare_verdict(n), FailureVerdict::Fatal);
-            assert_ne!(prepare_verdict(n), FailureVerdict::Escalate);
+            assert!(!prepare_escalates(n));
         }
     }
 

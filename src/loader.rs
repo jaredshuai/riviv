@@ -430,9 +430,10 @@ fn stream_animation(
         }
         total_frame_bytes += buffer.len();
         // ICM -> composite -> PixelFrame (#77/ADR 0002 D2). The frame
-        // itself is pure memory since #76; GDI derivations (and their
-        // failure class) live on the UI thread. (The decode-side mip
-        // pre-generation decision upstream threads through the same slot,
+        // itself is pure memory since #76 — through #89 its GDI
+        // derivations (and their failure class) lived on the UI thread;
+        // since #90 there are none. (The decode-side mip pre-generation
+        // decision upstream threads through the same slot,
         // viv.c:10302/10316, was retired with #81.)
         let frame = assemble_frame(w, h, buffer.into_raw(), &env, icm);
         if emitted == 0 {

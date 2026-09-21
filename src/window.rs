@@ -1363,8 +1363,9 @@ fn gpu_runtime_failure(owner: HWND) {
 /// swapchain to the new (physical-pixel — PMv2, #79) client rect, then
 /// invalidate + repaint synchronously (UpdateWindow kills the stretch lag
 /// while the user drags a border). Zero sizes (minimized) keep the old
-/// buffers for the restore. WITHOUT a stack this is the same no-op the
-/// arm always was (the GDI path's repaints come from on_size's chain).
+/// buffers for the restore. WITHOUT a stack this is a no-op (through #89
+/// the GDI arm's repaints came from on_size's chain; since #90 a missing
+/// stack means a fatal verdict is pending, whose modal outranks resizes).
 fn gpu_view_resized(view: HWND) {
     let mut client = RECT::default();
     // SAFETY: read-only rect query on our own child; a failed read leaves
@@ -1380,7 +1381,7 @@ fn gpu_view_resized(view: HWND) {
     let resize_result = (unsafe { state_of(owner) })
         .and_then(|state| state.gpu.as_mut().map(|gpu| gpu.resize(wide, high)));
     let Some(result) = resize_result else {
-        return; // no stack: the GDI arm's WM_SIZE stays a no-op
+        return; // no stack (a fatal verdict is pending — see paint_view)
     };
     if let Err(e) = result {
         // Any HRESULT failure feeds the same ladder as device loss
@@ -1392,8 +1393,9 @@ fn gpu_view_resized(view: HWND) {
         // synchronously — a transient failure with immediate recovery must
         // not lose that synchronous repaint under continued border
         // dragging (external review AI1). UpdateWindow is a no-op when the
-        // update region is empty (the ladder left the stack dead and GDI
-        // took over), so the call is free on that arm.
+        // update region is empty (the ladder left the stack dead with a
+        // fatal pending — its paints are the defensive no-op), so the
+        // call is free on that arm.
         // SAFETY: synchronously dispatches our own child's WM_PAINT when
         // its update region is non-empty — we are in a WM_SIZE handler,
         // not inside a paint, and no state borrow is live.
@@ -2954,8 +2956,9 @@ fn adopt_preload_flow(hwnd: HWND) {
 
 /// The shared body of the two adopt arms: the current display parks in
 /// last, the parked image takes the display (Surfaces wrapped here on
-/// the UI thread — pure ownership moves, #76; the GDI faces derive
-/// lazily at paint), re-anchored like upstream's
+/// the UI thread — pure ownership moves, #76; the GDI faces derived
+/// lazily at paint through #89, gone with the arm in #90), re-anchored
+/// like upstream's
 /// `_viv_start_first_frame` (viv.c:14313-14319), and the preload file
 /// commits as the display's entry (upstream copies preload_fd into
 /// current_fd/frame_fd, viv.c:14415/15134). `keep_session` moves the
@@ -5068,10 +5071,11 @@ fn on_load_replies(hwnd: HWND) {
             let slot_id = slot.session.id();
             let replies = slot.session.drain();
             for reply in replies {
-                // Frames stay pure memory — the GDI derivation happens
-                // only if/when the image takes the display (the same
-                // split upstream makes between _viv_preload_frames and
-                // _viv_frames).
+                // Frames stay pure memory — the UI-thread Surface wrap
+                // (an ownership move since #90 deleted the GDI face
+                // derivation) happens only if/when the image takes the
+                // display (the same split upstream makes between
+                // _viv_preload_frames and _viv_frames).
                 let reply = map_reply_frame(reply, Ok::<PixelFrame, String>);
                 let outcome = apply_reply(
                     &mut slot.image,
@@ -5668,10 +5672,13 @@ fn pick_folder(hwnd: HWND, initial_dir: Option<&OsStr>) -> Option<OsString> {
 /// line (#80 design §8) names the EFFECTIVE backend — the ticket-evidence
 /// channel in the one dialog everyone can find.
 fn show_about(hwnd: HWND) {
-    // SAFETY: read-only backend read.
+    // SAFETY: read-only backend read. The fallback is the transient
+    // no-stack window before a deferred fatal fires (AI2: the dead "gdi"
+    // identity must never render — practically unreachable, a modal owns
+    // the input by then).
     let backend = (unsafe { state_of(hwnd) })
         .and_then(|state| state.gpu.as_ref().map(|gpu| gpu.backend))
-        .unwrap_or("gdi");
+        .unwrap_or("(no renderer)");
     let text = format!(
         "riviv {}\n\nUnofficial Rust rewrite of voidtools void Image Viewer.\nUpstream (MIT): https://www.voidtools.com/voidimageviewer/\nSource: https://github.com/jaredshuai/riviv\nRenderer: {backend}",
         env!("CARGO_PKG_VERSION")

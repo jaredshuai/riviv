@@ -726,8 +726,9 @@ impl<K: PartialEq + Copy> Lru<K> {
 
 /// The byte ledger (the ticket's 分类记账): every buffer class the render
 /// path owns, so "bounded" and "not leaking" are statements about numbers
-/// rather than a feeling. Classes are the ticket's four; the counters feed
-/// the close-time stats line the smoke asserts on.
+/// rather than a feeling. Classes are three since #90 (four through #89 —
+/// the `cpu_display` class died with the GDI face; external review AI2
+/// P3); the counters feed the close-time stats line the smoke asserts on.
 ///
 /// Scope honesty (external review AI1 P3-2): `gpu_resident` counts the
 /// resident tiles plus a level >= 1 base bitmap — it does NOT count the
