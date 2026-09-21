@@ -240,8 +240,10 @@ pub(crate) fn copy_image(hwnd: HWND) {
 /// copy the displayed frame's pixels into a fresh SCREEN-compatible
 /// bitmap and hand it to the clipboard. The frame's master is the
 /// source (#76): a throwaway DIB derived from these bytes feeds the
-/// blit — the same 1:1 SRCCOPY from the same pixel values the display's
-/// own GDI face would have served, so the DDB out is byte-identical.
+/// blit — a 1:1 SRCCOPY of the master's own pixel values, so the DDB
+/// out is byte-identical to what the display renders (#90 note: through
+/// #89 the equivalence ran through the display's GDI face serving the
+/// same bytes; the face is gone, the invariant stands on the master).
 /// The master itself is never surrendered — the clipboard takes the
 /// copy, the display keeps the original. The clipboard session must
 /// already be open (upstream calls this both from _viv_copy, which

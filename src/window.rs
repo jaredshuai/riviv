@@ -609,9 +609,9 @@ fn update_src_pixel(hwnd: HWND, force: bool, update_statusbar: bool) -> bool {
         {
             // The displayed frame's master, read directly (#76; upstream
             // builds a scratch DC and GetPixels the displayed frame,
-            // viv.c:15063-15109 — the master holds the very bytes the GDI
-            // face derives from, so the pure read is the same value
-            // without the GDI roundtrip, device-independent).
+            // viv.c:15063-15109 — the master IS the displayed bytes, so
+            // the pure read is the same value without the GDI
+            // roundtrip, device-independent).
             let master = image.surface().master();
             // Out-of-bounds maps to the CLR_INVALID read-through the
             // unchecked GetRValue chain produced (255, 255, 255) — the
@@ -4253,8 +4253,8 @@ fn delete_current(hwnd: HWND, permanently: bool) {
 /// disk (upstream's own re-encode route; riviv keeps it verbatim, see
 /// README Differences) — then rotate every loaded frame in memory,
 /// re-anchor the view at the swapped dimensions, and refresh
-/// the POS/RGB sample, the status bar and the paint. (Masters rotate and
-/// the GDI face rebuilds at the next paint; there is no mip chain to
+/// the POS/RGB sample, the status bar and the paint. (Masters rotate
+/// and the next paint re-uploads them; there is no mip chain to
 /// drop since #81, ADR 0002 D7.) The decode-complete
 /// gate is upstream's own "wait for the image to load" FIXME
 /// (`_viv_frame_loaded_count == _viv_frame_count`, viv.c:7721-7723); a
@@ -4297,7 +4297,7 @@ fn rotate_current(hwnd: HWND, counterclockwise: bool) {
                 frame.rotate(!counterclockwise);
             }
             // #80 §5: every frame's pixels changed orientation — the D2D
-            // upload (and the GDI face) re-derive at the next paint.
+            // upload re-derives at the next paint.
             state.frame_gen += 1;
         }
         // `_viv_view_set(_viv_view_x,_viv_view_y,1)` (viv.c:7756): re-run
@@ -4852,9 +4852,9 @@ fn on_load_replies(hwnd: HWND) {
             let session_paint_signal = session.paint_signal().cloned();
             for reply in replies {
                 // Frames cross the thread boundary as pure memory (#76); the
-                // wrap is a plain ownership move — the GDI face derives
-                // lazily at the first paint, after this drain has adopted the
-                // image (see surface.rs's Face docs).
+                // wrap is a plain ownership move — since #90 the Surface IS
+                // the master's holder (the old GDI face derivation died
+                // with the render arm; nothing derives at paint anymore).
                 let reply =
                     map_reply_frame(reply, |f| Ok::<Surface, String>(Surface::from_master(f)));
                 // Whether THIS session already owned the display before the

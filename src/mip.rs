@@ -2,8 +2,9 @@
 //! size math, viv.c:14146-14300).
 //!
 //! Since #81 (ADR 0002 D7 — mip retirement for regular sizes) the runtime
-//! NEVER calls [`select_mip_level`]: the GDI arm draws shrinks from the
-//! single full-resolution face and the D2D arm samples the full master.
+//! NEVER calls [`select_mip_level`]: through #89 the GDI arm drew shrinks
+//! from the single full-resolution face (deleted with the arm in #90) and
+//! the D2D arm samples the full master.
 //! The quirk parity below is deliberately DROPPED, not kept: level
 //! selection is no longer an observable behavior, so replicating the quirk
 //! would be deliberately worse output (recorded in README Differences).

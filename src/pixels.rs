@@ -8,9 +8,10 @@
 //! the decode worker produces (plain memory, naturally `Send` — the
 //! cross-thread boundary carries no GDI objects) and what every
 //! consumer reads directly (the RGB status readout, the clipboard image
-//! blit's source, the rotate pass, the future D2D upload). The GDI face
-//! (DIB section + memory DC) is a UI-thread derivation owned by
-//! `surface::Surface`.
+//! blit's source, the rotate pass, the D2D upload). Through #89
+//! `surface::Surface` also derived a UI-thread GDI face from it — that
+//! derivation died with the GDI render arm (#90); the Surface is now
+//! the master's plain holder.
 
 /// image crate yields RGBA rows (top-down); GDI 32bpp DIBs want BGRA.
 pub(crate) fn rgba8_to_bgra_in_place(buf: &mut [u8]) {
@@ -120,9 +121,9 @@ pub(crate) fn rotate_bgra_270_cw(src: &[u8], wide: usize, high: usize, dst: &mut
 /// BGRA, exactly `width * height * 4` bytes, alpha forced opaque (the
 /// invariant `composite_over_background_in_place` and the clipboard DIB
 /// parser's three copy paths pin). This is the source of truth — the
-/// GDI face is derived from it on the UI thread; device-loss recovery
-/// and the D2D upload (#80) will re-derive from these bytes without
-/// re-decoding.
+/// D2D upload reads it, and device-loss recovery (#80) re-uploads from
+/// these bytes without re-decoding (the #76-era GDI face derived from
+/// them too, until #90 deleted the arm).
 #[derive(Debug)]
 pub(crate) struct PixelFrame {
     pub(crate) pixels: Box<[u8]>,
