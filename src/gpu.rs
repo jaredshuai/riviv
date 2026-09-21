@@ -1509,7 +1509,19 @@ pub(crate) fn paint_d2d(view: HWND, owner: HWND) -> PaintOutcome {
         // borrow (plain data, the borrow ends here).
         let plan = dims.map(|(mw, mh)| (draw_plan(state, cw, ch, mw as i32, mh as i32), mw, mh));
         let Some(gpu) = state.gpu.as_mut() else {
-            // Defensive: the router only calls here with a live stack.
+            // No stack: reachable on the same WM_PAINT whose
+            // gpu_rebuild_if_due just deferred a fatal (the router calls
+            // through with gpu=None, pre-review 2 F2) and while a fatal
+            // modal pumps later paints. The #76 handshake still fires
+            // (the iconic arm's rule — the decode must not park at its
+            // 5 s cap on a process that is about to exit either way);
+            // BeginPaint/EndPaint above validated the region, so no
+            // WM_PAINT hot loop.
+            if let Some(signal) = state.paint_signal.take() {
+                let (lock, cvar) = &*signal;
+                *lock.lock().unwrap() = true;
+                cvar.notify_all();
+            }
             let _ = EndPaint(view, &ps);
             return PaintOutcome::Painted;
         };
@@ -1542,6 +1554,13 @@ pub(crate) fn paint_d2d(view: HWND, owner: HWND) -> PaintOutcome {
                         // fatal. The count lives on the stack, so each
                         // ladder rebuild restarts it; the dump path never
                         // escalates (one-shot, no ladder consumer).
+                        // Boundary note (pre-review 2 F4): the escalation
+                        // advances only under PAINT pressure — a static
+                        // unattended image parks at count 1 with a blank
+                        // viewport until input/animation repaints (the
+                        // pre-#90 shape for a sick driver was the same
+                        // blank-and-wait, so no regression; with paints
+                        // flowing the whole ladder is bounded at ~18).
                         gpu.prepare_failures += 1;
                         eprintln!("riviv: d2d frame upload failed, blanking this frame: {e}");
                         if prepare_verdict(gpu.prepare_failures) == FailureVerdict::Escalate {
@@ -1549,8 +1568,18 @@ pub(crate) fn paint_d2d(view: HWND, owner: HWND) -> PaintOutcome {
                                 "riviv: {} consecutive frame upload failures — feeding the device-loss ladder",
                                 gpu.prepare_failures
                             );
-                            gpu.present_clear(bg);
-                            PaintOutcome::DeviceLost
+                            // The blank present's own verdict outranks the
+                            // escalation (pre-review 2 F3): an
+                            // Unrecoverable EndDraw there is deterministic
+                            // trouble and must take its deferred-fatal arm,
+                            // not be misreported as device loss for the
+                            // ladder to chew on.
+                            match gpu.present_clear(bg) {
+                                PaintOutcome::Unrecoverable { hr } => {
+                                    PaintOutcome::Unrecoverable { hr }
+                                }
+                                _ => PaintOutcome::DeviceLost,
+                            }
                         } else {
                             gpu.present_clear(bg)
                         }

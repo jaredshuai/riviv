@@ -413,6 +413,15 @@ pub(crate) struct WindowState {
     /// §7): the fatal is DEFERRED to after the paint borrow drops — the
     /// modal pumps messages and would alias `state_of` (PR #10 P1).
     pub(crate) gpu_pending_fatal: bool,
+    /// The STICKY terminal latch (pre-review 2 F1): set together with
+    /// `gpu_pending_fatal` at every fatal verdict and NEVER cleared —
+    /// the one-shot flag dies in the tail's `mem::take` before the
+    /// modal's message pump runs, and paints dispatched inside that pump
+    /// would otherwise re-enter `gpu_rebuild_if_due` and stack a fresh
+    /// `fatal` modal per failed create. The process is exiting either
+    /// way; this keeps the pump window as quiet as the old
+    /// `gpu_init_failed` latch kept the degrade era.
+    pub(crate) gpu_terminal: bool,
     /// The `-dump-viewport` path (#80 design §9): the sticky render-and-
     /// write intent consumed at WM_CLOSE, before the window dies.
     pub(crate) dump_pending: Option<OsString>,
@@ -1102,16 +1111,18 @@ unsafe extern "system" fn view_proc(
 /// D2D arm draws giants itself (an overview level, or tiles), so this
 /// router never tears the stack down for one.
 fn paint_view(view: HWND, owner: HWND) {
-    // A deferred fatal must not be preceded by a stack rebuild (#90: the
-    // old gpu_init_failed latch's ordering job): check the pending flag
-    // FIRST and skip the rebuild while it stands — the tail below fires
-    // the fatal outside the paint borrows. The decision rides the pure
-    // [`stack_rebuild_allowed`] predicate.
+    // The rebuild gate rides the STICKY terminal latch, not the one-shot
+    // pending flag (pre-review 2 F1): the tail's `mem::take` consumes the
+    // pending flag BEFORE `fatal`'s modal pumps messages, and paints
+    // dispatched inside that pump would re-enter the rebuild and stack a
+    // fresh fatal per failed create. `gpu_terminal` covers both windows —
+    // set-to-tail and post-take — and never clears (the process exits).
+    // The decision rides the pure [`stack_rebuild_allowed`] predicate.
     // SAFETY: the read-only borrow ends inside its is_some_and.
-    let fatal_pending = (unsafe { state_of(owner) }).is_some_and(|s| s.gpu_pending_fatal);
+    let terminal = (unsafe { state_of(owner) }).is_some_and(|s| s.gpu_terminal);
     // SAFETY: the read-only borrow ends inside its is_some_and.
     let has_gpu = (unsafe { state_of(owner) }).is_some_and(|s| s.gpu.is_some());
-    if stack_rebuild_allowed(has_gpu, fatal_pending) {
+    if stack_rebuild_allowed(has_gpu, terminal) {
         gpu_rebuild_if_due(view, owner);
     }
     match crate::gpu::paint_d2d(view, owner) {
@@ -1125,6 +1136,7 @@ fn paint_view(view: HWND, owner: HWND) {
             if let Some(state) = unsafe { state_of(owner) } {
                 state.gpu = None;
                 state.gpu_pending_fatal = true;
+                state.gpu_terminal = true;
             }
             eprintln!(
                 "riviv: unrecoverable renderer error ({hr:#010x}) - no fallback renderer left"
@@ -1147,13 +1159,14 @@ fn paint_view(view: HWND, owner: HWND) {
     }
 }
 
-/// The rebuild gate (pure so the pending-fatal ordering stays under the
-/// test net, #90): a stack rebuild may run only when no stack exists AND
-/// no deferred fatal is pending — paint_view checks the pending flag
-/// before it ever reaches [`gpu_rebuild_if_due`], so a fatal verdict's
-/// window never hosts a fresh stack creation.
-fn stack_rebuild_allowed(gpu_present: bool, fatal_pending: bool) -> bool {
-    !gpu_present && !fatal_pending
+/// The rebuild gate (pure so the fatal-ordering stays under the test net,
+/// #90): a stack rebuild may run only while no stack exists AND no fatal
+/// verdict has fired. The gate reads the STICKY `gpu_terminal` latch — it
+/// spans both the deferred-fatal window (flag set, tail not yet run) and
+/// the modal-pump window after the tail's `mem::take` (pre-review 2 F1) —
+/// so a dying session never hosts a fresh stack creation.
+fn stack_rebuild_allowed(gpu_present: bool, terminal: bool) -> bool {
+    !gpu_present && !terminal
 }
 
 /// Rebuild the D2D stack when a paint finds none (#80 design §5, widened
@@ -1170,7 +1183,7 @@ fn gpu_rebuild_if_due(view: HWND, owner: HWND) {
     // creation; nothing here dispatches messages, so no second state_of
     // borrow can alias this one.
     if let Some(state) = unsafe { state_of(owner) } {
-        if !stack_rebuild_allowed(state.gpu.is_some(), state.gpu_pending_fatal) {
+        if !stack_rebuild_allowed(state.gpu.is_some(), state.gpu_terminal) {
             return;
         }
         let kind = rebuild_kind(state.config.renderer, state.gpu_kind);
@@ -1188,6 +1201,7 @@ fn gpu_rebuild_if_due(view: HWND, owner: HWND) {
                 // before the paint, whose tail takes the flag on the very
                 // same WM_PAINT).
                 state.gpu_pending_fatal = true;
+                state.gpu_terminal = true;
                 eprintln!("riviv: renderer rebuild failed ({e}) - no fallback renderer left");
             }
         }
@@ -1257,6 +1271,7 @@ fn gpu_runtime_failure(owner: HWND) {
                 // runs on the fatal_view this arm just set.
                 state.gpu = None;
                 state.gpu_pending_fatal = true;
+                state.gpu_terminal = true;
                 fatal_view = Some(state.viewport);
                 (RendererKind::Warp, true)
             }
@@ -1291,6 +1306,7 @@ fn gpu_runtime_failure(owner: HWND) {
                     // the viewport from silently freezing on the last flip
                     // frame while the deferred modal is pending.
                     state.gpu_pending_fatal = true;
+                    state.gpu_terminal = true;
                     eprintln!("riviv: renderer rebuild failed ({e}) - no fallback renderer left");
                     degraded_view = Some(view);
                 }
@@ -8238,6 +8254,7 @@ pub(crate) fn run() -> Result<(), String> {
         tile_edge: None,
         gpu_failures: Vec::new(),
         gpu_pending_fatal: false,
+        gpu_terminal: false,
         dump_pending: None,
     };
 
@@ -8642,13 +8659,17 @@ mod tests {
     }
 
     #[test]
-    fn a_stack_rebuild_never_runs_while_a_fatal_is_pending() {
-        // #90's ordering pin (the design's "check gpu_pending_fatal before
-        // considering rebuild, or equivalent latch — pinned by a test"):
-        // paint_view consults this gate before gpu_rebuild_if_due, so a
-        // deferred fatal's window never hosts a fresh stack creation — the
-        // fatal fires at the paint's tail instead. No stack + no pending
-        // fatal is the only rebuild-allowed shape.
+    fn a_stack_rebuild_never_runs_once_a_fatal_verdict_fires() {
+        // #90's ordering pin (the design's "check the fatal state before
+        // considering rebuild, or equivalent latch — pinned by a test"),
+        // widened by pre-review 2 F1: the gate reads the STICKY
+        // `gpu_terminal` latch, so the rebuild is forbidden in BOTH
+        // windows — the deferred-fatal window (flag set, tail not yet
+        // run) AND the modal-pump window after the tail's `mem::take`
+        // consumes the one-shot flag (paints dispatched inside the fatal
+        // modal's pump would otherwise re-enter the rebuild and stack a
+        // fresh fatal per failed create). No stack + no verdict is the
+        // only rebuild-allowed shape.
         assert!(
             stack_rebuild_allowed(false, false),
             "a stack-less, healthy paint rebuilds"
@@ -8659,7 +8680,7 @@ mod tests {
         );
         assert!(
             !stack_rebuild_allowed(false, true),
-            "a pending fatal forbids the rebuild even with no stack"
+            "a fired fatal verdict forbids the rebuild even with no stack"
         );
         assert!(!stack_rebuild_allowed(true, true));
     }
