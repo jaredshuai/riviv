@@ -32,6 +32,17 @@ cargo build --release                      # 产出 target/release/riviv.exe
 - **质量档位(双轨)**:纯逻辑(fit 数学、BGRA 像素转换、标题构造)按产品标准——行为改动必须配套 `#[cfg(test)]` 断言,断言名写业务语义;unsafe 壳(窗口/GDI/消息循环)保持薄,推导逻辑一律下沉到纯函数纳入测试网,不要在 wnd_proc 里堆积可测逻辑。
 - **行为对齐以原版为准**:改动交互行为前先查 `c-original/src/viv.c` 对应实现;有意偏离必须写进 README「Differences」并在 commit 正文说明 why。
 
+## 依赖原则(2026-09-21 起,#97 S0 成文;破例一律走 ADR)
+
+1. **纯 Rust + 静态链接 + 零外部工具链**:构建不得依赖 nasm/cmake/perl/meson/pkg-config 等外部工具;破例需 ADR。
+2. **新依赖落在纯逻辑层**,不进 unsafe 壳(窗口/GDI/COM 壳保持薄,见上文质量档位)。
+3. **体积/编译预算先有基线再定阈值**:基线 = `cargo build --release` exe 字节数(S1 实录:3,099,648 B @ 559f1cc);单解码格式建议 ≤ +400 KB,超限须 ADR + 用户拍板(SVG resvg full 档 +3.92 MiB 即据此推迟,见 [s-svg](docs/spikes/s-svg.md))。
+4. **新解码器必须过同一套管线**:魔数嗅探(`with_guessed_format`)+ icm 链(`icc_profile` 取用)+ 帧时序契约(动画帧走现有帧管线),不得旁路自建。
+5. **优先 image 组织同族 crate**(png/gif/webp 同生态,API 与维护节奏一致)。
+6. **系统能力仅在「装机≈100% 且无授权费」时采用**:WCS/mscms 合格;WIC 的 AVIF/HEIF 依赖商店扩展装配,永不作唯一路径、只可探测登记(见 [s-avif](docs/spikes/s-avif.md))。
+
+另(S1 平台地板规则,详见 [s1-platform-floor](docs/spikes/s1-platform-floor.md)):min-OS 钉死 Win10 1607;版本敏感 API 一律 QI/运行时探测;**新增 DLL 静态导入必须先出 `dumpbin /imports` 证据并写 ADR**。
+
 ## 多 agent 协作纪律
 
 多个 agent 会话可能同时操作本仓库:
