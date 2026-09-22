@@ -361,10 +361,18 @@ fn decode_reader<R: BufRead + Seek>(
                 image::Limits::default(),
             )
             .map_err(|e| user(e.to_string()))?;
-            // Image-level limits: ApngDecoder's canvas compositing reserves
-            // its two full-canvas buffers against `inner.limits`, so the
-            // animated path's practical per-canvas cap is half the 512 MB
-            // budget (current + previous live concurrently, GIF/WebP-shaped).
+            // Image-level limits: ApngDecoder's compositing reserves TWO
+            // persistent full-canvas RGBA buffers against `inner.limits`
+            // (current + previous) and, per frame, the raw output plus the
+            // subframe-RGBA against a clone of them — the FIRST frame
+            // therefore needs FOUR canvases inside the 512 MB budget
+            // (~128 MB RGBA8 canvas ceiling; a low-bit-depth source's raw
+            // buffer is small but its canvases are not — a 7723^2 L8 file
+            // fails at the image gate before any frame, measured). Files
+            // over that wire fail user-level carrying the image crate's
+            // limit error rather than this arm's budget message (same
+            // class); the delivered-frame budget below keeps counting one
+            // canvas per frame exactly like GIF/WebP.
             decoder
                 .set_limits(image::Limits::default())
                 .map_err(|e| user(e.to_string()))?;
@@ -381,7 +389,14 @@ fn decode_reader<R: BufRead + Seek>(
             let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
             let transform = prepare_transform(&mut decoder, &env, shown);
             let (w, h) = decoder.dimensions();
-            let per_frame_bytes = w as usize * h as usize * 4;
+            // checked_mul: hostile IHDR dims are rejected by the png crate
+            // at construction today (measured at spec-max 0x7FFFFFFF^2),
+            // but this arm's own arithmetic must not lean on that — a bare
+            // w*h*4 overflows usize in debug builds.
+            let per_frame_bytes = (w as usize)
+                .checked_mul(h as usize)
+                .and_then(|px| px.checked_mul(4))
+                .ok_or_else(|| user("canvas exceeds the addressable budget".to_string()))?;
             let decoder = decoder.apng().map_err(|e| user(e.to_string()))?;
             // APNG delays are the fcTL fraction num × 1000 / (den || 100) ms,
             // already computed by the iterator; zero delays pass through like
@@ -2448,5 +2463,230 @@ mod apng_tests {
             "a single terminal reply — nothing decoded"
         );
         assert!(matches!(replies[0], LoadReply::FailedUser(_)));
+    }
+
+    // ------------------------------------------------------------------
+    // #98 external-review round 1: the budget wire and the acTL/fcTL
+    // corner semantics, each pinned by a characterization probe (the
+    // constants were measured first — the review's own arithmetic was
+    // refuted twice, see the individual tests).
+    // ------------------------------------------------------------------
+
+    /// n zero-filled frames at an arbitrary size/depth (budget fixtures).
+    fn apng_zero_frames(
+        w: u32,
+        h: u32,
+        color: png::ColorType,
+        depth: png::BitDepth,
+        frames: usize,
+    ) -> Vec<u8> {
+        let mut info = png::Info::with_size(w, h);
+        info.color_type = color;
+        info.bit_depth = depth;
+        let bytes_per_px = color.samples() * (depth as usize / 8);
+        let frame_len = w as usize * h as usize * bytes_per_px;
+        let mut out = Vec::new();
+        let mut enc = png::Encoder::with_info(&mut out, info).expect("with_info");
+        enc.set_animated(frames as u32, 0).expect("set_animated");
+        {
+            let mut writer = enc.write_header().expect("write_header");
+            let zeros = vec![0u8; frame_len];
+            for _ in 0..frames {
+                writer.set_frame_delay(1, 10).expect("delay");
+                writer.write_image_data(&zeros).expect("frame");
+            }
+            writer.finish().expect("finish");
+        }
+        out
+    }
+
+    #[test]
+    fn rgba_canvas_over_a_quarter_of_the_budget_fails_before_any_frame() {
+        // MEASURED wire: the first frame needs FOUR canvases inside the
+        // 512 MB image-side budget (current + previous persistent, raw
+        // output + subframe-RGBA transient) — this 6080^2 RGBA fixture
+        // (canvas ~= 147.9 MB; 2C = 295.8 <= 512, 3C = 443.7 <= 512,
+        // 4C = 591.7 > 512) decodes ZERO frames, which refutes the
+        // review's three-canvas model (3C fits yet the load fails). The
+        // failure is user-level with the image crate's own limit error —
+        // the same class, a different message than this arm's budget one.
+        let apng = apng_zero_frames(6080, 6080, png::ColorType::Rgba, png::BitDepth::Eight, 2);
+        let replies = decode_all(&apng, env());
+        assert_eq!(replies.len(), 1, "a single terminal reply");
+        assert!(matches!(replies[0], LoadReply::FailedUser(_)));
+    }
+
+    #[test]
+    fn low_depth_wire_counts_the_rgba_canvas_not_the_raw() {
+        // The review's fail-open scenario, refuted by measurement: a
+        // 7723^2 L8 two-framer (P = 59.6M px; raw accounting 9P =
+        // 511.96 MB <= 512 was predicted to DELIVER frames) fails before
+        // any frame — the subframe-RGBA reserve the review missed puts
+        // the first-frame wire at 13P (<= 512 MB => P <= ~39.4M px).
+        let apng = apng_zero_frames(
+            7723,
+            7723,
+            png::ColorType::Grayscale,
+            png::BitDepth::Eight,
+            2,
+        );
+        let replies = decode_all(&apng, env());
+        assert_eq!(replies.len(), 1, "a single terminal reply");
+        assert!(matches!(replies[0], LoadReply::FailedUser(_)));
+    }
+
+    #[test]
+    fn hostile_ihdr_spec_max_fails_user_never_panics() {
+        // IHDR (2^31-1)^2 — spec-max dims, acTL present. MEASURED: the
+        // png crate rejects the file at construction ("Sub frame is
+        // out-of-bounds") before this arm's per-frame multiply runs, so
+        // the debug-overflow shape the review feared is not reachable
+        // today. The pin guards the class: if a dependency change ever
+        // lets such a header construct, this test sees either the
+        // checked_mul's clean user error or a panic — never a silent
+        // pass. (Beyond-spec dims 0x80000000^2 were probed the same way.)
+        let base = apng_zero_frames(4, 4, png::ColorType::Grayscale, png::BitDepth::Eight, 2);
+        let hostile = edit_chunks(&base, |kind, slot| {
+            if kind == b"IHDR" {
+                let data = slot.as_mut().unwrap();
+                data[..4].copy_from_slice(&0x7FFF_FFFFu32.to_be_bytes());
+                data[4..8].copy_from_slice(&0x7FFF_FFFFu32.to_be_bytes());
+            }
+        });
+        let replies = decode_all(&hostile, env());
+        assert_eq!(replies.len(), 1, "a single terminal reply");
+        assert!(matches!(replies[0], LoadReply::FailedUser(_)));
+    }
+
+    // ---- acTL/fcTL corner semantics (probe-characterized, 4x4) ----
+
+    /// The standard two-color fixture's bytes (red then blue), for the
+    /// chunk surgery below.
+    fn two_color_apng() -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut info = png::Info::with_size(4, 4);
+        info.color_type = png::ColorType::Rgba;
+        info.bit_depth = png::BitDepth::Eight;
+        let mut enc = png::Encoder::with_info(&mut out, info).expect("with_info");
+        enc.set_animated(2, 0).expect("set_animated");
+        {
+            let mut writer = enc.write_header().expect("write_header");
+            for (delay, px) in [(1u16, [200u8, 60, 10, 255]), (2, [10, 60, 200, 255])] {
+                writer.set_frame_delay(delay, 10).expect("delay");
+                writer.write_image_data(&px.repeat(16)).expect("frame");
+            }
+            writer.finish().expect("finish");
+        }
+        out
+    }
+
+    #[test]
+    fn poster_layout_skips_the_idat_frame() {
+        // Drop the IDAT's fcTL (renumbering the survivors): the IDAT
+        // becomes a poster frame the animation never shows — the one
+        // delivered frame is the fdAT one (blue), the README's recorded
+        // poster-layout corner.
+        let base = two_color_apng();
+        let mut dropped = false;
+        let mut next_seq = 0u32;
+        let poster = edit_chunks(&base, |kind, slot| {
+            if kind == b"acTL" {
+                slot.as_mut().unwrap()[..4].copy_from_slice(&1u32.to_be_bytes());
+            } else if kind == b"fcTL" && !dropped {
+                dropped = true;
+                *slot = None;
+            } else if kind == b"fcTL" || kind == b"fdAT" {
+                let d = slot.as_mut().unwrap();
+                d[..4].copy_from_slice(&next_seq.to_be_bytes());
+                next_seq += 1;
+            }
+        });
+        let replies = decode_all(&poster, env());
+        assert_eq!(replies.len(), 2, "one frame + Complete");
+        match &replies[0] {
+            LoadReply::FirstFrame { frame, delay_ms } => {
+                assert_eq!(*delay_ms, 200, "the fdAT frame's own delay");
+                assert_eq!(rgb_at(frame, 0, 0), (10, 60, 200), "the poster never shows");
+            }
+            other => panic!("expected FirstFrame, got {other:?}"),
+        }
+        assert!(matches!(replies[1], LoadReply::Complete));
+    }
+
+    #[test]
+    fn actl_without_any_fctl_fails_user() {
+        // acTL present, every fcTL/fdAT stripped: is_apng is TRUE (acTL
+        // defines animation), but the first frame pull hits end-of-data —
+        // a clean user-level error, never a hang or a panic.
+        let base = two_color_apng();
+        let keep = edit_chunks(&base, |kind, slot| {
+            if kind == b"fcTL" || kind == b"fdAT" {
+                *slot = None;
+            }
+        });
+        let replies = decode_all(&keep, env());
+        assert_eq!(replies.len(), 1, "a single terminal reply");
+        assert!(matches!(replies[0], LoadReply::FailedUser(_)));
+    }
+
+    #[test]
+    fn actl_underdeclaring_truncates_cleanly() {
+        // acTL num_frames=1 over a two-frame stream: the iterator stops
+        // at the declared count — one frame, then Complete, the leftover
+        // fdAT silently unconsumed (no error, no phantom second frame).
+        let base = two_color_apng();
+        let lied = edit_chunks(&base, |kind, slot| {
+            if kind == b"acTL" {
+                slot.as_mut().unwrap()[..4].copy_from_slice(&1u32.to_be_bytes());
+            }
+        });
+        let replies = decode_all(&lied, env());
+        assert_eq!(replies.len(), 2, "one frame + Complete");
+        assert!(matches!(replies[0], LoadReply::FirstFrame { .. }));
+        assert!(matches!(replies[1], LoadReply::Complete));
+    }
+
+    #[test]
+    fn actl_num_plays_overflow_drops_the_chunk_to_static() {
+        // num_plays = 2^31 (invalid, > 0x7FFFFFFF): the png crate drops
+        // the whole acTL, is_apng turns false, and the file degrades to
+        // the static path — the same family as num_frames=0.
+        let base = two_color_apng();
+        let bad = edit_chunks(&base, |kind, slot| {
+            if kind == b"acTL" {
+                slot.as_mut().unwrap()[4..8].copy_from_slice(&0x8000_0000u32.to_be_bytes());
+            }
+        });
+        let replies = decode_all(&bad, env());
+        assert_eq!(replies.len(), 2, "static: one frame + Complete");
+        match &replies[0] {
+            LoadReply::FirstFrame { delay_ms, .. } => assert_eq!(*delay_ms, 0),
+            other => panic!("expected FirstFrame, got {other:?}"),
+        }
+        assert!(matches!(replies[1], LoadReply::Complete));
+    }
+
+    #[test]
+    fn corrupted_actl_crc_degrades_to_static() {
+        // A flipped acTL byte WITHOUT re-CRCing: the ancillary-chunk CRC
+        // failure makes the png crate silently drop the chunk — static
+        // decode, exactly why the hostile fixtures here recompute CRCs.
+        let mut base = two_color_apng();
+        let mut pos = 8;
+        while pos + 12 <= base.len() {
+            let len = u32::from_be_bytes(base[pos..pos + 4].try_into().unwrap()) as usize;
+            if &base[pos + 4..pos + 8] == b"acTL" {
+                base[pos + 8] ^= 0xFF;
+                break;
+            }
+            pos += 12 + len;
+        }
+        let replies = decode_all(&base, env());
+        assert_eq!(replies.len(), 2, "static: one frame + Complete");
+        match &replies[0] {
+            LoadReply::FirstFrame { delay_ms, .. } => assert_eq!(*delay_ms, 0),
+            other => panic!("expected FirstFrame, got {other:?}"),
+        }
+        assert!(matches!(replies[1], LoadReply::Complete));
     }
 }

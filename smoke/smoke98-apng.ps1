@@ -385,12 +385,16 @@ Reset-Ini ''
 $p1 = Start-Riv ('"' + $Apng + '"') 's1.err'
 $main1 = Wait-Main $p1
 $adopted1 = Wait-Title $p1 'test.apng' 12000
-# "n / 3" is 5 chars; static (or still-loading) shows 0. >=3 filters noise.
-$found1 = Wait-Until { $script:len1 = Get-FrameLen $main1; ($script:len1 -ge 3) } 15000
+# "n / 3" is exactly 5 chars. The length-only channel (SB_GETTEXT cross-
+# process returns empty on this machine) cannot distinguish a dropped
+# third frame ("1 / 2" is also 5) - that residual is accepted here and
+# covered by the unit suite instead; 5 still separates animated from
+# static/loading (0 or the verdict text in the MAIN part).
+$found1 = Wait-Until { $script:len1 = Get-FrameLen $main1; ($script:len1 -eq 5) } 15000
 $len1 = $script:len1
 $code1 = Close-Main $p1 $main1
 Check 'S1a window + title adopted for test.apng' (($main1 -ne [IntPtr]::Zero) -and $adopted1) ('main=' + $main1 + ' adopted=' + $adopted1)
-Check 'S1b frame counter part carries "n / m" text (len >= 3; empty while static)' ($found1 -and ($len1 -ge 3)) ('framePartLen=' + $len1)
+Check 'S1b frame counter part carries "n / m" text (len == 5; empty while static)' ($found1 -and ($len1 -eq 5)) ('framePartLen=' + $len1)
 Check 'S1c WM_CLOSE exit code 0' ($code1 -eq 0) ('code=' + $code1)
 Kill-Riviv
 
@@ -400,8 +404,13 @@ Kill-Riviv
 Reset-Ini ''
 $p2 = Start-Riv ('"' + $Apng + '"') 's2.err'
 $main2 = Wait-Main $p2
-$null = Wait-Until { $script:len2a = Get-FrameLen $main2; ($script:len2a -ge 3) } 15000
+$null = Wait-Until { $script:len2a = Get-FrameLen $main2; ($script:len2a -eq 5) } 15000
 $before2 = $script:len2a
+# Differential baseline: after a COMPLETED load the status main part is
+# empty (no Loading indicator, no verdict) - so the post-failure mainLen
+# > 0 below can only be the failure verdict, not a leftover indicator.
+$null = Wait-Until { $script:main2pre = Get-MainLen $main2; ($script:main2pre -eq 0) } 10000
+$main2pre = $script:main2pre
 # The #21 trap: a handoff arriving within add_command_line_timeout (500 ms
 # default) of instance 1's own command-line processing is APPEND mode - the
 # bad file would join the playlist instead of replacing the display. Sleep
@@ -423,8 +432,8 @@ $alive2 = (-not $p2.HasExited)
 $diag2 = ('p2bExited=' + $p2b.HasExited + ' rivivProcs=' + @(Get-Process riviv -ErrorAction SilentlyContinue).Count + ' title="' + $p2.MainWindowTitle + '"')
 $code2 = Close-Main $p2 $main2
 Check 'S2a forwarded instance adopted the failed file title (request-time)' ($titleOk2) $diag2
-Check 'S2b old animation display kept (frame counter part still live, len >= 3)' ($alive2 -and ($afterLen2 -ge 3)) ('framePartLen=' + $afterLen2 + ' before=' + $before2)
-Check 'S2c failure verdict visible in the status main part (len > 0)' ($mainLen2 -gt 0) ('mainPartLen=' + $mainLen2 + ' ' + $diag2)
+Check 'S2b old animation display kept (frame counter part still live, len == 5)' ($alive2 -and ($afterLen2 -eq 5)) ('framePartLen=' + $afterLen2 + ' before=' + $before2)
+Check 'S2c failure verdict visible in the status main part (differential: 0 before, > 0 after)' (($main2pre -eq 0) -and ($mainLen2 -gt 0)) ('mainPartLen pre=' + $main2pre + ' post=' + $mainLen2)
 Check 'S2d no dialog popup owned by the window' ($dialogs2 -eq 0) ('dialogs=' + $dialogs2)
 Check 'S2e WM_CLOSE exit code 0' ($code2 -eq 0) ('code=' + $code2)
 Kill-Riviv
@@ -444,7 +453,8 @@ $main3 = [IntPtr]::Zero
 if ($riv3 -ne $null) { $main3 = Wait-Main $riv3 }
 $titleOk3 = $false
 if ($riv3 -ne $null) { $titleOk3 = Wait-Title $riv3 'stdin' 12000 }
-$found3 = Wait-Until { $script:len3 = Get-FrameLen $main3; ($script:len3 -ge 3) } 15000
+# "n / 3" is exactly 5 chars (see S1b's channel note).
+$found3 = Wait-Until { $script:len3 = Get-FrameLen $main3; ($script:len3 -eq 5) } 15000
 $len3 = $script:len3
 $code3 = -9
 if ($riv3 -ne $null) {
@@ -457,7 +467,7 @@ if ($riv3 -ne $null) {
     } else { Stop-Process -Id $riv3.Id -Force -ErrorAction SilentlyContinue; $code3 = -1 }
 }
 Check 'S3a stdin: pipe launches its own window with the stdin title' (($riv3 -ne $null) -and ($main3 -ne [IntPtr]::Zero) -and $titleOk3) ('riv=' + $(if ($riv3) { 'yes' } else { 'no' }) + ' main=' + $main3 + ' title=' + $(if ($riv3) { $riv3.MainWindowTitle } else { '' }))
-Check 'S3b stdin: animation decoded (frame counter part len >= 3)' ($found3 -and ($len3 -ge 3)) ('framePartLen=' + $len3)
+Check 'S3b stdin: animation decoded (frame counter part len == 5)' ($found3 -and ($len3 -eq 5)) ('framePartLen=' + $len3)
 Check 'S3c stdin: WM_CLOSE exit code 0' ($code3 -eq 0) ('code=' + $code3)
 Kill-Riviv
 
@@ -507,12 +517,17 @@ if ($parityReady) {
 }
 
 # ---------------------------------------------------------------------------
-# Teardown
+# Teardown. The ini reset is UNCONDITIONAL (every scenario's WM_CLOSE may
+# have written one back, including when S4 was skipped for a missing
+# parity exe - external review R1's false-red), and a leftover riviv
+# process is a FAILURE, not something to sweep before asserting.
 # ---------------------------------------------------------------------------
+Reset-Ini ''
 $iniCleaned = -not (Test-Path $Ini)
-$leftover = Get-Process riviv -ErrorAction SilentlyContinue
+$leftover = @(Get-Process riviv -ErrorAction SilentlyContinue)
+$leftoverNames = ($leftover | ForEach-Object { $_.Id }) -join ','
 if ($leftover) { $leftover | Stop-Process -Force }
-Check 'S9 teardown: stage ini cleaned, no riviv left' ($iniCleaned) ('ini exists: ' + (Test-Path $Ini))
+Check 'S9 teardown: stage ini cleaned, no riviv left' ($iniCleaned -and ($leftover.Count -eq 0)) ('ini exists: ' + (Test-Path $Ini) + ' leftoverPids: [' + $leftoverNames + ']')
 Write-Output ('RESULT: pass=' + $script:pass + ' fail=' + $script:fail + ' skip=' + $script:skip)
 if ($script:fail -eq 0) { Remove-Item -Recurse -Force $Stage -ErrorAction SilentlyContinue }
 else { Write-Output ('FAILURES: evidence kept in ' + $Stage) }
