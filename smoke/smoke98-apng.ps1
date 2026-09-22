@@ -507,6 +507,11 @@ if ((Test-Path $tA.Out) -and (Test-Path $tB.Out)) {
     $advDetail = ('f0=(' + $cA.R + ',' + $cA.G + ',' + $cA.B + ') f2=(' + $cB.R + ',' + $cB.G + ',' + $cB.B + ') hashEq=' + ($hA -eq $hB) + ' codes=' + $tA.Code + '/' + $tB.Code)
 } else { $advDetail = 'dumpA=' + (Test-Path $tA.Out) + ' dumpB=' + (Test-Path $tB.Out) }
 Check 'S1b3 animation advances: @200ms dump center is frame-0 red, @1200ms is frame-2 green, hashes differ' $advOk $advDetail
+# Residual (external review R6, recorded): this scenario can only FALSE-RED,
+# never false-green - the window is a title-adoption gap wider than the
+# +-300 ms margins or a loaded machine stretching WM_CLOSE->dump past them.
+# If it ever flakes on CI, re-anchor the dump timing on "frame-0 pixels are
+# on screen" (poll the window center color) instead of the title.
 Kill-Riviv
 
 # ---------------------------------------------------------------------------
