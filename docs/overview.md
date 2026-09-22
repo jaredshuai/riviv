@@ -28,7 +28,7 @@ riviv 是 Windows 上的单 exe 看图程序，[voidImageViewer](https://github.
 
 **现状。** 唯一的后台线程一次只解一张（`src/loadthread.rs` 模块说明，162–164 行附近）。格式按文件内容嗅探，不看扩展名（`src/loader.rs` 208–224）。静态图和 GIF / WebP / APNG 动画都经过 `assemble_frame`（静态臂 653，动画的 `stream_animation` 599；三个分发点是 319、350、451）。有 ICC 变换时，swizzle 折进 `TranslateBitmapBits` 的输出，合成发生在已经是 BGRA 的缓冲上（`assemble_frame` 269–277）。`icm=0`、没有 profile、或不是 RGB ICC v2/v4 时不变换，画面仍显示（`src/icm.rs` `prepare`，349–356）。APNG 能动画是相对上游的明确偏离，README Differences 的 #98 段已写明。色深不能动画、或画布超过动画预算时，改为静态显示，并在 stderr 写下是哪一条（`src/loader.rs` 422–435）。
 
-播放列表只收九个扩展名：`bmp`、`gif`、`ico`、`jpeg`、`jpg`、`png`、`tif`、`tiff`、`webp`（`src/playlist.rs` 365–366）。名为 `.apng` 的文件进不了这张表（`is_valid_path`，384–392；`add_filename` 在 689 用它过滤）。README 的 #98 段写明：文件夹、多文件拖放、随机、Everything、跳转列表会丢掉这个扩展名；命令行直接打开、Ctrl+O、单个文件拖放和 `stdin:` 仍按内容解码。把 `.apng` 接进导航过滤是 #108，还没做。
+播放列表收十个扩展名：`bmp`、`gif`、`ico`、`jpeg`、`jpg`、`png`、`tif`、`tiff`、`webp`、`apng`（`src/playlist.rs` 365–366）。名为 `.apng` 的文件经 `is_valid_path`（384–392）进入这张表；`add_filename` 在 689 用它过滤。README 的 #98 段写明：文件夹、多文件拖放、随机、Everything 的 LIST2 入列和跳转列表认这个扩展名；命令行直接打开、单个文件拖放和 `stdin:` 仍按内容解码。Ctrl+O 的图像过滤器同步带上 `*.apng`（`src/text.rs` 80）。把 `.apng` 接进导航过滤是 #108，已经做了。安装器关联表仍是九项，没有改。
 
 ### 绘制
 
@@ -65,7 +65,7 @@ riviv 是 Windows 上的单 exe 看图程序，[voidImageViewer](https://github.
    - 命令行：安装族开关若处理完就退出、不建窗口（`run` 8044–8053）。否则在单实例门之后建窗口，再 `process_parsed_cl`（8591–8598）。一个文件词走 `open_from_filename`（4501–4503）。没有文件词则不发起加载，窗口是空的（README Usage）。第二个进程在默认单实例下把整行命令交给已在运行的窗口后自己退出（8055–8163）；接收端改到对方的工作目录，再调用同一个 `process_parsed_cl`（4628–4682）。
    - Ctrl+O 或文件菜单的打开：`open_image_via_dialog`。取消则返回。打开（不是添加）先清空播放列表，再 `open_from_filename`（5458–5496）。
    - 往窗口拖一个文件、且没有按 Shift：`WM_DROPFILES` → `on_drop_files` → `apply_drop_files` → `open_from_filename`（1062–1066、6937–7005）。
-2. **目录和普通文件在这里分开。** `open_from_filename` 见到目录就收进播放列表再 home；见到普通文件就 `request_open(..., OpenOrigin::Direct)`（3393–3408）。这一步不看扩展名。多个文件或按着 Shift 拖放会先经 `add_filename` 改播放列表，扩展名不在那九个里的文件不会进列表。本轮没有逐行读 `home_open`，所以文件夹打开后第一张是哪一个文件，这里不写死。
+2. **目录和普通文件在这里分开。** `open_from_filename` 见到目录就收进播放列表再 home；见到普通文件就 `request_open(..., OpenOrigin::Direct)`（3393–3408）。这一步不看扩展名。多个文件或按着 Shift 拖放会先经 `add_filename` 改播放列表，扩展名不在那十个里的文件不会进列表。本轮没有逐行读 `home_open`，所以文件夹打开后第一张是哪一个文件，这里不写死。
 3. **排队解码，或直接换上已有的图。** `request_open`（3137–3304）若命中上一张缓存或预加载，换上现成的帧并返回。若路径不存在，不进加载器，状态栏走 “File not found.”，旧画面留着（3177–3223）。否则记下当时的背景色和 `icm`（`decode_env`，3312–3316），`LoadThread::request` 送出 `LoadSource::File`，并打开第一帧绘制握手（3282–3288）。标题在这一刻就改成所请求的文件（3258–3302），不等解码结束。
 4. **工作线程产出内存帧。** `decode_to_sink` 成功则以 `Complete` 收尾，用户级错误则 `FailedUser`（121–132）。帧在进回复之前做 ICC（若启用）和背景合成，见上一节的 `assemble_frame`。透明在这一步变成不透明（`composite_over_background_in_place`，`src/pixels.rs` 52–70；BGRA 路径在 80–81 转调它）。工作线程不创建 GDI 对象（`loadthread.rs` 22–24）。
 5. **UI 收下第一帧。** 踢消息到达后 `on_load_replies` 排空队列（4819–4824、4850–4864）。帧用 `Surface::from_master` 包起来，这一步只是移交所有权，不建 DIB（`src/surface.rs` 330–340）。`apply_reply` 让第一帧替换当前显示；`frame_gen` 增加，下一轮 D2D 绘制会重新上传（4878–4914）。然后 `repaint` 让视口失效（5176–5177、1986–1990）。
