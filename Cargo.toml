@@ -62,6 +62,10 @@ winresource = "0.1.31"
 # 测试内合成带 ICC 应用扩展(ICCRGBG1012)的动画 GIF(#77 动画验收);
 # 经 image 的 gif feature 已在依赖树里,零新增下载
 gif = "0.14"
+# 测试内合成 APNG fixture(#98):png 0.18 Encoder 写 acTL/fcTL/IDAT/fdAT
+# (set_animated/set_dispose_op/with_info 带 iCCP);经 image 的 png feature
+# 已在依赖树里,零新增下载
+png = "0.18"
 
 [lints.clippy]
 # unsafe 密集 FFI:每个 unsafe 块必须带 SAFETY 注释(AGENTS.md 技术栈约定)
