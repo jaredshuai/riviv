@@ -12,6 +12,41 @@
 (#81)本无可测注入通道,且随 #90 GDI 删除而消亡。其余 %TEMP% 脚本维持
 不入库,不作为回归门。
 
+## smoke98-apng.ps1(#98 APNG 动画接入)
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File smoke\smoke98-apng.ps1 [-Exe <path>]
+```
+
+场景(18+ 检查;R2 起退出码三分:**0 全绿 / 1 断言失败 / 2 必需门未跑完**,
+失败与门不全都保留 stage 作证据):
+
+- **S0** fixture 自检:chunk 结构自走查(acTL-before-IDAT/fcTL 门每个图像/
+  共享序列号 0-4)+ GDI+ 独立解码首帧(红)。
+- **S1** 文件打开 → 状态栏帧计数 part 存活(len==5,即 "n / 3";跨进程
+  SB_GETTEXT 本机被 UIPI 拦返空,#40 坑,长度法=SB_GETTEXTLENGTH 于
+  SB_GETPARTS count-2)+ WM_CLOSE 退出 0。
+- **S2** 二实例转发恶意 fcTL(首 fcTL 宽度越界+CRC 重算,构造期失败=
+  任何帧前)→ 失败标题采纳/旧动画保留/失败文案差分断言(好载后 main
+  part=0 基线)/无弹窗/退出 0。**转发前 sleep 900ms 越
+  add_command_line_timeout=500ms 窗口**(#21 坑:窗口内落 ADD 模式)。
+- **S3** `stdin:` cmd type 管道 → 独立窗口动画;**按 exe Path 选靶**
+  (`Where-Object Path -eq $RunExe` 且恰好一个,开发者自用 riviv 豁免)。
+- **S4(必需门)** 静态 PNG 三对 `-dump-viewport` 与 **master parity exe
+  字节相等**:a) 纯 RGBA 1:1;b) 带 iCCP(#77 adobe-like profile,base64
+  内嵌)且 ini icm=1——盖住 prepare_transform 面;c) palette+tRNS
+  1200×1200——盖住 alpha 合成+缩小滤波档面。**parity exe 缺失 = exit 2
+  非静默 skip**(R2-3):构建配方
+  `git worktree add <tmp> <pre-#98 master sha>; cd <tmp>; cargo build --release;
+  copy target\release\riviv.exe %TEMP%\riviv-98-parity\riviv-master.exe`。
+- **S9** teardown:无条件清 stage ini(场景 WM_CLOSE 会回写)+ 残留
+  staged 进程计入失败(先抓后杀)。
+
+fixture 双源说明(R2-4):单测用 Rust `png` crate Encoder(dev-dep),
+冒烟用 C# 手写字节(zlib 0x78 0x01+adler32+CRC32,smoke81 配方;含
+APNG chunk 序列与 iCCP/PLTE/tRNS)——两套独立实现互为交叉验证,改动
+APNG 解码断言语义时两处都要对齐。
+
 ## smoke82-tiles.ps1(#82 巨图 overview + LRU tile + VRAM 字节预算)
 
 ```powershell

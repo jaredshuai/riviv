@@ -364,15 +364,14 @@ fn decode_reader<R: BufRead + Seek>(
             // Image-level limits: ApngDecoder's compositing reserves TWO
             // persistent full-canvas RGBA buffers against `inner.limits`
             // (current + previous) and, per frame, the raw output plus the
-            // subframe-RGBA against a clone of them — the FIRST frame
+            // subframe-RGBA against a clone of them — the first frame
             // therefore needs FOUR canvases inside the 512 MB budget
-            // (~128 MB RGBA8 canvas ceiling; a low-bit-depth source's raw
-            // buffer is small but its canvases are not — a 7723^2 L8 file
-            // fails at the image gate before any frame, measured). Files
-            // over that wire fail user-level carrying the image crate's
-            // limit error rather than this arm's budget message (same
-            // class); the delivered-frame budget below keeps counting one
-            // canvas per frame exactly like GIF/WebP.
+            // (measured; a low-bit-depth source's raw buffer is small but
+            // its canvases are not). A canvas over that wire degrades to
+            // the static path below (see apng_canvas_fits_animation_budget)
+            // — pre-#98 and upstream both display such a file statically,
+            // and the delivered-frame budget keeps counting one canvas per
+            // frame exactly like GIF/WebP once the frames do flow.
             decoder
                 .set_limits(image::Limits::default())
                 .map_err(|e| user(e.to_string()))?;
@@ -383,11 +382,6 @@ fn decode_reader<R: BufRead + Seek>(
                 // generic arm ran, output unchanged.
                 return sink_static(decoder, shown, env, sink);
             }
-            // ApngDecoder implements only AnimationDecoder, so orientation
-            // and the ICC profile must be taken from the PngDecoder before
-            // `.apng()` consumes it (#77's while-the-decoder-is-alive rule).
-            let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
-            let transform = prepare_transform(&mut decoder, &env, shown);
             let (w, h) = decoder.dimensions();
             // checked_mul: hostile IHDR dims are rejected by the png crate
             // at construction today (measured at spec-max 0x7FFFFFFF^2),
@@ -397,6 +391,19 @@ fn decode_reader<R: BufRead + Seek>(
                 .checked_mul(h as usize)
                 .and_then(|px| px.checked_mul(4))
                 .ok_or_else(|| user("canvas exceeds the addressable budget".to_string()))?;
+            // A canvas the animation path cannot afford (four of them inside
+            // the same 512 MB) still fits the static single-canvas path —
+            // degrade there instead of failing the load (external review R2:
+            // pre-#98, upstream GDI+, and every static PNG viewer show such a
+            // file's first frame; failing it would be a reachable regression).
+            if !apng_canvas_fits_animation_budget(per_frame_bytes) {
+                return sink_static(decoder, shown, env, sink);
+            }
+            // ApngDecoder implements only AnimationDecoder, so orientation
+            // and the ICC profile must be taken from the PngDecoder before
+            // `.apng()` consumes it (#77's while-the-decoder-is-alive rule).
+            let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
+            let transform = prepare_transform(&mut decoder, &env, shown);
             let decoder = decoder.apng().map_err(|e| user(e.to_string()))?;
             // APNG delays are the fcTL fraction num × 1000 / (den || 100) ms,
             // already computed by the iterator; zero delays pass through like
@@ -422,6 +429,18 @@ fn decode_reader<R: BufRead + Seek>(
             sink,
         ),
     }
+}
+
+/// Whether an APNG canvas fits the animated path's first-frame wire: the
+/// image crate's compositing needs FOUR canvases inside the same 512 MB
+/// budget the static path spends on one (two persistent buffers plus the
+/// raw output and the subframe-RGBA transients — measured, external
+/// review R1). Over the wire the load degrades to the static path, which
+/// affords one full-budget canvas (#98 R2: pre-#98 riviv, upstream GDI+,
+/// and any static viewer display such a file's first frame — failing it
+/// would be a reachable regression).
+fn apng_canvas_fits_animation_budget(per_frame_bytes: usize) -> bool {
+    per_frame_bytes.saturating_mul(4) <= MAX_TOTAL_FRAME_BYTES
 }
 
 /// Decode one frame at a time of an animation, replying per frame
@@ -2162,64 +2181,99 @@ mod apng_tests {
     }
 
     #[test]
-    fn apng_dispose_previous_restores_the_region() {
-        // The #2327-shaped regression net: frame 1 is a 2x2 subframe at
-        // (0,0) with dispose previous, frame 2 draws elsewhere — frame
-        // 2's (0,0) must be back to frame 0's red (a full-canvas
-        // "background" dispose would leave it transparent->composite, a
-        // "none" dispose would leave it blue).
+    fn apng_dispose_ops_are_region_limited() {
+        // The #2327-shaped regression net, with DISCRIMINATING geometry
+        // (external review R2: a plain previous-restore fixture cannot
+        // tell region-restore from full-canvas-restore — mix_next_frame
+        // full-clones `previous` from `current` every frame, so the two
+        // only ever differ inside the just-drawn frame's own sub-rect).
+        // Frames: f0 full red (dispose none); f1 2x2 GREEN at (2,2)
+        // (dispose background); f2 2x2 BLUE at (0,0) (dispose previous);
+        // f3 1x1 yellow at (3,3) (dispose none). The two kills:
+        // - f2's (3,0) stays RED — a full-canvas background dispose would
+        //   have cleared it to transparent (white after compositing).
+        // - f3's (2,2) stays WHITE (f2's background clear) — a full-canvas
+        //   previous-restore would have brought f1's green back; the
+        //   region restore only touches (0,0)-(1,1), where f3 does show
+        //   f1-era red again.
         let mut out = Vec::new();
         let mut enc = png::Encoder::with_info(&mut out, png_info(4, 4, None)).expect("with_info");
-        enc.set_animated(3, 0).expect("set_animated");
+        enc.set_animated(4, 0).expect("set_animated");
         {
             let mut writer = enc.write_header().expect("write_header");
             let red = [200u8, 60, 10, 255];
             let blue = [10u8, 60, 200, 255];
             let green = [10u8, 200, 60, 255];
-            // Frame 0: full-canvas red.
+            let yellow = [200u8, 200, 10, 255];
+            // f0: full-canvas red.
             writer.set_frame_delay(1, 10).expect("delay f0");
             writer
                 .write_image_data(&solid_rgba(4, 4, red))
                 .expect("frame 0");
-            // Frame 1: 2x2 blue at (0,0), disposed back afterwards.
+            // f1: 2x2 green at (2,2), disposed by background afterwards.
             writer
-                .set_dispose_op(png::DisposeOp::Previous)
+                .set_dispose_op(png::DisposeOp::Background)
                 .expect("disp f1");
             writer.set_frame_dimension(2, 2).expect("dim f1");
-            writer.set_frame_position(0, 0).expect("pos f1");
+            writer.set_frame_position(2, 2).expect("pos f1");
             writer.set_frame_delay(1, 10).expect("delay f1");
             writer
-                .write_image_data(&solid_rgba(2, 2, blue))
+                .write_image_data(&solid_rgba(2, 2, green))
                 .expect("frame 1");
-            // Frame 2: 2x2 green at (1,1), dispose none.
+            // f2: 2x2 blue at (0,0), disposed by previous afterwards.
             writer
-                .set_dispose_op(png::DisposeOp::None)
+                .set_dispose_op(png::DisposeOp::Previous)
                 .expect("disp f2");
             writer.set_frame_dimension(2, 2).expect("dim f2");
-            writer.set_frame_position(1, 1).expect("pos f2");
+            writer.set_frame_position(0, 0).expect("pos f2");
             writer.set_frame_delay(1, 10).expect("delay f2");
             writer
-                .write_image_data(&solid_rgba(2, 2, green))
+                .write_image_data(&solid_rgba(2, 2, blue))
                 .expect("frame 2");
+            // f3: 1x1 yellow at (3,3), dispose none.
+            writer
+                .set_dispose_op(png::DisposeOp::None)
+                .expect("disp f3");
+            writer.set_frame_dimension(1, 1).expect("dim f3");
+            writer.set_frame_position(3, 3).expect("pos f3");
+            writer.set_frame_delay(1, 10).expect("delay f3");
+            writer.write_image_data(&yellow).expect("frame 3");
             writer.finish().expect("finish");
         }
         let replies = decode_all(&out, env());
-        assert_eq!(replies.len(), 4, "3 frames + Complete");
+        assert_eq!(replies.len(), 5, "4 frames + Complete");
         let frame_of = |i: usize| match &replies[i] {
             LoadReply::FirstFrame { frame, .. } | LoadReply::AdditionalFrame { frame, .. } => frame,
             other => panic!("expected a frame reply, got {other:?}"),
         };
         let f1 = frame_of(1);
-        assert_eq!(rgb_at(f1, 0, 0), (10, 60, 200), "the blue subframe drew");
-        assert_eq!(rgb_at(f1, 3, 3), (200, 60, 10), "outside the subframe");
+        assert_eq!(rgb_at(f1, 2, 2), (10, 200, 60), "the green subframe drew");
+        assert_eq!(rgb_at(f1, 0, 0), (200, 60, 10), "outside the subframe");
         let f2 = frame_of(2);
+        assert_eq!(rgb_at(f2, 0, 0), (10, 60, 200), "the blue subframe drew");
         assert_eq!(
-            rgb_at(f2, 0, 0),
-            (200, 60, 10),
-            "dispose previous restored frame 1's region to red"
+            rgb_at(f2, 2, 2),
+            (255, 255, 255),
+            "background disposed ONLY f1's region (transparent over the white bg)"
         );
-        assert_eq!(rgb_at(f2, 1, 1), (10, 200, 60), "the green subframe drew");
-        assert_eq!(rgb_at(f2, 3, 3), (200, 60, 10));
+        assert_eq!(
+            rgb_at(f2, 3, 0),
+            (200, 60, 10),
+            "outside both subregions keeps the canvas — kills a full-canvas dispose"
+        );
+        let f3 = frame_of(3);
+        assert_eq!(
+            rgb_at(f3, 0, 0),
+            (200, 60, 10),
+            "previous restored f2's region to its pre-draw red"
+        );
+        assert_eq!(
+            rgb_at(f3, 2, 2),
+            (255, 255, 255),
+            "previous restored ONLY (0,0)-(1,1) — a full-canvas restore would bring f1's green back"
+        );
+        assert_eq!(rgb_at(f3, 3, 3), (200, 200, 10), "the yellow subframe drew");
+        assert_eq!(rgb_at(f3, 3, 0), (200, 60, 10));
     }
 
     #[test]
@@ -2501,28 +2555,44 @@ mod apng_tests {
     }
 
     #[test]
-    fn rgba_canvas_over_a_quarter_of_the_budget_fails_before_any_frame() {
+    fn rgba_canvas_over_the_animation_wire_degrades_to_static() {
         // MEASURED wire: the first frame needs FOUR canvases inside the
         // 512 MB image-side budget (current + previous persistent, raw
         // output + subframe-RGBA transient) — this 6080^2 RGBA fixture
         // (canvas ~= 147.9 MB; 2C = 295.8 <= 512, 3C = 443.7 <= 512,
-        // 4C = 591.7 > 512) decodes ZERO frames, which refutes the
-        // review's three-canvas model (3C fits yet the load fails). The
-        // failure is user-level with the image crate's own limit error —
-        // the same class, a different message than this arm's budget one.
+        // 4C = 591.7 > 512) cannot animate (R1's probe refuted the
+        // three-canvas model: 3C fits, the animation still fails). Since
+        // R2 it DEGRADES to the static single-canvas path instead of
+        // failing — pre-#98 riviv and upstream GDI+ display exactly this
+        // file's first frame, so failing it would be a reachable
+        // regression. Static shape: one frame + Complete, delay 0, the
+        // zero-filled frame 0 composited over the white background.
         let apng = apng_zero_frames(6080, 6080, png::ColorType::Rgba, png::BitDepth::Eight, 2);
         let replies = decode_all(&apng, env());
-        assert_eq!(replies.len(), 1, "a single terminal reply");
-        assert!(matches!(replies[0], LoadReply::FailedUser(_)));
+        assert_eq!(replies.len(), 2, "static: one frame + Complete");
+        match &replies[0] {
+            LoadReply::FirstFrame { frame, delay_ms } => {
+                assert_eq!(*delay_ms, 0);
+                assert_eq!(frame.dims(), (6080, 6080));
+                assert_eq!(
+                    rgb_at(frame, 0, 0),
+                    (255, 255, 255),
+                    "transparent zeros over white"
+                );
+            }
+            other => panic!("expected FirstFrame, got {other:?}"),
+        }
+        assert!(matches!(replies[1], LoadReply::Complete));
     }
 
     #[test]
-    fn low_depth_wire_counts_the_rgba_canvas_not_the_raw() {
-        // The review's fail-open scenario, refuted by measurement: a
-        // 7723^2 L8 two-framer (P = 59.6M px; raw accounting 9P =
-        // 511.96 MB <= 512 was predicted to DELIVER frames) fails before
-        // any frame — the subframe-RGBA reserve the review missed puts
-        // the first-frame wire at 13P (<= 512 MB => P <= ~39.4M px).
+    fn low_depth_canvas_over_the_animation_wire_degrades_to_static() {
+        // R1's probe (refuting the review's fail-open prediction): a 7723^2
+        // L8 two-framer cannot animate — its raw buffer is small but the
+        // canvases are not, putting the first-frame wire at 13P. The
+        // static path affords it (raw 59.6 MB + the RGBA conversion 227 MB
+        // fit one 512 MB budget), so since R2 the load degrades instead of
+        // failing: L8 zeros decode as opaque black.
         let apng = apng_zero_frames(
             7723,
             7723,
@@ -2531,8 +2601,32 @@ mod apng_tests {
             2,
         );
         let replies = decode_all(&apng, env());
-        assert_eq!(replies.len(), 1, "a single terminal reply");
-        assert!(matches!(replies[0], LoadReply::FailedUser(_)));
+        assert_eq!(replies.len(), 2, "static: one frame + Complete");
+        match &replies[0] {
+            LoadReply::FirstFrame { frame, delay_ms } => {
+                assert_eq!(*delay_ms, 0);
+                assert_eq!(frame.dims(), (7723, 7723));
+                assert_eq!(rgb_at(frame, 0, 0), (0, 0, 0), "L8 zeros are opaque black");
+            }
+            other => panic!("expected FirstFrame, got {other:?}"),
+        }
+        assert!(matches!(replies[1], LoadReply::Complete));
+    }
+
+    #[test]
+    fn animation_wire_boundary_is_exactly_a_quarter_of_the_budget() {
+        // The degradation predicate's exact edge, pinned on the pure
+        // function the arm consults: a quarter of the budget animates,
+        // one byte more degrades. (MAX_TOTAL_FRAME_BYTES is a multiple
+        // of 4, so the quarter is exact.)
+        assert!(apng_canvas_fits_animation_budget(MAX_TOTAL_FRAME_BYTES / 4));
+        assert!(!apng_canvas_fits_animation_budget(
+            MAX_TOTAL_FRAME_BYTES / 4 + 1
+        ));
+        // The saturating arm: an absurd canvas (already rejected by the
+        // checked_mul gate upstream) reads as not-fitting rather than
+        // wrapping around to "fits".
+        assert!(!apng_canvas_fits_animation_budget(usize::MAX));
     }
 
     #[test]
@@ -2688,5 +2782,38 @@ mod apng_tests {
             other => panic!("expected FirstFrame, got {other:?}"),
         }
         assert!(matches!(replies[1], LoadReply::Complete));
+    }
+
+    #[test]
+    fn corrupted_later_fctl_crc_fails_mid_stream() {
+        // The SAME corruption one chunk later meets the opposite fate
+        // (external review R3-1): a dropped NON-FIRST fcTL leaves the
+        // fdAT behind it with no preceding control chunk — the sequence
+        // chain errors (MissingFctl/ApngOrder). Frame 0 is already
+        // delivered when that lands: FirstFrame, then a user-level
+        // failure. Two fates of one damage class, both pinned.
+        let mut base = two_color_apng();
+        let mut pos = 8;
+        let mut seen_fctl = 0;
+        while pos + 12 <= base.len() {
+            let len = u32::from_be_bytes(base[pos..pos + 4].try_into().unwrap()) as usize;
+            if &base[pos + 4..pos + 8] == b"fcTL" {
+                seen_fctl += 1;
+                if seen_fctl == 2 {
+                    base[pos + 8] ^= 0xFF;
+                    break;
+                }
+            }
+            pos += 12 + len;
+        }
+        assert_eq!(seen_fctl, 2, "the fixture must carry a second fcTL");
+        let replies = decode_all(&base, env());
+        assert!(
+            replies
+                .iter()
+                .any(|r| matches!(r, LoadReply::FailedUser(_))),
+            "the orphaned fdAT must fail the load, got {replies:?}"
+        );
+        assert!(matches!(replies[0], LoadReply::FirstFrame { .. }));
     }
 }
