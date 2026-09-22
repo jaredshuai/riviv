@@ -424,7 +424,27 @@ Check 'S0b GDI+ independently decodes the fixture (64x64, frame 0 red)' $gdiOk $
 
 $chBad = Get-ChunkKinds $Bad
 $badPatched = (($chBad.Kinds -join ',') -eq ($wantKinds -join ','))
-Check 'S0c bad98.apng is structurally identical (only fcTL width + CRC differ)' $badPatched ("kinds=[$($chBad.Kinds -join ',')]")
+# The patch must have LANDED (external review R4: a chunk-kind walk alone
+# cannot tell a hostile file from the intact animation - if the width
+# surgery silently missed, every S2 assertion would pass vacuously).
+function Get-FirstFctlWidth($path) {
+    $b = [IO.File]::ReadAllBytes($path)
+    $pos = 8
+    while ($pos + 12 -le $b.Length) {
+        $len = ($b[$pos] -shl 24) -bor ($b[$pos+1] -shl 16) -bor ($b[$pos+2] -shl 8) -bor $b[$pos+3]
+        if ($pos + 12 + $len -gt $b.Length) { break }
+        $kind = [Text.Encoding]::ASCII.GetString($b, $pos + 4, 4)
+        if ($kind -eq 'fcTL') {
+            # [int] casts: PS byte-typed -shl wraps back to a byte and the
+            # high bytes vanish (9999 = 0x270F read back as 0x0F = 15).
+            return (([int]$b[$pos+12] -shl 24) -bor ([int]$b[$pos+13] -shl 16) -bor ([int]$b[$pos+14] -shl 8) -bor [int]$b[$pos+15])
+        }
+        $pos += 12 + $len
+    }
+    return -1
+}
+$badWidth = Get-FirstFctlWidth $Bad
+Check 'S0c bad98.apng structurally identical AND the hostile fcTL width really patched to 9999' ($badPatched -and ($badWidth -eq 9999)) ("kinds=[$($chBad.Kinds -join ',')] firstFctlWidth=$badWidth")
 
 # ---------------------------------------------------------------------------
 # S1 file open -> animation
@@ -477,10 +497,28 @@ if (Test-Path $errPath2) { Remove-Item $errPath2 -Force }
 $p2b = Start-Process -FilePath $RunExe -ArgumentList ('"' + $Bad + '"') -PassThru -RedirectStandardError $errPath2
 $null = $p2b.WaitForExit(12000)
 $titleOk2 = Wait-Title $p2 'bad98' 12000
-Start-Sleep -Milliseconds 800   # let the failure verdict settle
+# Poll the verdict with PERSISTENCE (external review R4: a single nonzero
+# main-part length is also true while the transient "Loading..." text is
+# up - a snapshot taken there would green the scenario before the failure
+# lands). The verdict PERSISTS until the next open; two equal nonzero
+# samples 500 ms apart can only be it. The frame counter must stay live
+# throughout (the old animation is the display).
+$verdictOk2 = $false
+$mainLen2 = -1
+$deadline = [DateTime]::UtcNow.AddSeconds(12)
+while ([DateTime]::UtcNow -lt $deadline) {
+    $l1 = Get-MainLen $main2
+    if ($l1 -gt 0) {
+        Start-Sleep -Milliseconds 500
+        $l2 = Get-MainLen $main2
+        $cnt = Get-FrameLen $main2
+        if (($l2 -eq $l1) -and ($l2 -gt 0) -and ($cnt -eq 5)) { $verdictOk2 = $true; $mainLen2 = $l2; break }
+    } else {
+        Start-Sleep -Milliseconds 100
+    }
+}
 
 $afterLen2 = Get-FrameLen $main2
-$mainLen2 = Get-MainLen $main2
 $dialogs2 = Count-Dialogs $p2.Id
 $alive2 = (-not $p2.HasExited)
 $diag2 = ('p2bExited=' + $p2b.HasExited + ' rivivProcs=' + @(Get-Process riviv -ErrorAction SilentlyContinue).Count + ' title="' + $p2.MainWindowTitle + '"')
@@ -506,7 +544,7 @@ if (Test-Path $S2Dump) {
 Check 'S2a forwarded instance adopted the failed file title (request-time)' ($titleOk2) $diag2
 Check 'S2b old animation display kept (frame counter part still live, len == 5)' ($alive2 -and ($afterLen2 -eq 5)) ('framePartLen=' + $afterLen2 + ' before=' + $before2)
 Check 'S2b2 pixel evidence: the dumped viewport center is one of the animation colors' $keepOk2 $keepDetail2
-Check 'S2c failure verdict visible in the status main part (differential: 0 before, > 0 after)' (($main2pre -eq 0) -and ($mainLen2 -gt 0)) ('mainPartLen pre=' + $main2pre + ' post=' + $mainLen2)
+Check 'S2c failure verdict visible (persistent nonzero main part; Loading is transient, two equal samples exclude it)' (($main2pre -eq 0) -and $verdictOk2) ('mainPartLen pre=' + $main2pre + ' post=' + $mainLen2 + ' verdictOk=' + $verdictOk2)
 Check 'S2d no dialog popup owned by the window' ($dialogs2 -eq 0) ('dialogs=' + $dialogs2)
 Check 'S2e WM_CLOSE exit code 0' ($code2 -eq 0) ('code=' + $code2)
 Kill-Riviv
