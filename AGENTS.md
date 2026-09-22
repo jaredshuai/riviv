@@ -1,5 +1,7 @@
 # AGENTS.md
 
+项目主要能力、职责、关键关系，以及「用户给出一张图 → 窗口里看见它」：见 [docs/overview.md](docs/overview.md)。已接受的设计与当前代码证据在该文件里分开写。
+
 ## Quick Start
 
 Rust 重写项目(裸 Win32 + GDI,单 exe)。验证与构建命令:
