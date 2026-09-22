@@ -273,19 +273,26 @@ function Wait-Until($sb, $ms) {
     return (& $sb)
 }
 function Kill-Riviv {
-    $ps = Get-Process riviv -ErrorAction SilentlyContinue
+    # R7 third axis: match S3/S9's path-targeted contract (R2's rule) -
+    # the developer's real viewer must survive every teardown, not only
+    # the scenarios with their own filter. $RunExe is the staged copy
+    # (same deterministic stage path across runs, so a leftover from a
+    # crashed run still gets killed here); riviv-master never matches
+    # a Get-Process riviv name query.
+    $ps = @(Get-Process riviv -ErrorAction SilentlyContinue |
+        Where-Object { $_.Path -eq $RunExe })
     if ($ps) { $ps | Stop-Process -Force; Start-Sleep -Milliseconds 300 }
 }
 
 [void][S98]::SetProcessDPIAware()
-Kill-Riviv
 
 $Stage = Join-Path $env:TEMP 'riviv-98-smoke'
 $Ini = Join-Path $Stage 'riviv.ini'
+$RunExe = Join-Path $Stage 'riviv.exe'
+Kill-Riviv
 if (Test-Path $Stage) { Remove-Item -Recurse -Force $Stage }
 New-Item -ItemType Directory -Path $Stage | Out-Null
 if (-not (Test-Path $Exe)) { Write-Output ('MISSING EXE: ' + $Exe); exit 2 }
-$RunExe = Join-Path $Stage 'riviv.exe'
 Copy-Item $Exe $RunExe -Force
 Check 'S0 staged exe copied, stage ini absent' ((Test-Path $RunExe) -and (-not (Test-Path $Ini))) 'Copy-Item failed or leftover ini'
 

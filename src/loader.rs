@@ -476,13 +476,18 @@ fn decode_reader<R: BufRead + Seek>(
 /// pre-#98 riviv and upstream GDI+ display such a file statically, the
 /// same rationale as the canvas fallback (#98 R5: a 16-bit APNG failing
 /// outright was the second member of the regression class R2 named).
+/// WHITELIST, not a 16-bit blacklist (external review R7, third axis):
+/// image's own catch-all for unknown PNG color types is `unreachable!`
+/// (png.rs animatable_color_type), so a future color type that slips a
+/// blacklist would panic the worker thread (a stuck load) — off the
+/// whitelist it degrades statically instead.
 fn apng_color_is_animatable(color: image::ColorType) -> bool {
-    !matches!(
+    matches!(
         color,
-        image::ColorType::L16
-            | image::ColorType::La16
-            | image::ColorType::Rgb16
-            | image::ColorType::Rgba16
+        image::ColorType::L8
+            | image::ColorType::La8
+            | image::ColorType::Rgb8
+            | image::ColorType::Rgba8
     )
 }
 
@@ -2758,6 +2763,35 @@ mod apng_tests {
             image::Limits::default().max_alloc,
             Some(MAX_TOTAL_FRAME_BYTES as u64)
         );
+    }
+
+    #[test]
+    fn animatable_colors_are_whitelisted_not_blacklisted() {
+        // R7 third axis: the predicate must be a WHITELIST — image's own
+        // catch-all for unknown PNG color types is unreachable!, so a
+        // blacklist would pass a future color type straight into a
+        // worker-thread panic (a stuck load). Pin today's eight: the
+        // four 8-bit types animate, the four 16-bit degrade; a type a
+        // future image adds starts OFF the list (matches! just says no).
+        for animatable in [
+            image::ColorType::L8,
+            image::ColorType::La8,
+            image::ColorType::Rgb8,
+            image::ColorType::Rgba8,
+        ] {
+            assert!(apng_color_is_animatable(animatable), "{animatable:?}");
+        }
+        for static_fallback in [
+            image::ColorType::L16,
+            image::ColorType::La16,
+            image::ColorType::Rgb16,
+            image::ColorType::Rgba16,
+        ] {
+            assert!(
+                !apng_color_is_animatable(static_fallback),
+                "{static_fallback:?}"
+            );
+        }
     }
 
     #[test]
