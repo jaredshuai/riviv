@@ -371,7 +371,11 @@ fn decode_reader<R: BufRead + Seek>(
             // the static path below (see apng_canvas_fits_animation_budget)
             // — pre-#98 and upstream both display such a file statically,
             // and the delivered-frame budget keeps counting one canvas per
-            // frame exactly like GIF/WebP once the frames do flow.
+            // frame exactly like GIF/WebP once the frames do flow. Note the
+            // budget is CUMULATIVE DELIVERED bytes, not the decode-transient
+            // peak: the iterator's per-frame returned clone sits outside
+            // `Limits` entirely, so the true footprint runs past the gate —
+            // bounded by it at every step, never roughly more than twice.
             decoder
                 .set_limits(image::Limits::default())
                 .map_err(|e| user(e.to_string()))?;
@@ -2432,11 +2436,20 @@ mod apng_tests {
     fn apng_actl_zero_frames_degrades_to_static() {
         // acTL num_frames=0 is invalid per the APNG spec; the png crate
         // silently drops such a chunk, so `is_apng` reports false and the
-        // file degrades to the static path rather than failing the load.
+        // file degrades to the static path rather than failing the load —
+        // and what displays is the IDAT's own pixels (external review R3:
+        // pin WHICH static frame, not just the static shape).
         let apng = two_red_frames();
         let still = with_actl_num_frames(&apng, 0);
         let replies = decode_all(&still, env());
         assert_eq!(replies.len(), 2, "static: one frame + Complete");
+        match &replies[0] {
+            LoadReply::FirstFrame { frame, delay_ms } => {
+                assert_eq!(*delay_ms, 0);
+                assert_eq!(rgb_at(frame, 0, 0), (200, 60, 10), "the IDAT frame shows");
+            }
+            other => panic!("expected FirstFrame, got {other:?}"),
+        }
         assert!(matches!(replies[1], LoadReply::Complete));
         assert!(
             replies
@@ -2477,17 +2490,15 @@ mod apng_tests {
     #[test]
     fn apng_truncated_mid_frame_fails_user_mid_stream() {
         // A stream cut inside the frame data: frame 0 decodes and is
-        // delivered, then the EOF surfaces as a user-level failure.
+        // delivered, then the EOF surfaces as a user-level failure —
+        // exactly two replies, FirstFrame then FailedUser, never Complete
+        // (external review R3: pin the exact shape, not the any-match).
         let apng = two_red_frames();
         let cut = truncated(&apng, 30);
         let replies = decode_all(&cut, env());
-        assert!(
-            replies
-                .iter()
-                .any(|r| matches!(r, LoadReply::FailedUser(_))),
-            "the truncated stream must fail user-level, got {replies:?}"
-        );
+        assert_eq!(replies.len(), 2, "one frame + the terminal failure");
         assert!(matches!(replies[0], LoadReply::FirstFrame { .. }));
+        assert!(matches!(replies[1], LoadReply::FailedUser(_)));
     }
 
     #[test]
@@ -2744,20 +2755,27 @@ mod apng_tests {
     fn actl_num_plays_overflow_drops_the_chunk_to_static() {
         // num_plays = 2^31 (invalid, > 0x7FFFFFFF): the png crate drops
         // the whole acTL, is_apng turns false, and the file degrades to
-        // the static path — the same family as num_frames=0.
-        let base = two_color_apng();
-        let bad = edit_chunks(&base, |kind, slot| {
-            if kind == b"acTL" {
-                slot.as_mut().unwrap()[4..8].copy_from_slice(&0x8000_0000u32.to_be_bytes());
+        // the static path — the same family as num_frames=0. External
+        // review R3: parse_actl drops on THREE conditions (num_frames=0,
+        // num_frames>0x7FFFFFFF, num_plays>0x7FFFFFFF) — pin the
+        // num_frames overflow variant too.
+        // acTL layout: num_frames[0..4], num_plays[4..8].
+        for (field_off, tag) in [(0usize, "num_frames"), (4, "num_plays")] {
+            let base = two_color_apng();
+            let bad = edit_chunks(&base, |kind, slot| {
+                if kind == b"acTL" {
+                    let d = slot.as_mut().unwrap();
+                    d[field_off..field_off + 4].copy_from_slice(&0x8000_0000u32.to_be_bytes());
+                }
+            });
+            let replies = decode_all(&bad, env());
+            assert_eq!(replies.len(), 2, "{tag}: static — one frame + Complete");
+            match &replies[0] {
+                LoadReply::FirstFrame { delay_ms, .. } => assert_eq!(*delay_ms, 0, "{tag}"),
+                other => panic!("{tag}: expected FirstFrame, got {other:?}"),
             }
-        });
-        let replies = decode_all(&bad, env());
-        assert_eq!(replies.len(), 2, "static: one frame + Complete");
-        match &replies[0] {
-            LoadReply::FirstFrame { delay_ms, .. } => assert_eq!(*delay_ms, 0),
-            other => panic!("expected FirstFrame, got {other:?}"),
+            assert!(matches!(replies[1], LoadReply::Complete), "{tag}");
         }
-        assert!(matches!(replies[1], LoadReply::Complete));
     }
 
     #[test]

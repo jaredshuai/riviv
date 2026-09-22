@@ -447,10 +447,16 @@ Check 'S1c WM_CLOSE exit code 0' ($code1 -eq 0) ('code=' + $code1)
 Kill-Riviv
 
 # ---------------------------------------------------------------------------
-# S2 hostile open over the live animation (second-instance handoff)
+# S2 hostile open over the live animation (second-instance handoff).
+# Instance 1 launches with -dump-viewport so the WM_CLOSE dump becomes
+# PIXEL evidence of the kept display (external review R3-6: the frame
+# counter is only a proxy; the center of the dumped scene must be one of
+# the animation's colors - a cleared display would letterbox white there).
 # ---------------------------------------------------------------------------
 Reset-Ini ''
-$p2 = Start-Riv ('"' + $Apng + '"') 's2.err'
+$S2Dump = Join-Path $Stage 's2-keep.png'
+if (Test-Path $S2Dump) { Remove-Item $S2Dump -Force }
+$p2 = Start-Riv ('"' + $Apng + '" -dump-viewport "' + $S2Dump + '"') 's2.err'
 $main2 = Wait-Main $p2
 $null = Wait-Until { $script:len2a = Get-FrameLen $main2; ($script:len2a -eq 5) } 15000
 $before2 = $script:len2a
@@ -479,8 +485,27 @@ $dialogs2 = Count-Dialogs $p2.Id
 $alive2 = (-not $p2.HasExited)
 $diag2 = ('p2bExited=' + $p2b.HasExited + ' rivivProcs=' + @(Get-Process riviv -ErrorAction SilentlyContinue).Count + ' title="' + $p2.MainWindowTitle + '"')
 $code2 = Close-Main $p2 $main2
+# Pixel evidence: the dump's center (the fitted 64x64 image's spot) must
+# still carry one of the animation's solid colors; the surrounding
+# letterbox stays white. Any mid-play frame is accepted.
+$keepOk2 = $false
+$keepDetail2 = 'no dump'
+if (Test-Path $S2Dump) {
+    try {
+        $bmp = [Drawing.Bitmap]::FromFile($S2Dump)
+        $cx = [int]($bmp.Width / 2)
+        $cy = [int]($bmp.Height / 2)
+        $c = $bmp.GetPixel($cx, $cy)
+        $bmp.Dispose()
+        foreach ($want in @(@(200, 60, 10), @(10, 60, 200), @(10, 200, 60))) {
+            if (([math]::Abs($c.R - $want[0]) -le 30) -and ([math]::Abs($c.G - $want[1]) -le 30) -and ([math]::Abs($c.B - $want[2]) -le 30)) { $keepOk2 = $true }
+        }
+        $keepDetail2 = ('center=(' + $c.R + ',' + $c.G + ',' + $c.B + ') at ' + $cx + ',' + $cy)
+    } catch { $keepDetail2 = 'exception: ' + $_.Exception.Message }
+}
 Check 'S2a forwarded instance adopted the failed file title (request-time)' ($titleOk2) $diag2
 Check 'S2b old animation display kept (frame counter part still live, len == 5)' ($alive2 -and ($afterLen2 -eq 5)) ('framePartLen=' + $afterLen2 + ' before=' + $before2)
+Check 'S2b2 pixel evidence: the dumped viewport center is one of the animation colors' $keepOk2 $keepDetail2
 Check 'S2c failure verdict visible in the status main part (differential: 0 before, > 0 after)' (($main2pre -eq 0) -and ($mainLen2 -gt 0)) ('mainPartLen pre=' + $main2pre + ' post=' + $mainLen2)
 Check 'S2d no dialog popup owned by the window' ($dialogs2 -eq 0) ('dialogs=' + $dialogs2)
 Check 'S2e WM_CLOSE exit code 0' ($code2 -eq 0) ('code=' + $code2)
@@ -511,9 +536,13 @@ $found3 = Wait-Until { $script:len3 = Get-FrameLen $main3; ($script:len3 -eq 5) 
 $len3 = $script:len3
 $code3 = -9
 if ($riv3 -ne $null) {
-    $h3 = $riv3.Handle
+    # Handle capture guarded: an early-dead process would throw on .Handle
+    # here (external review R3-6) - the scenario must FAIL cleanly, not
+    # abort the script; GetExitCodeProcess is skipped without the handle.
+    $h3 = [IntPtr]::Zero
+    if (-not $riv3.HasExited) { $h3 = $riv3.Handle }
     if ($main3 -ne [IntPtr]::Zero) { [void][S98]::PostMessage($main3, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero) }
-    if ($riv3.WaitForExit(12000)) {
+    if ($riv3.WaitForExit(12000) -and ($h3 -ne [IntPtr]::Zero)) {
         $c3 = 0
         [void][S98]::GetExitCodeProcess($h3, [ref]$c3)
         $code3 = $c3
