@@ -14,6 +14,16 @@
 //! fully loaded" is signaled by the terminal `Complete` reply instead of a
 //! pre-known total; the scheduler treats the loaded-prefix edge as "wait"
 //! until then (see `anim.rs`).
+//!
+//! Scope note on panics (#98 R5 decision, recorded rather than patched):
+//! the image/png crates carry internal `unwrap`/`expect`/`unreachable!`
+//! sites, and the "hostile input fails user-level" contract holds against
+//! them by exhaustive parse-gating today (see the hostile-IHDR test's
+//! class note), NOT by a catch boundary. Wrapping the decode in
+//! `catch_unwind` was considered and declined: it would silently mask
+//! decoder crate bugs as user-level load failures — the opposite of ADR
+//! 0001's fail-loud posture. A dependency regression that panics surfaces
+//! as a stuck load instead, which is visible.
 
 use std::ffi::OsStr;
 use std::io::{BufRead, Cursor, Seek};
@@ -395,12 +405,19 @@ fn decode_reader<R: BufRead + Seek>(
                 .checked_mul(h as usize)
                 .and_then(|px| px.checked_mul(4))
                 .ok_or_else(|| user("canvas exceeds the addressable budget".to_string()))?;
-            // A canvas the animation path cannot afford (four of them inside
-            // the same 512 MB) still fits the static single-canvas path —
-            // degrade there instead of failing the load (external review R2:
-            // pre-#98, upstream GDI+, and every static PNG viewer show such a
-            // file's first frame; failing it would be a reachable regression).
-            if !apng_canvas_fits_animation_budget(per_frame_bytes) {
+            // A file the animation path cannot take still fits the static
+            // single-canvas path — degrade there instead of failing the
+            // load (external review R2/R5: pre-#98, upstream GDI+, and
+            // every static PNG viewer show such a file's first frame;
+            // failing it would be a reachable regression). Two
+            // independent lines: a canvas four buffers cannot afford
+            // (size), and a color depth the animation side cannot decode
+            // at all (16-bit — `.apng()` itself is infallible, the
+            // rejection lands at the first frame pull, after two canvas
+            // allocations).
+            if !apng_color_is_animatable(decoder.color_type())
+                || !apng_canvas_fits_animation_budget(per_frame_bytes)
+            {
                 return sink_static(decoder, shown, env, sink);
             }
             // ApngDecoder implements only AnimationDecoder, so orientation
@@ -433,6 +450,23 @@ fn decode_reader<R: BufRead + Seek>(
             sink,
         ),
     }
+}
+
+/// Whether the image crate's animation side can take this color type:
+/// `ApngDecoder` decodes 8-bit only (16-bit hits `animatable_color_type`'s
+/// Err at the FIRST frame pull — `.apng()` itself is infallible). Over the
+/// line the load degrades to the static path, which decodes 16-bit fine —
+/// pre-#98 riviv and upstream GDI+ display such a file statically, the
+/// same rationale as the canvas fallback (#98 R5: a 16-bit APNG failing
+/// outright was the second member of the regression class R2 named).
+fn apng_color_is_animatable(color: image::ColorType) -> bool {
+    !matches!(
+        color,
+        image::ColorType::L16
+            | image::ColorType::La16
+            | image::ColorType::Rgb16
+            | image::ColorType::Rgba16
+    )
 }
 
 /// Whether an APNG canvas fits the animated path's first-frame wire: the
@@ -2502,12 +2536,14 @@ mod apng_tests {
     }
 
     #[test]
-    fn apng_16bit_animation_fails_user_without_panic() {
-        // The issue's non-goal corner: animated 16-bit PNG. The image
-        // crate's animation side is 8-bit only, so the FIRST frame pull
-        // errors — a clean user-level failure with nothing on screen
-        // (16-bit STATIC PNG still decodes through the unchanged static
-        // path).
+    fn apng_16bit_animation_degrades_to_static() {
+        // The issue's non-goal corner, R5-corrected: animated 16-bit PNG
+        // cannot ANIMATE (the image crate's animation side is 8-bit only),
+        // and since R5 it degrades to the static display of its first
+        // frame instead of failing the load — pre-#98 riviv and upstream
+        // GDI+ display exactly that (the second member of the regression
+        // class R2 named: "displays statically -> fails to open").
+        // 16-bit STATIC PNG itself always decoded through this same path.
         let mut info = png::Info::with_size(4, 4);
         info.color_type = png::ColorType::Rgba;
         info.bit_depth = png::BitDepth::Sixteen;
@@ -2522,12 +2558,18 @@ mod apng_tests {
             writer.finish().expect("finish");
         }
         let replies = decode_all(&out, env());
-        assert_eq!(
-            replies.len(),
-            1,
-            "a single terminal reply — nothing decoded"
-        );
-        assert!(matches!(replies[0], LoadReply::FailedUser(_)));
+        assert_eq!(replies.len(), 2, "static: one frame + Complete");
+        match &replies[0] {
+            LoadReply::FirstFrame { frame, delay_ms } => {
+                assert_eq!(*delay_ms, 0, "a static stream has no successor");
+                assert_eq!(frame.dims(), (4, 4));
+                // 16-bit 0xC700/0x3C00/0x0A00 scales by v*255/65535:
+                // 198.5/59.8/10.0 -> (198,60,10).
+                assert_eq!(rgb_at(frame, 0, 0), (198, 60, 10), "the IDAT frame shows");
+            }
+            other => panic!("expected FirstFrame, got {other:?}"),
+        }
+        assert!(matches!(replies[1], LoadReply::Complete));
     }
 
     // ------------------------------------------------------------------
@@ -2638,6 +2680,13 @@ mod apng_tests {
         // checked_mul gate upstream) reads as not-fitting rather than
         // wrapping around to "fits".
         assert!(!apng_canvas_fits_animation_budget(usize::MAX));
+        // The pixel ceiling is DEPTH-BLIND (external review R5): the
+        // predicate books the RGBA canvas (4 bytes/px) whatever the
+        // source depth, so the animation limit is 2^25 = 33,554,432 px
+        // (~5793^2) for L8 and RGBA8 alike — 2^25*4 is exactly the
+        // quarter, one pixel more is over.
+        assert!(apng_canvas_fits_animation_budget(33_554_432 * 4));
+        assert!(!apng_canvas_fits_animation_budget(33_554_433 * 4));
     }
 
     #[test]
@@ -2833,5 +2882,195 @@ mod apng_tests {
             "the orphaned fdAT must fail the load, got {replies:?}"
         );
         assert!(matches!(replies[0], LoadReply::FirstFrame { .. }));
+    }
+
+    // ------------------------------------------------------------------
+    // #98 external-review round 5: the legs the docs claimed but no test
+    // had walked (blend-Over + alpha, delay-fraction boundaries, eXIf
+    // orientation, static-arm equivalence) and the pixel-ceiling pin.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn blend_over_accumulates_transparent_subframes() {
+        // f0 full-canvas opaque red; f1/f2 a 2x2 half-transparent blue
+        // subframe at (0,0) with blend_op=Over drawn TWICE — the pixel
+        // must ACCUMULATE toward blue (a Source-like replace lands on the
+        // raw blue-over-white composite instead, a dispose bug whites it
+        // out). Characterized against image's integer blend, pinned +-1.
+        let mut out = Vec::new();
+        let mut enc = png::Encoder::with_info(&mut out, png_info(4, 4, None)).expect("with_info");
+        enc.set_animated(3, 0).expect("set_animated");
+        {
+            let mut writer = enc.write_header().expect("write_header");
+            writer.set_frame_delay(1, 10).expect("delay f0");
+            writer
+                .write_image_data(&solid_rgba(4, 4, [200, 60, 10, 255]))
+                .expect("frame 0");
+            for _ in 0..2 {
+                writer.set_blend_op(png::BlendOp::Over).expect("blend");
+                writer.set_frame_dimension(2, 2).expect("dim");
+                writer.set_frame_position(0, 0).expect("pos");
+                writer.set_frame_delay(1, 10).expect("delay");
+                writer
+                    .write_image_data(&solid_rgba(2, 2, [10, 60, 200, 128]))
+                    .expect("subframe");
+            }
+            writer.finish().expect("finish");
+        }
+        let replies = decode_all(&out, env());
+        assert_eq!(replies.len(), 4, "3 frames + Complete");
+        let frame_of = |i: usize| match &replies[i] {
+            LoadReply::FirstFrame { frame, .. } | LoadReply::AdditionalFrame { frame, .. } => frame,
+            other => panic!("expected a frame reply, got {other:?}"),
+        };
+        let f1 = frame_of(1);
+        let (r, g, b) = rgb_at(f1, 0, 0);
+        assert!(
+            (r as i32 - 105).abs() <= 1
+                && (g as i32 - 61).abs() <= 1
+                && (b as i32 - 106).abs() <= 1,
+            "one Over pass over red, got ({r},{g},{b}) — characterized ~(105,61,106); a Source replace would show the blue-over-white composite, a dispose bug whites it out"
+        );
+        assert_eq!(rgb_at(f1, 3, 3), (200, 60, 10), "outside the subframe");
+        let f2 = frame_of(2);
+        let (r, g, b) = rgb_at(f2, 0, 0);
+        assert!(
+            (r as i32 - 57).abs() <= 2 && (g as i32 - 61).abs() <= 1 && (b as i32 - 152).abs() <= 2,
+            "the second Over pass accumulates, got ({r},{g},{b}) — expected ~(57,61,152)"
+        );
+        assert!(r < 104 && b > 105, "monotonic accumulation toward blue");
+    }
+
+    #[test]
+    fn fc_tl_delay_fractions_truncate_and_pass_through() {
+        // The delay-boundary pins (external review R5): 1/3 s truncates
+        // to 333 ms; 1/65535 s truncates to 0 (the scheduler's 1 ms floor
+        // is anim.rs's domain, applied downstream); 65535/1 s = 65.5 s
+        // passes through verbatim — APNG lifts the per-frame ceiling
+        // from GIF's 2550 ms to 65535 s, and the downstream walk was
+        // audited for it (u32-saturating casts in anim.rs, i64 ticks).
+        let mut out = Vec::new();
+        let mut enc = png::Encoder::with_info(&mut out, png_info(4, 4, None)).expect("with_info");
+        enc.set_animated(3, 0).expect("set_animated");
+        {
+            let mut writer = enc.write_header().expect("write_header");
+            for (num, den) in [(1u16, 3u16), (1, 65535), (65535, 1)] {
+                writer.set_frame_delay(num, den).expect("delay");
+                writer
+                    .write_image_data(&solid_rgba(4, 4, [200, 60, 10, 255]))
+                    .expect("frame");
+            }
+            writer.finish().expect("finish");
+        }
+        let replies = decode_all(&out, env());
+        let delays: Vec<u32> = replies
+            .iter()
+            .filter_map(|r| match r {
+                LoadReply::FirstFrame { delay_ms, .. }
+                | LoadReply::AdditionalFrame { delay_ms, .. } => Some(*delay_ms),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(delays, vec![333, 0, 65_535_000]);
+    }
+
+    #[test]
+    fn stream_level_exif_orientation_applies_to_every_frame() {
+        // PNG's orientation rides the trait-default eXIf chain (PngDecoder
+        // implements exif_metadata, not orientation), so a stream-level
+        // eXIf rotates every COMPOSED frame — the animated-format-first
+        // for this leg (GIF carries no eXIf). Orientation 6 (rotate 90
+        // CW) swaps a 4x2 canvas to 2x4 on delivery.
+        let mut info = png::Info::with_size(4, 2);
+        info.color_type = png::ColorType::Rgba;
+        info.bit_depth = png::BitDepth::Eight;
+        // Minimal TIFF: II*, one IFD entry — Orientation (0x0112), SHORT,
+        // value 6.
+        info.exif_metadata = Some(std::borrow::Cow::Borrowed(&[
+            0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00, 0x01, 0x00, 0x12, 0x01, 0x03, 0x00,
+            0x01, 0x00, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ]));
+        let mut out = Vec::new();
+        let mut enc = png::Encoder::with_info(&mut out, info).expect("with_info");
+        enc.set_animated(2, 0).expect("set_animated");
+        {
+            let mut writer = enc.write_header().expect("write_header");
+            for _ in 0..2 {
+                writer.set_frame_delay(1, 10).expect("delay");
+                writer
+                    .write_image_data(&solid_rgba(4, 2, [200, 60, 10, 255]))
+                    .expect("frame");
+            }
+            writer.finish().expect("finish");
+        }
+        let replies = decode_all(&out, env());
+        assert_eq!(replies.len(), 3, "2 frames + Complete");
+        for reply in &replies {
+            match reply {
+                LoadReply::FirstFrame { frame, .. } | LoadReply::AdditionalFrame { frame, .. } => {
+                    assert_eq!(frame.dims(), (2, 4), "every composed frame rotated");
+                }
+                LoadReply::Complete => {}
+                other => panic!("unexpected reply {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn static_png_arm_matches_the_generic_into_decoder_route() {
+        // The static-arm equivalence is a COUPLING contract (external
+        // review R5): this arm hand-replicates what `into_decoder` runs
+        // for PNG — if image ever changes that branch (or this arm
+        // drifts), every static PNG silently diverges while S4's three
+        // A/B fixtures stay green. Same bytes through both constructions,
+        // byte-equal frames: one plain and one ICC-tagged decode.
+        crate::icm::test_fixtures::require_srgb();
+        for icc in [None, Some(crate::icm::test_fixtures::adobe_like_icc())] {
+            let mk_env = || DecodeEnv { icm: true, ..env() };
+            let mut bytes = Vec::new();
+            {
+                let mut enc = image::codecs::png::PngEncoder::new(&mut bytes);
+                if let Some(profile) = icc.clone() {
+                    image::ImageEncoder::set_icc_profile(&mut enc, profile).expect("icc embed");
+                }
+                image::ImageEncoder::write_image(
+                    enc,
+                    &image::RgbaImage::from_pixel(4, 4, image::Rgba([200, 60, 10, 255])),
+                    4,
+                    4,
+                    image::ExtendedColorType::Rgba8,
+                )
+                .expect("in-memory encode");
+            }
+            // Route A: this arm (decode_reader's PNG branch).
+            let mut a = Vec::new();
+            decode_bytes_to_sink(&bytes, mk_env(), &AtomicBool::new(false), None, &mut |r| {
+                a.push(r)
+            });
+            // Route B: the pre-#98 generic arm — into_decoder + sink_static.
+            let reader = ImageReader::new(Cursor::new(&bytes[..]))
+                .with_guessed_format()
+                .expect("guess");
+            assert_eq!(reader.format(), Some(ImageFormat::Png));
+            let decoder = reader.into_decoder().expect("into_decoder");
+            let mut b = Vec::new();
+            let _ = sink_static(decoder, "t", mk_env(), &mut |r| b.push(r));
+            match (&a[0], &b[0]) {
+                (
+                    LoadReply::FirstFrame { frame: fa, .. },
+                    LoadReply::FirstFrame { frame: fb, .. },
+                ) => {
+                    assert_eq!(fa.dims(), fb.dims());
+                    assert_eq!(fa.pixels, fb.pixels, "byte-identical static decode");
+                }
+                _ => panic!("both routes must deliver a first frame"),
+            }
+            // Route A carries the decode_to_sink wrapper's Complete; route
+            // B calls sink_static directly, whose contract stops at the
+            // one-frame stream (the old generic arm got its Complete from
+            // the same wrapper).
+            assert!(matches!(a[1], LoadReply::Complete));
+            assert_eq!(b.len(), 1, "sink_static is one reply by itself");
+        }
     }
 }
