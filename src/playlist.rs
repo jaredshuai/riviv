@@ -360,10 +360,10 @@ fn next_rand(state: &mut u64, modulus: usize) -> usize {
     (value % modulus as u64) as usize
 }
 
-/// The 9 playable extensions (upstream `_viv_association_extensions`,
-/// viv.c:1136-1147) — ASCII, compared case-insensitively.
-const EXTENSIONS: [&str; 9] = [
-    "bmp", "gif", "ico", "jpeg", "jpg", "png", "tif", "tiff", "webp",
+/// The 10 playable extensions. The first nine match upstream
+/// `_viv_association_extensions` (viv.c:1136-1147); `apng` is appended (#108).
+const EXTENSIONS: [&str; 10] = [
+    "bmp", "gif", "ico", "jpeg", "jpg", "png", "tif", "tiff", "webp", "apng",
 ];
 
 /// ASCII case-insensitive equality — upstream's
@@ -855,6 +855,13 @@ mod tests {
         assert!(is_valid_path(OsStr::new("D:\\pics\\photo.PNG")));
         assert!(is_valid_path(OsStr::new("photo.jpeg")));
         assert!(is_valid_path(OsStr::new("a.tar.webp"))); // last dot wins
+    }
+
+    /// `.apng` 是可入播放列表的扩展名，含 ASCII 大写 `.APNG`（#108）。
+    #[test]
+    fn apng_extension_is_a_valid_playlist_path() {
+        assert!(is_valid_path(OsStr::new("photo.apng")));
+        assert!(is_valid_path(OsStr::new("photo.APNG")));
     }
 
     #[test]
