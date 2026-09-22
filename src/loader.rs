@@ -92,6 +92,7 @@ pub(crate) enum LoadReply<F = PixelFrame> {
 
 /// Why the producer stopped early (mapped to terminal replies by
 /// `decode_to_sink`).
+#[derive(Debug)]
 enum Stop {
     /// User-level: keep the message for the FailedUser reply.
     User(String),
@@ -2884,6 +2885,37 @@ mod apng_tests {
         assert!(matches!(replies[0], LoadReply::FirstFrame { .. }));
     }
 
+    #[test]
+    fn fc_tl_sequence_disorder_fails_user() {
+        // The fcTL/fdAT shared sequence chain is a DEPENDENCY contract
+        // (external review R6): png 0.18.1 enforces next == prev+1 with
+        // the first number 0 — a hostile renumbering (here the SECOND
+        // fcTL's seq jumps to 5, CRC recomputed so the chunk is really
+        // parsed) must surface as a clean user-level failure, not a
+        // silent skip or a panic. Upstream-enforced today; this pin
+        // guards against the crate ever relaxing it. (The over-declared
+        // acTL sibling — m stays at the delivered prefix — is pinned by
+        // apng_actl_overdeclaring_frames_fails_mid_stream above.)
+        let base = two_color_apng();
+        let mut seen = 0;
+        let disorder = edit_chunks(&base, |kind, slot| {
+            if kind == b"fcTL" {
+                seen += 1;
+                if seen == 2 {
+                    slot.as_mut().unwrap()[..4].copy_from_slice(&5u32.to_be_bytes());
+                }
+            }
+        });
+        let replies = decode_all(&disorder, env());
+        assert!(
+            replies
+                .iter()
+                .any(|r| matches!(r, LoadReply::FailedUser(_))),
+            "the out-of-order sequence must fail the load, got {replies:?}"
+        );
+        assert!(matches!(replies[0], LoadReply::FirstFrame { .. }));
+    }
+
     // ------------------------------------------------------------------
     // #98 external-review round 5: the legs the docs claimed but no test
     // had walked (blend-Over + alpha, delay-fraction boundaries, eXIf
@@ -3054,7 +3086,7 @@ mod apng_tests {
             assert_eq!(reader.format(), Some(ImageFormat::Png));
             let decoder = reader.into_decoder().expect("into_decoder");
             let mut b = Vec::new();
-            let _ = sink_static(decoder, "t", mk_env(), &mut |r| b.push(r));
+            sink_static(decoder, "t", mk_env(), &mut |r| b.push(r)).expect("route B static decode");
             match (&a[0], &b[0]) {
                 (
                     LoadReply::FirstFrame { frame: fa, .. },
