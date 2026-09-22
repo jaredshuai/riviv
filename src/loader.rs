@@ -386,7 +386,10 @@ fn decode_reader<R: BufRead + Seek>(
             // budget is CUMULATIVE DELIVERED bytes, not the decode-transient
             // peak: the iterator's per-frame returned clone sits outside
             // `Limits` entirely, so the true footprint runs past the gate —
-            // bounded by it at every step, never roughly more than twice.
+            // bounded by it at every step, roughly 2–2.5× near the wire
+            // (delivered frames plus the ungated clone and the transient
+            // stack; the README's number — external review R7 caught the
+            // old "never roughly more than twice" understating it).
             decoder
                 .set_limits(image::Limits::default())
                 .map_err(|e| user(e.to_string()))?;
@@ -510,15 +513,36 @@ fn stream_animation(
     // allocates the frame's full canvas before returning it, so a gate that
     // runs after the pull would let a hostile file overshoot the budget by
     // one canvas (plus the iterator's own compositing canvas) before the
-    // user-level error lands. A file landing exactly on the budget edge is
-    // rejected conservatively (fail the load) — distinguishing it from
-    // "one more frame exists" would require decoding that frame.
+    // user-level error lands. One edge, though (external review R7): when
+    // the gate fires at the CUMULATIVE edge, one confirming pull separates
+    // "the file really has another frame" (fail the load) from "the file
+    // ended exactly on the budget" — a complete in-budget animation (the
+    // exactly-4096-frames file, or a byte-exact multiple of the frame
+    // size) that the conservative reject used to clear off the screen
+    // after its last frame was already displayed. Every end-of-stream
+    // path returns None BEFORE decoding anything (verified in the image
+    // 0.25.10 sources: ApngDecoder checks `remaining == 0` before any
+    // subframe decode, the GIF iterator checks `is_end`/`next_frame_info`
+    // before its buffer work, the WebP iterator checks its frame counter
+    // before allocating), so the confirming pull allocates only when a
+    // frame really exists — the same one-canvas class that frame could
+    // force by existing one frame earlier. A frame that ALONE exceeds the
+    // whole budget still fails without a pull: no arrangement of such a
+    // file ever fit, and pulling would hand the hostile canvas its
+    // allocation first (only GIF/WebP reach that arm — the APNG arm's
+    // constructor gate has already degraded such files to static).
     loop {
         if terminate.load(Ordering::Relaxed) {
             return Err(Stop::Terminated);
         }
-        if emitted >= MAX_FRAMES || total_frame_bytes + per_frame_bytes > MAX_TOTAL_FRAME_BYTES {
+        if per_frame_bytes > MAX_TOTAL_FRAME_BYTES {
             return Err(user("animation exceeds the decode budget".to_string()));
+        }
+        if emitted >= MAX_FRAMES || total_frame_bytes + per_frame_bytes > MAX_TOTAL_FRAME_BYTES {
+            match frames.next() {
+                None => break,
+                Some(_) => return Err(user("animation exceeds the decode budget".to_string())),
+            }
         }
         let Some(frame) = frames.next() else {
             break;
@@ -1933,6 +1957,30 @@ mod stdin_bytes_tests {
         out
     }
 
+    #[test]
+    fn gif_budget_edge_exactly_4096_frames_completes() {
+        // The R7 gate fix lives in the shared stream_animation — pin it
+        // on the GIF arm too: exactly 4096 frames complete where the
+        // pre-fix gate cleared the display after the last one. (The
+        // WebP arm shares the same gate; no cheap WebP animator exists
+        // in the dev-deps, mirroring the rest of the animation net.)
+        let mut out = Vec::new();
+        let palette: &[u8] = &[200, 60, 10, 255, 255, 255];
+        {
+            let mut enc = gif::Encoder::new(&mut out, 4, 4, palette).expect("gif encoder");
+            for _ in 0..4096 {
+                let mut frame = gif::Frame::from_indexed_pixels(4, 4, vec![0u8; 16], None);
+                frame.delay = 1;
+                enc.write_frame(&frame).expect("gif frame");
+            }
+        }
+        let terminate = AtomicBool::new(false);
+        let mut replies = Vec::new();
+        decode_bytes_to_sink(&out, env(), &terminate, None, &mut |r| replies.push(r));
+        assert_eq!(replies.len(), 4097, "4096 frames + Complete");
+        assert!(matches!(replies.last(), Some(LoadReply::Complete)));
+    }
+
     fn first_frame_pixels(bytes: &[u8], icm: bool) -> PixelFrame {
         let terminate = AtomicBool::new(false);
         let mut replies = Vec::new();
@@ -2711,6 +2759,76 @@ mod apng_tests {
         let replies = decode_all(&hostile, env());
         assert_eq!(replies.len(), 1, "a single terminal reply");
         assert!(matches!(replies[0], LoadReply::FailedUser(_)));
+    }
+
+    // ---- in-loop budget gate, cumulative edge (external review R7) ----
+
+    /// n full-canvas solid frames of a w×h RGBA8 APNG, 10 ms each.
+    fn apng_n_frames(w: u32, h: u32, n: u32, px: [u8; 4]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut enc = png::Encoder::with_info(&mut out, png_info(w, h, None)).expect("with_info");
+        enc.set_animated(n, 0).expect("set_animated");
+        {
+            let mut writer = enc.write_header().expect("write_header");
+            let raw = solid_rgba(w, h, px);
+            for _ in 0..n {
+                writer.set_frame_delay(1, 100).expect("delay");
+                writer.write_image_data(&raw).expect("frame");
+            }
+            writer.finish().expect("finish");
+        }
+        out
+    }
+
+    #[test]
+    fn budget_edge_exactly_4096_frames_completes() {
+        // External review R7: the gate used to reject a file landing
+        // exactly ON the frame budget — all 4096 frames delivered, then
+        // FailedUser cleared the display after the last one. The
+        // confirming pull now sees the stream end and completes the load.
+        // (Characterized pre-fix: 4097 replies with tail=FailedUser.)
+        let apng = apng_n_frames(4, 4, 4096, [200, 60, 10, 255]);
+        let replies = decode_all(&apng, env());
+        assert_eq!(replies.len(), 4097, "4096 frames + Complete");
+        assert!(matches!(replies.last(), Some(LoadReply::Complete)));
+    }
+
+    #[test]
+    fn over_budget_4097th_frame_still_fails() {
+        // The other side of the R7 fix: a 4097-frame file really has a
+        // frame past the budget — the confirming pull finds it and the
+        // load still fails user-level, after exactly 4096 delivered
+        // frames (the same reply count as the completing edge; only the
+        // tail differs, so neither test can stand in for the other).
+        let apng = apng_n_frames(4, 4, 4097, [200, 60, 10, 255]);
+        let replies = decode_all(&apng, env());
+        assert_eq!(replies.len(), 4097, "4096 frames + FailedUser");
+        assert!(matches!(replies.last(), Some(LoadReply::FailedUser(_))));
+    }
+
+    #[test]
+    fn budget_edge_byte_exact_multiple_completes() {
+        // The byte leg of the same edge: four 128 MiB frames (8192×4096
+        // RGBA8, exactly the constructor gate's cap/4 line) deliver
+        // exactly the 512 MB budget and the file ends — the delivered
+        // total never exceeded the cap, so the load completes.
+        // (Characterized pre-fix: 5 replies with tail=FailedUser.)
+        let apng = apng_n_frames(8192, 4096, 4, [200, 60, 10, 255]);
+        let replies = decode_all(&apng, env());
+        assert_eq!(replies.len(), 5, "4 frames + Complete");
+        assert!(matches!(replies.last(), Some(LoadReply::Complete)));
+    }
+
+    #[test]
+    fn over_budget_fifth_byte_frame_still_fails() {
+        // A fifth 128 MiB frame really crosses the cap: 4 frames +
+        // FailedUser, the mid-stream budget shape unchanged (the
+        // R7 fix only rescues files that END on the budget, never
+        // files that keep going past it).
+        let apng = apng_n_frames(8192, 4096, 5, [200, 60, 10, 255]);
+        let replies = decode_all(&apng, env());
+        assert_eq!(replies.len(), 5, "4 frames + FailedUser");
+        assert!(matches!(replies.last(), Some(LoadReply::FailedUser(_))));
     }
 
     // ---- acTL/fcTL corner semantics (probe-characterized, 4x4) ----
