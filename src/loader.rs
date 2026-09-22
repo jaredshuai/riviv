@@ -422,6 +422,19 @@ fn decode_reader<R: BufRead + Seek>(
             if !apng_color_is_animatable(decoder.color_type())
                 || !apng_canvas_fits_animation_budget(per_frame_bytes)
             {
+                // Support symmetry with the icc breadcrumb in
+                // prepare_transform: the degradation is silent on screen
+                // by design, but the stderr trace says WHICH of the two
+                // lines fired (external review R7).
+                if !apng_color_is_animatable(decoder.color_type()) {
+                    eprintln!(
+                        "riviv: apng: {shown}: color depth is not animatable - decoding statically"
+                    );
+                } else {
+                    eprintln!(
+                        "riviv: apng: {shown}: canvas over the animation wire - decoding statically"
+                    );
+                }
                 return sink_static(decoder, shown, env, sink);
             }
             // ApngDecoder implements only AnimationDecoder, so orientation
@@ -2736,6 +2749,15 @@ mod apng_tests {
         // quarter, one pixel more is over.
         assert!(apng_canvas_fits_animation_budget(33_554_432 * 4));
         assert!(!apng_canvas_fits_animation_budget(33_554_433 * 4));
+        // The four canvases are reserved against the DECODER's limits,
+        // so the predicate's ceiling only holds while riviv's budget
+        // equals image's default max_alloc — pin the coupling (external
+        // review R7): if either side drifts, this flips here instead of
+        // the predicate silently understating the wire.
+        assert_eq!(
+            image::Limits::default().max_alloc,
+            Some(MAX_TOTAL_FRAME_BYTES as u64)
+        );
     }
 
     #[test]
