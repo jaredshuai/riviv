@@ -467,6 +467,49 @@ Check 'S1c WM_CLOSE exit code 0' ($code1 -eq 0) ('code=' + $code1)
 Kill-Riviv
 
 # ---------------------------------------------------------------------------
+# S1b3 (external review R5): the animation actually ADVANCES over time -
+# the one assertion the frame-counter length channel is structurally blind
+# to ("1 / 3" is 5 chars for every n; a build whose timer never fires
+# passes S1b/S2b/S3b). Two timed WM_CLOSE dumps of the same fixture:
+# ~200 ms lands in frame 0 [0,500), ~1200 ms in frame 2 [1000,1500) -
+# launch overhead only ever ADDS time and both windows keep >=300 ms of
+# margin to their interval edges.
+# ---------------------------------------------------------------------------
+function Timed-Dump($ms, $outName, $errName) {
+    $out = Join-Path $Stage $outName
+    if (Test-Path $out) { Remove-Item $out -Force }
+    Reset-Ini ''
+    $p = Start-Riv ('"' + $Apng + '" -dump-viewport "' + $out + '"') $errName
+    $main = Wait-Main $p
+    $null = Wait-Title $p 'test.apng' 12000
+    Start-Sleep -Milliseconds $ms
+    $code = Close-Main $p $main
+    return @{ Out = $out; Code = $code }
+}
+function Dump-CenterColor($path) {
+    $bmp = [Drawing.Bitmap]::FromFile($path)
+    $c = $bmp.GetPixel([int]($bmp.Width / 2), [int]($bmp.Height / 2))
+    $bmp.Dispose()
+    return $c
+}
+$tA = Timed-Dump 200 's1b3-f0.png' 's1b3-a.err'
+$tB = Timed-Dump 1200 's1b3-f2.png' 's1b3-b.err'
+$advOk = $false
+$advDetail = 'no dumps'
+if ((Test-Path $tA.Out) -and (Test-Path $tB.Out)) {
+    $cA = Dump-CenterColor $tA.Out
+    $cB = Dump-CenterColor $tB.Out
+    $hA = (Get-FileHash $tA.Out -Algorithm SHA256).Hash
+    $hB = (Get-FileHash $tB.Out -Algorithm SHA256).Hash
+    $redHit = ([math]::Abs($cA.R - 200) -le 30) -and ([math]::Abs($cA.G - 60) -le 30) -and ([math]::Abs($cA.B - 10) -le 30)
+    $greenHit = ([math]::Abs($cB.R - 10) -le 30) -and ([math]::Abs($cB.G - 200) -le 30) -and ([math]::Abs($cB.B - 60) -le 30)
+    $advOk = ($tA.Code -eq 0) -and ($tB.Code -eq 0) -and $redHit -and $greenHit -and ($hA -ne $hB)
+    $advDetail = ('f0=(' + $cA.R + ',' + $cA.G + ',' + $cA.B + ') f2=(' + $cB.R + ',' + $cB.G + ',' + $cB.B + ') hashEq=' + ($hA -eq $hB) + ' codes=' + $tA.Code + '/' + $tB.Code)
+} else { $advDetail = 'dumpA=' + (Test-Path $tA.Out) + ' dumpB=' + (Test-Path $tB.Out) }
+Check 'S1b3 animation advances: @200ms dump center is frame-0 red, @1200ms is frame-2 green, hashes differ' $advOk $advDetail
+Kill-Riviv
+
+# ---------------------------------------------------------------------------
 # S2 hostile open over the live animation (second-instance handoff).
 # Instance 1 launches with -dump-viewport so the WM_CLOSE dump becomes
 # PIXEL evidence of the kept display (external review R3-6: the frame
