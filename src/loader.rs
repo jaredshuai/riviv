@@ -269,11 +269,12 @@ fn assemble_frame(
 /// The shared decode dispatch once a format-guessing reader exists —
 /// the single pipeline both the file path (#4) and the `stdin:` bytes
 /// (#65) feed. `shown` prefixes the user-level failure messages (the
-/// path asked to open / the `stdin:` pseudo-name). GIF and WebP are the
-/// only formats whose animation we honor — APNG stays static, matching
-/// upstream where GDI+ exposes no time dimension for it. Animated
-/// formats go through the frame iterators so transparency compositing
-/// and dispose handling are uniform.
+/// path asked to open / the `stdin:` pseudo-name). GIF, WebP and APNG
+/// are the formats whose animation we honor — APNG is an explicit
+/// deviation from upstream (#98: GDI+ exposes no time dimension for
+/// PNG, so upstream never animates it; see README Differences).
+/// Animated formats go through the frame iterators so transparency
+/// compositing and dispose handling are uniform.
 fn decode_reader<R: BufRead + Seek>(
     shown: &str,
     reader: ImageReader<R>,
@@ -298,7 +299,8 @@ fn decode_reader<R: BufRead + Seek>(
             // StreamICM slot.
             let transform = prepare_transform(&mut decoder, &env, shown);
             // GIF frame delays arrive as centiseconds × 10 ms from the image crate;
-            // the zero/absent fallback to 100 ms is upstream behavior (viv.c:10749).
+            // the zero/absent fallback to 100 ms is upstream behavior (viv.c:
+            // 10710-10714 for additional frames, 10740-10744 for the first).
             // Every frame costs a full canvas, so the budget gate knows the per-frame
             // cost up front (decoder dimensions == canvas dimensions).
             let (w, h) = decoder.dimensions();
@@ -334,6 +336,58 @@ fn decode_reader<R: BufRead + Seek>(
             // floors zero to 1 ms instead). Per-frame budget cost as for GIF above.
             let (w, h) = decoder.dimensions();
             let per_frame_bytes = w as usize * h as usize * 4;
+            stream_animation(
+                decoder.into_frames(),
+                |ms| ms,
+                orientation,
+                per_frame_bytes,
+                env,
+                transform.as_ref(),
+                terminate,
+                first_frame_painted,
+                sink,
+            )
+        }
+        Some(ImageFormat::Png) => {
+            // #98: an acTL-bearing PNG animates through the image crate's
+            // ApngDecoder — an explicit upstream deviation (upstream's GDI+
+            // reports one frame for every PNG, viv.c:10544/10565; see README
+            // Differences). The construction mirrors what `into_decoder` ran
+            // for the static case: `with_limits` seeds the png-crate-level
+            // 512 MB chunk budget (set_limits alone cannot reach back into
+            // the png Reader), keeping the static path byte-identical.
+            let mut decoder = image::codecs::png::PngDecoder::with_limits(
+                reader.into_inner(),
+                image::Limits::default(),
+            )
+            .map_err(|e| user(e.to_string()))?;
+            // Image-level limits: ApngDecoder's canvas compositing reserves
+            // its two full-canvas buffers against `inner.limits`, so the
+            // animated path's practical per-canvas cap is half the 512 MB
+            // budget (current + previous live concurrently, GIF/WebP-shaped).
+            decoder
+                .set_limits(image::Limits::default())
+                .map_err(|e| user(e.to_string()))?;
+            if !decoder.is_apng().map_err(|e| user(e.to_string()))? {
+                // Static PNG — including the fcTL-without-acTL corner and the
+                // spec-invalid acTL num_frames=0 (the png crate drops such a
+                // chunk, leaving `is_apng` false): the same sink_static the
+                // generic arm ran, output unchanged.
+                return sink_static(decoder, shown, env, sink);
+            }
+            // ApngDecoder implements only AnimationDecoder, so orientation
+            // and the ICC profile must be taken from the PngDecoder before
+            // `.apng()` consumes it (#77's while-the-decoder-is-alive rule).
+            let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
+            let transform = prepare_transform(&mut decoder, &env, shown);
+            let (w, h) = decoder.dimensions();
+            let per_frame_bytes = w as usize * h as usize * 4;
+            let decoder = decoder.apng().map_err(|e| user(e.to_string()))?;
+            // APNG delays are the fcTL fraction num × 1000 / (den || 100) ms,
+            // already computed by the iterator; zero delays pass through like
+            // upstream's WebP path (viv.c:10289-10313 — no load-time fallback)
+            // and land on the scheduler's 1 ms floor. acTL num_plays is
+            // ignored — every riviv animation loops forever, GIF/WebP alike.
             stream_animation(
                 decoder.into_frames(),
                 |ms| ms,
@@ -398,9 +452,9 @@ fn stream_animation(
         };
         let frame = frame.map_err(|e| user(e.to_string()))?;
         let (numer, denom) = frame.delay().numer_denom_ms();
-        // Both animated formats report whole-millisecond delays (GIF cs × 10,
-        // WebP ms); the division can only ever truncate a fractional value
-        // neither format produces.
+        // GIF reports centiseconds × 10 ms and WebP whole milliseconds;
+        // APNG's fcTL fraction (num × 1000 / den) can carry a
+        // sub-millisecond remainder, which the integer division truncates.
         let delay_ms = normalize_delay(numer / denom.max(1));
         // Orientation applies to every frame (upstream runs
         // _viv_orientate_hbitmap per frame, viv.c:10615-10623).
@@ -1981,5 +2035,418 @@ mod stdin_bytes_tests {
                 | LoadReply::FatalSystem(_) => panic!("expected FailedUser"),
             }
         }
+    }
+}
+
+/// #98's APNG acceptance: the fcTL/acTL wiring end to end through
+/// `decode_bytes_to_sink` (the same sniffing dispatch the file path runs).
+/// Well-formed fixtures come from the png crate's own Encoder (it writes
+/// acTL/fcTL/IDAT/fdAT with `set_animated`, and iCCP through
+/// `Info::icc_profile`); hostile corners are byte surgery on those
+/// streams via [`edit_chunks`], which recomputes CRCs — the png crate
+/// hard-fails a critical-chunk CRC mismatch, so a patched chunk without
+/// a fresh CRC would be rejected for the wrong reason.
+#[cfg(test)]
+mod apng_tests {
+    use super::*;
+
+    fn env() -> DecodeEnv {
+        DecodeEnv {
+            background: [255, 255, 255],
+            icm: false,
+        }
+    }
+
+    fn env_icm(icm: bool) -> DecodeEnv {
+        DecodeEnv { icm, ..env() }
+    }
+
+    /// The pixel at (x, y) of a PixelFrame as (R, G, B).
+    fn rgb_at(frame: &PixelFrame, x: i32, y: i32) -> (u8, u8, u8) {
+        crate::pixels::sample_bgra(&frame.pixels, frame.width as i32, x, y)
+            .unwrap_or_else(|| panic!("sample ({x},{y}) out of bounds"))
+    }
+
+    fn solid_rgba(w: u32, h: u32, pixel: [u8; 4]) -> Vec<u8> {
+        pixel.repeat((w * h) as usize)
+    }
+
+    fn png_info(w: u32, h: u32, icc: Option<&[u8]>) -> png::Info<'static> {
+        let mut info = png::Info::with_size(w, h);
+        info.color_type = png::ColorType::Rgba;
+        info.bit_depth = png::BitDepth::Eight;
+        if let Some(icc) = icc {
+            info.icc_profile = Some(std::borrow::Cow::Owned(icc.to_vec()));
+        }
+        info
+    }
+
+    /// A two-frame 4×4 APNG of full-canvas solid frames with 100/200 ms
+    /// delays (fcTL fractions 1/10 s and 2/10 s), optionally carrying an
+    /// embedded ICC profile through iCCP.
+    fn apng_two_frames(c0: [u8; 4], c1: [u8; 4], icc: Option<&[u8]>) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut enc = png::Encoder::with_info(&mut out, png_info(4, 4, icc)).expect("with_info");
+        enc.set_animated(2, 0).expect("set_animated");
+        {
+            let mut writer = enc.write_header().expect("write_header");
+            writer.set_frame_delay(1, 10).expect("delay f0");
+            writer
+                .write_image_data(&solid_rgba(4, 4, c0))
+                .expect("frame 0");
+            writer.set_frame_delay(2, 10).expect("delay f1");
+            writer
+                .write_image_data(&solid_rgba(4, 4, c1))
+                .expect("frame 1");
+            writer.finish().expect("finish");
+        }
+        out
+    }
+
+    /// Decode `bytes` and collect every reply (the tests' one harness).
+    fn decode_all(bytes: &[u8], env: DecodeEnv) -> Vec<LoadReply> {
+        let terminate = AtomicBool::new(false);
+        let mut replies = Vec::new();
+        decode_bytes_to_sink(bytes, env, &terminate, None, &mut |r| replies.push(r));
+        replies
+    }
+
+    /// The classic two-red-frames fixture: both frames (200,60,10).
+    fn two_red_frames() -> Vec<u8> {
+        apng_two_frames([200, 60, 10, 255], [200, 60, 10, 255], None)
+    }
+
+    #[test]
+    fn apng_streams_two_frames_with_delays_and_colors() {
+        // The happy path: FirstFrame + AdditionalFrame + Complete, the
+        // fcTL delays riding along as milliseconds (1/10 s -> 100,
+        // 2/10 s -> 200), both frames full-canvas 4x4, frame 0 red and
+        // frame 1 blue (the canvas compositing visible as distinct
+        // colors).
+        let apng = apng_two_frames([200, 60, 10, 255], [10, 60, 200, 255], None);
+        let replies = decode_all(&apng, env());
+        assert_eq!(replies.len(), 3, "2 frames + Complete");
+        match &replies[0] {
+            LoadReply::FirstFrame { frame, delay_ms } => {
+                assert_eq!(frame.dims(), (4, 4));
+                assert_eq!(*delay_ms, 100);
+                assert_eq!(rgb_at(frame, 0, 0), (200, 60, 10));
+                assert_eq!(rgb_at(frame, 3, 3), (200, 60, 10));
+            }
+            other => panic!("expected FirstFrame, got {other:?}"),
+        }
+        match &replies[1] {
+            LoadReply::AdditionalFrame { frame, delay_ms } => {
+                assert_eq!(*delay_ms, 200);
+                assert_eq!(rgb_at(frame, 0, 0), (10, 60, 200));
+                assert_eq!(rgb_at(frame, 3, 3), (10, 60, 200));
+            }
+            other => panic!("expected AdditionalFrame, got {other:?}"),
+        }
+        assert!(matches!(replies[2], LoadReply::Complete));
+    }
+
+    #[test]
+    fn apng_dispose_previous_restores_the_region() {
+        // The #2327-shaped regression net: frame 1 is a 2x2 subframe at
+        // (0,0) with dispose previous, frame 2 draws elsewhere — frame
+        // 2's (0,0) must be back to frame 0's red (a full-canvas
+        // "background" dispose would leave it transparent->composite, a
+        // "none" dispose would leave it blue).
+        let mut out = Vec::new();
+        let mut enc = png::Encoder::with_info(&mut out, png_info(4, 4, None)).expect("with_info");
+        enc.set_animated(3, 0).expect("set_animated");
+        {
+            let mut writer = enc.write_header().expect("write_header");
+            let red = [200u8, 60, 10, 255];
+            let blue = [10u8, 60, 200, 255];
+            let green = [10u8, 200, 60, 255];
+            // Frame 0: full-canvas red.
+            writer.set_frame_delay(1, 10).expect("delay f0");
+            writer
+                .write_image_data(&solid_rgba(4, 4, red))
+                .expect("frame 0");
+            // Frame 1: 2x2 blue at (0,0), disposed back afterwards.
+            writer
+                .set_dispose_op(png::DisposeOp::Previous)
+                .expect("disp f1");
+            writer.set_frame_dimension(2, 2).expect("dim f1");
+            writer.set_frame_position(0, 0).expect("pos f1");
+            writer.set_frame_delay(1, 10).expect("delay f1");
+            writer
+                .write_image_data(&solid_rgba(2, 2, blue))
+                .expect("frame 1");
+            // Frame 2: 2x2 green at (1,1), dispose none.
+            writer
+                .set_dispose_op(png::DisposeOp::None)
+                .expect("disp f2");
+            writer.set_frame_dimension(2, 2).expect("dim f2");
+            writer.set_frame_position(1, 1).expect("pos f2");
+            writer.set_frame_delay(1, 10).expect("delay f2");
+            writer
+                .write_image_data(&solid_rgba(2, 2, green))
+                .expect("frame 2");
+            writer.finish().expect("finish");
+        }
+        let replies = decode_all(&out, env());
+        assert_eq!(replies.len(), 4, "3 frames + Complete");
+        let frame_of = |i: usize| match &replies[i] {
+            LoadReply::FirstFrame { frame, .. } | LoadReply::AdditionalFrame { frame, .. } => frame,
+            other => panic!("expected a frame reply, got {other:?}"),
+        };
+        let f1 = frame_of(1);
+        assert_eq!(rgb_at(f1, 0, 0), (10, 60, 200), "the blue subframe drew");
+        assert_eq!(rgb_at(f1, 3, 3), (200, 60, 10), "outside the subframe");
+        let f2 = frame_of(2);
+        assert_eq!(
+            rgb_at(f2, 0, 0),
+            (200, 60, 10),
+            "dispose previous restored frame 1's region to red"
+        );
+        assert_eq!(rgb_at(f2, 1, 1), (10, 200, 60), "the green subframe drew");
+        assert_eq!(rgb_at(f2, 3, 3), (200, 60, 10));
+    }
+
+    #[test]
+    fn every_frame_of_a_tagged_apng_is_transformed() {
+        // #98's per-frame ICM acceptance, mirroring the GIF arm's: ONE
+        // prepared transform applied to EACH composed frame — both frames
+        // are the same (200,60,10) source, so both must land on the
+        // characterized mscms output (239,57,0) +-2.
+        crate::icm::test_fixtures::require_srgb();
+        let icc = crate::icm::test_fixtures::adobe_like_icc();
+        let apng = apng_two_frames([200, 60, 10, 255], [200, 60, 10, 255], Some(&icc));
+        let replies = decode_all(&apng, env_icm(true));
+        let mut colors = Vec::new();
+        for reply in &replies {
+            match reply {
+                LoadReply::FirstFrame { frame, .. } | LoadReply::AdditionalFrame { frame, .. } => {
+                    colors.push(rgb_at(frame, 0, 0))
+                }
+                LoadReply::Complete => {}
+                other => panic!("unexpected reply {other:?}"),
+            }
+        }
+        assert_eq!(colors.len(), 2);
+        for (r, g, b) in colors {
+            assert!(
+                (r as i32 - 239).abs() <= 2 && (g as i32 - 57).abs() <= 2 && b <= 2,
+                "every frame lands on the transformed color, got ({r},{g},{b})"
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Hostile/boundary fixtures: byte surgery on encoder-produced streams.
+    // ------------------------------------------------------------------
+
+    /// PNG CRC-32 (reflected 0xEDB88320) over the chunk's type+data.
+    fn crc32(data: &[u8]) -> u32 {
+        let mut crc = !0u32;
+        for &byte in data {
+            crc ^= u32::from(byte);
+            for _ in 0..8 {
+                crc = if crc & 1 != 0 {
+                    (crc >> 1) ^ 0xEDB8_8320
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        !crc
+    }
+
+    /// Rebuild a PNG stream chunk by chunk: `edit` sees each chunk's
+    /// (type, data) and may drop it (setting the slot to None) or replace
+    /// its data; every surviving chunk is re-CRC'd. Partial trailing
+    /// chunks (a truncated tail) are dropped.
+    fn edit_chunks(png: &[u8], mut edit: impl FnMut(&[u8; 4], &mut Option<Vec<u8>>)) -> Vec<u8> {
+        assert!(
+            png.starts_with(&[0x89, b'P', b'N', b'G']),
+            "not a PNG stream"
+        );
+        let mut out = Vec::with_capacity(png.len());
+        out.extend_from_slice(&png[..8]);
+        let mut pos = 8;
+        while pos + 12 <= png.len() {
+            let len = u32::from_be_bytes(png[pos..pos + 4].try_into().unwrap()) as usize;
+            if pos + 12 + len > png.len() {
+                break; // truncated tail — drop the partial chunk
+            }
+            let kind: [u8; 4] = png[pos + 4..pos + 8].try_into().unwrap();
+            let mut slot = Some(png[pos + 8..pos + 8 + len].to_vec());
+            edit(&kind, &mut slot);
+            if let Some(data) = slot {
+                out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+                out.extend_from_slice(&kind);
+                out.extend_from_slice(&data);
+                let mut crc_input = kind.to_vec();
+                crc_input.extend_from_slice(&data);
+                out.extend_from_slice(&crc32(&crc_input).to_be_bytes());
+            }
+            pos += 12 + len;
+        }
+        out
+    }
+
+    /// Drop the acTL chunk — leaving the fcTLs — from a two-frame APNG.
+    fn without_actl(png: &[u8]) -> Vec<u8> {
+        edit_chunks(png, |kind, slot| {
+            if kind == b"acTL" {
+                *slot = None;
+            }
+        })
+    }
+
+    /// Rewrite the acTL chunk's first data field (num_frames, BE u32).
+    fn with_actl_num_frames(png: &[u8], num_frames: u32) -> Vec<u8> {
+        edit_chunks(png, |kind, slot| {
+            if kind == b"acTL" {
+                let data = slot.as_mut().unwrap();
+                data[..4].copy_from_slice(&num_frames.to_be_bytes());
+            }
+        })
+    }
+
+    /// Blow up the FIRST fcTL's width (data bytes 4..8) beyond the IHDR
+    /// canvas — a hostile subframe bound, caught by the png crate's
+    /// parse-time validate() before any frame decodes.
+    fn with_hostile_first_fctl(png: &[u8]) -> Vec<u8> {
+        let mut seen = 0;
+        edit_chunks(png, |kind, slot| {
+            if kind == b"fcTL" {
+                seen += 1;
+                if seen == 1 {
+                    let data = slot.as_mut().unwrap();
+                    data[4..8].copy_from_slice(&9999u32.to_be_bytes());
+                }
+            }
+        })
+    }
+
+    /// Truncate inside the LAST data chunk before IEND (cut `cut` bytes
+    /// off the stream's tail) — mid-frame-data EOF.
+    fn truncated(png: &[u8], cut: usize) -> Vec<u8> {
+        let mut out = png.to_vec();
+        let new_len = out.len().saturating_sub(cut);
+        out.truncate(new_len);
+        out
+    }
+
+    #[test]
+    fn apng_without_actl_decodes_static_ignoring_fctl() {
+        // The is_apng boundary: fcTL chunks present but no acTL -> the
+        // file is a still PNG (animation control defines animation, not
+        // frame controls); the IDAT decodes through the static path with
+        // delay 0 and exactly one frame — byte-for-byte the pre-#98
+        // behavior for such a file.
+        let apng = apng_two_frames([200, 60, 10, 255], [10, 60, 200, 255], None);
+        let still = without_actl(&apng);
+        let replies = decode_all(&still, env());
+        assert_eq!(replies.len(), 2, "one frame + Complete");
+        match &replies[0] {
+            LoadReply::FirstFrame { frame, delay_ms } => {
+                assert_eq!(*delay_ms, 0, "a static stream has no successor");
+                assert_eq!(frame.dims(), (4, 4));
+                assert_eq!(
+                    rgb_at(frame, 0, 0),
+                    (200, 60, 10),
+                    "the IDAT (default image) shows"
+                );
+            }
+            other => panic!("expected FirstFrame, got {other:?}"),
+        }
+        assert!(matches!(replies[1], LoadReply::Complete));
+    }
+
+    #[test]
+    fn apng_actl_zero_frames_degrades_to_static() {
+        // acTL num_frames=0 is invalid per the APNG spec; the png crate
+        // silently drops such a chunk, so `is_apng` reports false and the
+        // file degrades to the static path rather than failing the load.
+        let apng = two_red_frames();
+        let still = with_actl_num_frames(&apng, 0);
+        let replies = decode_all(&still, env());
+        assert_eq!(replies.len(), 2, "static: one frame + Complete");
+        assert!(matches!(replies[1], LoadReply::Complete));
+        assert!(
+            replies
+                .iter()
+                .all(|r| !matches!(r, LoadReply::FailedUser(_))),
+            "no failure: the invalid chunk is dropped, not punished"
+        );
+    }
+
+    #[test]
+    fn apng_actl_overdeclaring_frames_fails_mid_stream() {
+        // acTL num_frames=3 over a two-frame stream: both real frames
+        // decode, then the third pull hits end-of-stream — the shared
+        // mid-stream failure shape (frames already delivered, then
+        // FailedUser; never Complete).
+        let apng = two_red_frames();
+        let lying = with_actl_num_frames(&apng, 3);
+        let replies = decode_all(&lying, env());
+        assert_eq!(replies.len(), 3, "2 frames + FailedUser");
+        assert!(matches!(replies[0], LoadReply::FirstFrame { .. }));
+        assert!(matches!(replies[1], LoadReply::AdditionalFrame { .. }));
+        assert!(matches!(replies[2], LoadReply::FailedUser(_)));
+    }
+
+    #[test]
+    fn apng_hostile_fctl_bounds_fail_user_before_any_frame() {
+        // A hostile fcTL (subframe bounds beyond the IHDR canvas) is
+        // rejected by the png crate's parse-time validate() — the decoder
+        // construction itself fails, so the failure lands BEFORE any
+        // frame: one FailedUser, no FirstFrame, no panic.
+        let apng = two_red_frames();
+        let hostile = with_hostile_first_fctl(&apng);
+        let replies = decode_all(&hostile, env());
+        assert_eq!(replies.len(), 1, "a single terminal reply");
+        assert!(matches!(replies[0], LoadReply::FailedUser(_)));
+    }
+
+    #[test]
+    fn apng_truncated_mid_frame_fails_user_mid_stream() {
+        // A stream cut inside the frame data: frame 0 decodes and is
+        // delivered, then the EOF surfaces as a user-level failure.
+        let apng = two_red_frames();
+        let cut = truncated(&apng, 30);
+        let replies = decode_all(&cut, env());
+        assert!(
+            replies
+                .iter()
+                .any(|r| matches!(r, LoadReply::FailedUser(_))),
+            "the truncated stream must fail user-level, got {replies:?}"
+        );
+        assert!(matches!(replies[0], LoadReply::FirstFrame { .. }));
+    }
+
+    #[test]
+    fn apng_16bit_animation_fails_user_without_panic() {
+        // The issue's non-goal corner: animated 16-bit PNG. The image
+        // crate's animation side is 8-bit only, so the FIRST frame pull
+        // errors — a clean user-level failure with nothing on screen
+        // (16-bit STATIC PNG still decodes through the unchanged static
+        // path).
+        let mut info = png::Info::with_size(4, 4);
+        info.color_type = png::ColorType::Rgba;
+        info.bit_depth = png::BitDepth::Sixteen;
+        let mut out = Vec::new();
+        let mut enc = png::Encoder::with_info(&mut out, info).expect("with_info");
+        enc.set_animated(2, 0).expect("set_animated");
+        {
+            let mut writer = enc.write_header().expect("write_header");
+            let px16 = [0xC7u8, 0x00, 0x3C, 0x00, 0x0A, 0x00, 0xFF, 0xFF];
+            writer.write_image_data(&px16.repeat(16)).expect("frame 0");
+            writer.write_image_data(&px16.repeat(16)).expect("frame 1");
+            writer.finish().expect("finish");
+        }
+        let replies = decode_all(&out, env());
+        assert_eq!(
+            replies.len(),
+            1,
+            "a single terminal reply — nothing decoded"
+        );
+        assert!(matches!(replies[0], LoadReply::FailedUser(_)));
     }
 }
