@@ -178,6 +178,54 @@ public class S98 {
         File.WriteAllBytes(path, ms.ToArray());
     }
 
+    /// A static PNG carrying an iCCP profile (the #77 adobe-like fixture
+    /// as base64, zlib per the smoke81 recipe) - the ICM-path A/B pair
+    /// (external review R2-4: the plain pair alone leaves prepare_transform
+    /// uncovered).
+    public static void WriteStaticPngIccp(string path, int w, int h, string iccB64) {
+        byte[] icc = Convert.FromBase64String(iccB64);
+        MemoryStream ms = new MemoryStream();
+        byte[] sig = { 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A };
+        ms.Write(sig, 0, 8);
+        byte[] ihdr = new byte[13];
+        PutBe32(ihdr, 0, (uint)w); PutBe32(ihdr, 4, (uint)h);
+        ihdr[8] = 8; ihdr[9] = 6;
+        Chunk(ms, "IHDR", ihdr);
+        byte[] kw = Encoding.ASCII.GetBytes("ICC profile");
+        byte[] head = new byte[kw.Length + 2];
+        kw.CopyTo(head, 0); head[kw.Length] = 0; head[kw.Length + 1] = 0;
+        byte[] z = Zlib(icc);
+        byte[] iccp = new byte[head.Length + z.Length];
+        head.CopyTo(iccp, 0); z.CopyTo(iccp, head.Length);
+        Chunk(ms, "iCCP", iccp);
+        Chunk(ms, "IDAT", Zlib(Scanlines(w, h, Solid(w, h, 200, 60, 10))));
+        Chunk(ms, "IEND", new byte[0]);
+        File.WriteAllBytes(path, ms.ToArray());
+    }
+
+    /// A palette + tRNS static PNG (2 entries: 50%-transparent red and
+    /// opaque blue, 8px checkerboard) - the alpha-composite + shrink-tier
+    /// A/B pair (external review R2-4; 1200x1200 in the pinned 800x600
+    /// window makes the fit a real shrink through the filter table).
+    public static void WritePltePng(string path, int w, int h) {
+        MemoryStream ms = new MemoryStream();
+        byte[] sig = { 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A };
+        ms.Write(sig, 0, 8);
+        byte[] ihdr = new byte[13];
+        PutBe32(ihdr, 0, (uint)w); PutBe32(ihdr, 4, (uint)h);
+        ihdr[8] = 8; ihdr[9] = 3; // palette
+        Chunk(ms, "IHDR", ihdr);
+        Chunk(ms, "PLTE", new byte[] { 200, 60, 10, 10, 60, 200 });
+        Chunk(ms, "tRNS", new byte[] { 128, 255 });
+        byte[] idx = new byte[w * h];
+        for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) idx[y * w + x] = (byte)((((x / 8) + (y / 8)) % 2));
+        byte[] raw = new byte[h * (1 + w)];
+        for (int y = 0; y < h; y++) { raw[y * (1 + w)] = 0; Array.Copy(idx, y * w, raw, y * (1 + w) + 1, w); }
+        Chunk(ms, "IDAT", Zlib(raw));
+        Chunk(ms, "IEND", new byte[0]);
+        File.WriteAllBytes(path, ms.ToArray());
+    }
+
     /// Patch the FIRST fcTL's width (data offset 4) beyond the canvas and
     /// re-CRC the chunk - hostile subframe bounds, caught at png parse
     /// time (before any frame decodes, keeping the old display).
@@ -245,7 +293,7 @@ $ParitySrc = Join-Path $env:TEMP 'riviv-98-parity\riviv-master.exe'
 $ParityExe = Join-Path $Stage 'riviv-master.exe'
 $parityReady = Test-Path $ParitySrc
 if ($parityReady) { Copy-Item $ParitySrc $ParityExe -Force }
-if (-not $parityReady) { Skip-Scenario 'S4 static PNG A/B (all)' ('master parity exe missing: ' + $ParitySrc) }
+$script:gateIncomplete = $false   # set by S4 when its REQUIRED parity arm is missing
 
 function Reset-Ini($text) {
     if (Test-Path $Ini) { Remove-Item $Ini -Force }
@@ -446,11 +494,16 @@ $errPath3 = Join-Path $Stage 's3.err'
 if (Test-Path $errPath3) { Remove-Item $errPath3 -Force }
 # cmd type pumps raw bytes (PS piping would re-encode); #65's recipe.
 $null = Start-Process -FilePath 'cmd.exe' -ArgumentList ('/c', ('type "' + $Apng + '" | "' + $RunExe + '" stdin:')) -PassThru -WindowStyle Hidden
+# Target by EXE PATH, never by name: riviv is the developer's daily
+# viewer, and @(Get-Process riviv)[0] would happily WM_CLOSE a real
+# browsing window (external review R2-5). Exactly one staged instance
+# must exist - a developer instance is ignored, two staged ones fail.
+$null = Wait-Until { $script:r3 = @(Get-Process riviv -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $RunExe }); ($script:r3.Count -eq 1) } 15000
 $riv3 = $null
-$null = Wait-Until { $script:r3 = @(Get-Process riviv -ErrorAction SilentlyContinue)[0]; ($script:r3 -ne $null) } 15000
-$riv3 = @(Get-Process riviv -ErrorAction SilentlyContinue)[0]
+if ($script:r3 -ne $null -and $script:r3.Count -eq 1) { $riv3 = $script:r3[0] }
 $main3 = [IntPtr]::Zero
 if ($riv3 -ne $null) { $main3 = Wait-Main $riv3 }
+$devInstances = @(Get-Process riviv -ErrorAction SilentlyContinue | Where-Object { $_.Path -ne $RunExe }).Count
 $titleOk3 = $false
 if ($riv3 -ne $null) { $titleOk3 = Wait-Title $riv3 'stdin' 12000 }
 # "n / 3" is exactly 5 chars (see S1b's channel note).
@@ -466,22 +519,34 @@ if ($riv3 -ne $null) {
         $code3 = $c3
     } else { Stop-Process -Id $riv3.Id -Force -ErrorAction SilentlyContinue; $code3 = -1 }
 }
-Check 'S3a stdin: pipe launches its own window with the stdin title' (($riv3 -ne $null) -and ($main3 -ne [IntPtr]::Zero) -and $titleOk3) ('riv=' + $(if ($riv3) { 'yes' } else { 'no' }) + ' main=' + $main3 + ' title=' + $(if ($riv3) { $riv3.MainWindowTitle } else { '' }))
+Check 'S3a stdin: pipe launches exactly one staged window with the stdin title' (($riv3 -ne $null) -and ($main3 -ne [IntPtr]::Zero) -and $titleOk3) ('staged=' + $(if ($riv3) { '1' } else { '0' }) + ' main=' + $main3 + ' title=' + $(if ($riv3) { $riv3.MainWindowTitle } else { '' }) + ' devInstancesIgnored=' + $devInstances)
 Check 'S3b stdin: animation decoded (frame counter part len == 5)' ($found3 -and ($len3 -eq 5)) ('framePartLen=' + $len3)
 Check 'S3c stdin: WM_CLOSE exit code 0' ($code3 -eq 0) ('code=' + $code3)
 Kill-Riviv
 
 # ---------------------------------------------------------------------------
-# S4 static PNG A/B dump byte equality (branch vs master parity exe)
+# S4 static PNG A/B dump byte equality (branch vs master parity exe).
+# REQUIRED gate (external review R2-3): a missing parity exe is NOT a
+# silent skip - the run exits 2 with the stage kept.
+# Three pairs (external review R2-4: the plain pair alone left the arm
+# migration's risk faces uncovered): (a) plain RGBA 1:1; (b) iCCP-bearing
+# PNG under icm=1 - the prepare_transform path; (c) palette+tRNS 1200x1200
+# - the alpha composite AND a real shrink through the filter table.
 # ---------------------------------------------------------------------------
+$IccB64 = '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'
 if ($parityReady) {
+    $StillIcc = Join-Path $Stage 'still-icc98.png'
+    [S98]::WriteStaticPngIccp($StillIcc, 64, 64, $IccB64)
+    $Plte = Join-Path $Stage 'plte98.png'
+    [S98]::WritePltePng($Plte, 1200, 1200)
+
     # Pinned rect so both runs letterbox identically; identical ini text
     # re-staged before each launch (WM_CLOSE writes the ini back).
-    $iniText = "[riviv]`r`nx=40`r`ny=40`r`nwide=800`r`nhigh=600`r`nauto_zoom=0`r`nicm=0`r`n"
-    $outA = Join-Path $Stage 's4-master.png'
-    $outB = Join-Path $Stage 's4-branch.png'
+    $rectIni = "x=40`r`ny=40`r`nwide=800`r`nhigh=600`r`nauto_zoom=0`r`n"
+    $iniPlain = "[riviv]`r`n" + $rectIni + "icm=0`r`n"
+    $iniIcm = "[riviv]`r`n" + $rectIni + "icm=1`r`n"
 
-    function Run-Dump($exePath, $img, $out, $errName) {
+    function Run-Dump($exePath, $img, $out, $errName, $iniText) {
         Reset-Ini $iniText
         if (Test-Path $out) { Remove-Item $out -Force }
         $errPath = Join-Path $Stage $errName
@@ -503,17 +568,26 @@ if ($parityReady) {
         }
         return @{ Out = $out; Code = $cc; Main = $mm }
     }
-    $rA = Run-Dump $ParityExe $Still $outA 's4-master.err'
-    $rB = Run-Dump $RunExe $Still $outB 's4-branch.err'
-    $hashA = $null; $hashB = $null
-    if ((Test-Path $outA) -and (Test-Path $outB)) {
-        $hashA = (Get-FileHash $outA -Algorithm SHA256).Hash
-        $hashB = (Get-FileHash $outB -Algorithm SHA256).Hash
+    function Compare-Pair($name, $img, $iniText) {
+        $outA = Join-Path $Stage ($name + '-master.png')
+        $outB = Join-Path $Stage ($name + '-branch.png')
+        $rA = Run-Dump $ParityExe $img $outA ($name + '-master.err') $iniText
+        $rB = Run-Dump $RunExe $img $outB ($name + '-branch.err') $iniText
+        $hashA = $null; $hashB = $null
+        if ((Test-Path $outA) -and (Test-Path $outB)) {
+            $hashA = (Get-FileHash $outA -Algorithm SHA256).Hash
+            $hashB = (Get-FileHash $outB -Algorithm SHA256).Hash
+        }
+        Check ('S4 ' + $name + ': both dumps exist, exit 0, byte-identical branch == master parity') ((Test-Path $outA) -and (Test-Path $outB) -and ($rA.Code -eq 0) -and ($rB.Code -eq 0) -and ($hashA -eq $hashB)) ('a=' + (Test-Path $outA) + '/' + $rA.Code + ' b=' + (Test-Path $outB) + '/' + $rB.Code + ' hashEq=' + ($hashA -eq $hashB))
     }
-    Check 'S4a both A/B dumps exist and exited 0' ((Test-Path $outA) -and (Test-Path $outB) -and ($rA.Code -eq 0) -and ($rB.Code -eq 0)) ('a=' + (Test-Path $outA) + '/' + $rA.Code + ' b=' + (Test-Path $outB) + '/' + $rB.Code)
-    Check 'S4b static PNG dump byte-identical: branch == master parity' (($hashA -ne $null) -and ($hashA -eq $hashB)) ('hashA=' + $hashA + ' hashB=' + $hashB)
+    Compare-Pair 's4a-plain' $Still $iniPlain
+    Compare-Pair 's4b-icc' $StillIcc $iniIcm
+    Compare-Pair 's4c-plte-shrink' $Plte $iniPlain
     Reset-Ini ''
     Kill-Riviv
+} else {
+    $script:gateIncomplete = $true
+    Skip-Scenario 'S4 static A/B (all three pairs)' ('REQUIRED gate: master parity exe missing at ' + $ParitySrc + ' - build it (git worktree add <tmp> 60c9f0f; cargo build --release inside; copy the exe) and rerun; exiting 2')
 }
 
 # ---------------------------------------------------------------------------
@@ -524,11 +598,13 @@ if ($parityReady) {
 # ---------------------------------------------------------------------------
 Reset-Ini ''
 $iniCleaned = -not (Test-Path $Ini)
-$leftover = @(Get-Process riviv -ErrorAction SilentlyContinue)
+# Leftover STAGED instances are a failure; the developer's own riviv
+# windows (a different exe path) are exempt - same targeting rule as S3.
+$leftover = @(Get-Process riviv -ErrorAction SilentlyContinue | Where-Object { ($_.Path -eq $RunExe) -or ($_.Path -eq $ParityExe) })
 $leftoverNames = ($leftover | ForEach-Object { $_.Id }) -join ','
 if ($leftover) { $leftover | Stop-Process -Force }
-Check 'S9 teardown: stage ini cleaned, no riviv left' ($iniCleaned -and ($leftover.Count -eq 0)) ('ini exists: ' + (Test-Path $Ini) + ' leftoverPids: [' + $leftoverNames + ']')
-Write-Output ('RESULT: pass=' + $script:pass + ' fail=' + $script:fail + ' skip=' + $script:skip)
-if ($script:fail -eq 0) { Remove-Item -Recurse -Force $Stage -ErrorAction SilentlyContinue }
-else { Write-Output ('FAILURES: evidence kept in ' + $Stage) }
-if ($script:fail -gt 0) { exit 1 }
+Check 'S9 teardown: stage ini cleaned, no staged riviv left' ($iniCleaned -and ($leftover.Count -eq 0)) ('ini exists: ' + (Test-Path $Ini) + ' leftoverPids: [' + $leftoverNames + ']')
+Write-Output ('RESULT: pass=' + $script:pass + ' fail=' + $script:fail + ' skip=' + $script:skip + ' gateIncomplete=' + $script:gateIncomplete)
+if ($script:fail -gt 0) { Write-Output ('FAILURES: evidence kept in ' + $Stage); exit 1 }
+if ($script:gateIncomplete) { Write-Output ('GATE INCOMPLETE: evidence kept in ' + $Stage); exit 2 }
+Remove-Item -Recurse -Force $Stage -ErrorAction SilentlyContinue
