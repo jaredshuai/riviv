@@ -394,12 +394,16 @@ function Get-ChunkKinds($path) {
     $seqs = @()
     $pos = 8
     while ($pos + 12 -le $b.Length) {
-        $len = ($b[$pos] -shl 24) -bor ($b[$pos+1] -shl 16) -bor ($b[$pos+2] -shl 8) -bor $b[$pos+3]
+        # [int] casts on every shift operand: PS byte-typed -shl wraps
+        # back to a byte (the R4 S0c trap) - today's chunks are all
+        # under 256 bytes so the truncation is latent, but a hardened
+        # fixture would desync the walk (external review R7).
+        $len = ([int]$b[$pos] -shl 24) -bor ([int]$b[$pos+1] -shl 16) -bor ([int]$b[$pos+2] -shl 8) -bor [int]$b[$pos+3]
         if ($pos + 12 + $len -gt $b.Length) { break }
         $kind = [Text.Encoding]::ASCII.GetString($b, $pos + 4, 4)
         $kinds += $kind
         if (($kind -eq 'fcTL') -or ($kind -eq 'fdAT')) {
-            $seq = ($b[$pos+8] -shl 24) -bor ($b[$pos+9] -shl 16) -bor ($b[$pos+10] -shl 8) -bor $b[$pos+11]
+            $seq = ([int]$b[$pos+8] -shl 24) -bor ([int]$b[$pos+9] -shl 16) -bor ([int]$b[$pos+10] -shl 8) -bor [int]$b[$pos+11]
             $seqs += $seq
         }
         $pos += 12 + $len
@@ -431,7 +435,7 @@ function Get-FirstFctlWidth($path) {
     $b = [IO.File]::ReadAllBytes($path)
     $pos = 8
     while ($pos + 12 -le $b.Length) {
-        $len = ($b[$pos] -shl 24) -bor ($b[$pos+1] -shl 16) -bor ($b[$pos+2] -shl 8) -bor $b[$pos+3]
+        $len = ([int]$b[$pos] -shl 24) -bor ([int]$b[$pos+1] -shl 16) -bor ([int]$b[$pos+2] -shl 8) -bor [int]$b[$pos+3]
         if ($pos + 12 + $len -gt $b.Length) { break }
         $kind = [Text.Encoding]::ASCII.GetString($b, $pos + 4, 4)
         if ($kind -eq 'fcTL') {
