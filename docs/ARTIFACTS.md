@@ -1,4 +1,4 @@
-<!-- lazypack:start block=artifacts-register src=DECISIONS.md@0.3.0 gen=bfce1f5fd317b6a0 input=a4942594f8f48dc9 fp=12a43eb981b27a30 -->
+<!-- lazypack:start block=artifacts-register src=DECISIONS.md@0.3.0 gen=bfce1f5fd317b6a0 input=a4942594f8f48dc9 fp=3c27e06bf86347b5 -->
 # 产物登记册 (ARTIFACTS)
 
 > 派生自 lazypack-discipline 固定层 DECISIONS.md@0.3.0（依据 lazypack-setup 内置快照编译，来源内容标识: 1c78a216d27b82666c9724701f858f2bafe2b10d；离线事实源查阅 lazypack-setup/references/DECISIONS.md）§4。
@@ -23,19 +23,8 @@
 | 产物相对路径 | 类别 | 状态 | 来源/对应票/ADR | 说明 |
 |---|---|---|---|---|
 | docs/agents/issue-tracker.md | 任务跟踪 | current | 外部前置(Matt 约定) | GitHub Issues + gh CLI 约定;前置双检通过(有实质正文) |
-| RELEASE.md | 发版规范 | current | lazypack 固定层 §5 | 块内固定发版纪律;块外=项目层打包/标签现状(4 段式标签,未裁决) |
+| RELEASE.md | 发版规范 | current | lazypack 固定层 §5 | 块内固定发版纪律;块外=项目层打包与版本方案(SemVer/首发 v0.1.0,2026-09-23 裁定) |
 | docs/agents/roles.md | 角色映射 | current | lazypack 固定层 §3 | 六角色防撞车边界+Skill 映射+留存策略 ideas-pool |
-| docs/overview.md | 现状与使用说明 | current | 书记员/架构变化时 | 项目总览与「给图→上屏」流程(#111 起) |
-| CONTEXT.md | 规则与术语 | current | 规划者/术语或决策变化时 | 单一上下文领域文档(docs/agents/domain.md 约定) |
-| docs/adr/0001-fail-loud.md | 设计与决策 | current | 规划者/错误处理策略变化时 | ADR:系统级失败显式直报 |
-| docs/adr/0002-d2d-wcs-render-stack.md | 设计与决策 | current | 规划者/渲染栈变化时 | ADR:D2D/WCS 渲染栈(M6 基石) |
-| docs/spikes/s1-platform-floor.md | 验证与观察 | current | 调查者/平台地板再评估时 | min-OS 钉死 1607 的导入表证据(#97) |
-| docs/spikes/s-svg.md | 验证与观察 | current | 调查者/SVG 复议时 | SVG=resvg-full 体积推迟结论(#97) |
-| docs/spikes/s-avif.md | 验证与观察 | current | 调查者/M8 启动时 | AVIF 三路线推迟 M8 结论(#97) |
-| docs/agents/triage-labels.md | 规则与术语 | current | 规划者/标签词汇变化时 | 五标签分诊词汇 |
-| docs/agents/domain.md | 规则与术语 | current | 规划者/文档架构变化时 | 单上下文+ADR 约定 |
-| docs/plan-26-association-nsis.md | 需求与验收 | reference | 书记员/历史留档 | #26 安装族历史规格;特性已交付,原位保留 |
-| docs/ideas/inbox.md | 来源材料 | exploration | 规划者/新想法产生时 | 碎片想法池(非现行基准) |
 <!-- lazypack:end block=artifacts-register -->
 
 ## 3. 项目自选材料与存量文档登记（非受管协作区）
@@ -48,3 +37,15 @@
 <!-- 示例：| specs/pay-v2.md | 需求与验收 | current | 规划者 / 支付网关变更时 | 现行支付网关重构规格；supersedes specs/pay-v1.md | -->
 <!-- 示例：| specs/pay-v1.md | 需求与验收 | superseded | 规划者 / 历史保留 | 初版支付规格；superseded by specs/pay-v2.md；原位保留 | -->
 <!-- 示例：| docs/ideas/inbox.md | 来源材料 | exploration | 团队与规划者 / 讨论产生新想法时 | 规划研讨碎片想法池，非现行基准 | -->
+| docs/overview.md | 现状与使用说明 | current | 书记员/架构变化时 | 项目总览与「给图→上屏」流程(#111 起) |
+| CONTEXT.md | 规则与术语 | current | 规划者/术语或决策变化时 | 单一上下文领域文档(docs/agents/domain.md 约定) |
+| docs/adr/0001-fail-loud.md | 设计与决策 | current | 规划者/错误处理策略变化时 | ADR:系统级失败显式直报 |
+| docs/adr/0002-d2d-wcs-render-stack.md | 设计与决策 | current | 规划者/渲染栈变化时 | ADR:D2D/WCS 渲染栈(M6 基石) |
+| docs/spikes/s1-platform-floor.md | 验证与观察 | current | 调查者/平台地板再评估时 | min-OS 钉死 1607 的导入表证据(#97) |
+| docs/spikes/s-svg.md | 验证与观察 | current | 调查者/SVG 复议时 | SVG=resvg-full 体积推迟结论(#97) |
+| docs/spikes/s-avif.md | 验证与观察 | current | 调查者/M8 启动时 | AVIF 三路线推迟 M8 结论(#97) |
+| docs/agents/triage-labels.md | 规则与术语 | current | 规划者/标签词汇变化时 | 五标签分诊词汇 |
+| docs/agents/domain.md | 规则与术语 | current | 规划者/文档架构变化时 | 单上下文+ADR 约定 |
+| docs/plan-26-association-nsis.md | 需求与验收 | reference | 书记员/历史留档 | #26 安装族历史规格;特性已交付,原位保留 |
+| docs/ideas/inbox.md | 来源材料 | exploration | 规划者/新想法产生时 | 碎片想法池(非现行基准) |
+| CHANGELOG.md | 工作与进度 | pipeline | 书记员/每次发版 | git 提交历史经 git-cliff 编译(cliff.toml 为策略);严禁手工修改派生文件;再生成命令见 RELEASE.md 项目层 |
