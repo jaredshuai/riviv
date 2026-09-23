@@ -33,11 +33,13 @@
 - **NSIS 安装包**：`installer/nsis/riviv.nsi`（MUI2 端口，`RequestExecutionLevel user` + staged exe `/install` runas 自提升），构建入口 `installer/build-installer.ps1`。本机试打可用（#26 期间多次实测）；**未接线任何云端发布**。
 - **裸单 exe**：`cargo build --release` → `target/release/riviv.exe`（纯 Rust 静态产物）。
 
-### 版本与标签现状（未裁决）
+### 版本与标签方案（已裁定，2026-09-23，用户委托旗舰 AI）
 
-- 仓库既有标签 `1.0.0.9`–`1.0.0.15`（7 枚，4 段式，沿用上游 voidImageViewer 版式，均为人手打的 README 类提交标签）。
-- **张力待裁决**：块内固定段的 SemVer 映射（`feat`→Minor 等）与仓库现行 4 段式 `1.0.0.N` 不一致。采用哪套、由谁转换，**未定**——需要项目维护者显式裁定后在本文档块外改写本节。
-- 现状：**不发版不打标签**；标签由人手打；无 CI 发版流水线（CI 仅跑门禁，#93）。
+- **旧 4 段式标签 = 上游参考标记**：仓库既有标签 `1.0.0.9`–`1.0.0.15`（7 枚）指向的是上游镜像提交，**不是 riviv 的发布记录**；保持原样，不改名、不重解释。
+- **riviv 版本标识 = `0.1.0`**：`Cargo.toml` 与 `installer/nsis/version.nsh` 两处一致，已是 SemVer 形状。
+- **首发 = `v0.1.0`**：在通过验收的发布提交上打标签并建 GitHub Release（0.x 阶段如实反映 early development；不提前借 `v0.2.0`/`v1.0.0` 表达更高成熟度）。此后按块内固定层 SemVer 映射执行（`feat`→Minor、`fix`/`perf`→Patch、破坏性→Major），每次发版打对应 `vX.Y.Z` 标签。
+- **首发尚未发生**：发版动作（标签/GitHub Release/CHANGELOG）由维护者决定时机；发布前须——①核对 `Cargo.toml` 与 `version.nsh` 均为 `0.1.0`；②跑齐四门禁 + `cargo build --release` + 安装器构建 + AGENTS.md 要求的 GUI QA 清单；③**建立 git 提交历史自动编译 CHANGELOG（Keep a Changelog 1.1.0）的可重复流程并生成首个 `CHANGELOG.md`**（工具选型待定，候选 git-cliff；禁止手写篡改生成结果）。
+- 现状：无 CI 发版流水线（CI 仅跑门禁，#93）；标签由人手打。
 
 ### 发布命令（未验证）
 
