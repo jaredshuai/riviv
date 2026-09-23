@@ -1,0 +1,57 @@
+# git-cliff configuration — the CHANGELOG auto-compilation flow (RELEASE.md
+# release-prep item 3; ruled 2026-09-23). Generation policy, NOT hand-editing:
+# the tool compiles CHANGELOG.md from git history; editing the output by hand
+# is forbidden (Keep a Changelog 1.1.0, lazypack RELEASE fixed section).
+#
+# House-style notes:
+# - riviv commits use compound types ("fix+test(m7): ...", "test+docs(m7): ...")
+#   where the PRIMARY type always leads — prefix regexes classify cleanly.
+# - Only SemVer-relevant types are included (feat / fix / perf / refactor — the
+#   same types the RELEASE fixed section maps to version bumps); docs/test/
+#   build/ci/chore stay internal noise.
+# - tag_pattern keeps the upstream-mirror 4-part tags (1.0.0.9-15, reference
+#   markers per the RELEASE.md project layer) out of the sectioning — only
+#   riviv's own `vX.Y.Z` tags build versions.
+# - History starts at the riviv rewrite (f916113, "feat(m1): Win32 窗口+");
+#   the command pins the range: git-cliff -o CHANGELOG.md f916113..HEAD
+
+[changelog]
+header = """\
+# Changelog
+
+All notable changes to this project are documented here — compiled from git
+history by git-cliff (cliff.toml is the policy; do not hand-edit the output).
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+"""
+body = """
+{% if version %}\
+## [{{ version | trim_start_matches(pat="v") }}] - {{ timestamp | date(format="%Y-%m-%d") }}
+{% else %}\
+## [Unreleased]
+{% endif %}\
+{% for group, commits in commits | group_by(attribute="group") %}\
+### {{ group }}
+
+{% for commit in commits %}\
+- {{ commit.message | upper_first | split(pat="\n") | first }} ({{ commit.id | truncate(length=7, end="") }})
+{% endfor %}\
+{% endfor %}\n
+"""
+footer = ""
+trim = true
+
+[git]
+conventional_commits = false
+filter_commits = true
+# Order matters only for readability of raw parsing; output groups by group name.
+commit_parsers = [
+  { message = "^feat", group = "Added" },
+  { message = "^fix", group = "Fixed" },
+  { message = "^perf", group = "Changed" },
+  { message = "^refactor", group = "Changed" },
+  { message = ".*", skip = true },
+]
+# Merge commits and everything non-matching fall to the skip rule above.
+tag_pattern = "v[0-9]+\\.[0-9]+\\.[0-9]+$"

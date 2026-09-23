@@ -38,7 +38,7 @@
 - **旧 4 段式标签 = 上游参考标记**：仓库既有标签 `1.0.0.9`–`1.0.0.15`（7 枚）指向的是上游镜像提交，**不是 riviv 的发布记录**；保持原样，不改名、不重解释。
 - **riviv 版本标识 = `0.1.0`**：`Cargo.toml` 与 `installer/nsis/version.nsh` 两处一致，已是 SemVer 形状。
 - **首发 = `v0.1.0`**：在通过验收的发布提交上打标签并建 GitHub Release（0.x 阶段如实反映 early development；不提前借 `v0.2.0`/`v1.0.0` 表达更高成熟度）。此后按块内固定层 SemVer 映射执行（`feat`→Minor、`fix`/`perf`→Patch、破坏性→Major），每次发版打对应 `vX.Y.Z` 标签。
-- **首发尚未发生**：发版动作（标签/GitHub Release/CHANGELOG）由维护者决定时机；发布前须——①核对 `Cargo.toml` 与 `version.nsh` 均为 `0.1.0`；②跑齐四门禁 + `cargo build --release` + 安装器构建 + AGENTS.md 要求的 GUI QA 清单；③**建立 git 提交历史自动编译 CHANGELOG（Keep a Changelog 1.1.0）的可重复流程并生成首个 `CHANGELOG.md`**（工具选型待定，候选 git-cliff；禁止手写篡改生成结果）。
+- **首发尚未发生**：发版动作（标签/GitHub Release）由维护者决定时机；发布前须——①核对 `Cargo.toml` 与 `version.nsh` 均为 `0.1.0`；②跑齐四门禁 + `cargo build --release` + 安装器构建 + AGENTS.md 要求的 GUI QA 清单；③CHANGELOG 自动编译流程**已建成**（2026-09-23）：git-cliff 2.14.2 + `cliff.toml` 策略（复合类型前缀分类、仅收 feat/fix/perf/refactor、`tag_pattern` 排除上游参考标签、历史起点 `f916113`），再生成命令 `git-cliff -o CHANGELOG.md f916113..HEAD`；首发打标签后重跑同一命令即产出 `vX.Y.Z` 分段，禁止手写篡改生成结果。
 - 现状：无 CI 发版流水线（CI 仅跑门禁，#93）；标签由人手打。
 
 ### 发布命令（未验证）
