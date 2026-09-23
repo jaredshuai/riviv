@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 ### Added
 
+- Feat(m1): Win32 窗口+GDI 渲染骨架——静态图片显示全链路 (f916113)
 - Feat(m2): 动画 GIF/WebP 播放 + 透明像素背景合成(#3) (64fdcc0)
 - Feat(m2): 后台解码线程——解 UI 冻结(#4) (460adf3)
 - Feat(m2): 状态栏——Loading / Failed to load image. / 帧计数 / 尺寸(#5) (0f80b82)

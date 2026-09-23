@@ -12,8 +12,9 @@
 # - tag_pattern keeps the upstream-mirror 4-part tags (1.0.0.9-15, reference
 #   markers per the RELEASE.md project layer) out of the sectioning — only
 #   riviv's own `vX.Y.Z` tags build versions.
-# - History starts at the riviv rewrite (f916113, "feat(m1): Win32 窗口+");
-#   the command pins the range: git-cliff -o CHANGELOG.md f916113..HEAD
+# - History starts at the FIRST riviv commit (0b370db, "docs(agents): skills 仓库配置") —
+#   upstream mirror ends at its parent 02a8acb; f916113 is the first CODE commit;
+#   the command pins the range: git-cliff -o CHANGELOG.md 0b370db^..HEAD
 
 [changelog]
 header = """\
