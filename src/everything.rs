@@ -147,12 +147,19 @@ impl Query2 {
     }
 }
 
-/// Wrap a search term for image-only results (upstream's literal,
-/// viv.c:13421-13423): the nine playable extensions — the same list as the
-/// association table — then the term in Everything's `<>` literal quoting.
+/// Wrap a search term for image-only results, upstream's shape
+/// (viv.c:13421-13423): `ext:` + the playable extension list + the term
+/// in Everything's `<>` literal quoting. The list is DERIVED from the
+/// playlist navigation filter (#114): upstream's literal was its own
+/// nine-extension association list, but riviv's search must ask for
+/// exactly what its playlist can take — apng included — while the
+/// association table's flag-bit wire format stays untouched.
 pub(crate) fn wrap_search(search: &[u16]) -> Vec<u16> {
-    const PREFIX: &str = "ext:bmp;gif;ico;jpeg;jpg;png;tif;tiff;webp <";
-    let mut out: Vec<u16> = PREFIX.encode_utf16().collect();
+    let mut out: Vec<u16> = "ext:".encode_utf16().collect();
+    let extensions = crate::playlist::EXTENSIONS.join(";");
+    out.extend(extensions.encode_utf16());
+    out.push(u16::from(b' '));
+    out.push(u16::from(b'<'));
     out.extend_from_slice(search);
     out.push(u16::from(b'>'));
     out
@@ -917,9 +924,12 @@ mod tests {
 
     #[test]
     fn wrap_search_is_ext_filter_then_quoted_term() {
-        // The prefix is upstream's literal (viv.c:13421) and must stay
-        // identical to the association table's extension list.
-        let list = crate::assoc::EXTENSIONS.join(";");
+        // The prefix follows the PLAYLIST navigation filter (#114): the
+        // search asks for exactly what the playlist can take — ten
+        // extensions, apng included — NOT the association table's
+        // wire-format nine (upstream's literal viv.c:13421 was its own
+        // association list).
+        let list = crate::playlist::EXTENSIONS.join(";");
         let text = unwide(&wrap_search(&wide("cat")));
         assert_eq!(text, format!("ext:{list} <cat>"));
     }
@@ -930,7 +940,7 @@ mod tests {
         // searches the extension set alone.
         assert_eq!(
             unwide(&wrap_search(&[])),
-            format!("ext:{} <>", crate::assoc::EXTENSIONS.join(";"))
+            format!("ext:{} <>", crate::playlist::EXTENSIONS.join(";"))
         );
     }
 
