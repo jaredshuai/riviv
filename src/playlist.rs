@@ -362,7 +362,9 @@ fn next_rand(state: &mut u64, modulus: usize) -> usize {
 
 /// The 10 playable extensions. The first nine match upstream
 /// `_viv_association_extensions` (viv.c:1136-1147); `apng` is appended (#108).
-const EXTENSIONS: [&str; 10] = [
+/// pub(crate): the Everything search prefix derives from this table (#114) —
+/// a search must ask for exactly what the playlist can take.
+pub(crate) const EXTENSIONS: [&str; 10] = [
     "bmp", "gif", "ico", "jpeg", "jpg", "png", "tif", "tiff", "webp", "apng",
 ];
 
