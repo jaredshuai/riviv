@@ -66,3 +66,15 @@ Default five-label vocabulary (`needs-triage` / `needs-info` / `ready-for-agent`
 ### Domain docs
 
 Single-context: one `CONTEXT.md` + `docs/adr/` at the repo root. See `docs/agents/domain.md`.
+
+<!-- lazypack:start block=resident-discipline src=DECISIONS.md@0.3.0 gen=bfce1f5fd317b6a0 input=df5a84edf8c05a1f fp=1a6620d7893e4739 -->
+## 工程纪律指针 (lazypack-discipline)
+
+> 派生自 lazypack-discipline 固定层 DECISIONS.md@0.3.0（依据 lazypack-setup 内置快照编译，来源内容标识: 1c78a216d27b82666c9724701f858f2bafe2b10d；离线事实源查阅 lazypack-setup/references/DECISIONS.md）。本段为受管托管区，请勿手工破坏标记行。
+
+- **纪律唯一事实源**：固定层规则跨项目不变。如需修改固定层，须走多 AI 讨论章程（§9）。
+- **双角色门禁要求**：执行者和审查者都必须运行适用的质量门禁；未接线、不适用、运行失败等按事实报告，不宣称通过或已生效。
+- **角色与职责**：查阅 [docs/agents/roles.md](docs/agents/roles.md)，遵循各角色防撞车边界与项目指引。
+- **产物登记**：查阅 [docs/ARTIFACTS.md](docs/ARTIFACTS.md)；未登记产物视为未决，先核实再动手。
+- **发版与提交纪律**：查阅 [RELEASE.md](RELEASE.md)；发版、打标签与变更记录遵循该文件。
+<!-- lazypack:end block=resident-discipline -->
