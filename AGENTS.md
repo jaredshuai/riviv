@@ -65,7 +65,7 @@ Default five-label vocabulary (`needs-triage` / `needs-info` / `ready-for-agent`
 
 ### Domain docs
 
-Single-context: one `CONTEXT.md` + `docs/adr/` at the repo root. See `docs/agents/domain.md`.
+Single-context: `CONTEXT.md` (lazily created — absent means not yet established) + `docs/adr/` at the repo root. See `docs/agents/domain.md`.
 
 <!-- lazypack:start block=resident-discipline src=DECISIONS.md@0.3.0 gen=bfce1f5fd317b6a0 input=df5a84edf8c05a1f fp=1a6620d7893e4739 -->
 ## 工程纪律指针 (lazypack-discipline)
