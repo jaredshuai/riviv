@@ -359,7 +359,13 @@ function Wait-Until($sb, $ms) {
     return (& $sb)
 }
 function Kill-Riviv {
-    $ps = Get-Process riviv -ErrorAction SilentlyContinue
+    # #109: match the smoke98 path-targeted contract (#98 R7 third axis) -
+    # the developer's real viewer must survive every teardown. $RunExe is
+    # the staged copy (same deterministic stage path across runs, so a
+    # leftover from a crashed run still gets killed here); a real viewer
+    # never matches it.
+    $ps = @(Get-Process riviv -ErrorAction SilentlyContinue |
+        Where-Object { $_.Path -eq $RunExe })
     if ($ps) { $ps | Stop-Process -Force; Start-Sleep -Milliseconds 300 }
 }
 function Reset-Ini($text) {
@@ -664,11 +670,10 @@ $StripW = 974; $StripH = 484
 
 $Stage = Join-Path $env:TEMP 'riviv-82-smoke'
 $Ini = Join-Path $Stage 'riviv.ini'
-
+$RunExe = Join-Path $Stage 'riviv.exe'
 Kill-Riviv
 if (Test-Path $Stage) { Remove-Item -Recurse -Force $Stage }
 New-Item -ItemType Directory -Path $Stage | Out-Null
-$RunExe = Join-Path $Stage 'riviv.exe'
 Copy-Item $Exe $RunExe -Force
 Check 'S0 staged exe copied, stage ini absent' ((Test-Path $RunExe) -and (-not (Test-Path $Ini))) 'Copy-Item failed or leftover ini'
 
@@ -1113,7 +1118,10 @@ Check 'S5c EVERY captured stats line satisfies gpu<=cap and peak_gpu<=cap (>=12 
 # only when something failed (dump PNGs + stderr captures are evidence).
 # ---------------------------------------------------------------------------
 $iniCleaned = -not (Test-Path $Ini)
-$leftover = Get-Process riviv -ErrorAction SilentlyContinue
+# #109: only the copy staged by THIS run counts as a leftover; the
+# developer's real viewer (different path) must survive the teardown.
+$leftover = @(Get-Process riviv -ErrorAction SilentlyContinue |
+    Where-Object { $_.Path -eq $RunExe })
 if ($leftover) { $leftover | Stop-Process -Force }
 if ($script:fail -eq 0) { Remove-Item -Recurse -Force $Stage }
 else { Write-Output ('FAILURES: evidence kept in ' + $Stage) }
