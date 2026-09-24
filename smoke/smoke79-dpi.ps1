@@ -129,15 +129,20 @@ function Is-Red($c) {
 # coordinates (halved on this 200% machine) and every geometry assertion
 # below breaks (diag79 finding, 2026-09-19).
 [void][S79]::SetProcessDPIAware()
-$pre = Get-Process riviv -ErrorAction SilentlyContinue
+$ini = Join-Path $Stage 'riviv.ini'
+$runExe = Join-Path $Stage 'riviv.exe'
+# #122: match the smoke80/81/82/98 path-targeted contract - the developer's
+# real viewer must survive the pre-flight kill. Only the staged copy counts
+# (the stage dir persists across runs, so a leftover from a crashed run is
+# exactly what this pre-kill is for).
+$pre = @(Get-Process riviv -ErrorAction SilentlyContinue |
+    Where-Object { $_.Path -eq $runExe })
 if ($pre) {
-    Write-Output ('PRE: stopping ' + @($pre).Count + ' pre-existing riviv process(es)')
+    Write-Output ('PRE: stopping ' + $pre.Count + ' staged riviv process(es)')
     $pre | Stop-Process -Force
     Start-Sleep -Milliseconds 400
 }
-$ini = Join-Path $Stage 'riviv.ini'
 if (Test-Path $ini) { Remove-Item $ini -Force }
-$runExe = Join-Path $Stage 'riviv.exe'
 Copy-Item $Exe $runExe -Force
 $img = Join-Path $Stage 'red512.png'
 $bmp = New-Object Drawing.Bitmap(512, 512)
