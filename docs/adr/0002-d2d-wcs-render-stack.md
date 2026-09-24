@@ -40,7 +40,7 @@ DXGI flip 的 GDI 互操作禁令是 **per-HWND**(官方原文 "Use flip model i
 
 `renderer = auto | d2d | warp | gdi`(默认 gdi,M6 末翻 auto);auto = 硬件 → WARP → (过渡期 GDI / 删除后 fatal)。WARP 是同一代码路径的枚举值,测试矩阵成本≈0;状态栏显示实际后端消灭「不可复现」类工单;不做驱动黑名单。失败三层(ADR 0001 的扩展):初始化失败=环境→温和降级;运行期 `D2DERR_RECREATE_TARGET`/`DEVICE_REMOVED`→从 master 重上传(不重解码);10s 内 3 次运行期失败→WARP;WARP 也败才 fatal。paint 路径内一律 degrade-not-fatal。**GDI 删除判据写死**(#82):auto 全环境初始化成功 + golden 冻结 + 一个稳定发布周期;不设无判据的「再保留一里程碑」。
 
-> **#81 落地后记(2026-09-20,外部评审 AI2)**:上段「默认 gdi,M6 末翻 auto」的翻默认已随 #81 落地——missing 键与未识别值双路均落 `auto`(详见 D7/D10 的同日后记与 README #81 条目)。迁移面注意:#80 保存的 ini 已显式写入 `renderer=gdi`(保存恒写当时值),这批 ini 升级后**保持 gdi**,翻默认只惠及无键/新建 ini。
+> **#81 落地后记(2026-09-20,外部评审 AI2)**:上段「默认 gdi,M6 末翻 auto」的翻默认已随 #81 落地——missing 键与未识别值双路均落 `auto`(详见 D7/D10 的同日后记与 README #81 条目)。迁移面注意:#80 保存的 ini 已显式写入 `renderer=gdi`(保存恒写当时值),这批 ini 升级后**保持 gdi**,翻默认只惠及无键/新建 ini。(#90 后记,外部评审 AI2 P3:本句「保持 gdi」的语义随 GDI 臂终结——`gdi` 值现于加载时迁移 `auto` 并留一行注记,见 D7 后记;终态 = 一切 ini 皆 D2D。)
 
 ### D6. 插值映射与 1:1 契约(#81)
 
@@ -60,6 +60,8 @@ DXGI flip 的 GDI 互操作禁令是 **per-HWND**(官方原文 "Use flip model i
 >
 > 风险在案(外部评审 AI2 P2-3):自 #82 起 D2D 臂的巨图失败链即已是 **D2D-only**(旧 #80 门的 GDI 交接随门退役;prepare 失败 = 该帧 letterbox,不拆栈不切 GDI);且 tile 路径在 WARP 上几乎不可达(WARP max=2^23),实证覆盖是「硬件 + 本机」单臂——这是 #90 环境矩阵(RDP/Hyper-V/WARP)成为删除判据的又一理由。遗留交 #90:`GiantRelief` 与 GDI 巨图支(`STRETCH_SOURCE_STITCH_TRIGGER`/`SLICE`)、mag 臂 ≥2^22 的未验证带(#81 遗留,本票未碰)、golden 冻结后的删除本体。
 
+> **#90 落地后记(2026-09-21)**:GDI 渲染主线已删(实现在 feat/90-gdi-removal;`Surface` 只剩 CPU 真源容器,`stitch.rs` 整文件退役——tile 自有纯数学,票面「tiling 仍在用 stitch」经核过时;chrome 的 GDI 永久保留)。**失败链终结形态**:init 失败=系统级 fatal(auto 已含 hw+warp 两臂诊断;`d2d`/`warp` 单驱动诊断同 fatal)——本 ADR 与 ADR 0001 的「初始化失败落 GDI」过渡语义随臂终结;运行时非丢失确定性错误、rebuild 失败、WARP 三连=**延迟 fatal**(paint 借约外开火,纯谓词 `stack_rebuild_allowed` 钉住 pending-fatal 先于 rebuild 的次序);`gpu_init_failed` latch 语义终结。#82 移交两件随票落地:prepare 连续 3 次失败喂入设备丢失 ladder(纯谓词 `prepare_verdict`)、tile 存储换 HashMap(诊断帧 O(n²) 扫描消除);Tiles↔Base 重传与 set_cap 钩子维持 #82 在案裁定。mag 臂 ≥2^22 未验证带随臂消失(#81 遗留闭合)。判据裁定:发布周期改判等价证据、RDP/Hyper-V 一键脚本用户实测为 merge 门(见 issue #90 评论 5754329845/5754373161)。**并纠正上文 #82 后记两句现行时表述**(外部评审 AI1 P3-1):「上传失败=该帧 letterbox、不 fatal」现为**有界升级**——连续 3 次 prepare 失败喂入设备丢失 ladder,终至延迟 fatal;「字节四类账本」的 `cpu_display` 类随 GDI face 刭,余三类(统计行 13→12 字段)。
+
 ### D8. 时序与线程(#80)
 
 D2D/D3D 对象只在 UI 线程(factory SINGLE_THREADED;D3D11 不加 SINGLETHREADED flag);worker 只产内存帧。**保持 invalidate→WM_PAINT 消息驱动**,不搞 Present 渲染循环(看图器 99% 静态);WM_PAINT 内:BeginPaint(忽略 rcPaint 整视口重绘)→ BeginDraw → Clear(bg)(letterbox 由 Clear 替代,「先 blit 后填」的防闪顺序及其整类 bug 归零)→ DrawBitmap → EndDraw(**HRESULT 必查**,设备丢失唯一上报点)→ Present(交互/动画 `Present(0,0)` 防 vsync 阻塞拖拽;OCCLUDED 停渲染轮询恢复)→ EndPaint。WM_SIZE:`SetTarget(None)`+释放全部引用→`ResizeBuffers`→重建→同步重绘一次。`MakeWindowAssociation(DXGI_MWA_NO_ALT_ENTER)` 必加。设备依赖对象收敛进一个 GpuStack struct 一起生一起死。
@@ -75,6 +77,8 @@ D2D/D3D 对象只在 UI 线程(factory SINGLE_THREADED;D3D11 不加 SINGLETHREAD
 > **#81 落地后记(2026-09-20)**:上段「golden 语料固定 WARP 生成」在 #81 落地为 **GDI 臂生成**(票面原文「GDI 栈生成→冻结入仓」,`smoke/golden81/`)——L1 正确性由比 golden 更硬的独立 oracle 承担(整数放大 dump 与 `src[x/k,y/k]` 复制模型逐像素相等,与生成臂无关),golden 只做跨 build 漂移检测,且每轮冒烟同时断言 warp==gdi 逐字节(warp-vs-golden 传递成立)。#82 冻结语料时择一而定,并更新本后记。
 
 > **#82 落地后记(2026-09-20)**:上段「#82 冻结语料时择一而定」**未在本票定案**——冻结语料唯一的用途是 #90 的删除前置(删除前必须有一份 GDI 栈产出的语料,否则删了 GDI 就没有生成臂了),而删除判据的三条在开工日两条无证据,故冻结随删除一起**移交 #90**(#90 依赖 #82 + 发布周期 + RDP/Hyper-V 实测留档,见该票)。本票自带的接缝/正确性证据不是 golden 而是**同构建内的对照**(tiled vs untiled、巨图 fit/1:1 的内容断言、边界阶跃对照),这些不依赖语料冻结;`smoke/golden81/` 继续作为跨 build 漂移的既有参考。
+
+> **#90 落地后记(2026-09-21)**:冻结在删除前完成——`smoke/golden90/` 5 帧(1:1 双底色、整数放大 k=2/k=3、旋转 90°+1:1),**GDI 臂生成**,冻结时逐帧验证 gdi dump == warp dump 原始字节相等(语料域=已证字节相等的 NEAREST 域;滤波档不入 golden,维持同构建内 A/B)。生成臂既亡,golden90 自此为跨 build 漂移的冻结参考(smoke81 断言 warp 臂逐字节复现;硬件臂同域复现时一并断言)。两条在案教训:EditRotate90 的 shell 动词会**改写磁盘 fixture**(#43 既定行为),rot90 场景每臂/每次须新造 fixture——且**逐场景独立**:(单 fixture 双臂互污,SHA 证据定位;首轮冻结中 s5 白底帧还因「与 rot90 场景共享同一 fixture 文件、s4 的两次 rotate 已改写之」被污染成 rot180 内容,bbox 与字节 oracle 双双免疫(两臂同读污染文件),最终由 smoke S10 的**内容模型对照**(dump vs HashSource 直立模型)抓获并以干净 fixture 重冻——bbox/字节比较不证内容身份,模型对照才是);golden 为本机生成参考,跨机器字节复现不是契约(矩阵脚本用内容级断言)。
 
 ### 非目标(M6 明确不做)
 

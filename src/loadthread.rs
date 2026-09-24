@@ -20,8 +20,9 @@
 //! interrupted, the same granularity upstream has). The queue — not the
 //! posted message — owns the replies, so a kick lost to window teardown
 //! cannot leak. Frames cross the boundary as pure memory (`PixelFrame`,
-//! #76 — no GDI object leaves the worker); the UI thread derives the
-//! GDI-carrying Surfaces from them (see `surface.rs`).
+//! #76 — no GDI object leaves the worker); the UI thread wraps them in
+//! Surfaces (the master's holder, `surface.rs` — the #76-era GDI-face
+//! derivation died with the render arm in #90).
 
 use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};

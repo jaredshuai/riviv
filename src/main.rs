@@ -1,9 +1,10 @@
 //! riviv — an unofficial Rust rewrite of voidtools/voidImageViewer (MIT).
 //!
-//! M3: the M2 feature set (Win32 window + GDI rendering, animated
+//! M3: the M2 feature set (Win32 window + D2D viewport rendering over a
+//! GDI chrome, animated
 //! GIF/WebP playback, background decoding, playlist navigation, zoom/pan,
-//! fullscreen, giant-image handling — the stitching of #9, reshaped by
-//! #81) plus the settings layer
+//! fullscreen, giant-image handling — the D2D tiling of #82, after the
+//! StretchBlt stitching of #9/#81) plus the settings layer
 //! (#19): the window rect is remembered across runs in a `[riviv]` ini
 //! (`config.rs`/`ini.rs`) with upstream's 60% first-run auto-fit, and the
 //! M1 image-sized startup window is gone — windows never resize on load
@@ -50,8 +51,8 @@
 //!   part-width model (#5, landed)
 //! - `cursor` — the fullscreen cursor-hide state machine, pure
 //!   show/timer/effects decisions (#8, landed)
-//! - `surface` — DIB section + memory DC; one per decoded frame (#3, landed);
-//!   the #76 on-demand face (the #81 direct-draw source)
+//! - `surface` — the UI-thread CPU master holder (`PixelFrame` wrap; #3/#76,
+//!   #90 reduced: the GDI face derivation is gone)
 //! - `loader` — streaming decode pipeline + the load reply state machine
 //!   (#3/#4, landed)
 //! - `loadthread` — background decode session: worker thread, reply queue,
@@ -71,15 +72,13 @@
 //!   compose, the WM_TIMER advance gate and the rate readout (#37)
 //! - `custom_rate_dlg` — the Set Custom Rate dialog over that model
 //!   (hand-built, the #22 dialog pattern) (#37)
-//! - `paint` — WM_PAINT render (the face-direct blit + letterbox strips;
-//!   the ≥32768 shrink gate since #81); zoom/pan offsets,
-//!   the BitBlt 1:1 path and the COLORONCOLOR magnify filter landed (#7);
-//!   #80: the scene body extracted (`render_scene`/`scene_rect`) for the
-//!   dump/degrade channels
+//! - `paint` — the shared view math ([`crate::paint::scene_rect`], the D2D
+//!   arm's geometry source) + the dump channel's PNG tail
 //! - `gpu` — the D2D/DXGI viewport stack (#80): GpuStack (device chain,
 //!   frame upload keyed by frame_gen, WM_SIZE resize, the three-tier
 //!   failure ladder, the WM_CLOSE dump readback) behind the `renderer`
-//!   ini key; #81: the full filter table, and `auto` is the default
+//!   ini key; #81: the full filter table, and `auto` is the default;
+//!   #90: the GDI render arm is gone — hardware D2D → WARP → fatal
 //! - `playlist` — playlist model + navigation math + recursive folder/wildcard
 //!   entry construction (#6, landed)
 //! - `status` — the status-bar common control: creation, height, and the
@@ -125,7 +124,6 @@ mod rename_dlg;
 mod shell;
 mod slideshow;
 mod status;
-mod stitch;
 mod surface;
 mod text;
 mod tile;

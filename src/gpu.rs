@@ -1,11 +1,12 @@
-//! The D2D/DXGI render stack (#80, ADR 0002 D4/D5/D8): one [`GpuStack`]
+//! The D2D render stack (#80, ADR 0002 D4/D5/D8; #90 makes it the ONLY
+//! render arm): one [`GpuStack`]
 //! owns every device-dependent object — D3D11 device, DXGI swapchain on
 //! the `riviv_view` child, D2D factory/device/device-context, the target
 //! bitmap (the swapchain's back buffer) and the uploaded frame bitmap —
 //! they live and die together (field order IS the drop order; the
 //! windows-rs COM wrappers Release in declaration order).
 //!
-//! The paint is message-driven like the GDI arm (ADR 0002 D8): WM_PAINT →
+//! The paint is message-driven (ADR 0002 D8): WM_PAINT →
 //! BeginPaint → BeginDraw → Clear → DrawBitmap → EndDraw → Present(0,0)
 //! → EndPaint. The 1:1 five-piece (ADR 0002 D6) is enforced here: unit
 //! mode PIXELS set once at build, NO SetTransform call anywhere in the
@@ -18,9 +19,11 @@
 //! The frame source is the CPU master (`PixelFrame`, #76): uploads copy
 //! the master's bytes straight into a D2D bitmap keyed by
 //! (frame_gen, w, h) — device-loss recovery re-uploads without a
-//! re-decode. The failure ladder (design §7) is degrade-not-fatal inside
-//! the paint; the final tier defers its fatal to after the paint borrow
-//! drops (`window.rs` checks `gpu_pending_fatal`).
+//! re-decode. The failure chain (#90) is hardware-D2D → WARP → fatal:
+//! device losses feed the rebuild ladder inside the paint, every
+//! non-recoverable verdict defers its fatal to after the paint borrow
+//! drops (`window.rs` checks `gpu_pending_fatal`) — there is no GDI
+//! session to fall back to anymore.
 
 use std::mem::ManuallyDrop;
 
@@ -103,6 +106,31 @@ pub(crate) fn failure_window(
     }
 }
 
+/// The consecutive-prepare-failure count that escalates (#90, landing #82
+/// PR #91's AI3 handoff): a driver that keeps failing `CreateBitmap`
+/// WITHOUT reporting device loss would otherwise blank the frame and
+/// retry forever — letterbox on screen, stderr every paint. Three
+/// consecutive failures are fed into the device-loss ladder instead,
+/// which reuses the existing bounded escalation (rebuild same kind →
+/// 3-in-10s → WARP → WARP failing 3-in-10s → deferred fatal).
+pub(crate) const PREPARE_ESCALATION_FAILURES: u32 = 3;
+
+/// Whether `consecutive_failures` prepare failures in a row warrant
+/// feeding the device-loss ladder: fewer than
+/// [`PREPARE_ESCALATION_FAILURES`] keeps blanking this frame (a single
+/// transient upload failure must not tear the stack down); reaching the
+/// threshold makes the caller return `PaintOutcome::DeviceLost` after
+/// the blank present, so the same ladder (and its 3-in-10s window on the
+/// window state) governs the escalation and the eventual fatal. A plain
+/// bool, deliberately NOT `FailureVerdict` (external review AI2 P3): the
+/// enum's `Escalate` means "switch to WARP" in `failure_window`'s
+/// domain, while this call only says "report DeviceLost" — an enum
+/// reuse would invite a future caller to read WARP semantics into it.
+/// Pure, like [`failure_window`].
+pub(crate) fn prepare_escalates(consecutive_failures: u32) -> bool {
+    consecutive_failures >= PREPARE_ESCALATION_FAILURES
+}
+
 /// The #81 full filter table (ADR 0002 D6): a 1:1 render is NEAREST
 /// unconditionally (the pixel-exact contract); a shrink follows
 /// `shrink_blit_mode`, a magnify follows `mag_filter` — the same
@@ -154,11 +182,6 @@ pub(crate) trait LevelSource {
     /// `mip_builds`, and the evidence line's proof that a giant's overview
     /// was really computed.
     fn level_builds(&self) -> u64;
-
-    /// The CPU bytes held by display DERIVATIONS outside this stack (the
-    /// GDI face's DIB) — the ledger's `cpu_display` class. The D2D arm
-    /// never reads it, but it is real memory in the same process.
-    fn display_bytes(&self) -> u64;
 }
 
 /// The master + level cache pair the window state hands the D2D arm
@@ -171,9 +194,6 @@ pub(crate) struct MasterLevels<'a> {
     /// The generation the cache's levels belong to (a new frame clears
     /// them: they were built from the previous frame's pixels).
     pub(crate) frame_gen: u64,
-    /// The derived-CPU-copy bytes outside this stack (the GDI face's DIB),
-    /// read by the caller from the surface it owns.
-    pub(crate) display_bytes: u64,
 }
 
 impl LevelSource for MasterLevels<'_> {
@@ -197,10 +217,6 @@ impl LevelSource for MasterLevels<'_> {
 
     fn level_builds(&self) -> u64 {
         self.cache.builds
-    }
-
-    fn display_bytes(&self) -> u64 {
-        self.display_bytes
     }
 
     fn rebind(&mut self, frame_gen: u64) {
@@ -269,19 +285,18 @@ pub(crate) struct DrawPlan {
 
 /// The L0 pixel-exact predicate (design §4): a render whose size equals
 /// the source's on both axes — NEAREST over an exact integer rect, the
-/// five-piece's resample-free clause. Since #81 retired the mip chain the
-/// GDI arm compares against the face's size, which IS the master's — so
-/// this predicate is the shared 1:1 test of BOTH arms on their whole
-/// domain (the off-1:1 filter selection is #81's table's surface).
+/// five-piece's resample-free clause. This is the render arm's single 1:1
+/// test on its whole domain (the off-1:1 filter selection is #81's
+/// table's surface).
 pub(crate) fn one_to_one_render(rw: i32, rh: i32, sw: i32, sh: i32) -> bool {
     rw == sw && rh == sh
 }
 
-/// Build the plan from the window state — the SAME scene_rect math the GDI
-/// blit runs (design §4's geometry clause), against the master's full-size
-/// bitmap: since #81 retired the mip chain (ADR 0002 D7) both arms draw
-/// from the single full-resolution source and the interpolation comes from
-/// the #81 full filter table.
+/// Build the plan from the window state — the SAME [`scene_rect`] math
+/// the render always runs (design §4's geometry clause), against the
+/// master's full-size bitmap: since #81 the single full-resolution source
+/// is the only source and the interpolation comes from the #81 full
+/// filter table.
 pub(crate) fn draw_plan(
     state: &crate::window::WindowState,
     cw: i32,
@@ -319,19 +334,22 @@ pub(crate) enum PaintOutcome {
     Painted,
     /// EndDraw or Present reported DEVICE LOSS — the failure ladder decides
     /// (rebuild same kind → 3-in-10s escalate to WARP → deferred fatal).
+    /// A prepare path that failed three times in a row reports this too
+    /// (see [`prepare_escalates`]): the ladder's rebuild/re-escalation is the
+    /// bounded response to a driver that keeps refusing uploads.
     DeviceLost,
     /// A NON-loss failure the ladder cannot fix (a deterministic error:
     /// `D2DERR_NOT_SUPPORTED`, Present `INVALID_CALL` after a bad resize …).
-    /// Escalating these would rebuild the same broken stack forever and end
-    /// in the deferred fatal — but ADR 0001 files them as USER-level: the
-    /// caller degrades the session to GDI (teardown + one-shot flash +
-    /// stderr), keeping the old image on screen instead of exiting
-    /// (external review AI2 P1: the old two-way misclassification froze the
-    /// frame on non-loss Present codes and fatal'd on non-loss EndDraws).
+    /// Escalating these would rebuild the same broken stack forever — and
+    /// since #90 there is no GDI session to degrade to either: the caller
+    /// tears the stack down, latches `gpu_pending_fatal` and the deferred
+    /// fatal fires after the paint borrow drops (ADR 0001: a renderer that
+    /// cannot draw deterministically is system-level, not user-level).
     Unrecoverable { hr: i32 },
 }
 
-/// The one HRESULT table both arms share (external review AI2 P1): a code
+/// The one HRESULT table every failure path shares (external review AI2
+/// P1): a code
 /// is DEVICE LOSS when a same-spec rebuild can plausibly fix it — the
 /// documented loss codes plus `DRIVER_INTERNAL_ERROR`, which the D3D11
 /// samples treat as device-gone. Everything else that FAILS is
@@ -388,8 +406,12 @@ pub(crate) struct GpuStack {
     /// (a new image, a rotate, an edit) drops every tile — they can never
     /// be drawn again.
     tile_gen: Option<u64>,
-    /// The resident tiles' bitmaps, keyed like the LRU beside them.
-    tiles: Vec<(crate::tile::TileKey, ID2D1Bitmap)>,
+    /// The resident tiles' bitmaps, keyed like the LRU beside them. A
+    /// HashMap (was a `Vec` of pairs, #90): lookup/evict/clear are O(1)
+    /// hash operations instead of O(n) `find`/`retain` scans — a forced
+    /// `-tile` diagnostic frame enumerates ~33,750 quads, where the scans
+    /// costed ~2×10⁸ comparisons per frame (#82 AI1 P3-5/AI3 in-record).
+    tiles: std::collections::HashMap<crate::tile::TileKey, ID2D1Bitmap>,
     /// The tile LRU's policy state (bytes, recency; the objects live in
     /// `tiles`) — the same pure [`crate::tile::Lru`] the plan math uses.
     tile_lru: crate::tile::Lru<crate::tile::TileKey>,
@@ -403,6 +425,14 @@ pub(crate) struct GpuStack {
     /// The frame's prepared draw list (built by [`GpuStack::prepare`],
     /// consumed by the scene pass) and the levels the stats line reports.
     scene: Scene,
+    /// Consecutive `prepare` failures (the [`prepare_escalates`] gate,
+    /// #90): cleared on every successful prepare, counted in the paint's
+    /// `Err` arm — at [`PREPARE_ESCALATION_FAILURES`] the paint feeds
+    /// `DeviceLost` into the failure ladder instead of blanking forever.
+    /// Not on the window state on purpose: each ladder rebuild drops the
+    /// stack, so the count restarts per stack while the LADDER's own
+    /// 3-in-10s window (on the window state) governs the runaway case.
+    prepare_failures: u32,
     /// The byte ledger (ticket's 分类记账) — observable at close.
     pub(crate) ledger: crate::tile::MemLedger,
     // NOTE: the device-loss timestamps do NOT live on the stack — the
@@ -465,16 +495,20 @@ fn bitmap_properties(options: D2D1_BITMAP_OPTIONS) -> D2D1_BITMAP_PROPERTIES1 {
 /// Build the whole stack (design §3's chain, in order). Returns the stack
 /// plus the EFFECTIVE renderer kind (auto resolves to hardware or WARP by
 /// what actually created) — the caller stores it for same-kind runtime
-/// rebuilds. Errors are environment diagnoses (strings): the caller
-/// degrades to GDI, never fatals.
+/// rebuilds. Errors are environment diagnoses (strings): since #90 there
+/// is no renderer below this one — the startup caller fatals with the
+/// diagnosis (ADR 0001 system-level; `auto` has already tried hardware
+/// AND WARP by the time the error surfaces), and a mid-session rebuild
+/// failure lands in the same deferred fatal.
 pub(crate) fn create(
     view: HWND,
     top: HWND,
     request: RendererKind,
 ) -> Result<(GpuStack, RendererKind), String> {
     // 1. The D3D device. The request picks the driver ladder: `warp` and
-    //    `d2d` are single-driver diagnostics (d2d's failure goes straight
-    //    to GDI, never WARP — design §2); `auto` retries on WARP.
+    //    `d2d` are single-driver diagnostics (a failing `d2d` request fails
+    //    outright — it never swaps in WARP, design §2); `auto` retries on
+    //    WARP.
     let (d3d_device, effective) = match request {
         RendererKind::Warp => (create_d3d_device(true)?, RendererKind::Warp),
         RendererKind::D2d => (create_d3d_device(false)?, RendererKind::D2d),
@@ -609,13 +643,14 @@ pub(crate) fn create(
         max_bitmap,
         uploaded: None,
         tile_gen: None,
-        tiles: Vec::new(),
+        tiles: std::collections::HashMap::new(),
         tile_lru: crate::tile::Lru::new(cap_bytes),
         cap_bytes,
         // The `-tile` diagnostic arrives at paint time (apply_diagnostics),
         // not here: the window state owns it and syncs it per paint.
         forced_edge: None,
         scene: Scene::Clear,
+        prepare_failures: 0,
         ledger: crate::tile::MemLedger {
             cap: cap_bytes,
             ..crate::tile::MemLedger::default()
@@ -806,7 +841,7 @@ impl GpuStack {
         src.rebind(frame_gen);
         if self.tile_gen != Some(frame_gen) {
             for key in self.tile_lru.clear() {
-                self.tiles.retain(|(k, _)| *k != key);
+                self.tiles.remove(&key);
             }
             self.tile_gen = Some(frame_gen);
         }
@@ -852,7 +887,7 @@ impl GpuStack {
                 let base = crate::tile::bgra_bytes(i64::from(wide) * i64::from(high));
                 if level > 0 {
                     for key in self.tile_lru.trim_to(self.cap_bytes.saturating_sub(base)) {
-                        self.tiles.retain(|(k, _)| *k != key);
+                        self.tiles.remove(&key);
                         self.ledger.tile_evictions += 1;
                     }
                 }
@@ -893,17 +928,17 @@ impl GpuStack {
                         Ok(bitmap) => {
                             let bytes = quad.bytes();
                             for key in self.tile_lru.insert(quad.key, bytes) {
-                                self.tiles.retain(|(k, _)| *k != key);
+                                self.tiles.remove(&key);
                                 self.ledger.tile_evictions += 1;
                             }
                             if self.tile_lru.contains(&quad.key) {
-                                self.tiles.push((quad.key, bitmap));
+                                self.tiles.insert(quad.key, bitmap);
                                 self.ledger.tile_uploads += 1;
                             } else {
                                 // Refused: a single tile larger than the
                                 // whole cap. Its column shows the cleared
                                 // background this frame (the fallback the
-                                // ticket's ladder is meant to keep rare) â
+                                // ticket's ladder is meant to keep rare) —
                                 // the post-pass verification below counts it.
                             }
                         }
@@ -922,7 +957,7 @@ impl GpuStack {
                 // the holes the draw will actually show.
                 let resident_now = tiles
                     .iter()
-                    .filter(|q| self.tiles.iter().any(|(k, _)| *k == q.key))
+                    .filter(|q| self.tiles.contains_key(&q.key))
                     .count();
                 // The post-pass count is the ground truth: it covers upload
                 // failures, refusals, AND same-frame evictions uniformly
@@ -946,7 +981,6 @@ impl GpuStack {
             }
         }
         self.ledger.cpu_source = src.cpu_bytes();
-        self.ledger.cpu_display = src.display_bytes();
         self.ledger.mip_builds = src.level_builds();
         // The base class counts the CURRENT plan's level bitmap: a tiled
         // frame holds no base (the tiles ARE the source), while an overview
@@ -961,6 +995,10 @@ impl GpuStack {
         self.ledger
             .note_gpu(self.ledger.gpu_base + self.tile_lru.total_bytes());
         self.ledger.cap = self.cap_bytes;
+        // A successful prepare clears the consecutive-failure count (the
+        // escalation counts FAILURES IN A ROW — one good frame restarts
+        // it; see [`prepare_escalates`]).
+        self.prepare_failures = 0;
         Ok(())
     }
 
@@ -1026,12 +1064,7 @@ impl GpuStack {
                     }
                     Scene::Tiles { quads, .. } => {
                         for quad in quads {
-                            let Some(bitmap) = self
-                                .tiles
-                                .iter()
-                                .find(|(key, _)| *key == quad.key)
-                                .map(|(_, bitmap)| bitmap)
-                            else {
+                            let Some(bitmap) = self.tiles.get(&quad.key) else {
                                 continue; // not resident: the clear stands
                             };
                             let clip = D2D_RECT_F {
@@ -1083,17 +1116,20 @@ impl GpuStack {
     }
 
     /// Classify one EndDraw failure through the shared table: loss codes
-    /// take the ladder, everything else is session-degrade (the old code
-    /// lumped ALL failures into the ladder — a deterministic error would
-    /// have rebuilt, escalated to WARP and finally fatal'd what ADR 0001
-    /// files as a user-level degrade; external review AI2 P1).
+    /// take the ladder, everything else is the DEFERRED FATAL (#90: the
+    /// old code degraded the session to the GDI arm; with that arm gone
+    /// there is no recovery below this stack — the caller latches
+    /// `gpu_pending_fatal` and the modal fires after the paint borrow
+    /// drops; external review AI2 P1 first separated these classes).
     fn enddraw_outcome(&self, e: windows::core::Error) -> PaintOutcome {
         let hr = e.code();
         if is_device_loss(hr) {
             eprintln!("riviv: EndDraw failed ({e}) — device loss ladder");
             PaintOutcome::DeviceLost
         } else {
-            eprintln!("riviv: EndDraw failed ({e}) — degrading the session to gdi");
+            eprintln!(
+                "riviv: EndDraw failed ({e}) — unrecoverable renderer error, no fallback renderer left"
+            );
             PaintOutcome::Unrecoverable { hr: hr.0 }
         }
     }
@@ -1126,8 +1162,8 @@ impl GpuStack {
         }
     }
 
-    /// One frame: the scene pass (the letterbox IS the Clear — the GDI
-    /// arm's strip concept does not exist here, design §4) plus
+    /// One frame: the scene pass (the letterbox IS the Clear — the
+    /// background fills the whole viewport in one call, design §4) plus
     /// Present(0,0). The rw>0&&rh>0 guard lives in the shared pass.
     fn draw_frame(&mut self, plan: &DrawPlan) -> PaintOutcome {
         match self.draw_pass(plan.bg, Some(plan)) {
@@ -1194,8 +1230,9 @@ impl GpuStack {
     /// hand the RGBA bytes back. Runs under the caller's window-state
     /// borrow: the plan and the frame arrive as parameters, this method
     /// never re-enters state_of. Since #82 the giant path renders THROUGH
-    /// here too (tiles), so the dump channel covers the whole domain — the
-    /// GDI fallback stays for a dead/absent stack only.
+    /// here too (tiles), so the dump channel covers the whole domain —
+    /// and since #90 it is the dump's only channel (a caller without a
+    /// live stack has nothing to dump with).
     pub(crate) fn dump(
         &mut self,
         req: DumpRequest,
@@ -1218,7 +1255,8 @@ impl GpuStack {
         // back buffer (a resize that failed and latched) would zero-fill
         // the staging bitmap and sail through with exit 0 (external review
         // AI2). Validate against the swapchain's actual buffer size first;
-        // a mismatch is an error the caller answers with the GDI channel.
+        // a mismatch is an error, and the dump channel has no fallback
+        // (the automation path fails loud on stderr + exit 2).
         // SAFETY: read-only description query on the live swapchain.
         let desc = unsafe { self.swapchain.GetDesc1() }
             .map_err(|e| format!("dump GetDesc1 failed: {e}"))?;
@@ -1371,8 +1409,9 @@ impl Drop for GpuStack {
 /// any OTHER failure is deterministic trouble a rebuild cannot fix
 /// (`INVALID_CALL` after a bad resize, …) — the old code just logged it
 /// and reported Painted, leaving a permanently frozen frame with no
-/// recovery path (external review AI2 P1); it now degrades the session to
-/// GDI through [`PaintOutcome::Unrecoverable`].
+/// recovery path (external review AI2 P1); since #90 it reports
+/// [`PaintOutcome::Unrecoverable`], which the caller answers with the
+/// deferred fatal (there is no GDI arm to degrade to).
 fn present(swapchain: &IDXGISwapChain1) -> PaintOutcome {
     // SAFETY: the shared reference guarantees the swapchain is live; flags
     // 0 = the plain interactive form.
@@ -1381,7 +1420,7 @@ fn present(swapchain: &IDXGISwapChain1) -> PaintOutcome {
         PaintOutcome::DeviceLost
     } else if hr.is_err() {
         eprintln!(
-            "riviv: Present returned {:#010x} — degrading the session to gdi",
+            "riviv: Present returned {:#010x} — unrecoverable renderer error, no fallback renderer left",
             hr.0 as u32
         );
         PaintOutcome::Unrecoverable { hr: hr.0 }
@@ -1396,7 +1435,8 @@ fn present(swapchain: &IDXGISwapChain1) -> PaintOutcome {
 
 /// The D2D paint (design §4, ADR 0002 D8 verbatim): IsIconic early-exit →
 /// BeginPaint (rcPaint ignored — a flip back buffer is discarded, the
-/// whole viewport redraws; failure is the GDI arm's fatal) → `prepare`
+/// whole viewport redraws; a BeginPaint failure is the same system-level
+/// fatal upstream's paint path has) → `prepare`
 /// (the plan + its uploads) → BeginDraw/Clear/DrawBitmap/EndDraw/Present →
 /// EndPaint → the #76 paint handshake (the render stack's health is
 /// irrelevant to the decode worker's first-frame wait). Device losses
@@ -1409,19 +1449,19 @@ pub(crate) fn paint_d2d(view: HWND, owner: HWND) -> PaintOutcome {
         // the animation timer keeps invalidating a minimized window, and a
         // WM_PAINT answered without BeginPaint/ValidateRect leaves the
         // region dirty — the queue regenerates WM_PAINT every idle pass and
-        // the paint spins hot until restore. The GDI arm's unconditional
-        // BeginPaint validates implicitly (upstream viv.c:4066 too); this
-        // is the D2D arm's explicit equivalent.
+        // the paint spins hot until restore. Upstream's paint always runs
+        // its BeginPaint, which validates implicitly (viv.c:4066 too); this
+        // is the equivalent without the draw.
         // SAFETY: validates our own child's whole client area; no borrow is
         // live.
         unsafe {
             let _ = ValidateRect(Some(view), None);
         }
-        // The #76 handshake fires here too (pre-review 3-a): the GDI arm's
-        // iconic paint still runs its body and releases the worker's held
+        // The #76 handshake fires here too (pre-review 3-a): the iconic
+        // paint still consumes the adoption and releases the worker's held
         // frame — skipping it here would park the decode at the 5 s cap and
-        // delay an animation adopted while minimized (an arm divergence,
-        // not a D2D constraint: "rendered" for the handshake's purpose
+        // delay an animation adopted while minimized (not a D2D constraint:
+        // "rendered" for the handshake's purpose
         // means "the adoption was consumed by a paint", iconic included).
         // SAFETY: the borrow spans the signal take and notify; nothing
         // pumps.
@@ -1470,7 +1510,19 @@ pub(crate) fn paint_d2d(view: HWND, owner: HWND) -> PaintOutcome {
         // borrow (plain data, the borrow ends here).
         let plan = dims.map(|(mw, mh)| (draw_plan(state, cw, ch, mw as i32, mh as i32), mw, mh));
         let Some(gpu) = state.gpu.as_mut() else {
-            // Defensive: the router only calls here with a live stack.
+            // No stack: reachable on the same WM_PAINT whose
+            // gpu_rebuild_if_due just deferred a fatal (the router calls
+            // through with gpu=None, pre-review 2 F2) and while a fatal
+            // modal pumps later paints. The #76 handshake still fires
+            // (the iconic arm's rule — the decode must not park at its
+            // 5 s cap on a process that is about to exit either way);
+            // BeginPaint/EndPaint above validated the region, so no
+            // WM_PAINT hot loop.
+            if let Some(signal) = state.paint_signal.take() {
+                let (lock, cvar) = &*signal;
+                *lock.lock().unwrap() = true;
+                cvar.notify_all();
+            }
             let _ = EndPaint(view, &ps);
             return PaintOutcome::Painted;
         };
@@ -1483,7 +1535,6 @@ pub(crate) fn paint_d2d(view: HWND, owner: HWND) -> PaintOutcome {
                     master: Some(image.surface().master()),
                     cache: &mut state.levels,
                     frame_gen,
-                    display_bytes: image.surface().face_bytes(),
                 };
                 let diag = crate::gpu::Diagnostics {
                     tile_edge: state.tile_edge,
@@ -1492,11 +1543,47 @@ pub(crate) fn paint_d2d(view: HWND, owner: HWND) -> PaintOutcome {
                     Ok(()) => gpu.draw_frame(plan),
                     Err(e) => {
                         // Upload trouble: blank this frame (the previous
-                        // frame must not linger behind a failed adopt); a
-                        // real device-gone condition reports through the
-                        // EndDraw/Present channel on a later paint.
+                        // frame must not linger behind a failed adopt).
+                        // Consecutive failures ESCALATE (#90, the #82 PR
+                        // #91 AI3 handoff): a driver that keeps failing
+                        // CreateBitmap without ever reporting device loss
+                        // must not blank + retry forever — at
+                        // PREPARE_ESCALATION_FAILURES in a row the paint
+                        // reports DeviceLost after the blank present, so
+                        // the router's ladder rebuilds, escalates to WARP
+                        // (its 3-in-10s window) and finally defers the
+                        // fatal. The count lives on the stack, so each
+                        // ladder rebuild restarts it; the dump path never
+                        // escalates (one-shot, no ladder consumer).
+                        // Boundary note (pre-review 2 F4): the escalation
+                        // advances only under PAINT pressure — a static
+                        // unattended image parks at count 1 with a blank
+                        // viewport until input/animation repaints (the
+                        // pre-#90 shape for a sick driver was the same
+                        // blank-and-wait, so no regression; with paints
+                        // flowing the whole ladder is bounded at ~18).
+                        gpu.prepare_failures += 1;
                         eprintln!("riviv: d2d frame upload failed, blanking this frame: {e}");
-                        gpu.present_clear(bg)
+                        if prepare_escalates(gpu.prepare_failures) {
+                            eprintln!(
+                                "riviv: {} consecutive frame upload failures — feeding the device-loss ladder",
+                                gpu.prepare_failures
+                            );
+                            // The blank present's own verdict outranks the
+                            // escalation (pre-review 2 F3): an
+                            // Unrecoverable EndDraw there is deterministic
+                            // trouble and must take its deferred-fatal arm,
+                            // not be misreported as device loss for the
+                            // ladder to chew on.
+                            match gpu.present_clear(bg) {
+                                PaintOutcome::Unrecoverable { hr } => {
+                                    PaintOutcome::Unrecoverable { hr }
+                                }
+                                _ => PaintOutcome::DeviceLost,
+                            }
+                        } else {
+                            gpu.present_clear(bg)
+                        }
                     }
                 }
             }
@@ -1598,6 +1685,46 @@ mod tests {
             "a pre-wrap timestamp is 400ms old across the wrap"
         );
         assert_eq!(failures, vec![u32::MAX - 100, 300]);
+    }
+
+    // ---- prepare_escalates (the #90 consecutive-upload-failure gate) ----
+
+    #[test]
+    fn a_lone_prepare_failure_keeps_the_frame_blanked() {
+        // One transient upload failure: keep the stack, blank this frame
+        // (the present still runs — only the gate stays closed).
+        assert!(!prepare_escalates(0));
+        assert!(!prepare_escalates(1));
+    }
+
+    #[test]
+    fn two_consecutive_prepare_failures_stay_below_the_escalation() {
+        // The threshold is inclusive at three: two blanks still retry in
+        // place (a driver hiccup spans a frame or two without tearing the
+        // stack down).
+        assert!(!prepare_escalates(2));
+    }
+
+    #[test]
+    fn the_third_consecutive_prepare_failure_escalates_into_the_ladder() {
+        // #90 / #82 PR #91 AI3: three in a row report DeviceLost — the
+        // router's ladder rebuilds (same kind), and its existing 3-in-10s
+        // window escalates to WARP and finally defers the fatal, so a
+        // persistently failing CreateBitmap is bounded, not infinite.
+        assert!(prepare_escalates(3));
+        assert!(prepare_escalates(10));
+        // The threshold constant itself is the contract the smoke greps.
+        assert_eq!(PREPARE_ESCALATION_FAILURES, 3);
+    }
+
+    #[test]
+    fn prepare_escalation_only_opens_at_the_threshold_not_before() {
+        // The gate only ever feeds the LADDER (which owns the WARP switch
+        // and the fatal); it has no opinion about the stack kind, and
+        // every count below the threshold stays closed.
+        for n in 0..PREPARE_ESCALATION_FAILURES {
+            assert!(!prepare_escalates(n));
+        }
     }
 
     // ---- d2d_interp_mode (#81's full filter table) ----
@@ -1722,9 +1849,9 @@ mod tests {
     #[test]
     fn the_shared_loss_table_separates_rebuildable_from_deterministic() {
         // External review AI2 P1: the loss codes (ladder — a same-spec
-        // rebuild can plausibly fix them) vs everything else (session
-        // degrade to GDI — a deterministic error the ladder would only
-        // escalate into a wrong fatal).
+        // rebuild can plausibly fix them) vs everything else (the
+        // deterministic errors the ladder cannot fix — since #90 they
+        // land in the deferred fatal instead of a session degrade).
         for hr in [
             DXGI_ERROR_DEVICE_REMOVED,
             DXGI_ERROR_DEVICE_RESET,

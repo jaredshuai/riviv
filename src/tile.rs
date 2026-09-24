@@ -15,7 +15,8 @@
 //!
 //! - **Exact partition.** Tile edges are the *same* i64 projection
 //!   ([`src_to_dest`]) evaluated at *shared source* coordinates — the
-//!   discipline `stitch.rs` established for the GDI arm's tiling. Adjacent
+//!   upstream `_viv_StretchBltStitch` discipline (viv.c:14987/15005).
+//!   Adjacent
 //!   tiles therefore share their dest and clip edges bit for bit: no gap,
 //!   no overlap, no dropped or duplicated column (the ticket's 缝/重复列/
 //!   丢列 clause) — with one documented exception: the degenerate-fringe
@@ -239,8 +240,8 @@ pub(crate) fn src_to_dest_f(src: i32, dest_origin: i32, dest_extent: i32, src_ex
 
 /// The projection for the tile GRID: integer edges, which the partition
 /// argument needs — two tiles meeting at one source column must produce the
-/// identical integer edge (the exact-partition property
-/// `stitch::stitch_tiles_sized` pins for the GDI arm). Bounds are integers;
+/// identical integer edge (the exact-partition property; the projection is
+/// the upstream stretch-stitch's own, viv.c:14987/15005). Bounds are integers;
 /// draws use [`src_to_dest_f`].
 pub(crate) fn src_to_dest(src: i32, dest_origin: i32, dest_extent: i32, src_extent: i32) -> i32 {
     (i64::from(dest_origin)
@@ -725,8 +726,9 @@ impl<K: PartialEq + Copy> Lru<K> {
 
 /// The byte ledger (the ticket's 分类记账): every buffer class the render
 /// path owns, so "bounded" and "not leaking" are statements about numbers
-/// rather than a feeling. Classes are the ticket's four; the counters feed
-/// the close-time stats line the smoke asserts on.
+/// rather than a feeling. Classes are three since #90 (four through #89 —
+/// the `cpu_display` class died with the GDI face; external review AI2
+/// P3); the counters feed the close-time stats line the smoke asserts on.
 ///
 /// Scope honesty (external review AI1 P3-2): `gpu_resident` counts the
 /// resident tiles plus a level >= 1 base bitmap — it does NOT count the
@@ -742,9 +744,6 @@ impl<K: PartialEq + Copy> Lru<K> {
 pub(crate) struct MemLedger {
     /// The decoded master plus every cached CPU mip level.
     pub(crate) cpu_source: u64,
-    /// CPU copies derived for display (the GDI face's DIB, the dump's
-    /// staging when it is a persistent buffer).
-    pub(crate) cpu_display: u64,
     /// Transient upload/readback staging alive right now.
     pub(crate) inflight: u64,
     /// Uploaded bitmaps: the base level bitmap plus every resident tile.
@@ -783,7 +782,7 @@ impl MemLedger {
         format!(
             "riviv: tiles level={level} tiles={tiles} base={} gpu={} peak_gpu={} \
              inflight={} peak_inflight={} uploads={} evictions={} mip_builds={} \
-             source={} display={} cap={}",
+             source={} cap={}",
             self.gpu_base,
             self.gpu_resident,
             self.peak_gpu,
@@ -793,7 +792,6 @@ impl MemLedger {
             self.tile_evictions,
             self.mip_builds,
             self.cpu_source,
-            self.cpu_display,
             self.cap
         )
     }
@@ -1656,6 +1654,33 @@ mod tests {
         ] {
             assert!(line.contains(field), "{field} missing from {line}");
         }
+    }
+
+    #[test]
+    fn the_stats_line_has_twelve_fields_and_no_display_class() {
+        // #90: the `cpu_display` ledger class (the GDI face's DIB) died
+        // with the GDI render arm — the line must carry exactly the 12
+        // remaining `key=value` fields, and no `display=` can ever
+        // resurrect (the smoke's stats assertion pins the shape too).
+        let ledger = MemLedger::default();
+        let line = ledger.stats_line(0, 0);
+        let fields: Vec<&str> = line
+            .split_whitespace()
+            .filter(|word| word.contains('=') && word != &"riviv:" && !word.starts_with("riviv:"))
+            .collect();
+        assert_eq!(
+            fields.len(),
+            12,
+            "the line carries {fields:?} — expected 12 fields"
+        );
+        assert!(
+            fields.iter().any(|f| f.starts_with("source=")),
+            "the cpu_source field stays"
+        );
+        assert!(
+            !line.contains("display="),
+            "the deleted cpu_display class must not appear in {line}"
+        );
     }
 
     #[test]

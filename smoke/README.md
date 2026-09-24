@@ -50,10 +50,11 @@ APNG 解码断言语义时两处都要对齐。
 ## smoke82-tiles.ps1(#82 巨图 overview + LRU tile + VRAM 字节预算)
 
 ```powershell
-powershell -NoProfile -File smokesmoke82-tiles.ps1 [-Exe <path>]
+powershell -NoProfile -File smoke\smoke82-tiles.ps1 [-Exe <path>]
 ```
 
-场景(46 检查;全部 D2D 断言附带「breadcrumb 在场」前置,防空 stderr 假绿):
+场景(43 检查;全部 D2D 断言附带「breadcrumb 在场」前置,防空 stderr 假绿;
+#90 起关机统计行为 12 字段——`display=` 记账字段随 GDI 臂删除):
 
 - **S0** 夹具:900×600 渐变(内容公式可复算)、40000×256 带红带 banner、
   16777217×1 手写宽条、900×600 硬边(两条 1px 全高黑列:源 x=256 恰在
@@ -71,8 +72,10 @@ powershell -NoProfile -File smokesmoke82-tiles.ps1 [-Exe <path>]
 - **S4** WARP 2^24+1:overview 路径 + 统计行解析(gpu≤cap)+ dump 按夹具
   公式复算(±3)。
 - **S5** 预算:每条捕获统计行 gpu/peak_gpu≤cap(≥12 行)。
-- **S6**(记录项)`renderer=gdi` banner 走 GDI 巨图支(本票未删的逃生舱)。
-- **S7** 证据纯度:15 条 D2D stderr 全扫,禁 `trying the gdi channel`。
+- **S6** 已随 **#90 GDI 渲染主线删除**退役:`renderer=gdi` 现映射 auto,
+  巨图 relief 路径不存在;编号保留,S7/S8/S9 编号不变。
+- **S7** 证据纯度:15 条 D2D stderr 全扫,禁 `trying the gdi channel`
+  (#90 后为恒真负向守卫,保留)。
 - **S8** 单实例变焦 churn(1:1→fit→1:1):uploads>0 且 gpu/peak≤cap。
 - **S9** 真压力:`-tile 4` 强制 33750 块 ≈624 MB 对 268 MB cap →
   evictions>0、peak 距 cap 10 KB(**强制诊断帧有意允许半覆盖**,脚本内
@@ -80,38 +83,67 @@ powershell -NoProfile -File smokesmoke82-tiles.ps1 [-Exe <path>]
 
 ## smoke81-filters.ps1(#81 滤波映射全表 + mip 退役 + 默认 auto)
 
-驱动 #81 的三面:D2D shrink Linear 档 HIGH_QUALITY_CUBIC、GDI 臂 face 直绘
-(mip 链退役后的巨图 relief 路径)、`renderer` 默认翻 auto。运行:
+驱动 #81 的三面:D2D shrink Linear 档 HIGH_QUALITY_CUBIC、`renderer` 默认翻
+auto。#90 删除 GDI 渲染主线后,原 warp-vs-gdi 双臂对照全部改判:字节域
+(NEAREST 域)对照冻结 golden 语料,滤波域改 warp 双跑确定性断言。运行:
 
 ```powershell
-powershell -NoProfile -File smoke\smoke81-filters.ps1 [-Exe <path>] [-Regolden]
+powershell -NoProfile -File smoke\smoke81-filters.ps1 [-Exe <path>] [-Regolden] [-Regolden90]
 ```
 
-场景(71 检查;golden 冻结于 `smoke/golden81/`,GDI 臂生成,票面原文):
+场景(54 检查;golden81 冻结于 `smoke/golden81/`,golden90 见下段):
 
-- **S1** 默认翻:missing key→`renderer=auto backend=`;frobnicate→
-  `unrecognized`+`using auto`;`renderer=gdi` 逃生键。
+- **S1** renderer 键:missing key→`renderer=auto backend=`;frobnicate→
+  `unrecognized`+`using auto`;`renderer=gdi`→**#90 迁移断言**:exit 0,
+  stderr 含 `renderer=gdi was removed, using auto` 且含
+  `renderer=auto backend=d2d/`,且永不出现 `backend=gdi`。
 - **S2(L1)** 整数放大 2×/3×/4×:`fill_window=1`+子窗精确 k× 校准
-  (SetWindowPos 循环);warp/gdi dump 文件字节+解码像素双等,且与
-  `src[x/k,y/k]` 复制模型逐像素等;magenta 边距场景边界 ±0px;四 golden
-  字节比对(`-Regolden` 重冻结,**失败场次拒写**——预审 3 P3-2)。
-- **S3(L2)**:mag=1 LINEAR 平滑区 MAE≤2;shrink=1 CUBIC vs HALFTONE 真实
-  差异记录;shrink=0 整数比 2× warp(NEAREST)/gdi(COLORONCOLOR)**字节相等**。
-- **S4 巨图**:banner 40000×256 双臂内容断言(warp 上传无 gate);极端
-  16777217×1 gdi+warp(自 #82 起 warp 侧断言与旧 gate 相反:D2D 自绘、无
-  gate 行、无 gdi 交接,统计行报形态 S4j/S4j2);边界 census
-  4,000,000/2^22/2^23/6,291,456×1(2^22 起走 relief 两级路径,接缝扫描;
-  6,291,456 = 非 2 幂倍数点,钉 relief_divisor 离开 2 幂格点)。
+  (SetWindowPos 循环);仅 warp 臂(gdi 双臂随 #90 删),dump 与
+  `src[x/k,y/k]` 复制模型逐像素等,并与 golden81 **字节比对**
+  (`-Regolden` 重冻结,**失败场次拒写**——预审 3 P3-2);magenta 边距
+  场景边界 ±0px。含 padded(192×128 源默认 fit)变体。
+- **S3(L2)滤波域**(非字节域,gdi 交叉 oracle 随臂删除):mag=1 LINEAR、
+  shrink=1 CUBIC、shrink=0 NEAREST 各改 **warp 双跑字节相等**(确定性是
+  滤波域仅存守卫),旧跨臂 MAE/相位统计降为记录档;shrink=1 保留无爆点
+  断言。
+- **S4 巨图**:banner 40000×256 仅 warp 内容断言(warp 上传无 gate、条带
+  均值/单调/接缝);极端 16777217×1 warp 侧断言无 gate、无 gdi 交接、
+  统计行报形态(S4j/S4j2)+ 渐变内容。原 `renderer=gdi` 巨图内容跑与
+  2^22 relief 边界 census(S4g–S4i、S4m/n/p/q)随 GDI 臂退役(#90:GiantRelief
+  与 relief 路径已删,mag ≥2^22 KNOWN GAP 一并消失)。
 - **S5** exit-2:dump 到不存在目录→exit 2+stderr。
-- **S6** 帧时间基线(记录档,数字存档见 issue #81)。
+- **S6** 帧时间基线(记录档,仅 warp,gdi 行随臂删除)。
+- **S10 golden90 语料**:见下段。
+
+### golden90 语料(#90)
+
+`smoke/golden90/` 是 **#90 删除前从 GDI 臂冻结的 5 张参考 dump**
+(冻结提交 5996944;域 = 双臂已证字节相等的 NEAREST 域:1:1 精确、
+整数放大 k=2/k=3、两档底色 letterbox、旋转 90° 后 1:1)。冻结时每场景
+gdi dump == warp dump 逐字节,故删除后 **warp 臂 dump 必须逐字节复现
+golden** = 「删除未改变输出」的跨臂 oracle:S10 对 5 场景各跑 warp 一枪硬断
+言;同场景再跑 `renderer=auto`(硬件)一枪,5/5 全中则升级为硬断言,有差异
+则保持记录档(报告字节差数,不强行绿)。**rot90 场景的 EditRotate90 走
+shell 动词会改写磁盘上的夹具文件**,所以 S10 每一枪前都重新生成夹具
+(HashSource+SaveRgba)——跨枪共用一个夹具会毒化第二枪。**历史(已闭环)**
+:s5-one2one 首轮冻结时夹具被更早场景的两次 rotate 动词转了 180°(freeze
+脚本共享夹具路径的残留;bbox 对称免疫、双臂同读污染文件使字节 oracle 免疫),
+master `be5097b` 以干净夹具重冻后 S10b-s5 通过、硬件臂 5/5 升级为硬断言。
+S10 的 rot180 自诊断分支保留为**未来冻结事故的守卫**(dump == 正立模型、
+golden == rot180 模型→该帧语料被污染、重新冻结即可,渲染器无错)。
+`-Regolden90` 从 warp 臂重冻结(失败场次拒写;文件名保留 `-gdi` 后缀 =
+语料身份,GDI 生成臂已亡、重冻内容自 warp——诚实记录在此)。`-Regolden`
+(golden81)的失败门只盖到 S2 段尾,S3/S4/S10 后失败仍可能改写 golden81
+——已知局限在案,勿在非绿跑上带此开关。
 
 S4 的 WriteWidePngGrad 手写 PNG 配方沿 smoke80 的 WriteWidePng(>65535 宽
 GDI+ 拒建),渐变列用于内容断言。
 
 ## smoke80-d2d.ps1 (#80 D2D renderer + -dump-viewport)
 
-Drives the #80 renderer stack (`renderer = auto|d2d|warp|gdi`) and the
-`-dump-viewport <path>` WM_CLOSE readback channel. Run:
+Drives the #80 renderer stack (`renderer = auto|d2d|warp`; since #90
+`renderer=gdi` maps to auto with a migration note on stderr - the GDI render
+arm is gone) and the `-dump-viewport <path>` WM_CLOSE readback channel. Run:
 
 ```text
 powershell -ExecutionPolicy Bypass -File smoke\smoke80-d2d.ps1
@@ -143,24 +175,24 @@ powershell -ExecutionPolicy Bypass -File smoke\smoke80-d2d.ps1 -Exe <other build
 
 | Scenario | Assertion | Notes |
 | --- | --- | --- |
-| S1a (gdi/d2d/warp/auto) | stderr breadcrumb `riviv: renderer=<req> backend=<eff>` per ini value | #94: exact-string disjunctions of the documented driver ladder — `warp` -> `d2d/warp` everywhere; `d2d` -> `d2d/hw`, or on a no-hardware host `backend=gdi` WITH its `falling back to gdi` line (a failed d2d goes straight to gdi, never warp); `auto` -> `d2d/hw` or `d2d/warp` (its retry ladder). No SKIP: both host shapes keep every wrong-backend regression failing |
+| S1a (d2d/warp/auto) | stderr breadcrumb `riviv: renderer=<req> backend=<eff>` per ini value | d2d/auto expect `d2d/hw` where hardware D3D11 exists; `warp` expects `d2d/warp` |
+| S1a-gdi | `renderer=gdi` -> exit 0, `riviv: renderer=gdi was removed, using auto` AND `riviv: renderer=auto backend=d2d/`, and `backend=gdi` never appears | the #90 migration (not the "unrecognized value" fallback - the word is legal, its arm is gone) |
 | S1b | `renderer=frobnicate` -> `renderer=auto backend=` + `unrecognized renderer value` + `using auto` hints | invalid string value falls back to the default (auto since #81; gdi pre-#81) |
 | S1c | missing key -> `renderer=auto backend=` | the default (auto since #81; gdi pre-#81) |
 | S2 | warp dump channel: adopted image + WM_CLOSE -> PNG on disk, exit 0, dims == view client rect | |
-| S3a-S3f | L0: the same 1:1 scene dumped through warp AND gdi | file bytes equal; non-white bbox == source rect at source size; every bbox pixel RGBA == source; both arms pixel-exact |
+| S3a-S3e | L0 byte-exactness vs the frozen golden90 corpus (#90 form): the golden90 s1 1:1 scene dumped through warp must BYTE-EQUAL `smoke/golden90/s1-one2one-gdi.png` (the GDI-arm reference, frozen where warp == gdi was proven); calibrated viewport exactly 256x192; letterbox margins pure magenta; image box pixel-exact vs the 96x64 source at (80,64) | the old warp-vs-gdi twin dump died with the arm; the frozen golden is the cross-arm oracle now |
 | S4a-S4c | resize chain: after SetWindowPos the dump dims follow the NEW viewport while the 1:1 bbox stays the source size | swapchain ResizeBuffers + target rebuild |
-| S5a-S5d | giant path (#82 contract): NO gate line, NO gdi hand-off, NO gdi dump fallback; process alive; dump succeeds out of the D2D channel, exit 0; close-time stats line names the form (level>=1 or tiles>=1) | the D2D arm draws giants itself (overview level or tiles) — the #80 gate is retired |
+| S5a-S5d | giant path (#82 contract): NO gate line, NO gdi hand-off, NO gdi dump fallback, NO `backend=gdi`; process alive; dump succeeds out of the D2D channel, exit 0; close-time stats line names the form (level>=1 or tiles>=1) | the D2D arm draws giants itself (overview level or tiles) — the #80 gate is retired |
 | S6a-S6d | animation re-upload: dumps before/after `AnimationFrameStep` (cmd 100) differ; frame 0 = red, frame 1 = blue at 1:1 | frame_gen bump re-uploads |
 | S7a-S7b | rotation re-upload: after `EditRotate90` (cmd 23) the bbox swaps 120x80 -> 80x120 and the content equals the source rotated 90 CW | rotate bumps frame_gen |
-| S8a | minimized-start warp instance (the 0x0 iconic viewport - the documented dump-refusal shape - is restored via SW_SHOWNOACTIVATE before the dump) dumps the image (content-checked) at WM_CLOSE | #94 naming clarification: NOT a pure iconic dump. The subject is the dump channel's independence from the display pipeline - no Present, no WM_PAINT; whether Windows' initial iconic activation handed the instance the foreground is host-dependent and stays recorded in the evidence note, not asserted (fgHeldByRiviv=True observed on the dev machine) |
-| S8b | gdi twin of S8 | SKIP by design (pre-existing background-paint gate, master-identical, smoke78 SKIP semantics); observed behavior recorded in the detail line |
+| S8a | minimized-start warp instance dumps the image (content-checked) at WM_CLOSE | the D2D dump renders from the CPU master inside the dump call - no Present, no WM_PAINT dependency; the former gdi twin is retired with the arm (#90) |
 
-Adjudicated (2026-09-19, commit 028abf7): S3b's original failure was the
-letterbox ALPHA only - warp wrote A=255 (D2D `Clear`) while gdi left the
-DIB-zeroed A=0 (GDI never writes the alpha byte; RGB was pixel-identical).
-The dump contract is now the fully opaque viewport BOTH arms render, and
-the gdi channel forces A=255 on readback - S3b asserts byte-identical
-files and passes.
+Historical note (2026-09-19, commit 028abf7): the pre-#90 S3 compared the
+warp and gdi dumps byte-for-byte; its one adjudicated failure was letterbox
+ALPHA only (warp wrote A=255 via the D2D `Clear`, gdi left the DIB-zeroed
+A=0; the gdi channel forced A=255 on readback). With the GDI arm deleted
+(#90) that twin comparison is replaced by the frozen golden90 byte oracle
+above.
 
 Adjudicated (2026-09-21, #94): S1a's `d2d/hw` expectations are now the
 exact-string disjunctions of the documented driver ladder (scene table

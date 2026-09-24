@@ -4,16 +4,25 @@
 # %TEMP%\riviv-81-smoke, WM_CLOSE dump channel, DPI-aware probe, poll-based
 # waits, GetExitCodeProcess on the captured live handle).
 #
+# #90 removed the GDI render arm: renderer=gdi now maps to auto with a
+# migration note on stderr, and every former warp-vs-gdi twin comparison is
+# judged against the frozen golden corpora instead (both corpora were
+# frozen from the GDI arm while it still existed, in the domains where
+# warp == gdi was proven byte-identical).
+#
 # Scenarios:
-#   S1 renderer default flip: missing key -> "riviv: renderer=auto
-#      backend=..."; frobnicate -> "unrecognized renderer value" + "using
-#      auto" + the auto line; gdi -> the gdi escape hatch still works.
+#   S1 renderer keys: missing key -> "riviv: renderer=auto backend=...";
+#      frobnicate -> "unrecognized renderer value" + "using auto" + the
+#      auto line; gdi -> the #90 migration: exit 0, "riviv: renderer=gdi
+#      was removed, using auto" AND "riviv: renderer=auto backend=d2d/"
+#      on stderr, and "backend=gdi" never appears.
 #   S2 L0/L1 integer magnify byte-exactness (core): 96x64 hash-pattern
-#      source, fill_window=1 recipe. k=3,4 calibrate the riviv_view child
-#      to EXACTLY k*96 x k*64 (fill renders edge to edge) -> warp (NEAREST)
-#      vs gdi (COLORONCOLOR) file bytes AND decoded pixels identical, dump
-#      exactly k*96 x k*64, pixel-exact vs the replication model
-#      expected[x,y] = src[x/k, y/k], gdi arm frozen as a golden.
+#      source, fill_window=1 recipe, warp arm only (the gdi twin died
+#      with #90). k=3,4 calibrate the riviv_view child to EXACTLY k*96 x
+#      k*64 (fill renders edge to edge) -> the warp (NEAREST) dump is
+#      compared byte-for-byte against the frozen golden81 dump, is exactly
+#      k*96 x k*64, and is pixel-exact vs the replication model
+#      expected[x,y] = src[x/k, y/k].
 #      k=2 is special: the window's minimum track width (the toolbar strip,
 #      ~256 px at this machine's 200% DPI) makes a 192-wide view
 #      unreachable, so the k=2 target is the 256x128 clamped viewport
@@ -28,38 +37,53 @@
 #      source that IS the exact 2x replication of the 96x64 pattern at the
 #      default fit (fill_window=0) in a 256x158 viewport (the 232 target
 #      clamps to the same min width) -> the same assertions (margins pure
-#      magenta, image box boundary +-0px, warp==gdi, golden): box
+#      magenta, image box boundary +-0px, golden byte-compare): box
 #      32..223 x 15..142, side margins 32, top/bottom margins 15.
-#   S3 L2 filter tiers: mag=1 on a 256x256 smooth gradient at exact 2x
-#      (warp LINEAR vs gdi HALFTONE: per-channel MAE <= 2, max <= 12);
-#      shrink=1 on 640x480 at exact 2x down (warp HIGH_QUALITY_CUBIC vs
-#      gdi HALFTONE: genuinely different, max diff outside block halos
-#      <= 40, no blown-out pixels); shrink=0 (warp NEAREST vs gdi
-#      COLORONCOLOR: byte-equal OR each arm matches ONE uniform 2x phase
-#      model of the source, census reported).
+#   S3 L2 filter tiers (filter domain: NOT byte-equal corpus, the gdi
+#      cross-arm MAE/phase oracles died with the arm): mag=1 on a 256x256
+#      smooth gradient at exact 2x (warp LINEAR; two runs must be
+#      byte-identical - determinism is the remaining guard - content
+#      stats recorded); shrink=1 on 640x480 at exact 2x down (warp
+#      HIGH_QUALITY_CUBIC, same determinism treatment, no blown-out
+#      pixels outside block halos); shrink=0 (warp NEAREST at exact 2x
+#      down: two runs byte-identical, the phase census stays as failure
+#      DIAGNOSTICS).
 #   S4 giant correctness: 40000x256 banner (luminance gradient + a 4000px
 #      2px-period stripe band at x=20000) at fit in a 1000x700 window ->
-#      warp uploads 40000 (no D2D gate) and CUBIC-deep-shrinks it; gdi
-#      takes the NEW full-res-face >=32768 clip-region branch; both must
-#      keep the gradient monotone, the averaged stripes ~128 and the bbox
-#      sane. 16777217x1 gradient giant via the hand-written PNG writer:
-#      renderer=gdi content (1px strip, gradient survived) plus one warp
-#      run asserting the gate line + the same content. Boundary census on
-#      the #81 relief trigger (source extent 2^22): 4000000x1 (below ->
-#      single full-rect path must still render), 4194304x1 (= 2^22, the
-#      first relief width) and 8388608x1 (= 2^23, the previously-black
-#      width), renderer=gdi, each with the extreme-giant content
-#      assertions; the two relief widths also get a seam scan over the
-#      strip's row: max adjacent-column |delta mean| <= 3*median + 2.
+#      warp uploads 40000 (no D2D gate) and CUBIC-deep-shrinks it; the
+#      warp content assertions stay (bbox shape, averaged stripes ~128,
+#      monotone gradient, seam scan); the gdi-arm banner checks died with
+#      the arm. 16777217x1 gradient giant via the hand-written PNG
+#      writer: the warp run asserts no gate line + no gdi fallback + the
+#      close-time stats line naming the giant form + the gradient
+#      content. The renderer=gdi giant content runs and the 2^22 relief
+#      boundary census (old S4g-S4i and S4m/n/p/q) are retired with the
+#      GDI arm (#90: GiantRelief and the relief path no longer exist; the
+#      mag >=2^22 KNOWN GAP went with them).
 #   S5 dump failure: -dump-viewport into a missing directory -> exit 2,
 #      stderr says so, no modal hang.
 #   S6 frame-time baseline (record-only): launch->exit wall time of the
-#      dump run, 3 runs per scene per renderer, printed as a table.
+#      dump run, 3 runs per scene, warp renderer only (the gdi rows died
+#      with the arm), printed as a table.
+#   S10 golden90 corpus (#90): smoke/golden90/ froze five GDI-arm dumps at
+#      commit 5996944 in the byte-equal NEAREST domain (1:1 exact, integer
+#      magnify k=2/k=3, letterboxed both backgrounds, rotated 90 then 1:1).
+#      Each scene runs under renderer=warp with a FRESH fixture
+#      (HashSource + SaveRgba regenerated before EVERY instance - the
+#      rot90 scene's EditRotate90 fires the shell rotate90 verb which
+#      REWRITES the fixture file on disk, so one shared fixture across
+#      instances poisons the second one) and must byte-match its golden:
+#      5 hard assertions. The same 5 scenes also run once under
+#      renderer=auto (hardware): all five byte-matching goldens promotes
+#      them to hard assertions; any mismatch stays record-only with
+#      byte-diff counts.
 #
-# Golden corpus: smoke/golden81/ holds the frozen gdi-arm dumps (S2 exact
-# k=2,3,4 + padded). -Regolden (re)creates them from this run; by default
-# the dumps are compared against them; a missing golden is a SKIP-with-note.
-param([string]$Exe = 'D:\codespace\riviv\target\release\riviv.exe', [switch]$Regolden)
+# Golden corpora: smoke/golden81/ holds the frozen gdi-arm dumps (S2 exact
+# k=2,3,4 + padded), smoke/golden90/ the five-scene #90 corpus. -Regolden
+# (re)creates golden81 from this run and -Regolden90 golden90 (both
+# regenerate from the warp arm); by default the dumps are compared against
+# them; a missing golden is a SKIP-with-note.
+param([string]$Exe = 'D:\codespace\riviv\target\release\riviv.exe', [switch]$Regolden, [switch]$Regolden90)
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Drawing
 Add-Type -TypeDefinition (@'
@@ -225,6 +249,42 @@ public static class Px {
             a[i + 3] = 255;
         }
         return a;
+    }
+    // S10 diagnostic: does a decoded 256x192 white-bg frame exactly equal
+    // the HashSource(96,64) fixture drawn 1:1 at (80,64), optionally
+    // rotated 180 degrees? Used ONLY on a golden byte-mismatch to separate
+    // "the golden was frozen from a rotated on-disk fixture" (a corpus
+    // defect: regolden) from a real renderer content error.
+    public static bool MatchesWhiteHashModel(byte[] b, int w, int h, bool rot) {
+        if (w != 256 || h != 192) return false;
+        int sw = 96, sh = 64;
+        byte[] src = new byte[sw * sh * 4];
+        HashSource(sw, sh, src);
+        for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) {
+            int di = (y * w + x) * 4;
+            byte r, g, b2;
+            if (x >= 80 && x < 176 && y >= 64 && y < 128) {
+                int lx = x - 80, ly = y - 64;
+                int sx = rot ? (sw - 1 - lx) : lx;
+                int sy = rot ? (sh - 1 - ly) : ly;
+                int si = (sy * sw + sx) * 4;
+                r = src[si]; g = src[si + 1]; b2 = src[si + 2];
+            } else { r = 255; g = 255; b2 = 255; }
+            if (b[di + 2] != r || b[di + 1] != g || b[di] != b2 || b[di + 3] != 255) return false;
+        }
+        return true;
+    }
+    public static void HashSource(int w, int h, byte[] a) {
+        for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) {
+            int i = (y * w + x) * 4;
+            if (x == 0 || y == 0 || x == w - 1 || y == h - 1) { a[i] = 0; a[i + 1] = 0; a[i + 2] = 0; }
+            else {
+                a[i] = (byte)((x * 7 + y * 13 + 11) & 255);
+                a[i + 1] = (byte)((x * 11 + y * 5 + 29) & 255);
+                a[i + 2] = (byte)((x * 3 + y * 17 + 101) & 255);
+            }
+            a[i + 3] = 255;
+        }
     }
     // Integer-k replication: dest[x,y] = src[x/k, y/k] (the magnify model).
     public static byte[] UpsampleK(byte[] src, int sw, int sh, int k) {
@@ -627,19 +687,11 @@ $pngBanner = Join-Path $Stage 'banner.png'
 [Px]::SaveRgba($pngBanner, [Px]::BannerSource(40000, 256, 20000, 4000), 40000, 256)
 $giantPng = Join-Path $Stage 'giant.png'
 [S81]::WriteWidePngGrad($giantPng, 16777217, 1)
-$giant4mPng = Join-Path $Stage 'giant4m.png'
-[S81]::WriteWidePngGrad($giant4mPng, 4000000, 1)
-$giant4nPng = Join-Path $Stage 'giant4n.png'
-[S81]::WriteWidePngGrad($giant4nPng, 4194304, 1)
-$giant4pPng = Join-Path $Stage 'giant4p.png'
-[S81]::WriteWidePngGrad($giant4pPng, 8388608, 1)
-$giant6mPng = Join-Path $Stage 'giant6m.png'
-[S81]::WriteWidePngGrad($giant6mPng, 6291456, 1)
-Check 'S0 fixtures built' ((Test-Path $png96) -and (Test-Path $pngPad) -and (Test-Path $pngGrad) -and (Test-Path $png640) -and (Test-Path $png800) -and (Test-Path $pngBanner) -and (Test-Path $giantPng) -and (Test-Path $giant4mPng) -and (Test-Path $giant4nPng) -and (Test-Path $giant4pPng) -and (Test-Path $giant6mPng)) 'a fixture PNG is missing'
+Check 'S0 fixtures built' ((Test-Path $png96) -and (Test-Path $pngPad) -and (Test-Path $pngGrad) -and (Test-Path $png640) -and (Test-Path $png800) -and (Test-Path $pngBanner) -and (Test-Path $giantPng)) 'a fixture PNG is missing'
 
 # ---------------------------------------------------------------------------
 # S1: the default renderer flip (#81): missing key AND unrecognized value
-# both land on auto; gdi stays the escape hatch.
+# both land on auto; the legacy `gdi` word MIGRATES to auto (#90, S1c).
 # ---------------------------------------------------------------------------
 Reset-Ini "[riviv]`r`nx=40`r`ny=40`r`nwide=800`r`nhigh=600`r`n"
 $p = Start-Riv '' 's1-missing.err'
@@ -662,15 +714,19 @@ $p = Start-Riv '' 's1-gdi.err'
 $main = Wait-Main $p
 $code = Close-Main $p $main
 $err = Read-Err 's1-gdi.err'
-Check 'S1c renderer=gdi escape hatch still works' (($code -eq 0) -and $err.Contains('riviv: renderer=gdi backend=gdi')) ("exit=$code stderr=[$($err.Trim())]")
+$bcLine = '(none)'
+if ($err -match 'riviv: renderer=[^\r\n]+') { $bcLine = $Matches[0] }
+Check 'S1c renderer=gdi -> #90 migration (removed note + auto backend line, never backend=gdi)' (($code -eq 0) -and $err.Contains('riviv: renderer=gdi was removed, using auto') -and $err.Contains('riviv: renderer=auto backend=d2d/') -and (-not $err.Contains('backend=gdi'))) ("exit=$code line=[$bcLine] stderr=[$($err.Trim())]")
 Kill-Riviv
 Reset-Ini ''
 
 # ---------------------------------------------------------------------------
-# S2 (core): integer magnify byte-exactness, k = 2, 3, 4, warp and gdi.
+# S2 (core): integer magnify byte-exactness, k = 2, 3, 4, warp arm only.
 # k=3/4: exact k*W x k*H viewport, fill renders edge to edge. k=2: the
 # window min track width clamps the view to 256, where fill_window=1 still
 # renders EXACTLY 2x (192x128) centered at (32,0) with 32px magenta sides.
+# The byte oracle is the frozen golden81 dump (frozen from the GDI arm
+# pre-#90, in the warp==gdi byte-equal domain).
 # ---------------------------------------------------------------------------
 $dumps = @{}
 $s2geo = @(
@@ -681,30 +737,20 @@ $s2geo = @(
 foreach ($geo in $s2geo) {
     $k = $geo.K
     $w = Run-Scene 'warp' 1 (@('mag_filter=0') + $BgMagenta) $png96 ("s2-k${k}-warp.png") ("s2-k${k}-warp.err") $geo.TW $geo.TH $null $null
-    $g = Run-Scene 'gdi' 1 (@('mag_filter=0') + $BgMagenta) $png96 ("s2-k${k}-gdi.png") ("s2-k${k}-gdi.err") $geo.TW $geo.TH $null $null
-    $dumps["k$k"] = $g.Out
-    $ranOk = ($w.Code -eq 0) -and ($g.Code -eq 0) -and (Test-Path $w.Out) -and (Test-Path $g.Out)
-    Check "S2a-k$k both dumps ran clean (exit 0, files exist)" $ranOk ("warp exit=$($w.Code) gdi exit=$($g.Code) warpPng=$(Test-Path $w.Out) gdiPng=$(Test-Path $g.Out) warpView=$($w.Vs[0])x$($w.Vs[1]) gdiView=$($g.Vs[0])x$($g.Vs[1])")
+    $dumps["k$k"] = $w.Out
+    $ranOk = ($w.Code -eq 0) -and (Test-Path $w.Out)
+    Check "S2a-k$k warp dump ran clean (exit 0, file exists)" $ranOk ("warp exit=$($w.Code) warpPng=$(Test-Path $w.Out) warpView=$($w.Vs[0])x$($w.Vs[1])")
     if (-not $ranOk) {
         Write-Output ("S2-k$k warp stderr: " + ($w.Err.Trim()))
-        Write-Output ("S2-k$k gdi stderr: " + ($g.Err.Trim()))
         continue
     }
-    $eqFile = [Px]::BytesEqual([IO.File]::ReadAllBytes($w.Out), [IO.File]::ReadAllBytes($g.Out))
     $qw = [Px]::Load($w.Out)
-    $qg = [Px]::Load($g.Out)
-    $ad = [Px]::AlphaDiff($qw.B, $qg.B)
-    $note = ''
-    if (-not $eqFile) { $note = " alphaDiffPixels=$ad (decoded RGB compared separately below; the known GDI-dump zeroed-alpha finding if RGB matches)" }
-    Check "S2b-k$k warp and gdi dump FILE bytes identical" $eqFile ("bytes $($qw.W)x$($qw.H)" + $note)
-    $rgbDiff = [Px]::RgbDiff($qw.B, $qg.B)
-    Check "S2c-k$k warp and gdi DECODED pixels identical (RGB; alpha counted apart)" (($rgbDiff -eq $null)) "rgbDiff=$rgbDiff alphaDiffPixels=$ad"
-    Check "S2d-k$k dump is the calibrated viewport $($geo.TW)x$($geo.TH)" (($qw.W -eq $geo.TW) -and ($qw.H -eq $geo.TH) -and ($qg.W -eq $geo.TW) -and ($qg.H -eq $geo.TH)) ("warp=$($qw.W)x$($qw.H) gdi=$($qg.W)x$($qg.H) want=$($geo.TW)x$($geo.TH)")
+    Check "S2d-k$k dump is the calibrated viewport $($geo.TW)x$($geo.TH)" (($qw.W -eq $geo.TW) -and ($qw.H -eq $geo.TH)) ("warp=$($qw.W)x$($qw.H) want=$($geo.TW)x$($geo.TH)")
     # Margins pure magenta where the clamped viewport leaves any (k=2 sides).
     $margOk2 = $true
     $margDet2 = ''
     if (($geo.BL -gt 0) -or ($geo.BT -gt 0)) {
-        foreach ($q in @($qw, $qg)) {
+        foreach ($q in @($qw)) {
             $strips = @()
             if ($geo.BL -gt 0) { $strips += ,(0, $geo.BT, $geo.BL, $geo.BH) }
             if ($geo.BT -gt 0) { $strips += ,($geo.BL, 0, $geo.BW, $geo.BT) }
@@ -715,21 +761,20 @@ foreach ($geo in $s2geo) {
                 if ($bad -ne 0) { $margOk2 = $false; $margDet2 += " rect($($s[0]),$($s[1]),$($s[2]),$($s[3]))nonbg=$bad" }
             }
         }
-        if ($margDet2 -eq '') { $margDet2 = 'all margin strips pure magenta in both arms' }
+        if ($margDet2 -eq '') { $margDet2 = 'all margin strips pure magenta' }
     } else {
         $margDet2 = 'exact fill - no margin strips by geometry'
     }
-    Check "S2e-k$k margins pure background color (both arms)" $margOk2 $margDet2
+    Check "S2e-k$k margins pure background color" $margOk2 $margDet2
     $model = [Px]::UpsampleK($src96, 96, 64, $k)
     $mw = [Px]::CompareRgb($qw.B, $qw.W, $geo.BL, $geo.BT, $model, $geo.BW)
-    $mg = [Px]::CompareRgb($qg.B, $qg.W, $geo.BL, $geo.BT, $model, $geo.BW)
-    Check "S2f-k$k image box == replication model src[x/k,y/k] at ($($geo.BL),$($geo.BT)) (both arms, exact RGB)" (($mw -eq $null) -and ($mg -eq $null)) "warp-first=$mw gdi-first=$mg"
+    Check "S2f-k$k image box == replication model src[x/k,y/k] at ($($geo.BL),$($geo.BT)) (exact RGB)" (($mw -eq $null)) "warp-first=$mw"
     $golden = Join-Path $GoldenDir ("s2-k$k-gdi.png")
     if (-not (Test-Path $golden)) {
         Skip-Scenario "S2g-k$k golden compare" "no golden yet (run -Regolden to freeze smoke\golden81\s2-k$k-gdi.png)"
     } else {
-        $same = [Px]::BytesEqual([IO.File]::ReadAllBytes($golden), [IO.File]::ReadAllBytes($g.Out))
-        Check "S2g-k$k gdi dump matches frozen golden" $same 'golden bytes differ from this run'
+        $same = [Px]::BytesEqual([IO.File]::ReadAllBytes($golden), [IO.File]::ReadAllBytes($w.Out))
+        Check "S2g-k$k warp dump matches frozen golden (the gdi-arm reference)" $same 'golden bytes differ from this run'
     }
 }
 Kill-Riviv
@@ -744,20 +789,16 @@ $PADH = 158
 $padL = 32
 $padT = 15
 $padW2 = Run-Scene 'warp' 0 $BgMagenta $pngPad 's2-pad-warp.png' 's2-pad-warp.err' $PADW $PADH $null $null
-$padG = Run-Scene 'gdi' 0 $BgMagenta $pngPad 's2-pad-gdi.png' 's2-pad-gdi.err' $PADW $PADH $null $null
-$dumps['pad'] = $padG.Out
-$padOk = ($padW2.Code -eq 0) -and ($padG.Code -eq 0) -and (Test-Path $padW2.Out) -and (Test-Path $padG.Out)
-Check 'S2p-a padded both dumps ran clean' $padOk ("warp exit=$($padW2.Code) gdi exit=$($padG.Code) views=$($padW2.Vs[0])x$($padW2.Vs[1])/$($padG.Vs[0])x$($padG.Vs[1])")
+$dumps['pad'] = $padW2.Out
+$padOk = ($padW2.Code -eq 0) -and (Test-Path $padW2.Out)
+Check 'S2p-a padded warp dump ran clean' $padOk ("warp exit=$($padW2.Code) view=$($padW2.Vs[0])x$($padW2.Vs[1])")
 if ($padOk) {
     $qw = [Px]::Load($padW2.Out)
-    $qg = [Px]::Load($padG.Out)
-    Check 'S2p-b padded dump is 256x158' (($qw.W -eq $PADW) -and ($qw.H -eq $PADH) -and ($qg.W -eq $PADW) -and ($qg.H -eq $PADH)) ("warp=$($qw.W)x$($qw.H) gdi=$($qg.W)x$($qg.H)")
-    $eqPad = [Px]::BytesEqual([IO.File]::ReadAllBytes($padW2.Out), [IO.File]::ReadAllBytes($padG.Out))
-    Check 'S2p-c padded warp and gdi file bytes identical' $eqPad ("alphaDiffPixels=$([Px]::AlphaDiff($qw.B, $qg.B)) rgbDiff=$([Px]::RgbDiff($qw.B, $qg.B))")
-    # Margins pure magenta, both arms (the whole frame outside the box).
+    Check 'S2p-b padded dump is 256x158' (($qw.W -eq $PADW) -and ($qw.H -eq $PADH)) ("warp=$($qw.W)x$($qw.H)")
+    # Margins pure magenta (the whole frame outside the box).
     $margsOk = $true
     $margDetail = ''
-    foreach ($q in @($qw, $qg)) {
+    foreach ($q in @($qw)) {
         $strips = @(
             @(0, 0, $PADW, $padT),
             @(0, ($padT + 128), $PADW, ($PADH - $padT - 128)),
@@ -769,25 +810,24 @@ if ($padOk) {
             if ($bad -ne 0) { $margsOk = $false; $margDetail += " rect($($s[0]),$($s[1]),$($s[2]),$($s[3]))nonbg=$bad" }
         }
     }
-    if ($margDetail -eq '') { $margDetail = 'all four strips pure magenta in both arms' }
-    Check 'S2p-d margins pure background color (both arms)' $margsOk $margDetail
+    if ($margDetail -eq '') { $margDetail = 'all four strips pure magenta' }
+    Check 'S2p-d margins pure background color' $margsOk $margDetail
     # Image box == the 2x replica at ($padL,$padT): boundary +-0 by build.
     $bw2 = [Px]::CompareRgb($qw.B, $qw.W, $padL, $padT, $src192, 192)
-    $bg2 = [Px]::CompareRgb($qg.B, $qg.W, $padL, $padT, $src192, 192)
-    Check 'S2p-e image box == 2x replica at (32,15), boundary +-0px (both arms)' (($bw2 -eq $null) -and ($bg2 -eq $null)) "warp-first=$bw2 gdi-first=$bg2"
+    Check 'S2p-e image box == 2x replica at (32,15), boundary +-0px (exact RGB)' (($bw2 -eq $null)) "warp-first=$bw2"
     $golden = Join-Path $GoldenDir 's2-pad-gdi.png'
     if (-not (Test-Path $golden)) {
         Skip-Scenario 'S2p-f golden compare' 'no golden yet (run -Regolden to freeze smoke\golden81\s2-pad-gdi.png)'
     } else {
-        $same = [Px]::BytesEqual([IO.File]::ReadAllBytes($golden), [IO.File]::ReadAllBytes($padG.Out))
-        Check 'S2p-f gdi dump matches frozen golden' $same 'golden bytes differ from this run'
+        $same = [Px]::BytesEqual([IO.File]::ReadAllBytes($golden), [IO.File]::ReadAllBytes($padW2.Out))
+        Check 'S2p-f warp dump matches frozen golden (the gdi-arm reference)' $same 'golden bytes differ from this run'
     }
 }
 if ($Regolden) {
     # Review pre-3 P3-2: never bless a run that failed - a regressed build
     # must not overwrite the frozen goldens (the same run's independent
-    # anchors - warp==gdi bytes and the src[x/k,y/k] replication model -
-    # narrow but do not close that hole).
+    # anchors - the src[x/k,y/k] replication model and the golden90 corpus
+    # in S10 - narrow but do not close that hole).
     if ($script:fail -gt 0) {
         Write-Output ('GOLDENS: regolden REFUSED - run has ' + $script:fail + ' failing check(s); fix before freezing new goldens')
     } else {
@@ -802,79 +842,77 @@ Kill-Riviv
 Reset-Ini ''
 
 # ---------------------------------------------------------------------------
-# S3: the L2 filter tiers.
+# S3: the L2 filter tiers. Filter domain - NOT byte-equal corpus: the
+# cross-arm MAE/phase oracles died with the GDI arm, so each tier runs the
+# warp arm TWICE and asserts determinism (two runs byte-identical); the
+# old cross-arm statistics are recorded as evidence only.
 # ---------------------------------------------------------------------------
 # S3a mag=1: 256x256 smooth gradient at exact 2x (fill recipe, 512x512):
-# warp LINEAR vs gdi HALFTONE.
+# warp LINEAR, two runs.
 $m1w = Run-Scene 'warp' 1 @('mag_filter=1') $pngGrad 's3a-mag1-warp.png' 's3a-warp.err' 512 512 $null $null
-$m1g = Run-Scene 'gdi' 1 @('mag_filter=1') $pngGrad 's3a-mag1-gdi.png' 's3a-gdi.err' 512 512 $null $null
-$m1ok = ($m1w.Code -eq 0) -and ($m1g.Code -eq 0) -and (Test-Path $m1w.Out) -and (Test-Path $m1g.Out)
-Check 'S3a-mag1 both dumps ran clean (exit 0, files exist)' $m1ok ("warp exit=$($m1w.Code) gdi exit=$($m1g.Code) views=$($m1w.Vs[0])x$($m1w.Vs[1])/$($m1g.Vs[0])x$($m1g.Vs[1])")
+$m1v = Run-Scene 'warp' 1 @('mag_filter=1') $pngGrad 's3a-mag1-warp2.png' 's3a-warp2.err' 512 512 $null $null
+$m1ok = ($m1w.Code -eq 0) -and ($m1v.Code -eq 0) -and (Test-Path $m1w.Out) -and (Test-Path $m1v.Out)
+Check 'S3a-mag1 both warp runs ran clean (exit 0, files exist)' $m1ok ("warp exit=$($m1w.Code) warp2 exit=$($m1v.Code) views=$($m1w.Vs[0])x$($m1w.Vs[1])/$($m1v.Vs[0])x$($m1v.Vs[1])")
 if ($m1ok) {
     $qw = [Px]::Load($m1w.Out)
-    $qg = [Px]::Load($m1g.Out)
-    Check 'S3a-mag1 both dumps are exactly 512x512 (exact-fill recipe held)' (($qw.W -eq 512) -and ($qw.H -eq 512) -and ($qg.W -eq 512) -and ($qg.H -eq 512)) ("warp=$($qw.W)x$($qw.H) gdi=$($qg.W)x$($qg.H)")
-    $s = [Px]::StatPair($qw.B, $qg.B, 512, 512, $null)
+    $qb = [Px]::Load($m1v.Out)
+    Check 'S3a-mag1 both dumps are exactly 512x512 (exact-fill recipe held)' (($qw.W -eq 512) -and ($qw.H -eq 512) -and ($qb.W -eq 512) -and ($qb.H -eq 512)) ("warp=$($qw.W)x$($qw.H) warp2=$($qb.W)x$($qb.H)")
+    $eqA = [Px]::BytesEqual([IO.File]::ReadAllBytes($m1w.Out), [IO.File]::ReadAllBytes($m1v.Out))
+    Check 'S3a-mag1 warp LINEAR deterministic: two runs byte-identical (the HALFTONE cross-arm oracle died with the gdi arm)' $eqA 'run1 vs run2 file bytes differ'
+    $s = [Px]::StatPair($qw.B, $qb.B, 512, 512, $null)
     $maeTxt = 'maeR={0:N3} maeG={1:N3} maeB={2:N3} max={3}' -f $s[0], $s[1], $s[2], [int]$s[3]
-    Check 'S3a-mag1 warp(LINEAR) vs gdi(HALFTONE) per-channel MAE <= 2.0' (($s[0] -le 2.0) -and ($s[1] -le 2.0) -and ($s[2] -le 2.0)) $maeTxt
-    Check 'S3a-mag1 max channel diff <= 12' ([int]$s[3] -le 12) $maeTxt
-    Write-Output ('  S3a evidence: ' + $maeTxt)
+    Write-Output ('  S3a record (warp self-consistency, gdi arm gone): ' + $maeTxt)
 }
 Kill-Riviv
 Reset-Ini ''
 
 # S3b shrink=1 (default tier): 640x480 at exactly half size (320x240):
-# warp HIGH_QUALITY_CUBIC vs gdi HALFTONE (from the full-res face).
+# warp HIGH_QUALITY_CUBIC, two runs (the HALFTONE cross-arm oracle died
+# with the gdi arm).
 $exclFlat = @(26, 26, 48, 38, 206, 41, 58, 48, 121, 156, 53, 43)  # blocks dilated 8 src px, /2
 $s1w = Run-Scene 'warp' 0 @('shrink_blit_mode=1') $png640 's3b-shrink1-warp.png' 's3b-warp.err' 320 240 $null $null
-$s1g = Run-Scene 'gdi' 0 @('shrink_blit_mode=1') $png640 's3b-shrink1-gdi.png' 's3b-gdi.err' 320 240 $null $null
-$s1ok = ($s1w.Code -eq 0) -and ($s1g.Code -eq 0) -and (Test-Path $s1w.Out) -and (Test-Path $s1g.Out)
-Check 'S3b-shrink1 both dumps ran clean (exit 0, files exist)' $s1ok ("warp exit=$($s1w.Code) gdi exit=$($s1g.Code)")
+$s1v = Run-Scene 'warp' 0 @('shrink_blit_mode=1') $png640 's3b-shrink1-warp2.png' 's3b-warp2.err' 320 240 $null $null
+$s1ok = ($s1w.Code -eq 0) -and ($s1v.Code -eq 0) -and (Test-Path $s1w.Out) -and (Test-Path $s1v.Out)
+Check 'S3b-shrink1 both warp runs ran clean (exit 0, files exist)' $s1ok ("warp exit=$($s1w.Code) warp2 exit=$($s1v.Code)")
 if ($s1ok) {
     $qw = [Px]::Load($s1w.Out)
-    $qg = [Px]::Load($s1g.Out)
-    Check 'S3b-shrink1 both dumps are exactly 320x240' (($qw.W -eq 320) -and ($qw.H -eq 240) -and ($qg.W -eq 320) -and ($qg.H -eq 240)) ("warp=$($qw.W)x$($qw.H) gdi=$($qg.W)x$($qg.H)")
-    $s = [Px]::StatPair($qw.B, $qg.B, 320, 240, $exclFlat)
-    $maeTxt = 'maeR={0:N3} maeG={1:N3} maeB={2:N3} max={3} maxOutsideBlocks={4} diffPixels={5}' -f $s[0], $s[1], $s[2], [int]$s[3], [int]$s[4], [int]$s[5]
-    Check 'S3b-shrink1 CUBIC and HALFTONE genuinely differ (>=1000 px)' ([int]$s[5] -ge 1000) $maeTxt
-    Check 'S3b-shrink1 max diff outside block halos <= 40' ([int]$s[4] -le 40) $maeTxt
+    $qb = [Px]::Load($s1v.Out)
+    Check 'S3b-shrink1 both dumps are exactly 320x240' (($qw.W -eq 320) -and ($qw.H -eq 240) -and ($qb.W -eq 320) -and ($qb.H -eq 240)) ("warp=$($qw.W)x$($qw.H) warp2=$($qb.W)x$($qb.H)")
+    $eqB = [Px]::BytesEqual([IO.File]::ReadAllBytes($s1w.Out), [IO.File]::ReadAllBytes($s1v.Out))
+    Check 'S3b-shrink1 warp CUBIC deterministic: two runs byte-identical' $eqB 'run1 vs run2 file bytes differ'
     $blowW = [Px]::CountOutside($qw.B, $qw.W, 320, 240, 4, 251, $exclFlat)
-    $blowG = [Px]::CountOutside($qg.B, $qg.W, 320, 240, 4, 251, $exclFlat)
-    Check 'S3b-shrink1 no blown-out pixels outside block halos (both arms)' (($blowW -eq 0) -and ($blowG -eq 0)) "warpOutside=$blowW gdiOutside=$blowG"
-    Write-Output ('  S3b evidence: ' + $maeTxt)
+    Check 'S3b-shrink1 no blown-out pixels outside block halos' ($blowW -eq 0) "warpOutside=$blowW"
+    $s = [Px]::StatPair($qw.B, $qb.B, 320, 240, $exclFlat)
+    $maeTxt = 'maeR={0:N3} maeG={1:N3} maeB={2:N3} max={3} maxOutsideBlocks={4} diffPixels={5}' -f $s[0], $s[1], $s[2], [int]$s[3], [int]$s[4], [int]$s[5]
+    Write-Output ('  S3b record (warp self-consistency, gdi arm gone): ' + $maeTxt)
 }
 Kill-Riviv
 Reset-Ini ''
 
-# S3c shrink=0: warp NEAREST vs gdi COLORONCOLOR at exact 2x down. Byte
-# equality is the ticket claim; a uniform one-source-pixel sampling phase
-# (src[2i] vs src[2i+1]) is the accepted legitimate divergence - the census
-# adjudicates, anything else is a FAIL.
+# S3c shrink=0: warp NEAREST at exact 2x down, two runs. The old byte
+# equality oracle was warp-vs-gdi (COLORONCOLOR) - that arm is gone, so
+# determinism across two warp runs is the assertion and the uniform
+# source-phase census stays as failure DIAGNOSTICS.
 $s0w = Run-Scene 'warp' 0 @('shrink_blit_mode=0') $png640 's3c-shrink0-warp.png' 's3c-warp.err' 320 240 $null $null
-$s0g = Run-Scene 'gdi' 0 @('shrink_blit_mode=0') $png640 's3c-shrink0-gdi.png' 's3c-gdi.err' 320 240 $null $null
-$s0ok = ($s0w.Code -eq 0) -and ($s0g.Code -eq 0) -and (Test-Path $s0w.Out) -and (Test-Path $s0g.Out)
-Check 'S3c-shrink0 both dumps ran clean (exit 0, files exist)' $s0ok ("warp exit=$($s0w.Code) gdi exit=$($s0g.Code)")
+$s0v = Run-Scene 'warp' 0 @('shrink_blit_mode=0') $png640 's3c-shrink0-warp2.png' 's3c-warp2.err' 320 240 $null $null
+$s0ok = ($s0w.Code -eq 0) -and ($s0v.Code -eq 0) -and (Test-Path $s0w.Out) -and (Test-Path $s0v.Out)
+Check 'S3c-shrink0 both warp runs ran clean (exit 0, files exist)' $s0ok ("warp exit=$($s0w.Code) warp2 exit=$($s0v.Code)")
 if ($s0ok) {
-    # Byte equality is THE assertion (external review AI2 P3: the earlier
-    # shape let two arms diverge by a uniform source-pixel phase and still
-    # pass). The phase census below stays as failure DIAGNOSTICS only -
-    # this build measured plain byte equality, and a divergence means a
-    # real behavior change on one arm that must go red.
-    $eq0 = [Px]::BytesEqual([IO.File]::ReadAllBytes($s0w.Out), [IO.File]::ReadAllBytes($s0g.Out))
+    $eq0 = [Px]::BytesEqual([IO.File]::ReadAllBytes($s0w.Out), [IO.File]::ReadAllBytes($s0v.Out))
     $diag0 = ''
     if (-not $eq0) {
         $cw = [Px]::PhaseCensus([Px]::Load($s0w.Out).B, 320, 0, 0, 320, 240, $photo640, 640, 480)
-        $cg = [Px]::PhaseCensus([Px]::Load($s0g.Out).B, 320, 0, 0, 320, 240, $photo640, 640, 480)
-        $diag0 = " warp: $cw | gdi: $cg"
+        $cv = [Px]::PhaseCensus([Px]::Load($s0v.Out).B, 320, 0, 0, 320, 240, $photo640, 640, 480)
+        $diag0 = " run1: $cw | run2: $cv"
     }
-    Check 'S3c-shrink0 warp(NEAREST) and gdi(COLORONCOLOR) byte-identical' $eq0 ("file bytes differ -$diag0")
+    Check 'S3c-shrink0 warp(NEAREST) deterministic: two runs byte-identical (the gdi(COLORONCOLOR) byte-equality oracle died with the arm)' $eq0 ("file bytes differ -$diag0")
 }
 Kill-Riviv
 Reset-Ini ''
 
 # ---------------------------------------------------------------------------
-# S4: giant correctness. Banner 40000x256 (>=32768 extent -> the gdi arm
-# takes the NEW full-res-face clip-region branch; warp still uploads).
+# S4: giant correctness. Banner 40000x256: warp uploads (no D2D gate) and
+# CUBIC-deep-shrinks; the gdi-arm banner twin died with the arm (#90).
 # ---------------------------------------------------------------------------
 function Banner-Checks($q) {
     # Returns the measured banner properties (no pipeline output). The
@@ -928,9 +966,8 @@ function Banner-Checks($q) {
     return $r
 }
 $baw = Run-Scene 'warp' 0 @('shrink_blit_mode=1') $pngBanner 's4-banner-warp.png' 's4-warp.err' $null $null $null 30000
-$bag = Run-Scene 'gdi' 0 @('shrink_blit_mode=1') $pngBanner 's4-banner-gdi.png' 's4-gdi.err' $null $null $null 30000
-$baOk = ($baw.Code -eq 0) -and ($bag.Code -eq 0) -and (Test-Path $baw.Out) -and (Test-Path $bag.Out)
-Check 'S4a-banner both dumps ran clean (exit 0)' $baOk ("warp exit=$($baw.Code) gdi exit=$($bag.Code) warpAlive=$($baw.Alive) gdiAlive=$($bag.Alive)")
+$baOk = ($baw.Code -eq 0) -and (Test-Path $baw.Out)
+Check 'S4a-banner warp dump ran clean (exit 0)' $baOk ("warp exit=$($baw.Code) warpAlive=$($baw.Alive)")
 if ($baOk) {
     $gateW = $baw.Err.Contains('exceeds the D2D max bitmap')
     Check 'S4a-banner-warp no D2D gate line (40000 uploaded, CUBIC deep shrink really ran)' (-not $gateW) ("stderr=[$($baw.Err.Trim())]")
@@ -939,55 +976,17 @@ if ($baOk) {
     Check 'S4b-banner-warp bbox: height <= 8, width == viewport width' (($rw.Bh -ge 1) -and ($rw.Bh -le 8) -and ($rw.Bw -eq $baw.Vs[0])) ("bbox l=$($rw.Bb[0]) t=$($rw.Bb[1]) $($rw.Bw)x$($rw.Bh) viewport=$($baw.Vs[0])x$($baw.Vs[1])")
     Check 'S4c-banner-warp stripes band mean luminance in [96,160] (averaged, no aliasing garbage)' (($rw.BandMean -ge 96) -and ($rw.BandMean -le 160)) ('bandMean={0:N1}' -f $rw.BandMean)
     Check 'S4d-banner-warp left-half monotone (+-2) and seam scan max <= 3*median+2' ($rw.Monotone -and ($rw.MaxExcl -le (3 * $rw.Median + 2))) ('worstDrop={0:N2} medianDelta={1:N3} maxExcl={2:N2} maxFull={3:N2}' -f $rw.WorstDrop, $rw.Median, $rw.MaxExcl, $rw.MaxFull)
-    $qg = [Px]::Load($bag.Out)
-    $rg = Banner-Checks $qg
-    Check 'S4e-banner-gdi bbox same shape (full-res-face branch drew the whole frame)' (($rg.Bh -ge 1) -and ($rg.Bh -le 8) -and ($rg.Bw -eq $bag.Vs[0])) ("bbox $($rg.Bw)x$($rg.Bh) viewport=$($bag.Vs[0])x$($bag.Vs[1])")
-    Check 'S4f-banner-gdi band mean in [80,176] (HALFTONE) + monotone + >=64 distinct lums' (($rg.BandMean -ge 80) -and ($rg.BandMean -le 176) -and $rg.Monotone -and ($rg.Lums -ge 64)) ('bandMean={0:N1} monotone={1} worstDrop={2:N2} lums={3}' -f $rg.BandMean, $rg.Monotone, $rg.WorstDrop, $rg.Lums)
-    $mae = [Px]::StatPair($qw.B, $qg.B, [Math]::Min($qw.W, $qg.W), [Math]::Min($qw.H, $qg.H), $null)
-    Write-Output ('  S4 banner record: warp bandMean={0:N1} gdi bandMean={1:N1} warp maxFull={2:N2} gdi maxFull={3:N2} warpVsGdiRegionMAE(R/G/B)={4:N2}/{5:N2}/{6:N2} max={7}' -f $rw.BandMean, $rg.BandMean, $rw.MaxFull, $rg.MaxFull, $mae[0], $mae[1], $mae[2], [int]$mae[3])
+    Write-Output ('  S4 banner record (warp only, gdi arm gone): bandMean={0:N1} maxFull={1:N2}' -f $rw.BandMean, $rw.MaxFull)
 }
 Kill-Riviv
 Reset-Ini ''
 
-# Extreme giant 16777217x1 horizontal gradient. The gdi run asserts the
-# CONTENT of the >=32768 giant branch; since #82 the warp run asserts the
-# OPPOSITE of the old gate: the D2D arm draws it itself (no gate line, no
-# gdi fallback), with the stats line naming the form (S4j/S4j2).
+# Extreme giant 16777217x1 horizontal gradient. Since #82 the warp run
+# asserts the OPPOSITE of the old gate: the D2D arm draws it itself (no
+# gate line, no gdi fallback), with the stats line naming the form
+# (S4j/S4j2). The former renderer=gdi content run (old S4g-S4i) is retired
+# with the GDI arm (#90).
 $giantExtra = @('shrink_blit_mode=1')
-$ggr = Run-Scene 'gdi' 0 $giantExtra $giantPng 's4-giant-gdi.png' 's4-giant-gdi.err' $null $null $null 90000
-$ggOk = ($ggr.Code -eq 0) -and (Test-Path $ggr.Out)
-Check 'S4g-giant-gdi ran clean (exit 0, dump exists, no gate on the gdi arm)' ($ggOk -and (-not $ggr.Err.Contains('exceeds the D2D max bitmap'))) ("exit=$($ggr.Code) stderr=[$($ggr.Err.Trim())]")
-if ($ggOk) {
-    $q = [Px]::Load($ggr.Out)
-    $bb = [Px]::BBox($q.B, $q.W, $q.H)
-    $bh = $bb[3] - $bb[1] + 1
-    $bwd = $bb[2] - $bb[0] + 1
-    $shapeOk = ($bh -ge 1) -and ($bh -le 2) -and ($bwd -eq $ggr.Vs[0])
-    Check 'S4h-giant-gdi image bbox is a strip spanning the viewport width, 1-2px tall' $shapeOk ("bbox l=$($bb[0]) t=$($bb[1]) ${bwd}x${bh} viewport=$($ggr.Vs[0])x$($ggr.Vs[1])")
-    $gradOk = $false
-    $gradDetail = 'bbox degenerate'
-    if ($shapeOk) {
-        $cm = [Px]::ColumnMeans($q.B, $q.W, $bb[0], $bb[1], $bwd, $bh)
-        $q4 = [int]($bwd / 4)
-        $lq = 0.0
-        $rq = 0.0
-        for ($c = 0; $c -lt $q4; $c++) { $lq += $cm[$c] }
-        for ($c = ($bwd - $q4); $c -lt $bwd; $c++) { $rq += $cm[$c] }
-        $lq = $lq / $q4
-        $rq = $rq / $q4
-        $maxRun = 0
-        $curRun = 0
-        for ($c = 0; $c -lt $bwd; $c++) {
-            if (($cm[$c] -lt 8) -or ($cm[$c] -gt 247)) { $curRun++ } else { if ($curRun -gt $maxRun) { $maxRun = $curRun }; $curRun = 0 }
-        }
-        if ($curRun -gt $maxRun) { $maxRun = $curRun }
-        $gradOk = ([Math]::Abs($lq - $rq) -ge 40) -and ($maxRun -lt 8)
-        $gradDetail = 'leftMean={0:N1} rightMean={1:N1} diff={2:N1} maxExtremeRun={3}' -f $lq, $rq, [Math]::Abs($lq - $rq), $maxRun
-    }
-    Check 'S4i-giant-gdi gradient survived (quarter means differ >= 40, no extreme run >= 8)' $gradOk $gradDetail
-}
-Kill-Riviv
-Reset-Ini ''
 
 $gwr = Run-Scene 'warp' 0 $giantExtra $giantPng 's4-giant-warp.png' 's4-giant-warp.err' $null $null $null 90000
 $gwOk = ($gwr.Code -eq 0) -and (Test-Path $gwr.Out)
@@ -1036,91 +1035,14 @@ Kill-Riviv
 Reset-Ini ''
 
 # ---------------------------------------------------------------------------
-# S4 boundary census: the #81 giant-relief trigger at 2^22. The gdi shrink
-# arm draws a source extent >= STRETCH_SOURCE_STITCH_TRIGGER (2^22) through
-# the transient relief intermediate (512px HALFTONE slices build a ~2^21
-# DIB, one full-rect blit from it), keeping the 32768..2^22 band on the
-# single full-rect StretchBlt. Three widths at height 1 straddle the
-# boundary; each runs renderer=gdi fit-dump with the same content
-# assertions as the 16777217x1 extreme giant above (strip spans the
-# viewport width, left/right quarter mean luminance differ >= 40, no run
-# of >= 8 consecutive all-black/all-white columns) and the two relief
-# widths add a seam scan: over the strip's row, max adjacent-column
-# |delta mean| <= 3*median + 2 (numbers recorded in the detail).
+# S4 boundary census RETIRED with the GDI arm (#90): the old census ran
+# renderer=gdi over widths straddling the 2^22 STRETCH_SOURCE_STITCH_
+# TRIGGER relief boundary (old S4m/n/p/q, fed by the Giant-Checks helper
+# and the 4M/2^22/2^23/6.29M census fixtures). GiantRelief, the relief
+# path and the trigger are deleted; the mag >=2^22 KNOWN GAP went with
+# them. Giant content on the D2D arms is covered by S4j/S4k here and by
+# smoke82 S3/S4.
 # ---------------------------------------------------------------------------
-function Giant-Checks($q, $viewW) {
-    # Strip shape + content stats for a 1px-tall gradient giant, mirroring
-    # the inline assertions of the 16777217x1 scenario (no pipeline output).
-    $r = @{}
-    $bb = [Px]::BBox($q.B, $q.W, $q.H)
-    $r.Bb = $bb
-    $r.Bh = $bb[3] - $bb[1] + 1
-    $r.Bw = $bb[2] - $bb[0] + 1
-    $r.ShapeOk = ($r.Bh -ge 1) -and ($r.Bh -le 2) -and ($r.Bw -eq $viewW)
-    $r.Lq = -1.0
-    $r.Rq = -1.0
-    $r.Diff = -1.0
-    $r.MaxRun = -1
-    $r.MaxDelta = -1.0
-    $r.MedianDelta = -1.0
-    if (-not $r.ShapeOk) { return $r }
-    $cm = [Px]::ColumnMeans($q.B, $q.W, $bb[0], $bb[1], $r.Bw, $r.Bh)
-    $q4 = [int]($r.Bw / 4)
-    $lq = 0.0
-    $rq = 0.0
-    for ($c = 0; $c -lt $q4; $c++) { $lq += $cm[$c] }
-    for ($c = ($r.Bw - $q4); $c -lt $r.Bw; $c++) { $rq += $cm[$c] }
-    $r.Lq = $lq / $q4
-    $r.Rq = $rq / $q4
-    $r.Diff = [Math]::Abs($r.Lq - $r.Rq)
-    $maxRun = 0
-    $curRun = 0
-    for ($c = 0; $c -lt $r.Bw; $c++) {
-        if (($cm[$c] -lt 8) -or ($cm[$c] -gt 247)) { $curRun++ } else { if ($curRun -gt $maxRun) { $maxRun = $curRun }; $curRun = 0 }
-    }
-    if ($curRun -gt $maxRun) { $maxRun = $curRun }
-    $r.MaxRun = $maxRun
-    $deltas = New-Object System.Collections.Generic.List[double]
-    $r.MaxDelta = 0.0
-    for ($c = 1; $c -lt $r.Bw; $c++) {
-        $d = [Math]::Abs($cm[$c] - $cm[$c - 1])
-        if ($d -gt $r.MaxDelta) { $r.MaxDelta = $d }
-        $deltas.Add($d)
-    }
-    if ($deltas.Count -gt 0) {
-        $arr = $deltas.ToArray()
-        [Array]::Sort($arr)
-        $r.MedianDelta = $arr[[int]($arr.Length / 2)]
-    }
-    return $r
-}
-$giantCensus = @(
-    @{ N = 'm'; W = 4000000; Png = $giant4mPng; Seam = $false },  # below the 2^22 trigger: single full-rect path must still render
-    @{ N = 'n'; W = 4194304; Png = $giant4nPng; Seam = $true },   # exactly 2^22: the first relief width
-    @{ N = 'p'; W = 8388608; Png = $giant4pPng; Seam = $true },   # 2^23: the width that rendered black before the relief fix
-    @{ N = 'q'; W = 6291456; Png = $giant6mPng; Seam = $true }    # 3*2^21, a NON-power-of-two multiple: k=4 -> 1,572,864 relief (pins relief_divisor off the power-of-2 grid; external review AI1 P3-8)
-)
-foreach ($cw in $giantCensus) {
-    $tag = 'S4' + $cw.N
-    if ($cw.Seam) { $pathTxt = 'relief(two-stage)' } else { $pathTxt = 'single-full-rect' }
-    $crr = Run-Scene 'gdi' 0 $giantExtra $cw.Png ('s4-census-' + $cw.N + '-gdi.png') ('s4-census-' + $cw.N + '-gdi.err') $null $null $null 90000
-    $crOk = ($crr.Code -eq 0) -and (Test-Path $crr.Out)
-    Check ($tag + '-census-' + $cw.W + '-gdi ran clean (exit 0, dump exists, no gate on the gdi arm)') ($crOk -and (-not $crr.Err.Contains('exceeds the D2D max bitmap'))) ("exit=$($crr.Code) stderr=[$($crr.Err.Trim())]")
-    if (-not $crOk) { Kill-Riviv; Reset-Ini ''; continue }
-    $cq = [Px]::Load($crr.Out)
-    $ck = Giant-Checks $cq $crr.Vs[0]
-    Check ($tag + '-census-' + $cw.W + '-gdi bbox strip spans the viewport width, 1-2px tall') $ck.ShapeOk ("bbox l=$($ck.Bb[0]) t=$($ck.Bb[1]) $($ck.Bw)x$($ck.Bh) viewport=$($crr.Vs[0])x$($crr.Vs[1])")
-    if ($ck.ShapeOk) {
-        Check ($tag + '-census-' + $cw.W + '-gdi gradient survived (quarter means differ >= 40, no extreme run >= 8)') (($ck.Diff -ge 40) -and ($ck.MaxRun -lt 8)) ('leftMean={0:N1} rightMean={1:N1} diff={2:N1} maxExtremeRun={3}' -f $ck.Lq, $ck.Rq, $ck.Diff, $ck.MaxRun)
-        if ($cw.Seam) {
-            $seamBound = 3 * $ck.MedianDelta + 2
-            Check ($tag + '-census-' + $cw.W + '-gdi relief-path seam scan (max |dmean| <= 3*median + 2)') ($ck.MaxDelta -le $seamBound) ('medianDelta={0:N4} maxDelta={1:N4} bound={2:N4}' -f $ck.MedianDelta, $ck.MaxDelta, $seamBound)
-        }
-    }
-    Write-Output ('  ' + $tag + ' census evidence: width=' + $cw.W + ' path=' + $pathTxt + ' strip=' + $ck.Bw + 'x' + $ck.Bh + ' leftMean=' + ('{0:N2}' -f $ck.Lq) + ' rightMean=' + ('{0:N2}' -f $ck.Rq) + ' maxExtremeRun=' + $ck.MaxRun + ' medianDelta=' + ('{0:N4}' -f $ck.MedianDelta) + ' maxDelta=' + ('{0:N4}' -f $ck.MaxDelta))
-    Kill-Riviv
-    Reset-Ini ''
-}
 
 # ---------------------------------------------------------------------------
 # S5: dump failure = exit 2, stderr says so, no modal hang.
@@ -1138,9 +1060,10 @@ Reset-Ini ''
 
 # ---------------------------------------------------------------------------
 # S6: frame-time baseline (record-only). Launch->exit wall time of the dump
-# run, 3 runs per scene per renderer. Includes process start, PS
-# Start-Process overhead, adoption wait polls, (scenes b/c) calibration and
-# the WM_CLOSE dump - a comparability baseline, not a product-only number.
+# run, 3 runs per scene, warp renderer only (the gdi rows died with the
+# arm, #90). Includes process start, PS Start-Process overhead, adoption
+# wait polls, (scenes b/c) calibration and the WM_CLOSE dump - a
+# comparability baseline, not a product-only number.
 # ---------------------------------------------------------------------------
 $one2one = { param($m) [void][S81]::PostMessage($m, $WM_COMMAND, [IntPtr]$CMD_ONE2ONE, [IntPtr]::Zero) }
 $s6scenes = @(
@@ -1148,13 +1071,13 @@ $s6scenes = @(
     @{ Name = 'mag2-96x64'; Img = $png96; Fill = 1; Extra = (@('mag_filter=0') + $BgMagenta); TW = 256; TH = 128; Cmds = $null },
     @{ Name = 'shrink2-640x480'; Img = $png640; Fill = 0; Extra = @('shrink_blit_mode=1'); TW = 320; TH = 240; Cmds = $null },
     @{ Name = 'bannerfit-40000x256'; Img = $pngBanner; Fill = 0; Extra = @('shrink_blit_mode=1'); TW = $null; TH = $null; Cmds = $null },
-    # The relief path itself (external review AI1 P2-4): a >=2^22 fit dump
-    # pays the per-paint relief build (raw DIB + in-place zero + the 512px
-    # HALFTONE slice blits) - the only per-paint machine #81 adds.
+    # The giant fit dump itself (external review AI1 P2-4 row, now on the
+    # D2D overview/tile path since #90 deleted the per-paint GDI relief
+    # build): a >=2^24 fit dump pays the mip/overview machinery.
     @{ Name = 'relieffit-16777217x1'; Img = $giantPng; Fill = 0; Extra = @('shrink_blit_mode=1'); TW = $null; TH = $null; Cmds = $null }
 )
 foreach ($sc in $s6scenes) {
-    foreach ($rnd in @('warp', 'gdi')) {
+    foreach ($rnd in @('warp')) {
         $times = @()
         for ($i = 0; $i -lt 3; $i++) {
             $sw = [System.Diagnostics.Stopwatch]::StartNew()
@@ -1164,6 +1087,135 @@ foreach ($sc in $s6scenes) {
             if ($r.Code -ne 0) { Write-Output ('  S6 note: ' + $sc.Name + '/' + $rnd + ' run ' + $i + ' exit=' + $r.Code) }
         }
         Write-Output ('S6 baseline: scene=' + $sc.Name + ' renderer=' + $rnd + ' ms1=' + $times[0] + ' ms2=' + $times[1] + ' ms3=' + $times[2])
+    }
+}
+Kill-Riviv
+Reset-Ini ''
+
+# ---------------------------------------------------------------------------
+# S10: the golden90 corpus (#90). smoke/golden90/ froze five GDI-arm dumps
+# at commit 5996944 in the byte-equal NEAREST domain (at freeze time each
+# scene's gdi dump == its warp dump byte for byte), so after the #90
+# deletion a warp dump must reproduce each golden byte-for-byte: the
+# frozen file is the oracle for the removed arm. EVERY scene regenerates
+# its fixture fresh right before its instance (HashSource + SaveRgba):
+# the rot90 scene's EditRotate90 fires the shell rotate90 verb which
+# REWRITES the fixture file on disk, so one shared fixture across
+# instances poisons the second one. The same scenes also run once under
+# renderer=auto (hardware): all five byte-matching goldens promotes them
+# to hard assertions; any mismatch stays record-only with byte-diff
+# counts (never forced green).
+# ---------------------------------------------------------------------------
+$GoldenDir90 = Join-Path $PSScriptRoot 'golden90'
+$CMD_ROTATE90 = 23   # menu.rs Cmd::EditRotate90.id()
+$rot90Cmds = { param($m)
+    [void][S81]::PostMessage($m, $WM_COMMAND, [IntPtr]$CMD_ROTATE90, [IntPtr]::Zero)
+    Start-Sleep -Milliseconds 300
+    [void][S81]::PostMessage($m, $WM_COMMAND, [IntPtr]$CMD_ONE2ONE, [IntPtr]::Zero)
+    Start-Sleep -Milliseconds 400
+}
+function New-Hash96Fixture([string]$path) {
+    $s = [Px]::HashSource(96, 64)
+    [Px]::SaveRgba($path, $s, 96, 64)
+}
+$g90Fixture = Join-Path $Stage 'g90hash96.png'
+$s10scenes = @(
+    @{ Name = 's1-one2one-gdi.png';       Fill = 1; Extra = (@('mag_filter=0', 'shrink_blit_mode=0') + $BgMagenta); TW = 256; TH = 192; Cmds = $one2one },
+    @{ Name = 's2-magk2-gdi.png';         Fill = 1; Extra = (@('mag_filter=0') + $BgMagenta); TW = 256; TH = 128; Cmds = $null },
+    @{ Name = 's3-magk3-gdi.png';         Fill = 1; Extra = (@('mag_filter=0') + $BgMagenta); TW = 288; TH = 192; Cmds = $null },
+    @{ Name = 's4-rot90-one2one-gdi.png'; Fill = 1; Extra = (@('mag_filter=0') + $BgMagenta); TW = 256; TH = 192; Cmds = $rot90Cmds },
+    @{ Name = 's5-one2one-white-gdi.png'; Fill = 1; Extra = @('mag_filter=0', 'shrink_blit_mode=0'); TW = 256; TH = 192; Cmds = $one2one }
+)
+$g90WarpDumps = @{}
+foreach ($sc in $s10scenes) {
+    New-Hash96Fixture $g90Fixture
+    $r = Run-Scene 'warp' $sc.Fill $sc.Extra $g90Fixture ('s10-warp-' + $sc.Name) ('s10-warp-' + $sc.Name + '.err') $sc.TW $sc.TH $sc.Cmds $null
+    $g90WarpDumps[$sc.Name] = $r.Out
+    $golden = Join-Path $GoldenDir90 $sc.Name
+    $ranOk = ($r.Code -eq 0) -and (Test-Path $r.Out)
+    Check ('S10a ' + $sc.Name + ' warp run clean (exit 0, dump exists)') $ranOk ("exit=$($r.Code) view=$($r.Vs[0])x$($r.Vs[1]) stderr=[$($r.Err.Trim())]")
+    if ((-not $ranOk) -or (-not (Test-Path $golden))) {
+        if (-not (Test-Path $golden)) { Skip-Scenario ('S10b ' + $sc.Name + ' golden byte-compare') 'golden90 file missing (broken checkout)' }
+        Kill-Riviv
+        Start-Sleep -Milliseconds 500   # settle before the next fixture rewrite (see the loop-end note)
+        Reset-Ini ''
+        continue
+    }
+    $same = [Px]::BytesEqual([IO.File]::ReadAllBytes($golden), [IO.File]::ReadAllBytes($r.Out))
+    if ($same) {
+        Check ('S10b ' + $sc.Name + ' warp dump byte-identical to the frozen golden90 reference') $true 'byte-identical'
+    } else {
+        # Mismatch diagnosis (S10 s5 finding): separate "the golden was
+        # frozen from a rotated on-disk fixture" (a corpus defect -> regolden)
+        # from a real renderer content error (STOP). Runs only on mismatch.
+        $qd = [Px]::Load($r.Out)
+        $qg2 = [Px]::Load($golden)
+        $pxDiff = 0
+        if (($qd.W -eq $qg2.W) -and ($qd.H -eq $qg2.H)) {
+            for ($i = 0; $i -lt $qd.B.Length; $i += 4) {
+                if ($qd.B[$i] -ne $qg2.B[$i] -or $qd.B[$i + 1] -ne $qg2.B[$i + 1] -or $qd.B[$i + 2] -ne $qg2.B[$i + 2] -or $qd.B[$i + 3] -ne $qg2.B[$i + 3]) { $pxDiff++ }
+            }
+        }
+        $dumpUpright = [Px]::MatchesWhiteHashModel($qd.B, $qd.W, $qd.H, $false)
+        $goldenRot = [Px]::MatchesWhiteHashModel($qg2.B, $qg2.W, $qg2.H, $true)
+        $diag = ''
+        if ($dumpUpright -and $goldenRot) {
+            $diag = ' DIAGNOSIS: dump == fresh-HashSource model AND golden == rot180(fixture) model - the GOLDEN was frozen from a 180-degree-rotated on-disk fixture (freeze-harness shared-fixture artifact); the renderer is correct, regolden the mismatching scene'
+        }
+        Check ('S10b ' + $sc.Name + ' warp dump byte-identical to the frozen golden90 reference') $false ("bytes differ, pixelDiffs=$pxDiff$diag")
+    }
+    # The rot90 shell verb may finish writing the fixture AFTER the
+    # process exit - settle INSIDE the loop, before the next iteration
+    # rewrites the fixture path (AI1 P3-7: the poison window is the
+    # cross-scene handoff s4->s5, not the loop's end; the first freeze
+    # was poisoned exactly there).
+    Start-Sleep -Milliseconds 500
+    Kill-Riviv
+    Reset-Ini ''
+}
+# Hardware arm: record-only unless ALL five dumps byte-match the goldens.
+$g90AutoMatches = 0
+$g90AutoDetail = ''
+foreach ($sc in $s10scenes) {
+    New-Hash96Fixture $g90Fixture
+    $r = Run-Scene 'auto' $sc.Fill $sc.Extra $g90Fixture ('s10-auto-' + $sc.Name) ('s10-auto-' + $sc.Name + '.err') $sc.TW $sc.TH $sc.Cmds $null
+    $golden = Join-Path $GoldenDir90 $sc.Name
+    $verdict = 'nodump'
+    if (($r.Code -eq 0) -and (Test-Path $r.Out) -and (Test-Path $golden)) {
+        $ga = [IO.File]::ReadAllBytes($golden)
+        $gb = [IO.File]::ReadAllBytes($r.Out)
+        if ([Px]::BytesEqual($ga, $gb)) {
+            $verdict = 'match'
+            $g90AutoMatches++
+        } else {
+            $n = -1
+            if ($ga.Length -eq $gb.Length) {
+                $n = 0
+                for ($i = 0; $i -lt $ga.Length; $i++) { if ($ga[$i] -ne $gb[$i]) { $n++ } }
+            }
+            $verdict = 'differs bytes=' + $n
+        }
+    }
+    $g90AutoDetail += (' ' + $sc.Name + '=' + $verdict)
+    Start-Sleep -Milliseconds 500   # same cross-scene settle as the warp loop
+    Kill-Riviv
+    Reset-Ini ''
+}
+Write-Output ('  S10 auto-vs-golden record:' + $g90AutoDetail)
+if ($g90AutoMatches -eq 5) {
+    Check 'S10c all five auto (hardware) dumps byte-identical to the frozen golden90 references' ($g90AutoMatches -eq 5) ('all-match;' + $g90AutoDetail)
+} else {
+    Write-Output ('  S10 RECORD-ONLY: the hardware auto arm does not byte-match the goldens on this machine (' + $g90AutoMatches + '/5) - kept as recorded evidence, not asserted')
+}
+if ($Regolden90) {
+    if ($script:fail -gt 0) {
+        Write-Output ('GOLDENS90: regolden REFUSED - run has ' + $script:fail + ' failing check(s); fix before freezing new goldens')
+    } else {
+        foreach ($sc in $s10scenes) {
+            $src = $g90WarpDumps[$sc.Name]
+            if (($src -ne $null) -and (Test-Path $src)) { Copy-Item $src (Join-Path $GoldenDir90 $sc.Name) -Force }
+        }
+        Write-Output 'GOLDENS90: (re)written from the warp arm of this run (-Regolden90)'
     }
 }
 Kill-Riviv

@@ -86,8 +86,11 @@ pub(crate) struct FitPolicy {
 
 impl FitPolicy {
     /// The upstream defaults with both fill modes off (config.c:46-47) —
-    // keep aspect, never upscale. The tests pin it; paint uses it when no
-    // window state exists (a degenerate frame).
+    /// keep aspect, never upscale. Test-only since #90: the render path's
+    /// policies come mode-resolved from `window::fit_policy` (the old
+    /// paint.rs no-state fallback was its last production consumer); the
+    /// tests keep it as their baseline policy.
+    #[cfg(test)]
     pub(crate) const WITHOUT_FILL: FitPolicy = FitPolicy {
         keep_aspect: true,
         fill: false,
@@ -625,73 +628,6 @@ fn clamp_axis(r: i32, len: i32, limit: i32, view: i32) -> i32 {
     } else {
         0
     }
-}
-
-/// One blit: destination rect + source rect (the clipped magnify path in
-/// `paint` builds these).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct BlitRect {
-    pub(crate) dx: i32,
-    pub(crate) dy: i32,
-    pub(crate) dw: i32,
-    pub(crate) dh: i32,
-    pub(crate) sx: i32,
-    pub(crate) sy: i32,
-    pub(crate) sw: i32,
-    pub(crate) sh: i32,
-}
-
-/// Clip a blit of the whole source down to the viewport at
-/// `(clip_x, clip_y)`, mapping the cut back to source coordinates. Returns
-/// `None` when nothing is visible. The input's `sx`/`sy` are ignored (the
-/// whole-source blit always starts at 0,0).
-///
-/// For the magnify path: GDI walks the full destination extent of a
-/// StretchBlt regardless of the DC's clip region (upstream viv.c:4056-4062),
-/// so a 16x blit stretches a rect tens of thousands of pixels wide on every
-/// paint — upstream avoids exactly this with its tiled stretch
-/// (`_viv_StretchBltStitch`, viv.c:14929-14936; the full stitch is #9).
-/// The proportional mapping is ±1 source px at the seams versus the
-/// unclipped stretch; COLORONCOLOR decimation makes that invisible.
-/// (The shrink path deliberately does NOT use this: HALFTONE filter taps
-/// would realign — upstream clips that path with a DC region instead,
-/// which GDI honors for shrinks.)
-pub(crate) fn clip_blit(
-    blit: BlitRect,
-    clip_x: i32,
-    clip_y: i32,
-    clip: Viewport,
-) -> Option<BlitRect> {
-    let BlitRect {
-        dx,
-        dy,
-        dw,
-        dh,
-        sw,
-        sh,
-        ..
-    } = blit;
-    let x2 = dx.max(clip_x);
-    let y2 = dy.max(clip_y);
-    let w2 = (dx + dw).min(clip_x + clip.wide) - x2;
-    let h2 = (dy + dh).min(clip_y + clip.high) - y2;
-    if w2 <= 0 || h2 <= 0 || dw <= 0 || dh <= 0 {
-        return None;
-    }
-    let sx = (i64::from(x2 - dx) * i64::from(sw) / i64::from(dw)) as i32;
-    let sy = (i64::from(y2 - dy) * i64::from(sh) / i64::from(dh)) as i32;
-    let sw2 = ((i64::from(w2) * i64::from(sw) / i64::from(dw)) as i32).max(1);
-    let sh2 = ((i64::from(h2) * i64::from(sh) / i64::from(dh)) as i32).max(1);
-    Some(BlitRect {
-        dx: x2,
-        dy: y2,
-        dw: w2,
-        dh: h2,
-        sx,
-        sy,
-        sw: sw2,
-        sh: sh2,
-    })
 }
 
 #[cfg(test)]
@@ -1295,116 +1231,6 @@ mod tests {
         v.reset_zoom(0, 0, VP, FIT);
         assert_eq!(v.view_x, 0);
         assert_eq!(v.view_y, 0);
-    }
-
-    #[test]
-    fn clip_blit_returns_the_rect_unchanged_when_fully_visible() {
-        // dest inside the clip: the mapping must be the identity (source
-        // starts at 0, no cut).
-        let whole = BlitRect {
-            dx: 10,
-            dy: 20,
-            dw: 100,
-            dh: 200,
-            sx: 0,
-            sy: 0,
-            sw: 50,
-            sh: 60,
-        };
-        assert_eq!(clip_blit(whole, 0, 0, VP), Some(whole));
-    }
-
-    #[test]
-    fn clip_blit_cuts_to_the_viewport_and_maps_back_exactly() {
-        // 4x magnification (dest 400 <- source 100) panned so the image
-        // starts 100px left of the viewport: half the blit is off-view.
-        // Visible: dest [0, 200) <- the second half of the source.
-        let whole = BlitRect {
-            dx: -100,
-            dy: 0,
-            dw: 400,
-            dh: 100,
-            sx: 0,
-            sy: 0,
-            sw: 100,
-            sh: 60,
-        };
-        let clipped = BlitRect {
-            dx: 0,
-            dy: 0,
-            dw: 200,
-            dh: 100,
-            sx: 25,
-            sy: 0,
-            sw: 50,
-            sh: 60,
-        };
-        assert_eq!(
-            clip_blit(
-                whole,
-                0,
-                0,
-                Viewport {
-                    wide: 200,
-                    high: 100
-                }
-            ),
-            Some(clipped)
-        );
-    }
-
-    #[test]
-    fn clip_blit_bounds_the_high_zoom_extent() {
-        // The audit case: a 4000px source at level 15 renders 64000px wide;
-        // pinned at the right edge the visible strip is just the viewport,
-        // and the blit GDI walks must never exceed it.
-        let whole = BlitRect {
-            dx: -63500,
-            dy: 0,
-            dw: 64000,
-            dh: 1600,
-            sx: 0,
-            sy: 0,
-            sw: 4000,
-            sh: 100,
-        };
-        let b = clip_blit(
-            whole,
-            0,
-            0,
-            Viewport {
-                wide: 500,
-                high: 100,
-            },
-        )
-        .expect("a visible strip");
-        assert_eq!((b.dx, b.dw), (0, 500));
-        // the visible 500px shows the source's last 1/128th: ~31px.
-        assert_eq!(b.sx, 63500 * 4000 / 64000);
-        assert_eq!(b.sw, 500 * 4000 / 64000);
-    }
-
-    #[test]
-    fn clip_blit_reports_nothing_when_off_view() {
-        let base = BlitRect {
-            dx: 0,
-            dy: 0,
-            dw: 100,
-            dh: 100,
-            sx: 0,
-            sy: 0,
-            sw: 50,
-            sh: 50,
-        };
-        let mut right = base;
-        right.dx = 500;
-        let mut left = base;
-        left.dx = -200;
-        let mut above = base;
-        above.dy = -200;
-        assert_eq!(clip_blit(right, 0, 0, VP), None);
-        assert_eq!(clip_blit(left, 0, 0, VP), None);
-        assert_eq!(clip_blit(above, 0, 0, VP), None);
     }
 
     #[test]
