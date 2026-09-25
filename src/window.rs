@@ -456,6 +456,24 @@ pub(crate) struct WindowState {
     /// established yet — no stack ever built; unreachable on the dump
     /// path, which needs a live stack).
     pub(crate) output_identity: Option<crate::transform_stage::OutputIdentity>,
+    /// #130: the display judge's latest outcome — the query value plus
+    /// the profile path/bytes the effect and the fingerprint consume.
+    /// Refreshed at every output-decision establishment (with the
+    /// identity); event-driven refresh is the hot-reload phase's.
+    pub(crate) display_query: crate::display_profile::DisplayQueryOutcome,
+    /// #130: the display segment's consecutive application failures (the
+    /// quality ratchet, `transform_stage::stage_degrades`): counted per
+    /// frame failure, cleared on every clean frame, latching at
+    /// STAGE_DEGRADE_FAILURES. Session-level on the window state on
+    /// purpose — it must survive ladder rebuilds (the stack's graph dies
+    /// with each rebuild; the latch is about the SESSION's verdict on
+    /// this display profile).
+    pub(crate) stage_failures: u32,
+    /// #130: the session latch — once set, the display segment stays off
+    /// until the process exits (quality downgrade, breadcrumb-only per
+    /// ADR 0001; the flip is a fingerprint transition the tracker mints
+    /// a new generation for).
+    pub(crate) stage_latched: bool,
 }
 
 /// Window state pointer stored in GWLP_USERDATA between WM_NCCREATE and
@@ -1164,6 +1182,23 @@ fn paint_view(view: HWND, owner: HWND) {
     match crate::gpu::paint_d2d(view, owner) {
         crate::gpu::PaintOutcome::Painted => {}
         crate::gpu::PaintOutcome::DeviceLost => gpu_runtime_failure(owner),
+        // #130: a non-loss failure inside the two-phase effect path — the
+        // frame was NOT presented (its back buffer content is undefined),
+        // and the quality ratchet owns the recovery: the drain below
+        // counts it, and at the third consecutive failure the latch
+        // switches the segment off (the next paint then draws direct —
+        // visible untransformed content). The invalidate keeps the retry
+        // loop alive: without a fresh WM_PAINT a static image would park
+        // blank at count < 3 until input (the same boundary note the
+        // prepare-escalation carries; with paints flowing the whole
+        // ratchet is bounded at 3).
+        crate::gpu::PaintOutcome::DisplayEffectFailed => {
+            // SAFETY: invalidates our own child; no borrow is live (this
+            // runs after paint_d2d returned).
+            unsafe {
+                let _ = InvalidateRect(Some(view), None, false);
+            }
+        }
         crate::gpu::PaintOutcome::Unrecoverable { hr } => {
             // No GDI arm to degrade to (#90): tear the stack down and
             // latch the deferred fatal — the tail below fires it, outside
@@ -1188,6 +1223,11 @@ fn paint_view(view: HWND, owner: HWND) {
             }
         }
     }
+    // #130: the display segment's per-frame bookkeeping rides every
+    // paint's tail — construction failures surface on the Painted path
+    // too (the frame drew direct, untransformed), and the ratchet must
+    // see them exactly like the no-present draw failures.
+    drain_display_failure(owner);
     // The ladder's final tier defers its fatal to HERE: the paint's state
     // borrows are gone, so the modal may pump (design §7). The reason
     // rides along (AI1 P3-6): each latch site recorded its diagnosis —
@@ -1274,16 +1314,124 @@ fn renderer_request(state: &WindowState) -> RendererKind {
 
 /// (Re)establish the output identity at one of the decision points
 /// (#126): stack creation and every rebuild — wherever `gpu_kind` was
-/// just (re)assigned. The fingerprint is the wiring-phase one (see
-/// `transform_stage::current_output_fingerprint`); a same-kind rebuild
-/// re-identifies the same fingerprint idempotently (same gen — the
-/// tracker's own contract), a backend change mints the next gen, and the
-/// dump channel prints the stored generation.
+/// just (re)assigned. #130: each establishment first re-runs the display
+/// judge (the WCS query over the window's monitor — cheap, and the
+/// identity stays fresh per decision), then mints the identity. A
+/// same-decision rebuild re-identifies the same fingerprint idempotently
+/// (same gen), any real input change (backend, judge answer, latch) mints
+/// the next gen, and the dump channel prints the stored generation.
 fn establish_output_identity(state: &mut WindowState) {
-    let fingerprint = crate::transform_stage::current_output_fingerprint(
-        crate::transform_stage::Backend::from_effective(state.gpu_kind),
-    );
+    state.display_query = crate::display_profile::query(state.viewport);
+    identify_output(state);
+}
+
+/// The identity recompute WITHOUT a judge call (#130): the latch flip and
+/// every later non-display change (same-decision rebuilds included) walk
+/// exactly this — the query result is already on the state.
+fn identify_output(state: &mut WindowState) {
+    let backend = crate::transform_stage::Backend::from_effective(state.gpu_kind);
+    let query = state.display_query.query;
+    let latched = state.stage_latched;
+    let bytes = state.display_query.bytes.clone();
+    let fingerprint =
+        crate::transform_stage::fingerprint_for(backend, query, latched, bytes.as_deref());
     state.output_identity = Some(state.output_tracker.identify(fingerprint));
+    let stage = crate::transform_stage::effective_stage(
+        crate::transform_stage::desired_stage(backend, query),
+        latched,
+    );
+    let profile = state
+        .display_query
+        .path
+        .as_ref()
+        .and_then(|p| p.file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "none".to_string());
+    eprintln!(
+        "riviv: display-stage={} profile={} backend={}",
+        stage_label(stage),
+        profile,
+        backend_label(backend)
+    );
+}
+
+/// The display segment's application intent for the CURRENT state
+/// (#130): the EFFECTIVE stage (the table's answer clamped by the session
+/// latch) says whether the two-phase effect pass runs; the judge's
+/// profile is its destination. Computed before the mutable gpu borrow on
+/// both consumers — the paint (gpu.rs) and the dump (below).
+pub(crate) fn display_intent(state: &WindowState) -> (bool, Option<std::path::PathBuf>) {
+    let backend = crate::transform_stage::Backend::from_effective(state.gpu_kind);
+    let stage = crate::transform_stage::effective_stage(
+        crate::transform_stage::desired_stage(backend, state.display_query.query),
+        state.stage_latched,
+    );
+    let want = stage == crate::transform_stage::TransformStage::GpuEffect;
+    (
+        want,
+        if want {
+            state.display_query.path.clone()
+        } else {
+            None
+        },
+    )
+}
+
+/// The stderr breadcrumb's stage word (the ticket's vocabulary:
+/// none | cpu | gpu_effect | dwm_acm).
+fn stage_label(stage: crate::transform_stage::TransformStage) -> &'static str {
+    match stage {
+        crate::transform_stage::TransformStage::None => "none",
+        crate::transform_stage::TransformStage::Cpu => "cpu",
+        crate::transform_stage::TransformStage::GpuEffect => "gpu_effect",
+        crate::transform_stage::TransformStage::DwmAcm => "dwm_acm",
+    }
+}
+
+/// The breadcrumb's backend word (the table's axis, not the renderer
+/// label — "hw" reads cleaner next to the decision vocabulary).
+fn backend_label(backend: crate::transform_stage::Backend) -> &'static str {
+    match backend {
+        crate::transform_stage::Backend::Hardware => "hw",
+        crate::transform_stage::Backend::Warp => "warp",
+    }
+}
+
+/// The display segment's post-paint bookkeeping (#130): drains this
+/// frame's effect failure (construction or two-phase draw — whichever
+/// happened last) into the quality ratchet. A clean frame resets the
+/// consecutive counter; the third consecutive failure latches the
+/// segment off for the session (breadcrumb-only, ADR 0001) and the
+/// latch flip re-identifies the output (a fingerprint transition — the
+/// dump channel's gen must move).
+fn drain_display_failure(owner: HWND) {
+    // SAFETY: the borrow spans the take and the counter updates; nothing
+    // here pumps (D2D objects are already idle — the paint returned).
+    let Some(state) = (unsafe { state_of(owner) }) else {
+        return;
+    };
+    let Some(gpu) = state.gpu.as_mut() else {
+        return;
+    };
+    let Some(detail) = gpu.take_display_failure() else {
+        // A clean application (or no segment at all): the ratchet's
+        // counter restarts — only CONSECUTIVE failures count.
+        state.stage_failures = 0;
+        return;
+    };
+    state.stage_failures += 1;
+    eprintln!(
+        "riviv: display effect failure #{}: {}",
+        state.stage_failures, detail
+    );
+    if crate::transform_stage::stage_degrades(state.stage_failures) && !state.stage_latched {
+        state.stage_latched = true;
+        eprintln!(
+            "riviv: display-stage degrade latched ({} consecutive effect failures) - display segment off for the session",
+            state.stage_failures
+        );
+        identify_output(state);
+    }
 }
 
 /// The rebuild request kind (external review AI2 P2-3): a session that
@@ -1585,10 +1733,15 @@ fn dump_via_gpu(hwnd: HWND, view: HWND) -> Result<(u32, u32, Vec<u8>), String> {
     });
     // Field-disjoint from `gpu` (and from the image borrow inside
     // `prepared`): the CPU level cache the stack uploads from.
+    // #130: the display intent syncs BEFORE the draw — the dump must
+    // capture the same pass shape the screen shows, or the output
+    // identity would label pixels that never existed.
+    let (want_effect, display_profile) = display_intent(state);
     let levels = &mut state.levels;
     let Some(gpu) = state.gpu.as_mut() else {
         return Err("no gpu stack".into());
     };
+    gpu.sync_display_intent(want_effect, display_profile.as_deref());
     match prepared {
         Some((plan, frame_gen, wide, high, master)) => {
             let mut src = crate::gpu::MasterLevels {
@@ -8395,6 +8548,9 @@ pub(crate) fn run() -> Result<(), String> {
         dump_pending: None,
         output_tracker: crate::transform_stage::OutputTracker::default(),
         output_identity: None,
+        display_query: crate::display_profile::DisplayQueryOutcome::default(),
+        stage_failures: 0,
+        stage_latched: false,
     };
 
     // SAFETY: returns the module handle of this exe; no side effects.

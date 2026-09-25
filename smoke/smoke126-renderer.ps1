@@ -24,8 +24,12 @@
 #       output_gen=1, viewport-sized PNG at close.
 #   S1b the switch overrides the ini in both directions (auto over warp,
 #       warp over d2d).
-#   S2  hw vs warp 1:1 byte equality: same fixture, same calibrated 900x600
-#       view, WM_COMMAND 45 (1:1) in both arms, dumps whole-file identical.
+#   S2  hw vs warp 1:1 comparison: same fixture, same calibrated 900x600
+#       view, WM_COMMAND 45 (1:1) in both arms. Since #130 the two dumps
+#       intentionally diverge when the display profile is non-sRGB (hw
+#       runs the display-segment ColorManagement effect); S2d pins the
+#       divergence + readability, smoke130-stage.ps1 S3 pins hw pixel
+#       correctness against an mscms reference.
 #   S3  the override is never persisted: the ini still reads renderer=auto.
 #   S4  handoff: second instance forwards and exits 0; the first prints the
 #       ignore breadcrumb and keeps its original startup line.
@@ -377,15 +381,29 @@ Check 'S2a arm A (ini auto): clean run, exact "renderer=auto backend=d2d/hw" lin
 Check 'S2b arm B (-renderer warp): clean run, exact "renderer=warp backend=d2d/warp" line, PNG' (($r2b.Code -eq 0) -and $r2b.Adopted -and ($line2b -ceq 'riviv: renderer=warp backend=d2d/warp') -and (Test-Path $r2b.Out)) ("exit=$($r2b.Code) adopted=$($r2b.Adopted) line=[$line2b] png=$(Test-Path $r2b.Out) stderr=[$($r2b.Err.Trim())]")
 $calOk2 = (($r2a.Vs[0] -eq 900) -and ($r2a.Vs[1] -eq 600) -and ($r2b.Vs[0] -eq 900) -and ($r2b.Vs[1] -eq 600))
 Check 'S2c both runs calibrated to exactly 900x600' $calOk2 ("a=$($r2a.Vs[0])x$($r2a.Vs[1]) b=$($r2b.Vs[0])x$($r2b.Vs[1])")
-$hashEq2 = $false
+# S2d, rewritten for #130 (M8-3): the two backends are now INTENTIONALLY
+# divergent on a machine with a non-sRGB display profile - the hw arm runs
+# the display-segment D2D ColorManagement effect over the dump, the warp
+# arm does not (the decision table is hw-only). Pre-#130 the whole-file
+# SHA256 equality held; on this machine (Custom-class profile
+# TPLCD_8BAF_AdobeRGB.icm) byte equality would mean the display segment
+# silently failed to apply. Pixel-correctness of the hw arm is asserted
+# with a tolerance against an mscms CPU reference transform in
+# smoke130-stage.ps1 S3 - that is the correctness channel; here we pin
+# the divergence plus readability of both dumps.
+$hashNe2 = $false
 $hA2 = '(missing)'
 $hB2 = '(missing)'
+$pxOk2 = $false
 if ((Test-Path $r2a.Out) -and (Test-Path $r2b.Out)) {
     $hA2 = (Get-FileHash $r2a.Out -Algorithm SHA256).Hash
     $hB2 = (Get-FileHash $r2b.Out -Algorithm SHA256).Hash
-    $hashEq2 = ($hA2 -ceq $hB2)
+    $hashNe2 = ($hA2 -cne $hB2)
+    $qa2 = [Px]::Load($r2a.Out)
+    $qb2 = [Px]::Load($r2b.Out)
+    $pxOk2 = (($qa2.W -eq $r2a.Vs[0]) -and ($qa2.H -eq $r2a.Vs[1]) -and ($qb2.W -eq $r2b.Vs[0]) -and ($qb2.H -eq $r2b.Vs[1]))
 }
-Check 'S2d hw vs warp 1:1 dumps whole-file identical (SHA256)' $hashEq2 "a=$hA2 b=$hB2"
+Check 'S2d hw vs warp dumps diverge (hw ran the #130 display stage) and both are viewport-readable' ($hashNe2 -and $pxOk2) "a=$hA2 b=$hB2 diverged=$hashNe2 readable=$pxOk2"
 Kill-Riviv
 Reset-Ini ''
 

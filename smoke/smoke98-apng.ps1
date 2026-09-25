@@ -485,12 +485,20 @@ Kill-Riviv
 # ~200 ms lands in frame 0 [0,500), ~1200 ms in frame 2 [1000,1500) -
 # launch overhead only ever ADDS time and both windows keep >=300 ms of
 # margin to their interval edges.
+# Both dumps pin -renderer warp (#130): the hw dump runs the whole
+# viewport through the sRGB->display transform (the green frame
+# 10,200,60 reads R~113 on hw), which the +-30 sRGB-calibrated color
+# windows would reject. The assertion's purpose - "the animation
+# advanced to the green frame" - is renderer-agnostic, and warp's dump
+# is pure sRGB (hard mutual exclusion with the display stage).
 # ---------------------------------------------------------------------------
 function Timed-Dump($ms, $outName, $errName) {
     $out = Join-Path $Stage $outName
     if (Test-Path $out) { Remove-Item $out -Force }
     Reset-Ini ''
-    $p = Start-Riv ('"' + $Apng + '" -dump-viewport "' + $out + '"') $errName
+    # -renderer warp: see the S1b3 block note (#130 hw display transform
+    # vs the sRGB-calibrated color windows; timing semantics unchanged).
+    $p = Start-Riv ('"' + $Apng + '" -renderer warp -dump-viewport "' + $out + '"') $errName
     $main = Wait-Main $p
     $null = Wait-Title $p 'test.apng' 12000
     Start-Sleep -Milliseconds $ms
@@ -669,8 +677,16 @@ if ($parityReady) {
     # Pinned rect so both runs letterbox identically; identical ini text
     # re-staged before each launch (WM_CLOSE writes the ini back).
     $rectIni = "x=40`r`ny=40`r`nwide=800`r`nhigh=600`r`nauto_zoom=0`r`n"
-    $iniPlain = "[riviv]`r`n" + $rectIni + "icm=0`r`n"
-    $iniIcm = "[riviv]`r`n" + $rectIni + "icm=1`r`n"
+    # renderer=warp on BOTH arms, via the INI key: the master parity exe
+    # (60c9f0f) predates the -renderer CLI switch (an unknown switch pops
+    # the usage box there), while the renderer= ini key exists on both
+    # sides. #130 made the branch's hw dump run the whole viewport through
+    # the sRGB->display transform, so hw bytes could never match the
+    # master's; apng decode/composite parity is renderer-agnostic and warp
+    # restores byte determinism (pure sRGB on both sides). REQUIRED gate
+    # semantics unchanged.
+    $iniPlain = "[riviv]`r`n" + $rectIni + "icm=0`r`nrenderer=warp`r`n"
+    $iniIcm = "[riviv]`r`n" + $rectIni + "icm=1`r`nrenderer=warp`r`n"
 
     function Run-Dump($exePath, $img, $out, $errName, $iniText) {
         Reset-Ini $iniText

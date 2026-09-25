@@ -351,21 +351,51 @@ pub(crate) fn prepare(enabled: bool, icc: Option<Vec<u8>>, shown: &str) -> Optio
         return None;
     }
     let blob = icc?;
+    match probe_equivalence(blob, shown, "decoding untagged") {
+        // The ladder's own failures breadcrumb inside; the equivalent
+        // verdicts both mean "no transform" for Stage 1.
+        None | Some(EquivalenceProbe::Equivalent) => None,
+        Some(EquivalenceProbe::Different(transform)) => Some(transform),
+    }
+}
+
+/// The shared sRGB-equivalence ladder (#130): Stage 1's skip decision and
+/// the display segment's `SrgbEquivalent` classification run the SAME
+/// sequence — the RGB v2/v4 gate, the byte-identical short-circuit, then
+/// the probe through a transform built for THIS blob. Direction note: the
+/// probe always runs blob->sRGB (Stage 1's direction); the max-channel
+/// noise floor is direction-agnostic — a same-space pair drifts LSBs
+/// either way, a genuinely different space moves midtones either way — so
+/// the display side (whose real transform runs sRGB->display on the GPU)
+/// reuses this verbatim for classification. `None` = the ladder itself
+/// failed; every failure breadcrumbs with `downgrade` as the consequence
+/// phrase (Stage 1 passes "decoding untagged"; the display judge passes
+/// its own fall-to-Unknown wording).
+pub(crate) enum EquivalenceProbe {
+    Equivalent,
+    Different(Transform),
+}
+
+pub(crate) fn probe_equivalence(
+    blob: Vec<u8>,
+    shown: &str,
+    downgrade: &str,
+) -> Option<EquivalenceProbe> {
     if !icc_declares_rgb_v2v4(&blob) {
-        eprintln!("riviv: icm: {shown}: embedded profile is not RGB ICC v2/v4 — decoding untagged");
+        eprintln!("riviv: icm: {shown}: embedded profile is not RGB ICC v2/v4 — {downgrade}");
         return None;
     }
     let srgb = system_srgb()?;
     if blob.as_slice() == srgb {
         // The common tagged case: byte-identical to the system sRGB
         // profile — skipped without a single WCS call.
-        return None;
+        return Some(EquivalenceProbe::Equivalent);
     }
     let src = match ProfileHandle::open_mem(blob) {
         Ok(h) => h,
         Err(gle) => {
             eprintln!(
-                "riviv: icm: {shown}: OpenColorProfileW(source) failed (GLE={gle}) — decoding untagged"
+                "riviv: icm: {shown}: OpenColorProfileW(source) failed (GLE={gle}) — {downgrade}"
             );
             return None;
         }
@@ -374,7 +404,7 @@ pub(crate) fn prepare(enabled: bool, icc: Option<Vec<u8>>, shown: &str) -> Optio
         Ok(h) => h,
         Err(gle) => {
             eprintln!(
-                "riviv: icm: {shown}: OpenColorProfileW(sRGB) failed (GLE={gle}) — decoding untagged"
+                "riviv: icm: {shown}: OpenColorProfileW(sRGB) failed (GLE={gle}) — {downgrade}"
             );
             return None;
         }
@@ -383,7 +413,7 @@ pub(crate) fn prepare(enabled: bool, icc: Option<Vec<u8>>, shown: &str) -> Optio
         Ok(xform) => xform,
         Err(gle) => {
             eprintln!(
-                "riviv: icm: {shown}: CreateMultiProfileTransform failed (GLE={gle}) — decoding untagged"
+                "riviv: icm: {shown}: CreateMultiProfileTransform failed (GLE={gle}) — {downgrade}"
             );
             return None;
         }
@@ -404,13 +434,13 @@ pub(crate) fn prepare(enabled: bool, icc: Option<Vec<u8>>, shown: &str) -> Optio
     let probe = probe_pixels();
     let mut out = vec![0u8; probe.len()];
     if let Err(gle) = transform.translate((probe.len() / 4) as u32, 1, &probe, &mut out) {
-        eprintln!("riviv: icm: {shown}: probe transform failed (GLE={gle}) — decoding untagged");
+        eprintln!("riviv: icm: {shown}: probe transform failed (GLE={gle}) — {downgrade}");
         return None;
     }
     if probe_max_channel_diff(&probe, &out) <= SRGB_EQUIVALENT_TOLERANCE {
-        return None;
+        return Some(EquivalenceProbe::Equivalent);
     }
-    Some(transform)
+    Some(EquivalenceProbe::Different(transform))
 }
 
 // ---- a minimal synthetic ICC v2 profile builder (test fixtures) ----

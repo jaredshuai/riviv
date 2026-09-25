@@ -33,9 +33,16 @@
 #   S2 zero-seam core, tiled vs untiled same image/transform:
 #      S2a TRUE 1:1 (WM_COMMAND 45, same calibrated geometry): dump files
 #      byte-identical (Get-FileHash), image bbox exactly 900x600, ramp
-#      samples within +-2 of the source formula (identity cannot mean
-#      identically blank).
-#      S2b default fit into 674x246: whole-frame maxDelta <= 1, and the
+#      samples within +-10 of the source formula (identity cannot mean
+#      identically blank). Post-#130 the hw dump's display-stage
+#      transform shifts content up to 8/channel at these points (the old
+#      +-2 died with it), and the magenta-era scenes carry a BLACK
+#      letterbox: the transform moves every chromatic margin off its
+#      exact code (255,0,255 -> 219,0,250) while black sits on the fixed
+#      neutral axis and dumps at exactly (0,0,0).
+#      S2b default fit into 674x246: whole-frame maxDelta <= 2 (#130's
+#      transform slope doubles the interpolation rounding; the diff pixel
+#      group is unchanged), and the
 #      seam scan (max adjacent-column luminance step within +-2 px of each
 #      tile boundary; candidate boundaries enumerated for every drawn-level
 #      choice that covers the render) shows tiledMax <= untiledMax + 1.
@@ -111,7 +118,9 @@ public class S82 {
     // needs a hand-rolled payload anyway; no SetPixel loops on 10M pixels.
 
     // 900x600 ramp fixture: r = x*255/(w-1), g = y*255/(h-1), b = 128
-    // (constant, so no pixel can equal the magenta letterbox background).
+    // (constant, so no pixel can equal the black letterbox background -
+    // never white, never black; #130 moved the injected scenes to a
+    // black margin).
     // Integer division matches the PS-side expected-value math.
     public static void WriteGradRamp(string path, int w, int h) {
         byte[] raw = new byte[(w * 4 + 1) * h];
@@ -152,7 +161,13 @@ public class S82 {
     }
     // Flat mid-grey field with two 1-px full-height BLACK columns at
     // explicit source columns (the S2b-d hard-edge probe: one column on a
-    // -tile 256 grid boundary, one mid-tile). Never white, never magenta.
+    // -tile 256 grid boundary, one mid-tile). The columns are deliberate
+    // black INSIDE the image, which since #130 matches the black
+    // letterbox - that is safe: the bbox probes take first/last
+    // non-background pixels on the center lines only (the dip columns
+    // are interior, and the vertical center scan crosses grey at the
+    // 674x246 geometry), so the detected rect edges never land on a dip;
+    // the dip scan itself runs strictly inside the detected bbox.
     public static void WriteHardEdge(string path, int w, int h, int colA, int colB) {
         byte[] raw = new byte[(w * 4 + 1) * h];
         for (int y = 0; y < h; y++) {
@@ -511,9 +526,16 @@ function Stats-Detail($h) {
 # would shadow the script-level $Ini (the staged ini path) inside anything
 # Run-Scene calls (Reset-Ini would then Test-Path the ini TEXT - the
 # "illegal characters in path" abort caught on the first run).
-function Scene-Ini($renderer, $wide, $high, $magenta) {
+function Scene-Ini($renderer, $wide, $high, $blackMargin) {
+    # The $blackMargin switch (was $magenta) injects a BLACK windowed
+    # background. #130: the hw dump's display-stage transform keeps the
+    # neutral axis fixed (black dumps at exactly (0,0,0)) but moves every
+    # chromatic color off its exact code (measured 255,0,255 -> 219,0,250),
+    # which broke the exact-color RectEdges bbox probes. Magenta was only
+    # ever a high-contrast margin; black serves the same purpose AND
+    # survives the transform exactly.
     $lines = @('[riviv]', 'x=40', 'y=40', "wide=$wide", "high=$high", 'auto_zoom=0', 'icm=0')
-    if ($magenta) { $lines += @('windowed_background_color_r=255', 'windowed_background_color_g=0', 'windowed_background_color_b=255') }
+    if ($blackMargin) { $lines += @('windowed_background_color_r=0', 'windowed_background_color_g=0', 'windowed_background_color_b=0') }
     if ($renderer -ne '') { $lines += "renderer=$renderer" }
     return (($lines -join "`r`n") + "`r`n")
 }
@@ -713,8 +735,12 @@ if (($st1 -eq $null) -or (-not (Test-Path $a1.Out)) -or (-not (Test-Path $b1.Out
 } else {
     $ha = (Get-FileHash $a1.Out -Algorithm SHA256).Hash
     $hb = (Get-FileHash $b1.Out -Algorithm SHA256).Hash
-    $dimA = [S82]::RectEdges($a1.Out, 255, 0, 255)
-    $dimB = [S82]::RectEdges($b1.Out, 255, 0, 255)
+    # Background probe = BLACK (0,0,0): the injected margin survives the
+    # #130 display transform exactly (neutral axis). The magenta-era
+    # (255,0,255) probe died because the transform moved the margin to
+    # (219,0,250), making every margin pixel read as "image".
+    $dimA = [S82]::RectEdges($a1.Out, 0, 0, 0)
+    $dimB = [S82]::RectEdges($b1.Out, 0, 0, 0)
     Check 'S2a-1 TRUE 1:1: tiled and untiled dump files byte-identical (Get-FileHash)' (($ha -eq $hb) -and ($dimA[4] -eq $dimB[4]) -and ($dimA[5] -eq $dimB[5])) ("hashA=$($ha.Substring(0, 16)) hashB=$($hb.Substring(0, 16)) dimsA=$($dimA[4])x$($dimA[5]) dimsB=$($dimB[4])x$($dimB[5])")
     # The bbox must be exactly the 900x600 source (true 1:1 proof: fit
     # capped at 100%, then WM_COMMAND 45).
@@ -722,7 +748,11 @@ if (($st1 -eq $null) -or (-not (Test-Path $a1.Out)) -or (-not (Test-Path $b1.Out
     $bh = $dimB[3] - $dimB[1] + 1
     Check 'S2a-2 image bbox is exactly 900x600 (fit capped at 100%)' (($bw -eq 900) -and ($bh -eq 600)) ("bbox l=$($dimB[0]) t=$($dimB[1]) ${bw}x${bh}")
     # Ramp samples at known source coords vs the writer's integer formula,
-    # +-2 per channel, so byte-identity cannot mean identically blank.
+    # +-10 per channel, so byte-identity cannot mean blank. Tolerance was
+    # +-2 pre-#130; the hw dump's display-stage transform shifts content
+    # (measured at these very points: up to 8/channel, worst on the dark
+    # blue-ish start and the B channel at the bright end), while a blank
+    # or black frame still misses by ~100 and a channel swap by tens.
     $ixs = @(50, 200, 400, 600, 750, 850)
     $iys = @(30, 150, 300, 420, 520, 560)
     $xs = New-Object System.Collections.Generic.List[int]
@@ -735,13 +765,13 @@ if (($st1 -eq $null) -or (-not (Test-Path $a1.Out)) -or (-not (Test-Path $b1.Out
         $eR = [math]::Floor($ixs[$i] * 255 / 899)
         $eG = [math]::Floor($iys[$i] * 255 / 599)
         $gR = $smp[$i * 3]; $gG = $smp[$i * 3 + 1]; $gB = $smp[$i * 3 + 2]
-        if (([math]::Abs($gR - $eR) -gt 2) -or ([math]::Abs($gG - $eG) -gt 2) -or ([math]::Abs($gB - 128) -gt 2)) {
+        if (([math]::Abs($gR - $eR) -gt 10) -or ([math]::Abs($gG - $eG) -gt 10) -or ([math]::Abs($gB - 128) -gt 10)) {
             $smpOk = $false
             $smpDetail += (" src({0},{1}) got=({2},{3},{4}) want=({5},{6},128)" -f $ixs[$i], $iys[$i], $gR, $gG, $gB, $eR, $eG)
         }
     }
-    if ($smpDetail -eq '') { $smpDetail = 'all 6 ramp samples within +-2 of the source formula' }
-    Check 'S2a-3 ramp content present and correct (6 samples, +-2/channel)' $smpOk $smpDetail
+    if ($smpDetail -eq '') { $smpDetail = 'all 6 ramp samples within +-10 of the source formula' }
+    Check 'S2a-3 ramp content present and correct (6 samples, +-10/channel incl. #130 display-transform drift)' $smpOk $smpDetail
     # R3 P2-6: S1c's tiles>0 proves the PAINT tiled; this close stats line
     # prints AFTER the WM_CLOSE dump re-planned with the same -tile, so
     # tiles>0 here is the DUMP-side tiling proof.
@@ -769,12 +799,17 @@ $s2bRan = ($b2.Code -eq 0) -and ($t2.Code -eq 0) -and (Test-Path $b2.Out) -and (
 Check 'S2b-a both fit dumps ran clean (exit 0, files exist)' $s2bRan ("untiled exit=$($b2.Code) tiled exit=$($t2.Code) views=$($b2.Vs[0])x$($b2.Vs[1])/$($t2.Vs[0])x$($t2.Vs[1])")
 if ($s2bRan) {
     $ps2 = [S82]::PairStats($t2.Out, $b2.Out)
-    Check 'S2b-b fractional scale: whole-frame maxDelta <= 1' (($ps2[0] -ge 0) -and ($ps2[0] -le 1)) ("max=$($ps2[0]) diffPx=$($ps2[1]) of $($ps2[2])x$($ps2[3]) (measured reference: max=1 on ~9.5% of pixels)")
+    # Tolerance 2 (was 1): #130's display-stage transform slope doubles
+    # the interpolation rounding of the fractional fit; the diff pixel
+    # group is the same as before, only the amplitude moved 1 -> 2
+    # (measured max=2 on this pair).
+    Check 'S2b-b fractional scale: whole-frame maxDelta <= 2 (#130 display transform doubles interpolation rounding)' (($ps2[0] -ge 0) -and ($ps2[0] -le 2)) ("max=$($ps2[0]) diffPx=$($ps2[1]) of $($ps2[2])x$($ps2[3]) (measured reference: max=2)")
     # R3 P2-6: the dump re-plans with the same -tile at WM_CLOSE (before
     # the stats line prints) - tiles>0 here is the DUMP-side tiling proof
     # for this scene; S1c only proved the live paint.
     Check 'S2b-b2 ramp tiled dump re-planned with tiles at close (close stats tiles>0)' (($st2t -ne $null) -and ($st2t.Tiles -gt 0)) (Stats-Detail $st2t)
-    $eu2 = [S82]::RectEdges($b2.Out, 255, 0, 255)
+    # BLACK bg probe (was magenta) - see the S2a note (#130 margin fix).
+    $eu2 = [S82]::RectEdges($b2.Out, 0, 0, 0)
     $rw2 = $eu2[2] - $eu2[0] + 1
     $rh2 = $eu2[3] - $eu2[1] + 1
     $row2 = $eu2[1] + [int]($rh2 / 2)
@@ -819,10 +854,15 @@ Note-D2dErr $bdt.Err 'S2b-d-tiled'
 $bdRan = ($bdu.Code -eq 0) -and ($bdt.Code -eq 0) -and (Test-Path $bdu.Out) -and (Test-Path $bdt.Out)
 Check 'S2b-d hard-edge runs clean + tiled dump re-planned with tiles (close stats tiles>0)' ($bdRan -and ($stdbd -ne $null) -and ($stdbd.Tiles -gt 0)) ("untiled exit=$($bdu.Code) tiled exit=$($bdt.Code) statsTiled=" + (Stats-Detail $stdbd))
 if ($bdRan) {
-    $eud = [S82]::RectEdges($bdu.Out, 255, 0, 255)
+    # BLACK bg probes (was magenta) - see the S2a note. The dip scan
+    # below is bounded to the detected bbox, so once the bbox is exact
+    # again the black margins (lum 0, below the dip threshold) cannot
+    # leak in as extra dark runs; the fixture's own interior black
+    # columns are the intended dips.
+    $eud = [S82]::RectEdges($bdu.Out, 0, 0, 0)
     $rwd = $eud[2] - $eud[0] + 1
     $rhd = $eud[3] - $eud[1] + 1
-    $edd = [S82]::RectEdges($bdt.Out, 255, 0, 255)
+    $edd = [S82]::RectEdges($bdt.Out, 0, 0, 0)
     $rwt = $edd[2] - $edd[0] + 1
     $rht = $edd[3] - $edd[1] + 1
     $rowd = $eud[1] + [int]($rhd / 2)

@@ -21,6 +21,12 @@
 //! bit from `DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO` is a diagnostic
 //! label that rides along in the output identity, nothing more.
 //!
+//! #130 wired the judge (`display_profile.rs`: the modern getter via
+//! dynamic mscms resolution, per output-decision point) and the static
+//! gpu_effect application; `fingerprint_for` consumes the REAL query,
+//! bytes, and latch. What stays future work: the profile hot reload
+//! (event-driven re-query) and the ACM diagnostic read.
+//!
 //! WARP never runs the gpu_effect (hard exclusion, ticket) and never
 //! runs the CPU pass either (probe P3: a WCS viewport transform
 //! measured 9.61 ms median at 1080p with a matrix-shaper profile — an
@@ -102,6 +108,9 @@ pub(crate) enum TransformStage {
     None,
     /// A WCS pass over the viewport on the CPU — reserved, currently
     /// unreachable (P3: 9.61 ms median at 1080p over the 8 ms gate).
+    /// Dead in the non-test build on purpose; the unreachable-from-the-
+    /// table pin below is the truthful record.
+    #[allow(dead_code)]
     Cpu,
     /// The D2D ColorManagement effect in the draw pass (hardware
     /// only — the WARP exclusion is one of the table's hard rules).
@@ -222,7 +231,10 @@ pub(crate) struct OutputPolicy {
 /// wideColorEnforced, bit 3 = advancedColorForceDisabled. `Unknown`
 /// covers every read failure (probe P1 saw the whole API family
 /// return ERROR_GEN_FAILURE in agent contexts on build 26200).
+/// Off/On stay dead in the non-test build until the ACM read's own
+/// phase wires them into `fingerprint_for`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[allow(dead_code)]
 pub(crate) enum AcState {
     Off,
     On,
@@ -268,24 +280,28 @@ pub(crate) fn profile_hash(bytes: &[u8]) -> u64 {
     h
 }
 
-/// The wiring-phase fingerprint (#126): what a dump actually went through
-/// TODAY. The judge — the WCS display-profile query — is not wired yet,
-/// so the query is [`DisplayProfileQuery::Unknown`] and the table's own
-/// answer governs (never transform on a guess: stage None on both
-/// backends); no profile bytes exist, so the digest is the empty
-/// profile's; the ACM diagnostic is unread (probe P1: the API family
-/// failed across the board in agent contexts). Each later phase swaps
-/// exactly one placeholder for the real input — the query (the
-/// profile-hot-reload phase), the profile bytes, the applied stage (the
-/// static gpu_effect phase), the ac read — and the swap is a fingerprint
-/// transition the tracker mints a new generation for, which is the whole
-/// point of the dump channel's `output_gen` line. Until then the ONE
-/// live term is the backend: `-renderer warp` at startup and the failure
-/// ladder's hw->warp escalation are both transitions.
-pub(crate) fn current_output_fingerprint(backend: Backend) -> OutputFingerprint {
+/// The wiring fingerprint (#126 established it, #130 swapped the
+/// placeholders for real inputs): what the output actually went through.
+/// The judge — the WCS display-profile query — is REAL here (the modern
+/// getter, resolved per output-decision point); the stage term is the
+/// EFFECTIVE stage (`desired_stage` clamped by the session latch — a
+/// latched degrade switches the segment off, and the flip is a
+/// fingerprint transition the tracker mints a new generation for); the
+/// profile bytes are the real destination profile's (`None` = the query
+/// carries none — Unknown, NoProfile, or an unreadable file — and the
+/// digest is the empty profile's, pinned so an absent term never
+/// drifts). The ONE remaining placeholder is the ACM diagnostic (its own
+/// later phase); each future swap stays a visible transition through the
+/// dump channel's `output_gen` line.
+pub(crate) fn fingerprint_for(
+    backend: Backend,
+    query: DisplayProfileQuery,
+    degraded_latched: bool,
+    profile_bytes: Option<&[u8]>,
+) -> OutputFingerprint {
     OutputFingerprint {
-        stage: desired_stage(backend, DisplayProfileQuery::Unknown),
-        profile_hash: profile_hash(&[]),
+        stage: effective_stage(desired_stage(backend, query), degraded_latched),
+        profile_hash: profile_hash(profile_bytes.unwrap_or(&[])),
         ac: AcState::Unknown,
         backend,
         policy: OutputPolicy {
@@ -578,47 +594,71 @@ mod tests {
     }
 
     #[test]
-    fn the_wiring_fingerprint_pins_the_unwired_placeholders() {
-        // The dump channel's identity for TODAY (see the constructor's
-        // doc): the unwired judge reads Unknown (the table answers None on
-        // both backends — never transform on a guess), the profile bytes
-        // are the empty digest, the ACM diagnostic is unread, and the
-        // policy is the pinned pair. Every field is pinned so a later
-        // phase's swap is a visible fingerprint transition, not a drift.
+    fn the_real_input_fingerprint_pins_every_cell() {
+        // #130's constructor (see its doc): the judge is real, the stage
+        // is the EFFECTIVE one (the latch clamps GpuEffect down to None),
+        // the digest is the real bytes' (or the pinned empty one when the
+        // query carries none), and the ACM placeholder stays Unknown
+        // until its own phase. Every cell pinned so a later phase's swap
+        // is a visible transition, not a drift.
+        let bytes: &[u8] = &[0xab, 0xcd, 0xef];
         for backend in both_backends() {
-            let fp = current_output_fingerprint(backend);
-            assert_eq!(fp.stage, TransformStage::None, "{backend:?}");
-            assert_eq!(fp.profile_hash, profile_hash(b""));
-            assert_eq!(fp.ac, AcState::Unknown);
-            assert_eq!(fp.backend, backend);
-            assert_eq!(fp.policy.intent, RenderIntent::RelativeColorimetric);
-            assert_eq!(fp.policy.quality, RenderQuality::Best);
+            for query in all_queries() {
+                for latched in [false, true] {
+                    let fp = fingerprint_for(backend, query, latched, Some(bytes));
+                    let expected_stage = effective_stage(desired_stage(backend, query), latched);
+                    assert_eq!(fp.stage, expected_stage, "{backend:?}/{query:?}/{latched}");
+                    assert_eq!(fp.profile_hash, profile_hash(bytes));
+                    assert_eq!(fp.ac, AcState::Unknown);
+                    assert_eq!(fp.backend, backend);
+                    assert_eq!(fp.policy.intent, RenderIntent::RelativeColorimetric);
+                    assert_eq!(fp.policy.quality, RenderQuality::Best);
+
+                    // No bytes to hash: the pinned empty digest — an
+                    // absent term must never drift.
+                    let fp_empty = fingerprint_for(backend, query, latched, None);
+                    assert_eq!(fp_empty.profile_hash, profile_hash(b""));
+                }
+            }
         }
     }
 
     #[test]
-    fn the_backend_is_the_one_live_fingerprint_term_and_walks_the_gens() {
-        // The erratum semantics (Codex P2, PR #128) exercised through the
-        // REAL constructor: today only the backend varies — a hw->warp
-        // escalation then a rebuild back are fingerprint transitions, so
-        // the dump channel sees 1, 2, 3, and a same-backend re-identify
-        // (an ordinary same-kind rebuild) is idempotent.
+    fn backend_latch_and_bytes_transitions_mint_new_gens_through_the_real_constructor() {
+        // The erratum semantics (Codex P2, PR #128) through #130's REAL
+        // constructor: today the live terms are backend, stage (via the
+        // latch and the judge), and the profile bytes — each flip is a
+        // fingerprint transition, so the dump channel sees a new gen;
+        // re-identifying an unchanged decision stays idempotent.
+        use DisplayProfileQuery::Profile;
+        use DisplayProfileSpace::Custom;
+        use TransformStage::{GpuEffect, None as NoStage};
+        let adobe = b"TPLCD_8BAF_AdobeRGB.icm-bytes".as_slice();
         let mut tracker = OutputTracker::default();
-        let hw = current_output_fingerprint(Backend::Hardware);
-        let warp = current_output_fingerprint(Backend::Warp);
-        assert_ne!(hw, warp);
-        assert_eq!(tracker.identify(hw).output_gen, 1);
-        assert_eq!(tracker.identify(warp).output_gen, 2);
-        assert_eq!(
-            tracker.identify(hw).output_gen,
-            3,
-            "the return to hardware must mint a new gen, not restore gen 1"
+        // hw + custom + unlatched: the effect stage.
+        let hw_effect = fingerprint_for(Backend::Hardware, Profile(Custom), false, Some(adobe));
+        assert_eq!(hw_effect.stage, GpuEffect);
+        assert_eq!(tracker.identify(hw_effect).output_gen, 1);
+        // The session latch flips the effective stage: a transition.
+        let hw_latched = fingerprint_for(Backend::Hardware, Profile(Custom), true, Some(adobe));
+        assert_eq!(hw_latched.stage, NoStage);
+        assert_eq!(tracker.identify(hw_latched).output_gen, 2);
+        // A backend flip on top: another transition.
+        let warp = fingerprint_for(Backend::Warp, Profile(Custom), false, Some(adobe));
+        assert_eq!(warp.stage, NoStage, "the WARP hard exclusion");
+        assert_eq!(tracker.identify(warp).output_gen, 3);
+        // New profile bytes under the same decision shape: the digest is
+        // a fingerprint term, so a profile change mints a new gen too.
+        let other = fingerprint_for(
+            Backend::Warp,
+            Profile(Custom),
+            false,
+            Some(b"a-different-display-profile".as_slice()),
         );
-        assert_eq!(
-            tracker.identify(hw).output_gen,
-            3,
-            "a same-kind rebuild re-identifies idempotently"
-        );
+        assert_eq!(tracker.identify(other).output_gen, 4);
+        // An ordinary same-decision re-identify (a same-kind rebuild):
+        // idempotent, same gen.
+        assert_eq!(tracker.identify(other).output_gen, 4);
     }
 
     // ---- R2 / D5 pins ----

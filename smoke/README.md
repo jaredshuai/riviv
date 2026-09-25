@@ -27,9 +27,13 @@ powershell -NoProfile -ExecutionPolicy Bypass -File smoke\smoke126-renderer.ps1 
   `riviv: dump-viewport output_gen=1`;`d2d max_bitmap` 行在场。S1b 双向
   override:ini=warp + `-renderer auto` → `renderer=auto backend=d2d/hw`;
   ini=d2d + `-renderer warp` → `renderer=warp backend=d2d/warp`。
-- **S2**(rescope 一致性表落断言)同 1:1(NEAREST 纯拷贝)场景、同校准
-  900×600 视口,ini=auto(hw)与 `-renderer warp` 两臂 dump **整文件 SHA256
-  相等**——force-warp 跨机器可复现色彩断言的前提。
+- **S2**(一致性表;**#130 起前提翻转**)同 1:1(NEAREST 纯拷贝)场景、
+  同校准 900×600 视口,ini=auto(hw)与 `-renderer warp` 两臂 dump
+  **整文件 SHA256 不等**——hw 臂过 #130 显示段 ColorManagement 变换、
+  warp 臂不过(决策表硬互斥),字节相等反而=显示段静默失效;hw 像素
+  **正确性**由 smoke130 S3 的 mscms 参考容差断言承担,本节只钉「分歧
+  在场 + 两臂可读」。(#130 之前两臂逐字节相等,是 force-warp 跨机器
+  色彩断言的前提;该确定性在 warp 侧由 smoke130 S2c 保留。)
 - **S3** 不写 ini:staged `renderer=auto` 跑 `-renderer warp` 会话,关闭后
   ini 仍 `renderer=auto` 且无 `renderer=warp` 泄漏(override 只存内存)。
 - **S4** 单实例 handoff=面包屑+忽略:A(无开关)先起,B 以
@@ -44,6 +48,40 @@ powershell -NoProfile -ExecutionPolicy Bypass -File smoke\smoke126-renderer.ps1 
 stderr 重定向文件——smoke80 只在退出后读);S4 在 B 的 Start-Riv 覆盖
 `$script:RawH` 前保存 A 的活句柄、关 A 前还原(Close-Main 从该句柄读
 退出码)。
+
+## smoke130-stage.ps1(#130 M8-3 静态 gpu_effect 显示段)
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File smoke\smoke130-stage.ps1 [-Exe <path>]
+```
+
+场景(11 检查;S0 前置门同 smoke126 退出 3;**机器钉**:本机显示
+profile=TPLCD_8BAF_AdobeRGB.icm(Custom 类)才全绿——sRGB 等价 profile
+的机器 S1 的 gpu_effect 行不会出现,该脚本诚实 FAIL 而非静默 skip):
+
+- **S1** hw 臂(`-renderer d2d` + dump):stderr
+  `riviv: display-stage=gpu_effect profile=<name> backend=hw`(在
+  `renderer=` 行之前),profile 名解析存变量并校验存在于
+  `%windir%\System32\spool\drivers\color`;PNG=视口尺寸;
+  `output_gen=1`。
+- **S2** warp 臂互斥:`display-stage=none profile=<同名> backend=warp`
+  + gen=1;**S2c warp 确定性**:两次 warp dump 整文件 SHA256 相等
+  (#126 时代的跨后端确定性在 warp 侧的保留)。
+- **S3**(P4 容差断言,正确性核心)**warp dump(S2,未变换 sRGB 原像)
+  整幅过 mscms CPU 参考**(C# P/Invoke `OpenColorProfileW`
+  (MEMBUFFER)+`CreateMultiProfileTransform`(RelativeColorimetric+Best)
+  +`TranslateBitmapBits`,BM_xRGBQUADS 双侧零 swizzle,常量与
+  src/icm.rs 所链一致)得参考图;hw dump 逐像素 max 通道差 ≤ **24**
+  (首标定实测 **10**)+ 差异像素数 > 0(防双臂恒等假通过)。
+- **S4** 棘轮契约(形态断言,不强制触发):hw stderr **无**
+  `display effect failure`(防「构建失败静默降级直绘、gen 照打」假绿;
+  触发路径由单测+面包屑契约覆盖)。
+
+工程注:S3 的 profile 文件路径从 S1 的 stderr 行解析(与 riviv 判据
+同源);参考变换对整幅 dump(含 letterbox 边距)做——边距也过变换,
+整幅比对即端到端。#130 顺带前提修复:smoke82 品红边距换黑(中性轴
+在相对色码下不变,S2a/S2b 检测恢复精确),smoke98 颜色窗/parity 臂改
+warp(断言语义渲染器无关)。
 
 ## smoke98-apng.ps1(#98 APNG 动画接入)
 
