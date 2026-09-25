@@ -22,6 +22,7 @@
 //! - `string_to_int` (string.c:260-285) skips non-digits WITHOUT stopping
 //!   ("1x2" parses as 12) and an absent parameter word parses as 0.
 
+use crate::config::RendererKind;
 use crate::playlist::SortMode;
 
 /// One tokenizer word (string.c:804-835): the unquoted text. Whether the
@@ -220,6 +221,17 @@ pub(crate) struct Parsed {
     /// parse (a single-instance handoff arms it in the FIRST instance — no
     /// special-casing, README-noted), never persisted.
     pub dump_viewport: Option<Vec<u16>>,
+    /// `-renderer <auto|d2d|warp>` (#126): the sticky per-session renderer
+    /// request — it overrides the ini's `renderer` key for the stack
+    /// creation and every rebuild request, never persists, and a
+    /// single-instance handoff carrying it is breadcrumb + ignore (the
+    /// receiving instance's device is already built; run() takes the word
+    /// out of the STARTUP parse before the stack exists, so the arm in
+    /// `process_parsed_cl` only ever fires on handoff lines). A dangling
+    /// or unrecognized parameter leaves the intent unarmed — the -tile
+    /// precedent ("anything that does not parse is the natural decision"):
+    /// the natural renderer decision is the INI key, not a silent `auto`.
+    pub renderer: Option<RendererKind>,
     /// `-tile <edge>` (#82): the forced tile-grid edge in px for the D2D
     /// arm's giant path — a DIAGNOSTIC (the smoke's tiled-vs-untiled
     /// channel), so it bypasses the single-bitmap shortcut and never
@@ -289,6 +301,23 @@ pub(crate) fn parse(cl: &[u16], is_add: bool, has_current: bool) -> Parsed {
                 let word = param(&mut i);
                 let text = String::from_utf16_lossy(&word);
                 out.tile_edge = Some(text.trim().parse::<i32>().unwrap_or(0));
+            } else if eq_switch(arm, "renderer") {
+                // #126 (riviv-authored): the NEXT word is the renderer
+                // request, the same auto|d2d|warp word family the ini key
+                // parses (ASCII whole-word, case-insensitive). A dangling
+                // or unrecognized word leaves the intent unarmed — the
+                // natural renderer decision is the ini key (see the field
+                // doc); the switch itself is KNOWN, so no usage box either.
+                let word = param(&mut i);
+                out.renderer = if eq_switch(&word, "auto") {
+                    Some(RendererKind::Auto)
+                } else if eq_switch(&word, "d2d") {
+                    Some(RendererKind::D2d)
+                } else if eq_switch(&word, "warp") {
+                    Some(RendererKind::Warp)
+                } else {
+                    None
+                };
             } else if eq_switch(arm, "fullscreen") {
                 out.start_fullscreen = true;
                 out.start_window = false;
@@ -872,6 +901,67 @@ mod tests {
         // Absent = None (not Some(0)): the distinction the stack's
         // forced_edge reads.
         assert_eq!(parse(&w("exe a.png"), false, false).tile_edge, None);
+    }
+
+    // ---- the -renderer switch (#126) ----
+
+    #[test]
+    fn renderer_takes_both_spellings_and_all_three_values() {
+        // The tokenizer strips the prefix before the arm match, and the
+        // parameter word is matched ASCII whole-word case-insensitively —
+        // the ini key's own word family.
+        for (cl, kind) in [
+            ("exe -renderer warp a.png", RendererKind::Warp),
+            ("exe /renderer warp a.png", RendererKind::Warp),
+            ("exe -RENDERER WARP a.png", RendererKind::Warp),
+            ("exe -renderer d2d a.png", RendererKind::D2d),
+            ("exe -renderer D2D a.png", RendererKind::D2d),
+            ("exe -renderer auto a.png", RendererKind::Auto),
+        ] {
+            let p = parse(&w(cl), false, false);
+            assert_eq!(p.renderer, Some(kind), "{cl}");
+            assert_eq!(p.file_count, 1, "{cl} must not eat the image word");
+            assert_eq!(s(p.single.as_ref().unwrap()), "a.png", "{cl}");
+            assert!(p.unknown.is_empty(), "{cl}");
+        }
+    }
+
+    #[test]
+    fn renderer_dangling_or_unrecognized_leaves_the_intent_unarmed() {
+        // The -tile precedent ("anything that does not parse is the natural
+        // decision") with the renderer's own reading of it: the natural
+        // renderer decision is the INI key, so a dangling switch, a typo
+        // and the dead `gdi` word all leave the intent unset — never a
+        // silent `auto` that would quietly override the ini. The switch is
+        // still KNOWN: no usage box for any of these. A dangling switch
+        // consumes the empty tail word (no file words left on the line).
+        let p = parse(&w("exe -renderer"), false, false);
+        assert_eq!(p.renderer, None);
+        assert_eq!(p.file_count, 0);
+        for cl in ["exe -renderer oops a.png", "exe -renderer gdi a.png"] {
+            let p = parse(&w(cl), false, false);
+            assert_eq!(p.renderer, None, "{cl}");
+            assert_eq!(s(p.single.as_ref().unwrap()), "a.png", "{cl}");
+            assert!(p.unknown.is_empty(), "{cl}");
+        }
+        // Absent by default, and a quoted "-renderer" is a FILE word.
+        assert_eq!(parse(&w("exe a.png"), false, false).renderer, None);
+        let p = parse(&w("exe \"-renderer\" warp"), false, false);
+        assert_eq!(p.renderer, None);
+        assert_eq!(p.file_count, 2);
+    }
+
+    #[test]
+    fn renderer_is_a_sticky_intent_not_an_ordered_action() {
+        // Like /close and -dump-viewport: no ClAction rows, armed
+        // regardless of walk position.
+        let p = parse(&w("exe a.png -renderer warp /slideshow"), false, false);
+        assert_eq!(
+            p.actions,
+            vec![ClAction::ExitRandom, ClAction::ClearPlaylist]
+        );
+        assert!(p.start_slideshow);
+        assert_eq!(p.renderer, Some(RendererKind::Warp));
     }
 
     // ---- the clipboard: pseudo-filename (#66) ----

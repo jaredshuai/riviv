@@ -12,6 +12,39 @@
 (#81)本无可测注入通道,且随 #90 GDI 删除而消亡。其余 %TEMP% 脚本维持
 不入库,不作为回归门。
 
+## smoke126-renderer.ps1(#126 `-renderer` sticky 开关 + dump output_gen)
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File smoke\smoke126-renderer.ps1 [-Exe <path>]
+```
+
+场景(17 检查;**S0 前置门**:任何非 staged 路径的 riviv 进程在场即
+`FATAL foreign riviv running` 退出 3——真窗口会劫持单实例转发,#109 教训;
+退出码 0 全绿 / 1 断言失败,失败保留 stage 作证据):
+
+- **S1** force-warp 全链:`-renderer warp` + `-dump-viewport` → stderr 精确
+  `riviv: renderer=warp backend=d2d/warp`;PNG 产出且尺寸=视口;
+  `riviv: dump-viewport output_gen=1`;`d2d max_bitmap` 行在场。S1b 双向
+  override:ini=warp + `-renderer auto` → `renderer=auto backend=d2d/hw`;
+  ini=d2d + `-renderer warp` → `renderer=warp backend=d2d/warp`。
+- **S2**(rescope 一致性表落断言)同 1:1(NEAREST 纯拷贝)场景、同校准
+  900×600 视口,ini=auto(hw)与 `-renderer warp` 两臂 dump **整文件 SHA256
+  相等**——force-warp 跨机器可复现色彩断言的前提。
+- **S3** 不写 ini:staged `renderer=auto` 跑 `-renderer warp` 会话,关闭后
+  ini 仍 `renderer=auto` 且无 `renderer=warp` 泄漏(override 只存内存)。
+- **S4** 单实例 handoff=面包屑+忽略:A(无开关)先起,B 以
+  `<img> -renderer warp` 起 → B 秒退 0(转发),A stderr 精确
+  `riviv: -renderer warp ignored - device already built (d2d/hw)` 且原
+  startup 行不变(与 -dump-viewport「照常武装」的关键差异)。
+- **S5** 悬空/坏值=不 armed:`-renderer`(尾)/`-renderer oops` → 无 usage
+  弹窗(弹窗会阻塞 WM_CLOSE→退出码 -1)、ini 值生效(auto/hw)、无 ignore
+  面包屑、退出 0。
+
+工程注:Read-Err 以 FileShare ReadWrite 打开(S4 需在 A 存活时轮询其
+stderr 重定向文件——smoke80 只在退出后读);S4 在 B 的 Start-Riv 覆盖
+`$script:RawH` 前保存 A 的活句柄、关 A 前还原(Close-Main 从该句柄读
+退出码)。
+
 ## smoke98-apng.ps1(#98 APNG 动画接入)
 
 ```powershell
