@@ -30,6 +30,8 @@
 
 ## 2. 已采纳与已归档想法 (Promoted / Archived Ideas)
 
+- [IDEA-260925-01] 安装器桌面快捷方式选项 → **已放弃**,原因:上游 voidImageViewer 本无桌面快捷方式(全脚本零 CreateShortCut,仅开始菜单且由 staged exe 自建),riviv 忠实对齐;用户 2026-09-25 裁定不加(需要时手动「发送到桌面快捷方式」顶用),考古证据=当日对 `c-original/nsis/installer.nsi` 与 `installer/nsis/riviv.nsi` 的逐行核对 (2026-09-25)
+
 <!-- 流转与归档示例：
 - [IDEA-YYMMDD-00] 标题 → 已采纳，关联至 Issue #12 / docs/adr/0002-*.md (YYYY-MM-DD)
 - [IDEA-YYMMDD-00] 标题 → 已放弃，原因：评估后发现与既有三方库冲突 (YYYY-MM-DD)
