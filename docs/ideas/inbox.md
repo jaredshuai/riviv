@@ -14,12 +14,6 @@
 
 ## 1. 活跃想法池 (Active Ideas)
 
-### [IDEA-260922-01] About 对话框内容补实
-- **提出时间与来源**:2026-09-22(#98 R7 收尾盘点;长期存在于会话交接记忆)
-- **核心设想与场景**:About 对话框当前为 filler 文案;补齐版本/版权/上游致谢等实内容
-- **未立项原因/权衡**:纯 UI 小票,一直排在产品票之后;非当期核心链路
-- **状态**:exploration
-
 ### [IDEA-260922-02] Default Programs 注册(采用率候选)
 - **提出时间与来源**:2026-09-21(M7 咨询 AI3 本地核查;#97 会话)
 - **核心设想与场景**:注册 RegisteredApplications/Capabilities,让 riviv 出现在系统「默认应用」选择器——beyond-original(原版无此注册)
@@ -30,6 +24,7 @@
 
 ## 2. 已采纳与已归档想法 (Promoted / Archived Ideas)
 
+- [IDEA-260922-01] About 对话框内容补实 → **已采纳**,关联至 Issue #124(用户 2026-09-25 v0.1.0 收官盘点点名「About 补实一票就能关」+认可顺手消小件=方向性授权;版本已有,补版权/上游作者归属,措辞逐字取 README License 节) (2026-09-25)
 - [IDEA-260925-01] 安装器桌面快捷方式选项 → **已放弃**,原因:上游 voidImageViewer 本无桌面快捷方式(全脚本零 CreateShortCut,仅开始菜单且由 staged exe 自建),riviv 忠实对齐;用户 2026-09-25 裁定不加(需要时手动「发送到桌面快捷方式」顶用),考古证据=当日对 `c-original/nsis/installer.nsi` 与 `installer/nsis/riviv.nsi` 的逐行核对 (2026-09-25)
 
 <!-- 流转与归档示例：
