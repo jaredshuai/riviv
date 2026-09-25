@@ -128,7 +128,7 @@ use crate::slideshow;
 use crate::status;
 use crate::surface::Surface;
 use crate::text::{
-    TitleFormat, dialog_filter, temp_animation_rate_text, temp_pos_zoom_text,
+    TitleFormat, about_text, dialog_filter, temp_animation_rate_text, temp_pos_zoom_text,
     temp_slideshow_rate_text, title_wide, to_wide,
 };
 use crate::zoom::{FitPolicy, View, Viewport};
@@ -5668,8 +5668,9 @@ fn pick_folder(hwnd: HWND, initial_dir: Option<&OsStr>) -> Option<OsString> {
 
 /// Help→About (upstream `VIV_ID_HELP_ABOUT` → the IDD_ABOUT resource
 /// dialog, viv.c:1696/9728-9800). riviv ships no dialog resources — a
-/// message box carries the same facts (README Differences). The renderer
-/// line (#80 design §8) names the EFFECTIVE backend — the ticket-evidence
+/// message box carries the same fact classes (README Differences):
+/// version, the license statement, both URLs, and the renderer line
+/// (#80 design §8) naming the EFFECTIVE backend — the ticket-evidence
 /// channel in the one dialog everyone can find.
 fn show_about(hwnd: HWND) {
     // SAFETY: read-only backend read. The fallback is the transient
@@ -5679,10 +5680,7 @@ fn show_about(hwnd: HWND) {
     let backend = (unsafe { state_of(hwnd) })
         .and_then(|state| state.gpu.as_ref().map(|gpu| gpu.backend))
         .unwrap_or("(no renderer)");
-    let text = format!(
-        "riviv {}\n\nUnofficial Rust rewrite of voidtools void Image Viewer.\nUpstream (MIT): https://www.voidtools.com/voidimageviewer/\nSource: https://github.com/jaredshuai/riviv\nRenderer: {backend}",
-        env!("CARGO_PKG_VERSION")
-    );
+    let text = about_text(env!("CARGO_PKG_VERSION"), backend);
     let text_wide = to_wide(&text);
     let caption = to_wide(loc::get(loc::Id::AppName));
     // SAFETY: both buffers outlive the modal call; hwnd is the live owner.

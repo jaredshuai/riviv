@@ -89,6 +89,24 @@ pub(crate) fn dialog_filter() -> Vec<u16> {
     .collect()
 }
 
+/// The About box body (#124): the #23 MessageBox-About's fact set made
+/// complete. Upstream's IDD_ABOUT dialog carries version, a localized
+/// `Copyright © <year> voidtools`, email, and website (viv.c:9777-9786);
+/// riviv's box stays English (README Differences) and carries version,
+/// the README's license statement verbatim, both project URLs, and the
+/// renderer line (#80's ticket-evidence channel).
+pub(crate) fn about_text(version: &str, backend: &str) -> String {
+    format!(
+        "riviv {version}\n\n\
+         Unofficial Rust rewrite of voidtools void Image Viewer.\n\
+         License: MIT — same as upstream.\n\
+         Original C implementation © voidtools / David Carpenter.\n\
+         Upstream: https://www.voidtools.com/voidimageviewer/\n\
+         Source: https://github.com/jaredshuai/riviv\n\
+         Renderer: {backend}"
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Status bar (#5)
 // ---------------------------------------------------------------------------
@@ -443,6 +461,29 @@ mod tests {
              All Files (*.*)\0*.*\0"
         );
         assert_eq!(*filter.last().unwrap(), 0, "double-null terminated");
+    }
+
+    #[test]
+    fn about_text_carries_version_license_and_upstream_attribution() {
+        // #124: the first line names the app and version; the license
+        // statement is README-verbatim (the legal record); both URLs and
+        // the renderer line close the body.
+        let text = about_text("0.1.0", "d2d/hw");
+        assert!(text.starts_with("riviv 0.1.0\n"));
+        assert!(text.contains("License: MIT — same as upstream.\n"));
+        assert!(text.contains("Original C implementation © voidtools / David Carpenter.\n"));
+        assert!(text.contains("Upstream: https://www.voidtools.com/voidimageviewer/\n"));
+        assert!(text.contains("Source: https://github.com/jaredshuai/riviv\n"));
+        assert!(text.ends_with("Renderer: d2d/hw"));
+    }
+
+    #[test]
+    fn about_text_names_whatever_backend_the_window_reported() {
+        // The renderer line is #80's ticket-evidence channel — the shell's
+        // fallback label for the transient no-stack window passes through
+        // untouched, like any live backend.
+        assert!(about_text("1.2.3", "d2d/warp").ends_with("Renderer: d2d/warp"));
+        assert!(about_text("0.1.0", "(no renderer)").ends_with("Renderer: (no renderer)"));
     }
 
     #[test]
