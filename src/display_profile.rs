@@ -244,7 +244,13 @@ fn active_paths() -> Option<Vec<PathInfo>> {
             .map(|p| PathInfo {
                 adapter_luid: p.targetInfo.adapterId,
                 source_id: p.sourceInfo.id,
-                source_name: source_name(p.targetInfo.adapterId, p.sourceInfo.id),
+                // The source-name request keys on the SOURCE side
+                // (sourceInfo.adapterId + sourceInfo.id); the getter below
+                // keys on the TARGET side (targetInfo.adapterId + the
+                // same source id) — two different adapter axes of one
+                // path, and mixing them fails the name lookup on
+                // split-adapter topologies (Codex P2, PR #131).
+                source_name: source_name(p.sourceInfo.adapterId, p.sourceInfo.id),
             })
             .collect(),
     )

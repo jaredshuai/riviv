@@ -1226,8 +1226,19 @@ fn paint_view(view: HWND, owner: HWND) {
     // #130: the display segment's per-frame bookkeeping rides every
     // paint's tail — construction failures surface on the Painted path
     // too (the frame drew direct, untransformed), and the ratchet must
-    // see them exactly like the no-present draw failures.
-    drain_display_failure(owner);
+    // see them exactly like the no-present draw failures. A counted
+    // failure also drives its own retry (Codex P2, PR #131): a static
+    // image would otherwise paint once and never reach the latch —
+    // bounded at STAGE_DEGRADE_FAILURES repaints, after which the latch
+    // turns the segment off and the failures stop.
+    if drain_display_failure(owner) {
+        // SAFETY: invalidates our own child; no borrow is live (this
+        // runs after paint_d2d returned and after the drain's borrow
+        // ended).
+        unsafe {
+            let _ = InvalidateRect(Some(view), None, false);
+        }
+    }
     // The ladder's final tier defers its fatal to HERE: the paint's state
     // borrows are gone, so the modal may pump (design §7). The reason
     // rides along (AI1 P3-6): each latch site recorded its diagnosis —
@@ -1403,21 +1414,23 @@ fn backend_label(backend: crate::transform_stage::Backend) -> &'static str {
 /// consecutive counter; the third consecutive failure latches the
 /// segment off for the session (breadcrumb-only, ADR 0001) and the
 /// latch flip re-identifies the output (a fingerprint transition — the
-/// dump channel's gen must move).
-fn drain_display_failure(owner: HWND) {
+/// dump channel's gen must move). Returns whether a failure was counted
+/// this frame — the caller turns that into a repaint so a static image
+/// still walks the ratchet to its latch (Codex P2, PR #131).
+fn drain_display_failure(owner: HWND) -> bool {
     // SAFETY: the borrow spans the take and the counter updates; nothing
     // here pumps (D2D objects are already idle — the paint returned).
     let Some(state) = (unsafe { state_of(owner) }) else {
-        return;
+        return false;
     };
     let Some(gpu) = state.gpu.as_mut() else {
-        return;
+        return false;
     };
     let Some(detail) = gpu.take_display_failure() else {
         // A clean application (or no segment at all): the ratchet's
         // counter restarts — only CONSECUTIVE failures count.
         state.stage_failures = 0;
-        return;
+        return false;
     };
     state.stage_failures += 1;
     eprintln!(
@@ -1431,7 +1444,11 @@ fn drain_display_failure(owner: HWND) {
             state.stage_failures
         );
         identify_output(state);
+        // The latch ended the failure sequence — no retry needed (the
+        // next paint draws direct and succeeds).
+        return false;
     }
+    true
 }
 
 /// The rebuild request kind (external review AI2 P2-3): a session that
