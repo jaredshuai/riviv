@@ -628,7 +628,12 @@ fn update_src_pixel(hwnd: HWND, force: bool, update_statusbar: bool) -> bool {
             // builds a scratch DC and GetPixels the displayed frame,
             // viv.c:15063-15109 — the master IS the displayed bytes, so
             // the pure read is the same value without the GDI
-            // roundtrip, device-independent).
+            // roundtrip, device-independent). R2 contract (#127): this
+            // readout is an "sRGB-normalized reading" — it always
+            // samples the sRGB master BEFORE the display-segment
+            // transform, whatever `transform_stage` resolves to;
+            // semi-transparent pixels read with their composited
+            // background baked in.
             let master = image.surface().master();
             // Out-of-bounds maps to the CLR_INVALID read-through the
             // unchecked GetRValue chain produced (255, 255, 255) — the
