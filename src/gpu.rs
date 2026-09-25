@@ -18,7 +18,7 @@
 //!
 //! The frame source is the CPU master (`PixelFrame`, #76): uploads copy
 //! the master's bytes straight into a D2D bitmap keyed by
-//! (frame_gen, w, h) — device-loss recovery re-uploads without a
+//! (frame_gen, level, w, h) — device-loss recovery re-uploads without a
 //! re-decode. The failure chain (#90) is hardware-D2D → WARP → fatal:
 //! device losses feed the rebuild ladder inside the paint, every
 //! non-recoverable verdict defers its fatal to after the paint borrow

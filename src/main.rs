@@ -128,6 +128,9 @@ mod surface;
 mod text;
 mod tile;
 mod toolbar;
+#[allow(dead_code)]
+// #127 ships the decision table + output-identity keys; consumers land with #126 and the static-gpu_effect phase
+mod transform_stage;
 mod window;
 mod zoom;
 
