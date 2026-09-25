@@ -31,6 +31,9 @@ windows = { version = "0.62", features = [
     "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Gdi",
     "Win32_Storage_FileSystem",
+    # QueryDisplayConfig/DisplayConfigGetDeviceInfo — display-profile judge
+    # (#130): user32 exports present since Win7, floor-safe
+    "Win32_Devices_Display",
     "Win32_System_Com",
     "Win32_System_DataExchange",
     "Win32_System_Environment",

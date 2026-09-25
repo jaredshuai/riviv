@@ -28,17 +28,20 @@
 use std::mem::ManuallyDrop;
 
 use windows::Win32::Foundation::{D2DERR_RECREATE_TARGET, GetLastError, HMODULE, HWND, RECT};
+use windows::Win32::Graphics::Direct2D::Common::D2D1_COMPOSITE_MODE_SOURCE_OVER;
 use windows::Win32::Graphics::Direct2D::Common::{
     D2D_RECT_F, D2D_RECT_U, D2D_SIZE_U, D2D1_ALPHA_MODE_IGNORE, D2D1_COLOR_F, D2D1_PIXEL_FORMAT,
 };
 use windows::Win32::Graphics::Direct2D::{
-    D2D1_ANTIALIAS_MODE_ALIASED, D2D1_BITMAP_OPTIONS, D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
-    D2D1_BITMAP_OPTIONS_CPU_READ, D2D1_BITMAP_OPTIONS_NONE, D2D1_BITMAP_OPTIONS_TARGET,
-    D2D1_BITMAP_PROPERTIES1, D2D1_DEVICE_CONTEXT_OPTIONS_NONE, D2D1_FACTORY_TYPE_SINGLE_THREADED,
-    D2D1_INTERPOLATION_MODE, D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,
-    D2D1_INTERPOLATION_MODE_LINEAR, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
-    D2D1_MAP_OPTIONS_READ, D2D1_PRIMITIVE_BLEND_COPY, D2D1_UNIT_MODE_PIXELS, D2D1CreateFactory,
-    ID2D1Bitmap, ID2D1Device, ID2D1DeviceContext, ID2D1Factory1, ID2D1Image, ID2D1RenderTarget,
+    CLSID_D2D1ColorManagement, D2D1_ANTIALIAS_MODE_ALIASED, D2D1_BITMAP_OPTIONS,
+    D2D1_BITMAP_OPTIONS_CANNOT_DRAW, D2D1_BITMAP_OPTIONS_CPU_READ, D2D1_BITMAP_OPTIONS_NONE,
+    D2D1_BITMAP_OPTIONS_TARGET, D2D1_BITMAP_PROPERTIES1, D2D1_COLOR_SPACE_SRGB,
+    D2D1_DEVICE_CONTEXT_OPTIONS_NONE, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_INTERPOLATION_MODE,
+    D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, D2D1_INTERPOLATION_MODE_LINEAR,
+    D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, D2D1_MAP_OPTIONS_READ, D2D1_PRIMITIVE_BLEND_COPY,
+    D2D1_PROPERTY_TYPE_COLOR_CONTEXT, D2D1_PROPERTY_TYPE_ENUM, D2D1_UNIT_MODE_PIXELS,
+    D2D1CreateFactory, ID2D1Bitmap, ID2D1ColorContext, ID2D1Device, ID2D1DeviceContext,
+    ID2D1Effect, ID2D1Factory1, ID2D1Image, ID2D1RenderTarget,
 };
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP};
 use windows::Win32::Graphics::Direct3D11::{
@@ -338,6 +341,14 @@ pub(crate) enum PaintOutcome {
     /// (see [`prepare_escalates`]): the ladder's rebuild/re-escalation is the
     /// bounded response to a driver that keeps refusing uploads.
     DeviceLost,
+    /// The display-segment effect failed this frame (#130's quality
+    /// ratchet, NOT the device ladder): the effect graph's construction
+    /// or the two-phase draw hit a non-loss error while the effect was
+    /// in the path. The frame is NOT presented; the caller feeds the
+    /// session's consecutive-failure counter (three latches the segment
+    /// off — `transform_stage::stage_degrades`), which is the bounded
+    /// response to a driver/profile quirk the LADDER must not fire on.
+    DisplayEffectFailed,
     /// A NON-loss failure the ladder cannot fix (a deterministic error:
     /// `D2DERR_NOT_SUPPORTED`, Present `INVALID_CALL` after a bad resize …).
     /// Escalating these would rebuild the same broken stack forever — and
@@ -346,6 +357,40 @@ pub(crate) enum PaintOutcome {
     /// fatal fires after the paint borrow drops (ADR 0001: a renderer that
     /// cannot draw deterministically is system-level, not user-level).
     Unrecoverable { hr: i32 },
+}
+
+/// A draw-pass failure, split by WHO owns the recovery (#130): a
+/// `Renderer` error takes the existing two-way classification (device
+/// loss → the ladder; anything else → the deferred fatal), while an
+/// `Effect` error came from inside the two-phase effect path — a
+/// non-loss refusal of the graph itself, which the session's quality
+/// ratchet (three consecutive → segment off) owns, never the ladder.
+#[derive(Debug)]
+enum DrawFailure {
+    Renderer(windows::core::Error),
+    Effect(windows::core::Error),
+}
+
+impl DrawFailure {
+    /// The two-phase pass's own rule: device loss is the LADDER's
+    /// signal wherever it happens (the whole device is going away — the
+    /// effect graph dies with the rebuild anyway); every other error
+    /// inside the effect path is the ratchet's.
+    fn classify(e: windows::core::Error) -> Self {
+        if is_device_loss(e.code()) {
+            DrawFailure::Renderer(e)
+        } else {
+            DrawFailure::Effect(e)
+        }
+    }
+}
+
+impl std::fmt::Display for DrawFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DrawFailure::Renderer(e) | DrawFailure::Effect(e) => write!(f, "{e}"),
+        }
+    }
 }
 
 /// The one HRESULT table every failure path shares (external review AI2
@@ -365,6 +410,77 @@ pub(crate) fn is_device_loss(hr: windows::core::HRESULT) -> bool {
 // ---------------------------------------------------------------------------
 // The stack
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// The display segment's D2D ColorManagement effect (#130, M8-3): the one
+// post-composition viewport pass (AI1's ruling — never per-tile) that the
+// transform table's GpuEffect cell drives on hardware.
+// ---------------------------------------------------------------------------
+
+// The ColorManagement effect's property indices and enum values are NOT in
+// windows-rs 0.62 — transcribed from the installed SDK 10.0.26100.0
+// d2d1effects.h lines 791-860 (the #127 AcState precedent: the docs page
+// is unreliable, the header transcription is pinned here and each value
+// is exercised by the smoke that runs the real effect).
+/// `D2D1_COLORMANAGEMENT_PROP_SOURCE_COLOR_CONTEXT = 0`
+const D2D1_COLORMANAGEMENT_PROP_SOURCE_COLOR_CONTEXT: u32 = 0;
+/// `D2D1_COLORMANAGEMENT_PROP_SOURCE_RENDERING_INTENT = 1`
+const D2D1_COLORMANAGEMENT_PROP_SOURCE_RENDERING_INTENT: u32 = 1;
+/// `D2D1_COLORMANAGEMENT_PROP_DESTINATION_COLOR_CONTEXT = 2`
+const D2D1_COLORMANAGEMENT_PROP_DESTINATION_COLOR_CONTEXT: u32 = 2;
+/// `D2D1_COLORMANAGEMENT_PROP_DESTINATION_RENDERING_INTENT = 3`
+const D2D1_COLORMANAGEMENT_PROP_DESTINATION_RENDERING_INTENT: u32 = 3;
+/// `D2D1_COLORMANAGEMENT_PROP_ALPHA_MODE = 4`
+const D2D1_COLORMANAGEMENT_PROP_ALPHA_MODE: u32 = 4;
+/// `D2D1_COLORMANAGEMENT_PROP_QUALITY = 5`
+const D2D1_COLORMANAGEMENT_PROP_QUALITY: u32 = 5;
+/// `D2D1_COLORMANAGEMENT_RENDERING_INTENT_RELATIVE_COLORIMETRIC = 1`
+/// (D8-1: the effect's PERCEPTUAL default is overridden on BOTH ends to
+/// match Stage 1 and the pinned policy — in-gamut colors land
+/// byte-accurate and the equivalence gates stay meaningful).
+const D2D1_COLORMANAGEMENT_RENDERING_INTENT_RELATIVE_COLORIMETRIC: u32 = 1;
+/// `D2D1_COLORMANAGEMENT_ALPHA_MODE_PREMULTIPLIED = 1` (note: NOT 0 —
+/// the enum starts at 1; D2D render targets are premultiplied and the
+/// composite's opaque background keeps alpha at 1 everywhere).
+const D2D1_COLORMANAGEMENT_ALPHA_MODE_PREMULTIPLIED: u32 = 1;
+/// `D2D1_COLORMANAGEMENT_QUALITY_BEST = 2` (matches
+/// `transform_stage::RenderQuality::Best`; a future NORMAL decision
+/// re-keys the output identity through the fingerprint's policy term).
+const D2D1_COLORMANAGEMENT_QUALITY_BEST: u32 = 2;
+
+/// The built effect graph: the intermediate the scene composites into,
+/// the ColorManagement effect wired sRGB->display-profile, and the
+/// contexts the effect's properties reference (held so their lifetime is
+/// visibly the graph's, though the property system AddRefs them anyway).
+/// Everything here is UI-thread only and dies with the stack (or with an
+/// intent/size change — `built_for` is what the lazy builder checks).
+struct EffectGraph {
+    /// The composite surface, TARGET-only (sized to the viewport; the
+    /// resize path drops the whole graph and the next paint rebuilds).
+    intermediate: ID2D1Image,
+    /// The effect, already holding `intermediate` as input 0.
+    effect_image: ID2D1Image,
+    _effect: ID2D1Effect,
+    _src_ctx: ID2D1ColorContext,
+    _dst_ctx: ID2D1ColorContext,
+    built_for: (u32, u32),
+}
+
+/// The display segment's per-frame application state — what the window
+/// side wants RIGHT NOW (the effective stage from the table + the latch,
+/// plus the profile the judge returned). The graph is rebuilt whenever
+/// the intent or the target size changes, so a rebuild or a resize never
+/// reuses a stale graph.
+#[derive(Default)]
+struct DisplaySegment {
+    want_effect: bool,
+    profile: Option<std::path::PathBuf>,
+    graph: Option<EffectGraph>,
+    /// This frame's effect failure (construction or two-phase draw),
+    /// drained by the paint caller to feed the session ratchet. None on
+    /// every clean frame.
+    failure: Option<String>,
+}
 
 pub(crate) struct GpuStack {
     // Field order IS the drop order (COM wrappers Release in declaration
@@ -433,6 +549,13 @@ pub(crate) struct GpuStack {
     /// stack, so the count restarts per stack while the LADDER's own
     /// 3-in-10s window (on the window state) governs the runaway case.
     prepare_failures: u32,
+    /// The display segment's application state (#130): the effective
+    /// intent (table + session latch, synced per paint by the window),
+    /// the lazily built effect graph, and this frame's failure record.
+    /// Session-latch state does NOT live here — the latch must survive
+    /// ladder rebuilds, so it sits on the window state (the same split
+    /// as the device-loss timestamps).
+    display: DisplaySegment,
     /// The byte ledger (ticket's 分类记账) — observable at close.
     pub(crate) ledger: crate::tile::MemLedger,
     // NOTE: the device-loss timestamps do NOT live on the stack — the
@@ -651,6 +774,9 @@ pub(crate) fn create(
         forced_edge: None,
         scene: Scene::Clear,
         prepare_failures: 0,
+        // The judge's verdict arrives with the first paint's intent sync
+        // (#130), not here: the window state owns the decision point.
+        display: DisplaySegment::default(),
         ledger: crate::tile::MemLedger {
             cap: cap_bytes,
             ..crate::tile::MemLedger::default()
@@ -1002,29 +1128,199 @@ impl GpuStack {
         Ok(())
     }
 
-    /// One blank-letterbox frame: BeginDraw → Clear → EndDraw → Present.
-    /// The degenerate-image arm of the paint (and the upload-failure
-    /// degrade: the previous frame must not linger behind a failed adopt).
-    /// BeginDraw reports nothing (void); EndDraw is the loss channel.
-    /// One BeginDraw→Clear[→DrawBitmap]→EndDraw pass — the ONE scene body
-    /// the present paths and the dump share (external review AI2: the dump
-    /// used to duplicate the sequence, so a paint-path drift would have
-    /// been invisible to the L0 channel). The EndDraw HRESULT is the sole
-    /// error channel (BeginDraw/DrawBitmap report nothing themselves).
-    fn draw_pass(
+    /// The display-segment intent sync (#130): what the EFFECTIVE stage
+    /// (the table's answer clamped by the session latch, computed on the
+    /// window state) and the judge's profile say RIGHT NOW. Called per
+    /// paint and before every dump — one channel for stack rebuilds,
+    /// latch flips, and (later) profile changes, each of which just
+    /// changes the intent and lets the lazy graph builder react.
+    pub(crate) fn sync_display_intent(
         &mut self,
-        bg: [u8; 3],
-        plan: Option<&DrawPlan>,
-    ) -> Result<(), windows::core::Error> {
+        want_effect: bool,
+        profile: Option<&std::path::Path>,
+    ) {
+        let profile = profile.map(|p| p.to_path_buf());
+        if self.display.want_effect == want_effect && self.display.profile == profile {
+            return; // unchanged intent: the graph (if any) stays valid
+        }
+        self.display.want_effect = want_effect;
+        self.display.profile = profile;
+        // The graph is intent-shaped (its destination context and input
+        // wiring belong to one profile): drop it, rebuild lazily.
+        self.display.graph = None;
+    }
+
+    /// Drains this frame's effect failure (the quality ratchet's feed —
+    /// construction or two-phase draw, whichever happened last; the
+    /// window state counts consecutive failures and latches the segment
+    /// off at `transform_stage::STAGE_DEGRADE_FAILURES`).
+    pub(crate) fn take_display_failure(&mut self) -> Option<String> {
+        self.display.failure.take()
+    }
+
+    /// True when the effect graph is usable this frame, building it
+    /// lazily when the intent wants one. A construction failure records
+    /// the ratchet feed ONCE (get_or_insert — the direct pass may still
+    /// fail on its own after this) and answers false: the frame draws
+    /// direct (content visible untransformed beats blank; the ratchet
+    /// still counts it).
+    fn ensure_effect_graph(&mut self, w: u32, h: u32) -> bool {
+        if w == 0 || h == 0 {
+            return false;
+        }
+        if let Some(graph) = self.display.graph.as_ref()
+            && graph.built_for == (w, h)
+        {
+            return true;
+        }
+        self.display.graph = None;
+        match self.build_effect_graph(w, h) {
+            Ok(graph) => {
+                self.display.graph = Some(graph);
+                true
+            }
+            Err(e) => {
+                self.display
+                    .failure
+                    .get_or_insert_with(|| format!("display effect build failed: {e}"));
+                false
+            }
+        }
+    }
+
+    /// The graph build (#130's applied-artifact list): the viewport-sized
+    /// intermediate, the ColorManagement effect wired sRGB source →
+    /// display-profile destination with BOTH intents forced to relative
+    /// colorimetric (D8-1) and quality BEST, and the intermediate as the
+    /// effect's input 0. Everything here is device-object creation —
+    /// device losses do not happen at construction; every error is a
+    /// profile/driver refusal the ratchet is for.
+    fn build_effect_graph(&self, w: u32, h: u32) -> Result<EffectGraph, String> {
+        let profile = self
+            .display
+            .profile
+            .as_deref()
+            .ok_or("effect wanted but the judge carried no profile")?;
+        // SAFETY: the context is live; no source data (a bare TARGET
+        // bitmap); the properties struct is a stack temporary outliving
+        // the call.
+        let intermediate = unsafe {
+            self.context.CreateBitmap(
+                D2D_SIZE_U {
+                    width: w,
+                    height: h,
+                },
+                None,
+                0,
+                &bitmap_properties(D2D1_BITMAP_OPTIONS_TARGET),
+            )
+        }
+        .map_err(|e| format!("intermediate CreateBitmap failed: {e}"))?;
+        // SetTarget/DrawImage/SetInput take the parent ID2D1Image (no
+        // auto upcast in 0.62) — one QI per build, none per frame.
+        let intermediate_img: ID2D1Image = intermediate
+            .cast()
+            .map_err(|e| format!("cast intermediate to ID2D1Image failed: {e}"))?;
+        drop(intermediate); // the Image reference keeps the object alive
+        // SAFETY: the context is live; the CLSID is a static constant.
+        let effect = unsafe { self.context.CreateEffect(&CLSID_D2D1ColorManagement) }
+            .map_err(|e| format!("CreateEffect(ColorManagement) failed: {e}"))?;
+        // The simple sRGB source context (the master's space) and the
+        // destination context loaded from the judge's ICC file.
+        // SAFETY: the context is live; the enum is a plain value; no
+        // custom profile bytes for the simple-space form.
+        let src_ctx = unsafe { self.context.CreateColorContext(D2D1_COLOR_SPACE_SRGB, None) }
+            .map_err(|e| format!("CreateColorContext(sRGB) failed: {e}"))?;
+        let profile_name = windows::core::HSTRING::from(profile.as_os_str());
+        // SAFETY: the context is live; the path string outlives the call.
+        let dst_ctx = unsafe { self.context.CreateColorContextFromFilename(&profile_name) }
+            .map_err(|e| {
+                format!(
+                    "CreateColorContextFromFilename({}) failed: {e}",
+                    profile.display()
+                )
+            })?;
+        // The property writes: COLOR_CONTEXT-typed properties (the SDK's
+        // "Property Type: ID2D1ColorContext *" — registered as
+        // D2D1_PROPERTY_TYPE_COLOR_CONTEXT, verified by the #130 probe:
+        // IUNKNOWN answers E_INVALIDARG) take the interface pointer value
+        // as their bytes; ENUM-typed ones take the i32 value (u32 width
+        // here, same 4 bytes).
+        // SAFETY: property setters on the live effect; each slice's
+        // width matches its declared property type; the contexts outlive
+        // the calls (held by the returned graph).
+        unsafe {
+            let src_raw = src_ctx.as_raw() as usize;
+            effect
+                .SetValue(
+                    D2D1_COLORMANAGEMENT_PROP_SOURCE_COLOR_CONTEXT,
+                    D2D1_PROPERTY_TYPE_COLOR_CONTEXT,
+                    &src_raw.to_ne_bytes(),
+                )
+                .map_err(|e| format!("SetValue(source context) failed: {e}"))?;
+            let dst_raw = dst_ctx.as_raw() as usize;
+            effect
+                .SetValue(
+                    D2D1_COLORMANAGEMENT_PROP_DESTINATION_COLOR_CONTEXT,
+                    D2D1_PROPERTY_TYPE_COLOR_CONTEXT,
+                    &dst_raw.to_ne_bytes(),
+                )
+                .map_err(|e| format!("SetValue(destination context) failed: {e}"))?;
+            for index in [
+                D2D1_COLORMANAGEMENT_PROP_SOURCE_RENDERING_INTENT,
+                D2D1_COLORMANAGEMENT_PROP_DESTINATION_RENDERING_INTENT,
+            ] {
+                effect
+                    .SetValue(
+                        index,
+                        D2D1_PROPERTY_TYPE_ENUM,
+                        &D2D1_COLORMANAGEMENT_RENDERING_INTENT_RELATIVE_COLORIMETRIC.to_ne_bytes(),
+                    )
+                    .map_err(|e| format!("SetValue(rendering intent {index}) failed: {e}"))?;
+            }
+            effect
+                .SetValue(
+                    D2D1_COLORMANAGEMENT_PROP_ALPHA_MODE,
+                    D2D1_PROPERTY_TYPE_ENUM,
+                    &D2D1_COLORMANAGEMENT_ALPHA_MODE_PREMULTIPLIED.to_ne_bytes(),
+                )
+                .map_err(|e| format!("SetValue(alpha mode) failed: {e}"))?;
+            effect
+                .SetValue(
+                    D2D1_COLORMANAGEMENT_PROP_QUALITY,
+                    D2D1_PROPERTY_TYPE_ENUM,
+                    &D2D1_COLORMANAGEMENT_QUALITY_BEST.to_ne_bytes(),
+                )
+                .map_err(|e| format!("SetValue(quality) failed: {e}"))?;
+            // Input 0 = the intermediate, set once here (the effect holds
+            // its own reference); no invalidation flag.
+            effect.SetInput(0, Some(&intermediate_img), false);
+        }
+        let effect_image: ID2D1Image = effect
+            .cast()
+            .map_err(|e| format!("cast effect to ID2D1Image failed: {e}"))?;
+        Ok(EffectGraph {
+            intermediate: intermediate_img,
+            effect_image,
+            _effect: effect,
+            _src_ctx: src_ctx,
+            _dst_ctx: dst_ctx,
+            built_for: (w, h),
+        })
+    }
+
+    /// The scene body both pass shapes share (design §4: the letterbox IS
+    /// the Clear; the tile loop's clip pairs stay balanced). No
+    /// Begin/EndDraw here — the caller owns the target switch and the
+    /// bracket; nothing here reports an error.
+    fn draw_scene(&self, bg: [u8; 3], plan: Option<&DrawPlan>) {
         // SAFETY: the context and (when the scene draws) the uploaded
         // bitmaps are live (the stack holds them; `prepare` only ever
         // replaces a bitmap while no draw is running); every
-        // rectangle/parameter outlives the calls; nothing pumps. The tile
-        // loop's `PushAxisAlignedClip`/`PopAxisAlignedClip` calls are
-        // paired one-for-one inside it, so the context never reaches
-        // `EndDraw` with a clip still on the stack (D2D rejects that).
+        // rectangle/parameter outlives the calls; nothing pumps. The
+        // clip pairs below stay balanced, so EndDraw never runs with a
+        // clip still open (D2D rejects that).
         unsafe {
-            self.context.BeginDraw();
             let color = bg_color_f(bg);
             self.context.Clear(Some(&color));
             if let Some(plan) = plan
@@ -1111,7 +1407,107 @@ impl GpuStack {
                     }
                 }
             }
-            self.context.EndDraw(None, None)
+        } // the unsafe scene block
+    }
+
+    /// One BeginDraw→scene→EndDraw pass — the ONE scene body the present
+    /// paths and the dump share (external review AI2: a duplicated
+    /// sequence here would let paint-path drift go invisible to the L0
+    /// channel). The EndDraw HRESULT is the sole error channel
+    /// (BeginDraw/DrawBitmap report nothing themselves). #130: the pass
+    /// SHAPE follows the display segment — the two-phase effect pass
+    /// when the effective stage says GpuEffect and the graph is usable,
+    /// the direct pass otherwise (stage None/DwmAcm, a latched session,
+    /// or a construction failure THIS frame — content visible
+    /// untransformed beats a blank frame, and the ratchet counts it).
+    fn draw_pass(&mut self, bg: [u8; 3], plan: Option<&DrawPlan>) -> Result<(), DrawFailure> {
+        // SAFETY: read-only target-size query on the live context (the
+        // target is the swapchain's bitmap on entry — set by
+        // create/resize and restored by every effect-pass exit).
+        let size = unsafe { self.context.GetPixelSize() };
+        if self.display.want_effect && self.ensure_effect_graph(size.width, size.height) {
+            // SAFETY: the graph, context and (when the scene draws) the
+            // uploaded bitmaps are all live (the stack holds them;
+            // `prepare` only ever replaces a bitmap while no draw is
+            // running); every rectangle/parameter outlives the calls;
+            // nothing pumps. The clip pairs inside draw_scene stay
+            // balanced, so neither EndDraw runs with a clip open.
+            self.effect_pass(bg, plan)
+        } else {
+            // SAFETY: same liveness contract, direct into the swapchain
+            // target.
+            unsafe {
+                self.context.BeginDraw();
+                self.draw_scene(bg, plan);
+                self.context
+                    .EndDraw(None, None)
+                    .map_err(DrawFailure::Renderer)
+            }
+        }
+    }
+
+    /// The two-phase effect pass: the scene composites into the
+    /// intermediate, then the ColorManagement effect draws the transform
+    /// into the swapchain target (the post-composition viewport pass,
+    /// AI1's ruling). Every non-loss error inside this pass is the
+    /// ratchet's feed, never the ladder's — a driver refusing the graph
+    /// must not fatal the renderer (#130). The target is restored on
+    /// every exit so a later direct pass never draws into the stale
+    /// intermediate.
+    fn effect_pass(&mut self, bg: [u8; 3], plan: Option<&DrawPlan>) -> Result<(), DrawFailure> {
+        // The caller's ensure_effect_graph just proved the graph alive.
+        let graph = self.display.graph.as_ref().expect("graph ensured");
+        // SAFETY: the graph, context and (when the scene draws) the
+        // uploaded bitmaps are live (the stack holds them; `prepare` only
+        // ever replaces a bitmap while no draw is running); every
+        // rectangle/parameter outlives the calls; nothing pumps. Phase 1
+        // binds the intermediate (a plain TARGET bitmap the stack owns),
+        // draws the composite, and closes the bracket; phase 2 rebinds
+        // the swapchain target, draws the effect image (live — the graph
+        // holds it) at 1:1 (no target offset, no source rect — the
+        // intermediate is viewport-sized, so the effect's interpolation
+        // never resamples; composite SOURCE_OVER over the cleared target
+        // with an opaque source — alpha 1 everywhere, the composite's
+        // opaque background), and closes the bracket again.
+        unsafe {
+            // Phase 1: the composite, into the intermediate.
+            self.context.SetTarget(Some(&graph.intermediate));
+            self.context.BeginDraw();
+            self.draw_scene(bg, plan);
+            if let Err(e) = self.context.EndDraw(None, None) {
+                let failure = DrawFailure::classify(e);
+                self.restore_target();
+                return Err(failure);
+            }
+            // Phase 2: the transform, into the swapchain target.
+            // DrawImage reports nothing itself (the D2D contract:
+            // command-level errors surface at EndDraw) — the bracket
+            // completes unconditionally and EndDraw carries the verdict.
+            self.context.SetTarget(self.target.as_ref());
+            self.context.BeginDraw();
+            self.context.DrawImage(
+                &graph.effect_image,
+                None,
+                None,
+                D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
+                D2D1_COMPOSITE_MODE_SOURCE_OVER,
+            );
+            if let Err(e) = self.context.EndDraw(None, None) {
+                let failure = DrawFailure::classify(e);
+                self.restore_target();
+                return Err(failure);
+            }
+        }
+        Ok(())
+    }
+
+    /// Rebinds the swapchain target after an effect-pass failure (the
+    /// failed phase may have died with the intermediate still bound).
+    fn restore_target(&self) {
+        // SAFETY: plain rebind on the live context; the target reference
+        // is the stack's own (create/resize proved it valid).
+        unsafe {
+            self.context.SetTarget(self.target.as_ref());
         }
     }
 
@@ -1158,7 +1554,7 @@ impl GpuStack {
     fn present_clear(&mut self, bg: [u8; 3]) -> PaintOutcome {
         match self.draw_pass(bg, None) {
             Ok(()) => present(&self.swapchain),
-            Err(e) => self.enddraw_outcome(e),
+            Err(e) => self.draw_failure_outcome(e),
         }
     }
 
@@ -1168,7 +1564,24 @@ impl GpuStack {
     fn draw_frame(&mut self, plan: &DrawPlan) -> PaintOutcome {
         match self.draw_pass(plan.bg, Some(plan)) {
             Ok(()) => present(&self.swapchain),
-            Err(e) => self.enddraw_outcome(e),
+            Err(e) => self.draw_failure_outcome(e),
+        }
+    }
+
+    /// The shared error arm of the present paths (#130): renderer errors
+    /// keep the existing two-way classification; an effect-path failure
+    /// records the ratchet feed and reports the no-present outcome (the
+    /// failed frame's back buffer content is undefined — the next paint
+    /// redraws, latched or not).
+    fn draw_failure_outcome(&mut self, failure: DrawFailure) -> PaintOutcome {
+        match failure {
+            DrawFailure::Renderer(e) => self.enddraw_outcome(e),
+            DrawFailure::Effect(e) => {
+                self.display
+                    .failure
+                    .get_or_insert_with(|| format!("display effect draw failed: {e}"));
+                PaintOutcome::DisplayEffectFailed
+            }
         }
     }
 
@@ -1184,11 +1597,16 @@ impl GpuStack {
         // sequence requires EVERY back-buffer reference gone: the context's
         // own (SetTarget(None) below) and ours (the field drop). The
         // uploaded frame bitmap holds no back-buffer reference and stays.
+        // #130: the effect graph's intermediate is viewport-sized — drop
+        // the whole graph; the next paint rebuilds it at the new size
+        // (the intermediate holds no back-buffer reference either, so the
+        // drop is order-free).
         // SAFETY: plain unbind on the live context.
         unsafe {
             self.context.SetTarget(None);
         }
         self.target = None;
+        self.display.graph = None;
         // SAFETY: the swapchain is live; buffer count 0 + size 0 + UNKNOWN
         // keep the current buffer count and the window's client size and
         // format; flags 0.
@@ -1278,9 +1696,14 @@ impl GpuStack {
         // The SAME scene pass the present paths run (external review AI2:
         // a duplicated sequence here would let paint-path drift go
         // invisible to the L0 channel) — minus the Present, so a
-        // never-shown window dumps identically.
-        self.draw_pass(bg, plan.as_ref())
-            .map_err(|e| format!("dump EndDraw failed: {e}"))?;
+        // never-shown window dumps identically. #130: the pass shape
+        // follows the display segment here too — a transformed screen
+        // dumps transformed, or the dump channel would diverge from what
+        // the viewport shows.
+        self.draw_pass(bg, plan.as_ref()).map_err(|e| match e {
+            DrawFailure::Renderer(e) => format!("dump EndDraw failed: {e}"),
+            DrawFailure::Effect(e) => format!("dump effect pass failed: {e}"),
+        })?;
         // The readback staging bitmap: CPU_READ | CANNOT_DRAW, viewport
         // sized, the same UNORM format (design §9).
         // The readback plus the two decoded copies below are this call's
@@ -1509,6 +1932,9 @@ pub(crate) fn paint_d2d(view: HWND, owner: HWND) -> PaintOutcome {
         // The plan reads the whole state — computed before the mutable gpu
         // borrow (plain data, the borrow ends here).
         let plan = dims.map(|(mw, mh)| (draw_plan(state, cw, ch, mw as i32, mh as i32), mw, mh));
+        // #130: the display segment's intent, synced before the mutable
+        // gpu borrow (the same computation the dump path runs).
+        let (want_effect, display_profile) = crate::window::display_intent(state);
         let Some(gpu) = state.gpu.as_mut() else {
             // No stack: reachable on the same WM_PAINT whose
             // gpu_rebuild_if_due just deferred a fatal (the router calls
@@ -1526,6 +1952,10 @@ pub(crate) fn paint_d2d(view: HWND, owner: HWND) -> PaintOutcome {
             let _ = EndPaint(view, &ps);
             return PaintOutcome::Painted;
         };
+        // #130: one channel, both draw paths — the intent sync happens
+        // before EVERY draw this paint (draw_frame and present_clear
+        // alike), so even the blank-letterbox arm stays in the segment.
+        gpu.sync_display_intent(want_effect, display_profile.as_deref());
         let outcome = match (&plan, state.image.as_ref()) {
             (Some((plan, mw, mh)), Some(image)) => {
                 // The CPU level source (master + mip cache) — a disjoint
