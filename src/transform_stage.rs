@@ -36,8 +36,6 @@
 //! below); the end-to-end assertion channel is #126's dump
 //! OutputIdentity gen.
 
-use std::collections::HashMap;
-
 // ---------------------------------------------------------------------
 // Inputs — the render-environment identity the table decides on.
 // ---------------------------------------------------------------------
@@ -255,31 +253,34 @@ pub(crate) fn profile_hash(bytes: &[u8]) -> u64 {
     h
 }
 
-/// Mints `OutputIdentity` values: a returning fingerprint gets its
-/// original gen back — profile A -> B -> A reuses A's resources, which
-/// is CORRECT reuse (D5) — while a new fingerprint takes the next
-/// monotonic gen. The remembered map is bounded by the profile count
-/// times the stage count a session actually sees: single digits.
+/// Mints `OutputIdentity` values with a strict division of labor:
+/// `output_gen` is the change signal, the fingerprint is the reuse
+/// key. Every fingerprint TRANSITION mints the next monotonic gen —
+/// including a return to a previous fingerprint (A -> B -> A walks
+/// gens 1, 2, 3), so a gen-only consumer (#126's dump channel, whose
+/// contract reads "a decision change must show as a new gen") never
+/// misses a change. Resource reuse on the round trip is CORRECT reuse
+/// (D5) and happens downstream by keying on the fingerprint the
+/// identity carries — never by re-issuing an old gen (Codex P2, PR
+/// #128: a memoizing tracker hands back gen 1 after the B -> A
+/// change, and the change silently disappears from the gen channel).
 #[derive(Debug, Default)]
 pub(crate) struct OutputTracker {
     next_gen: u64,
-    seen: HashMap<OutputFingerprint, u64>,
+    active: Option<OutputFingerprint>,
 }
 
 impl OutputTracker {
-    /// `gen` starts at 1: zero stays free for the wiring's "no output
-    /// identity yet" sentinel.
+    /// `output_gen` starts at 1: zero stays free for the wiring's "no
+    /// output identity yet" sentinel. Re-identifying the unchanged
+    /// active fingerprint is idempotent — same gen, same identity.
     pub(crate) fn identify(&mut self, fingerprint: OutputFingerprint) -> OutputIdentity {
-        let output_gen = match self.seen.get(&fingerprint) {
-            Some(&output_gen) => output_gen,
-            None => {
-                self.next_gen += 1;
-                self.seen.insert(fingerprint, self.next_gen);
-                self.next_gen
-            }
-        };
+        if self.active != Some(fingerprint) {
+            self.next_gen += 1;
+            self.active = Some(fingerprint);
+        }
         OutputIdentity {
-            output_gen,
+            output_gen: self.next_gen,
             fingerprint,
             content_space: ContentSpace::Srgb,
         }
@@ -451,11 +452,13 @@ mod tests {
     // ---- OutputIdentity ----
 
     #[test]
-    fn a_returning_fingerprint_gets_its_original_generation_back() {
-        // D5: profile A -> B -> A reusing A's resources is CORRECT
-        // reuse — the tracker memoizes fingerprint -> gen, so the
-        // round trip restores A's identity instead of minting a new
-        // one; a genuinely new fingerprint keeps the gen monotonic.
+    fn every_decision_change_mints_a_new_generation_and_reuse_keys_on_the_fingerprint() {
+        // Division of labor (Codex P2, PR #128): the gen is the change
+        // signal — every fingerprint TRANSITION bumps it, including the
+        // B -> A return, because #126's dump contract reads "a decision
+        // change must show as a new gen"; reuse of A's resources on the
+        // round trip is what the fingerprint (the identity's reuse key)
+        // is for, never a re-issued old gen. A -> B -> A walks 1, 2, 3.
         let mut tracker = OutputTracker::default();
         let a = fingerprint(TransformStage::None, 0xaaa);
         let b = fingerprint(TransformStage::GpuEffect, 0xbbb);
@@ -466,12 +469,24 @@ mod tests {
         );
         assert_eq!(tracker.identify(b).output_gen, 2);
         let a2 = tracker.identify(a);
-        assert_eq!(a2, a1, "A returns with its original identity, not gen 3");
+        assert_eq!(
+            a2.output_gen, 3,
+            "the B -> A change must mint a new gen, not restore gen 1"
+        );
+        assert_eq!(
+            a2.fingerprint, a1.fingerprint,
+            "the reuse key survives the round trip — A's cached output resources stay valid"
+        );
+        assert_eq!(
+            tracker.identify(a).output_gen,
+            3,
+            "re-identifying the unchanged decision is idempotent"
+        );
         let c = fingerprint(TransformStage::None, 0xccc);
         assert_eq!(
             tracker.identify(c).output_gen,
-            3,
-            "new fingerprints stay monotonic"
+            3 + 1,
+            "a new fingerprint keeps the counter monotonic"
         );
     }
 
