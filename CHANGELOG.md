@@ -5,7 +5,7 @@ history by git-cliff (cliff.toml is the policy; do not hand-edit the output).
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
-## [Unreleased]
+## [0.1.0] - 2026-09-24
 ### Added
 
 - Feat(m1): Win32 窗口+GDI 渲染骨架——静态图片显示全链路 (f916113)
@@ -52,6 +52,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Feat(m6b): #81 滤波映射全表 + mip 运行时退役 + 默认 renderer 翻 auto (f110fef)
 - Feat(m6b): #82 巨图 overview+LRU tile + VRAM 字节预算(删除拆出为 #90) (f1a39df)
 - Feat(m7): #98 APNG 动画接入现有帧管线——PNG 臂 is_apng 分流,显式偏离原版 (910f1ff)
+- Feat(m6b): #90 GDI 渲染主线删除(渲染栈 D2D 单臂化) (561346e)
 ### Changed
 
 - Refactor(m2): 拆分 main.rs 为模块——按 M2 子系统边界(#2) (a3292fa)
@@ -141,5 +142,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fix+test(m7): #98 外部评审第七轮第三轴处置——smoke98 Kill-Riviv 路径过滤(补 R2-5 契约漏网)+色型谓词白名单化 (02c5ae4)
 - Fix+test(m7): #108 把 .apng 接进播放列表与 Ctrl+O 过滤 (974a763)
 - Fix+test(m7): #114 Everything 搜索前缀改为派生自播放列表过滤表——.apng 搜索可达 (d42bb76)
+- Fix(m6b): #90 预审 R2 处置(P2 sticky 终态闩 + P3 三件) (f16b428)
+- Fix+docs(m6b): #90 外部评审 AI1 处置(P2 全修 + P3 六改两录 + 设计欠句落地) (030c3c6)
+- Fix+docs(m6b): #90 外部评审 AI2 处置(P2×2 修 1 时间差 + P3×5 全修 2 录) (c4d788e)
+- Fix(smoke): #109 smoke80/81/82 的 Kill-Riviv 路径过滤(#98 R7 第三轴 P2-1 同构点,#92 merge 后幸存版) (85ee653)
+- Fix(smoke): #122 smoke79 预杀路径过滤(#109 同族核实发现的同病) (b575114)
 
 
