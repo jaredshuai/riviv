@@ -393,6 +393,16 @@ pub(crate) struct WindowState {
     /// Warp after a runtime escalation (the escalation ignores the request
     /// mode — design §7).
     pub(crate) gpu_kind: crate::config::RendererKind,
+    /// `-renderer <kind>` (#126): the startup-forced renderer request,
+    /// honored by the stack creation and by every REBUILD request —
+    /// mirrors "as if the ini said so" (the failure ladder's escalation
+    /// outranks it exactly like it outranks the ini). Never persisted:
+    /// the ini save writes `config.renderer`, which this never touches.
+    /// `None` = no switch on the startup line, the ini governs. A HANDOFF
+    /// line carrying the switch never lands here (the receiving device is
+    /// already built — `process_parsed_cl`'s renderer arm breadcrumbs and
+    /// ignores it).
+    pub(crate) renderer_forced: Option<RendererKind>,
     /// Bumped at every display-pixel change (#80 design §5): the D2D
     /// upload compares (gen, level, w, h) against the resident bitmap and
     /// re-uploads on mismatch. Pure bookkeeping.
@@ -433,6 +443,19 @@ pub(crate) struct WindowState {
     /// The `-dump-viewport` path (#80 design §9): the sticky render-and-
     /// write intent consumed at WM_CLOSE, before the window dies.
     pub(crate) dump_pending: Option<OsString>,
+    /// #126: the session's output-identity tracker (#127 D5). Fed at every
+    /// OUTPUT DECISION ESTABLISHMENT (stack creation, every rebuild) — not
+    /// at dump time: a session dumps once (WM_CLOSE), so identify-at-dump
+    /// could never observe a change, while identify-at-establishment makes
+    /// `output_identity` carry the CURRENT generation and a mid-session
+    /// backend flip (the ladder's hw->warp escalation) show as gen > 1 in
+    /// the dump's stderr line.
+    pub(crate) output_tracker: crate::transform_stage::OutputTracker,
+    /// The identity the tracker last minted (#126): what a dump reports as
+    /// `output_gen`. `None` = the zero-gen sentinel (no output decision
+    /// established yet — no stack ever built; unreachable on the dump
+    /// path, which needs a live stack).
+    pub(crate) output_identity: Option<crate::transform_stage::OutputIdentity>,
 }
 
 /// Window state pointer stored in GWLP_USERDATA between WM_NCCREATE and
@@ -1214,11 +1237,12 @@ fn gpu_rebuild_if_due(view: HWND, owner: HWND) {
         if !stack_rebuild_allowed(state.gpu.is_some(), state.gpu_terminal) {
             return;
         }
-        let kind = rebuild_kind(state.config.renderer, state.gpu_kind);
+        let kind = rebuild_kind(renderer_request(state), state.gpu_kind);
         match crate::gpu::create(view, crate::gpu::owner_of(view), kind) {
             Ok((stack, effective)) => {
                 state.gpu = Some(stack);
                 state.gpu_kind = effective;
+                establish_output_identity(state);
             }
             Err(e) => {
                 // The environment lost its device stack since startup, and
@@ -1237,6 +1261,29 @@ fn gpu_rebuild_if_due(view: HWND, owner: HWND) {
             }
         }
     }
+}
+
+/// The renderer REQUEST a rebuild re-issues (#126): the startup-forced
+/// `-renderer` value when the startup line carried one (mirroring "as if
+/// the ini said so"), else the ini key. Only the rebuild REQUEST goes
+/// through here — the ladder's ESCALATION tier ignores requests entirely
+/// (safety outranks both the ini and the switch).
+fn renderer_request(state: &WindowState) -> RendererKind {
+    state.renderer_forced.unwrap_or(state.config.renderer)
+}
+
+/// (Re)establish the output identity at one of the decision points
+/// (#126): stack creation and every rebuild — wherever `gpu_kind` was
+/// just (re)assigned. The fingerprint is the wiring-phase one (see
+/// `transform_stage::current_output_fingerprint`); a same-kind rebuild
+/// re-identifies the same fingerprint idempotently (same gen — the
+/// tracker's own contract), a backend change mints the next gen, and the
+/// dump channel prints the stored generation.
+fn establish_output_identity(state: &mut WindowState) {
+    let fingerprint = crate::transform_stage::current_output_fingerprint(
+        crate::transform_stage::Backend::from_effective(state.gpu_kind),
+    );
+    state.output_identity = Some(state.output_tracker.identify(fingerprint));
 }
 
 /// The rebuild request kind (external review AI2 P2-3): a session that
@@ -1289,7 +1336,7 @@ fn gpu_runtime_failure(owner: HWND) {
         let verdict = crate::gpu::failure_window(now_ms, already_warp, &mut state.gpu_failures);
         let (kind, escalated) = match verdict {
             crate::gpu::FailureVerdict::None => {
-                (rebuild_kind(state.config.renderer, state.gpu_kind), false)
+                (rebuild_kind(renderer_request(state), state.gpu_kind), false)
             }
             crate::gpu::FailureVerdict::Escalate => (RendererKind::Warp, true),
             crate::gpu::FailureVerdict::Fatal => {
@@ -1325,6 +1372,7 @@ fn gpu_runtime_failure(owner: HWND) {
                     } else {
                         effective
                     };
+                    establish_output_identity(state);
                     state.gpu = Some(stack);
                     // The failing paint already validated its region without
                     // drawing — a static image has no timer or hover to
@@ -1477,6 +1525,19 @@ fn dump_viewport_now(hwnd: HWND, path: &OsStr) {
         eprintln!("riviv: dump-viewport write {} failed: {e}", path.display());
         std::process::exit(2);
     }
+    // #126: the dumped frame's output identity — the change-signal channel
+    // (#127 D5 + the erratum): `output_gen` is minted at every output
+    // DECISION establishment (stack creation, rebuilds), so a session whose
+    // backend changed mid-run (the ladder's hw->warp escalation) reports a
+    // generation past 1 here. Printed only on full success: the failure
+    // arms above are stderr + exit 2, so a missing line IS the failure
+    // signal. `None` maps to the zero sentinel (no stack ever built —
+    // unreachable past the readback, pinned for honesty).
+    // SAFETY: the read-only borrow ends inside the map.
+    let output_gen = (unsafe { state_of(hwnd) })
+        .and_then(|state| state.output_identity)
+        .map_or(0, |identity| identity.output_gen);
+    eprintln!("riviv: dump-viewport output_gen={output_gen}");
 }
 
 /// The D2D dump arm: render once more into the target (no Present — a
@@ -4594,6 +4655,23 @@ fn process_parsed_cl(hwnd: HWND, parsed: &cli::Parsed) {
     // SAFETY: the borrow spans one field store.
     if let Some(state) = unsafe { state_of(hwnd) } {
         state.tile_edge = parsed.tile_edge.filter(|edge| *edge > 0);
+    }
+    // #126: `-renderer <kind>` on a HANDOFF line — the key difference from
+    // `-dump-viewport` (which arms here in the first instance): the
+    // receiving instance's device is already built and cannot change, so
+    // the intent is breadcrumb + ignore (the rescope's ruling). The
+    // STARTUP line never reaches this arm — run() takes the renderer out
+    // of its parse before the stack is created, the one place the intent
+    // is honored.
+    if let Some(kind) = parsed.renderer {
+        // SAFETY: the read-only borrow ends inside and_then.
+        let backend = (unsafe { state_of(hwnd) })
+            .and_then(|state| state.gpu.as_ref().map(|gpu| gpu.backend))
+            .unwrap_or("");
+        eprintln!(
+            "riviv: -renderer {} ignored - device already built ({backend})",
+            kind.to_ini()
+        );
     }
     if parsed.start_slideshow {
         slideshow_start(hwnd);
@@ -8233,6 +8311,19 @@ pub(crate) fn run() -> Result<(), String> {
     // — copied off before the state owns the config, like show_maximized.
     let show_menu = config.show_menu != 0;
     let mut rect = initial_window_rect(&config)?;
+    // The startup command line, parsed ONCE and EARLY (#126 hoisted this
+    // above the stack creation): `-renderer <kind>` must reach the CREATE
+    // request, which runs before the old parse site could see it. The
+    // parse is pure and its inputs are startup constants (never add-mode —
+    // the tick starts unset; never a current file), so the position within
+    // run() does not change its result. The renderer word is TAKEN here:
+    // the startup line's intent is consumed by the create block below,
+    // and `process_parsed_cl`'s renderer arm (handoff-only: breadcrumb +
+    // ignore, the receiving device being already built) must stay silent
+    // when the startup line replays there.
+    let startup_cl = crate::assoc::command_line_wide();
+    let mut startup_parsed = cli::parse(&startup_cl, false, false);
+    let forced_renderer = startup_parsed.renderer.take();
     let state = WindowState {
         image: None,
         path: None,
@@ -8293,6 +8384,7 @@ pub(crate) fn run() -> Result<(), String> {
         virtual_display: false,
         gpu: None,
         gpu_kind: crate::config::RendererKind::Auto,
+        renderer_forced: forced_renderer,
         frame_gen: 0,
         levels: crate::mip::LevelCache::new(crate::mip::LEVEL_CACHE_BYTES),
         tile_edge: None,
@@ -8301,6 +8393,8 @@ pub(crate) fn run() -> Result<(), String> {
         gpu_terminal: false,
         gpu_fatal_reason: None,
         dump_pending: None,
+        output_tracker: crate::transform_stage::OutputTracker::default(),
+        output_identity: None,
     };
 
     // SAFETY: returns the module handle of this exe; no side effects.
@@ -8523,7 +8617,12 @@ pub(crate) fn run() -> Result<(), String> {
     // so we fatal with the diagnosis string.
     // SAFETY: the read-only borrow ends inside the map.
     let (request, view_target) = (unsafe { state_of(hwnd) })
-        .map(|state| (state.config.renderer, state.viewport))
+        .map(|state| {
+            (
+                state.renderer_forced.unwrap_or(state.config.renderer),
+                state.viewport,
+            )
+        })
         // The fallback mirrors the config default (auto); the path is
         // unreachable in practice (state missing = the window is going
         // away) and fatals below either way.
@@ -8541,6 +8640,7 @@ pub(crate) fn run() -> Result<(), String> {
     if let Some(state) = unsafe { state_of(hwnd) } {
         state.gpu = Some(stack);
         state.gpu_kind = effective;
+        establish_output_identity(state);
     }
     // The always-on stderr breadcrumb (#80 design §8): renderer=<request>
     // backend=<effective> — the automation assertion channel and the
@@ -8620,10 +8720,11 @@ pub(crate) fn run() -> Result<(), String> {
     // _viv_process_command_line the handoff receive re-runs, #21): the
     // first run through never takes add-mode (the tick starts unset) and
     // has no current file, so both parse inputs are false. The RAW line —
-    // #48's second pass needs the quoting `args_os` cannot see.
-    let cl = crate::assoc::command_line_wide();
-    let parsed = cli::parse(&cl, false, false);
-    process_parsed_cl(hwnd, &parsed);
+    // #48's second pass needs the quoting `args_os` cannot see. Since
+    // #126 the parse runs ONCE, hoisted above the stack creation (see the
+    // hoist site); the renderer word was consumed there, so this replay
+    // carries every intent EXCEPT the one only the create block honors.
+    process_parsed_cl(hwnd, &startup_parsed);
 
     // If we did not show the window above, make sure it is shown now
     // (upstream viv.c:5444-5451).

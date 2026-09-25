@@ -49,6 +49,21 @@ pub(crate) enum Backend {
     Warp,
 }
 
+impl Backend {
+    /// Map the stack's EFFECTIVE renderer kind (config.rs) onto the table's
+    /// backend axis (#126's dump wiring): `create` resolves auto/d2d into
+    /// D2d or Warp before the kind is stored, so Auto never reaches a live
+    /// stack — the total-function pin below maps it to Hardware anyway (a
+    /// pre-create read is the only way to see it, and no device means no
+    /// output identity either).
+    pub(crate) fn from_effective(kind: crate::config::RendererKind) -> Self {
+        match kind {
+            crate::config::RendererKind::Warp => Backend::Warp,
+            _ => Backend::Hardware,
+        }
+    }
+}
+
 /// What the WCS display-profile query came back with — the primary
 /// judge (D3). `NoProfile` means the OS owns the display transform
 /// (ACM active without the legacy compat helper): riviv's sRGB output
@@ -253,6 +268,33 @@ pub(crate) fn profile_hash(bytes: &[u8]) -> u64 {
     h
 }
 
+/// The wiring-phase fingerprint (#126): what a dump actually went through
+/// TODAY. The judge — the WCS display-profile query — is not wired yet,
+/// so the query is [`DisplayProfileQuery::Unknown`] and the table's own
+/// answer governs (never transform on a guess: stage None on both
+/// backends); no profile bytes exist, so the digest is the empty
+/// profile's; the ACM diagnostic is unread (probe P1: the API family
+/// failed across the board in agent contexts). Each later phase swaps
+/// exactly one placeholder for the real input — the query (the
+/// profile-hot-reload phase), the profile bytes, the applied stage (the
+/// static gpu_effect phase), the ac read — and the swap is a fingerprint
+/// transition the tracker mints a new generation for, which is the whole
+/// point of the dump channel's `output_gen` line. Until then the ONE
+/// live term is the backend: `-renderer warp` at startup and the failure
+/// ladder's hw->warp escalation are both transitions.
+pub(crate) fn current_output_fingerprint(backend: Backend) -> OutputFingerprint {
+    OutputFingerprint {
+        stage: desired_stage(backend, DisplayProfileQuery::Unknown),
+        profile_hash: profile_hash(&[]),
+        ac: AcState::Unknown,
+        backend,
+        policy: OutputPolicy {
+            intent: RenderIntent::RelativeColorimetric,
+            quality: RenderQuality::Best,
+        },
+    }
+}
+
 /// Mints `OutputIdentity` values with a strict division of labor:
 /// `output_gen` is the change signal, the fingerprint is the reuse
 /// key. Every fingerprint TRANSITION mints the next monotonic gen —
@@ -290,6 +332,7 @@ impl OutputTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::RendererKind;
     use crate::tile::TileKey;
 
     /// The full judge space: every `DisplayProfileQuery` shape the
@@ -513,6 +556,69 @@ mod tests {
         assert_eq!(profile_hash(b"a"), 0xaf63_dc4c_8601_ec8c);
         assert_eq!(profile_hash(b"foobar"), 0x85944171f73967e8);
         assert_ne!(profile_hash(b"abc"), profile_hash(b"abd"));
+    }
+
+    // ---- the #126 wiring constructor ----
+
+    #[test]
+    fn the_effective_kind_maps_onto_the_table_backend_axis() {
+        // create() resolves auto/d2d before the kind is stored, so a live
+        // stack is D2d or Warp; the mapping is total anyway (Auto is
+        // pinned to Hardware — no device, no output identity, unreachable
+        // through the wiring).
+        assert_eq!(Backend::from_effective(RendererKind::Warp), Backend::Warp);
+        assert_eq!(
+            Backend::from_effective(RendererKind::D2d),
+            Backend::Hardware
+        );
+        assert_eq!(
+            Backend::from_effective(RendererKind::Auto),
+            Backend::Hardware
+        );
+    }
+
+    #[test]
+    fn the_wiring_fingerprint_pins_the_unwired_placeholders() {
+        // The dump channel's identity for TODAY (see the constructor's
+        // doc): the unwired judge reads Unknown (the table answers None on
+        // both backends — never transform on a guess), the profile bytes
+        // are the empty digest, the ACM diagnostic is unread, and the
+        // policy is the pinned pair. Every field is pinned so a later
+        // phase's swap is a visible fingerprint transition, not a drift.
+        for backend in both_backends() {
+            let fp = current_output_fingerprint(backend);
+            assert_eq!(fp.stage, TransformStage::None, "{backend:?}");
+            assert_eq!(fp.profile_hash, profile_hash(b""));
+            assert_eq!(fp.ac, AcState::Unknown);
+            assert_eq!(fp.backend, backend);
+            assert_eq!(fp.policy.intent, RenderIntent::RelativeColorimetric);
+            assert_eq!(fp.policy.quality, RenderQuality::Best);
+        }
+    }
+
+    #[test]
+    fn the_backend_is_the_one_live_fingerprint_term_and_walks_the_gens() {
+        // The erratum semantics (Codex P2, PR #128) exercised through the
+        // REAL constructor: today only the backend varies — a hw->warp
+        // escalation then a rebuild back are fingerprint transitions, so
+        // the dump channel sees 1, 2, 3, and a same-backend re-identify
+        // (an ordinary same-kind rebuild) is idempotent.
+        let mut tracker = OutputTracker::default();
+        let hw = current_output_fingerprint(Backend::Hardware);
+        let warp = current_output_fingerprint(Backend::Warp);
+        assert_ne!(hw, warp);
+        assert_eq!(tracker.identify(hw).output_gen, 1);
+        assert_eq!(tracker.identify(warp).output_gen, 2);
+        assert_eq!(
+            tracker.identify(hw).output_gen,
+            3,
+            "the return to hardware must mint a new gen, not restore gen 1"
+        );
+        assert_eq!(
+            tracker.identify(hw).output_gen,
+            3,
+            "a same-kind rebuild re-identifies idempotently"
+        );
     }
 
     // ---- R2 / D5 pins ----
