@@ -55,17 +55,19 @@ stderr 重定向文件——smoke80 只在退出后读);S4 在 B 的 Start-Riv �
 powershell -NoProfile -ExecutionPolicy Bypass -File smoke\smoke130-stage.ps1 [-Exe <path>]
 ```
 
-场景(11 检查;S0 前置门同 smoke126 退出 3;**机器钉**:本机显示
+场景(12 检查;S0 前置门同 smoke126 退出 3;**机器钉**:本机显示
 profile=TPLCD_8BAF_AdobeRGB.icm(Custom 类)才全绿——sRGB 等价 profile
 的机器 S1 的 gpu_effect 行不会出现,该脚本诚实 FAIL 而非静默 skip):
 
 - **S1** hw 臂(`-renderer d2d` + dump):stderr
-  `riviv: display-stage=gpu_effect profile=<name> backend=hw`(在
-  `renderer=` 行之前),profile 名解析存变量并校验存在于
-  `%windir%\System32\spool\drivers\color`;PNG=视口尺寸;
-  `output_gen=1`。
-- **S2** warp 臂互斥:`display-stage=none profile=<同名> backend=warp`
-  + gen=1;**S2c warp 确定性**:两次 warp dump 整文件 SHA256 相等
+  `riviv: display-stage=gpu_effect profile=<name> backend=hw ac=<off|on|unknown>`(在
+  `renderer=` 行之前;`ac=` 是 #134 的 ACM 诊断位字段),profile 名解析存变量并
+  校验存在于 `%windir%\System32\spool\drivers\color`;PNG=视口尺寸;
+  `output_gen=1`;**S1d** ac 词在场且 ∈ {off, on, unknown}(面包屑词表钉)。
+- **S2** warp 臂互斥:`display-stage=none profile=<同名> backend=warp ac=<同 S1>`
+  + gen=1——ac 词取 S1 实测值作精确期望:矩阵内无 ACM 切换场景,ac 恒定
+  (#134 设计评论的回归注),钉字段在场与稳定而不硬编码机器的 ACM 态;
+  **S2c warp 确定性**:两次 warp dump 整文件 SHA256 相等
   (#126 时代的跨后端确定性在 warp 侧的保留)。
 - **S3**(P4 容差断言,正确性核心)**warp dump(S2,未变换 sRGB 原像)
   整幅过 mscms CPU 参考**(C# P/Invoke `OpenColorProfileW`
@@ -91,13 +93,14 @@ powershell -NoProfile -ExecutionPolicy Bypass -File smoke\smoke132-stage.ps1 [-E
 
 场景(5 检查;S0 前置门同 smoke130 退出 3;机器钉同 smoke130——本机
 Custom profile 才有 hw 臂 gpu_effect 行)。**热重载的「真切换」路径不
-冒烟**(改机器显示 profile 侵入性大):其证据=issue #132 设计评论的
-P5 探针(getter 即时翻转 + 写侧零广播),人工验收走 QA 清单;本脚本
-钉的是**判据输入不变时新鲜度通道必须零动作**(恰好一条 display-stage
-面包屑 + `output_gen=1` + 棘轮无噪音):
+冒烟**(改机器显示 profile / ACM 态侵入性大):其证据=issue #132/#134
+设计评论的探针(getter 即时翻转 + 写侧零广播 + type 9 三次重复逐字节
+稳定),人工验收走 QA 清单;本脚本钉的是**判据输入不变时新鲜度通道必须
+零动作**(判据输入 = #132 的 raw 名字 + #134 扩入的 ACM 诊断位 + 监视器;
+恰好一条 display-stage 面包屑 + `output_gen=1` + 棘轮无噪音):
 
 - **S1** hw 臂:会话中向主窗投递合成 `WM_DISPLAYCHANGE`(0x7E)→ 面包屑
-  恰 1 条、gen=1(事件臂对未变名字 no-op)。
+  恰 1 条、gen=1(事件臂对未变名字+未变 ac no-op,#134 扩级后的稳定侧)。
 - **S2** hw 臂闲置 5s(≥2 个 2000ms 计时器周期)→ 同上 + 无
   `display effect failure`(计时器臂不刷屏、不喂棘轮)。
 - **S3** hw 臂同屏平移(`SetWindowPos(+80,+80)`,SWP_NOSIZE|

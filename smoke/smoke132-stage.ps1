@@ -1,11 +1,12 @@
 # smoke132 - #132 M8-4 profile hot reload: the freshness channel must be
-# IDEMPOTENT while the judge's raw name and the window's monitor stand
-# still - one display-stage breadcrumb, output_gen=1, no ratchet noise,
-# across a synthetic WM_DISPLAYCHANGE, two-plus freshness-timer periods,
-# and a same-monitor move. The real-switch path (profile A -> B) is NOT
-# smoked: flipping the machine's display profile is too invasive for an
-# automated harness; its evidence lives in the ticket's probe (design
-# comment) and the QA checklist (manual). ASCII-only source (PS 5.1
+# IDEMPOTENT while the judge's raw name, the ACM diagnostic (the #134 ac
+# term), and the window's monitor stand still - one display-stage
+# breadcrumb, output_gen=1, no ratchet noise, across a synthetic
+# WM_DISPLAYCHANGE, two-plus freshness-timer periods, and a same-monitor
+# move. The real-switch path (profile A -> B, ACM/HDR on -> off) is NOT
+# smoked: flipping the machine's display state is too invasive for an
+# automated harness; its evidence lives in the tickets' probes (design
+# comments) and the QA checklist (manual). ASCII-only source (PS 5.1
 # encoding trap, #79 lesson). Harness cribbed from smoke130-stage.ps1
 # (staged-exe discipline, poll-based waits, one return value per
 # function, narration via Write-Host only).
@@ -19,8 +20,9 @@
 # Scenarios:
 #   S0  stage the exe; FATAL-exit 3 when a FOREIGN riviv is alive (#109).
 #   S1  hw arm: post a synthetic WM_DISPLAYCHANGE mid-session (same
-#       profile) -> exactly ONE display-stage breadcrumb, dump
-#       output_gen=1 (the freshness check no-ops on an unchanged name).
+#       profile, same ACM state) -> exactly ONE display-stage breadcrumb,
+#       dump output_gen=1 (the freshness check no-ops on unchanged name
+#       AND ac - the #134 widened gate's stable side).
 #   S2  hw arm: idle 5s (>=2 freshness-timer periods) -> ONE breadcrumb,
 #       gen=1 (the 2s poll must not spam the smoke channel).
 #   S3  hw arm: same-monitor move via SetWindowPos(+80,+80) -> ONE
@@ -207,21 +209,23 @@ function Count-Lines($err, $prefix) {
 }
 function Get-Stage-Line($err, $stage, $backend) {
     if ($null -eq $err) { return '' }
-    $want = ('riviv: display-stage=' + $stage + ' profile=')
-    $tail = (' backend=' + $backend)
+    # #134: the line ends with a trailing ' ac=<off|on|unknown>' field, so
+    # the tail anchors on the ac= VALUE: a line-end-anchored match requires
+    # ' backend=<word> ac=' followed by a non-empty value.
     foreach ($ln in ($err -split "`n")) {
         $t = $ln.TrimEnd("`r")
-        if ($t.StartsWith($want) -and $t.EndsWith($tail)) { return $t }
+        if ($t -match ('^riviv: display-stage=' + $stage + ' profile=.* backend=' + $backend + ' ac=\S+$')) { return $t }
     }
     return ''
 }
 function Profile-Of($stageLine) {
-    if ($stageLine -match '^riviv: display-stage=\S+ profile=(.*) backend=\S+$') {
+    # 'riviv: display-stage=<stage> profile=<name> backend=<backend> ac=<ac>' ->
+    # <name>. Greedy .* is safe: ' backend=' terminates the name.
+    if ($stageLine -match '^riviv: display-stage=\S+ profile=(.*) backend=\S+ ac=\S+$') {
         return $Matches[1]
     }
     return ''
 }
-
 # One adopt -> mid-action -> WM_CLOSE dump instance. $midAction receives
 # the main window handle after adoption; returns the closed instance.
 function Run-Case($argStr, $outName, $errName, $midAction) {
