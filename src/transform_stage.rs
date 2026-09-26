@@ -191,13 +191,35 @@ pub(crate) fn effective_stage(desired: TransformStage, degraded: bool) -> Transf
 // ---------------------------------------------------------------------
 
 /// The one-byte content space of everything upstream of the display
-/// segment — master, LevelCache, uploads, tiles. Pinned `Srgb` for
-/// the whole 8-bit era (D10's known limitation: wide-gamut sources
-/// are clipped through it); the HDR phase's FP16/scRGB pipeline is
-/// what introduces a second variant.
+/// segment — master, LevelCache, uploads, tiles. `Srgb` is the 8-bit
+/// era's single space (D10's known limitation: wide-gamut sources are
+/// clipped through it); `F16Srgb` is L1's FP16 master (ADR 0003: the
+/// sRGB EOTF encoding values held as f16, gamma domain). #140 added
+/// the variant and the gating; the cache-key and seam-read consumers
+/// land with #141.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ContentSpace {
     Srgb,
+    F16Srgb,
+}
+
+/// The L1 master's per-input gate (ADR 0003 D1): an image earns the
+/// FP16 master only when there is precision worth keeping — either
+/// Stage 1 actually applied the embedded-profile transform (a 16-bit
+/// CMM output would be clipped by an 8-bit master) or the source
+/// decodes deeper than 8 bits (the loader's old `into_rgba8()` was the
+/// truncation). The untagged 8-bit majority stays `Srgb`, byte-ident
+/// to the 8-bit era — they gain nothing from f16 and must not pay its
+/// ×2 cache footprint.
+pub(crate) fn master_content_space(
+    source_bits_per_sample: u16,
+    transform_applied: bool,
+) -> ContentSpace {
+    if source_bits_per_sample > 8 || transform_applied {
+        ContentSpace::F16Srgb
+    } else {
+        ContentSpace::Srgb
+    }
 }
 
 /// The rendering intent of the display segment. Stage 1 pins
@@ -813,5 +835,26 @@ mod tests {
                 ty: 4
             }
         );
+    }
+
+    // ---- L1 master gating (#140, ADR 0003 D1) ----
+
+    #[test]
+    fn the_untagged_8bit_majority_stays_in_the_srgb_master() {
+        // The gate's zero-change arm: a plain 8-bit source with no
+        // applied transform gains nothing from f16 (its values ARE
+        // 8-bit) and must not pay the ×2 cache footprint.
+        assert_eq!(master_content_space(8, false), ContentSpace::Srgb);
+    }
+
+    #[test]
+    fn deep_sources_and_transformed_frames_earn_the_f16_master() {
+        // Both gate arms of ADR 0003 D1: a >8-bit source (PNG16's old
+        // `into_rgba8()` truncation had precision to keep) and an
+        // actually-applied Stage-1 transform (the 16-bit CMM output
+        // an 8-bit master would clip) — either one alone suffices.
+        assert_eq!(master_content_space(16, false), ContentSpace::F16Srgb);
+        assert_eq!(master_content_space(8, true), ContentSpace::F16Srgb);
+        assert_eq!(master_content_space(16, true), ContentSpace::F16Srgb);
     }
 }

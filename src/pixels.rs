@@ -13,6 +13,8 @@
 //! derivation died with the GDI render arm (#90); the Surface is now
 //! the master's plain holder.
 
+use crate::transform_stage::ContentSpace;
+
 /// image crate yields RGBA rows (top-down); GDI 32bpp DIBs want BGRA.
 pub(crate) fn rgba8_to_bgra_in_place(buf: &mut [u8]) {
     let (pixels, tail) = buf.as_chunks_mut::<4>();
@@ -117,6 +119,170 @@ pub(crate) fn rotate_bgra_270_cw(src: &[u8], wide: usize, high: usize, dst: &mut
     }
 }
 
+// ---------------------------------------------------------------------
+// FP16 conversion (L1's master encoding, ADR 0003 D2): the pure math
+// of the gamma-sRGB-f16 master. #137 probe 1's hand conversion, landed
+// — every reference point and the 256-code round trip are pinned below.
+// ---------------------------------------------------------------------
+
+/// Encode one f32 as IEEE 754 binary16 bits, round-to-nearest-even:
+/// normals, subnormals, Inf/NaN (quieted) and overflow-to-infinity all
+/// handled (probe 1: 1.0 = 0x3C00, 65504 = 0x7BFF, the smallest
+/// subnormal 0x0001, 65520 rounds up to infinity).
+pub(crate) fn f32_to_f16_bits(v: f32) -> u16 {
+    let bits = v.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exp = ((bits >> 23) & 0xff) as i32;
+    let mant = bits & 0x007f_ffff;
+    if exp == 0xff {
+        // Inf / NaN carry over; quiet the NaN bit.
+        return sign | 0x7c00 | if mant != 0 { 0x0200 } else { 0 };
+    }
+    if exp == 0 {
+        // f32 subnormals (< 2^-126) always round to zero in f16.
+        return sign;
+    }
+    let unbiased = exp - 127;
+    if unbiased > 15 {
+        // Overflow rounds to infinity.
+        return sign | 0x7c00;
+    }
+    if unbiased >= -14 {
+        let e = (unbiased + 15) as u32;
+        let m = mant >> 13;
+        let mut h = sign | ((e << 10) as u16) | m as u16;
+        let round = mant & 0x1fff;
+        if round > 0x1000 || (round == 0x1000 && (m & 1) == 1) {
+            h += 1; // carry into the exponent field is the encoding
+        }
+        h
+    } else {
+        // f16 subnormal: value = m_half * 2^-24, so the implicit-one
+        // f32 mantissa shifts right by (-unbiased - 1).
+        let shift = (-unbiased - 1) as u32; // 14..=24
+        let full = mant | 0x0080_0000;
+        let m = full >> shift;
+        let round = full & ((1 << shift) - 1);
+        let mut h = sign | m as u16;
+        let half = 1u32 << (shift - 1);
+        if round > half || (round == half && (m & 1) == 1) {
+            h += 1;
+        }
+        h
+    }
+}
+
+/// Decode IEEE 754 binary16 bits back to f32 — exact for every f16
+/// value (all halves are f32-representable); subnormals normalize.
+pub(crate) fn f16_bits_to_f32(h: u16) -> f32 {
+    let sign = ((h & 0x8000) as u32) << 16;
+    let exp = ((h >> 10) & 0x1f) as i32;
+    let mant = (h & 0x03ff) as u32;
+    if exp == 0x1f {
+        f32::from_bits(sign | 0x7f80_0000 | (mant << 13))
+    } else if exp == 0 {
+        if mant == 0 {
+            f32::from_bits(sign)
+        } else {
+            // Subnormal half: value = mant * 2^-24. Normalize the
+            // mantissa into [0x400, 0x800): value = 1.m' * 2^(-14-s),
+            // so the f32 exponent field is 127 - 14 - s = 113 - s.
+            let mut s = 0u32;
+            let mut m = mant;
+            while m & 0x0400 == 0 {
+                m <<= 1;
+                s += 1;
+            }
+            m &= 0x03ff;
+            f32::from_bits(sign | ((113 - s) << 23) | (m << 13))
+        }
+    } else {
+        f32::from_bits(sign | (((exp - 15 + 127) as u32) << 23) | (mant << 13))
+    }
+}
+
+/// The f16 master's 8-bit reading (#140's interim landing, #141's seam
+/// reads): sRGB gamma code = round-half-up(v * 255), clamped to
+/// [0, 255]. L1's gamma arm keeps values in [0,1], but the read stays
+/// defined for ANY half (out-of-range clamps — the same reading the
+/// composite and dump channels would make of it).
+fn f16_bits_to_u8_code(h: u16) -> u8 {
+    let scaled = f16_bits_to_f32(h) * 255.0;
+    if scaled <= 0.0 {
+        0
+    } else if scaled >= 255.0 {
+        255
+    } else {
+        (scaled + 0.5) as u8
+    }
+}
+
+/// One 16-bit code-value sample (full scale 65535) through the f16
+/// master encoding: u16 -> f32 -> f16 -> 8-bit reading.
+fn u16_code_to_u8_via_f16(code: u16) -> u8 {
+    f16_bits_to_u8_code(f32_to_f16_bits(f32::from(code) / 65535.0))
+}
+
+/// The >8-bit `DynamicImage` sample layouts the direct path converts
+/// (#140): 16-bit code-value samples. The 32-bit float (HDR radiance)
+/// variants stay out — radiance is linear light, not code values; the
+/// crate's tonemapped `into_rgba8()` remains their path.
+pub(crate) enum DeepSamples<'a> {
+    Rgb16(&'a [u16]),
+    Rgba16(&'a [u16]),
+    Luma16(&'a [u16]),
+    LumaA16(&'a [u16]),
+}
+
+/// Convert one frame of 16-bit samples to RGBA8 through the f16 master
+/// encoding (ADR 0003 D6's direct path, no mscms): u16 -> f32 (code /
+/// 65535) -> f16 (the master's own quantization, D2) -> 8-bit reading.
+/// Until #141 lands the f16 master storage this is the interim 8-bit
+/// landing — the conversion semantics are the master's, so the bytes
+/// the later tickets carry downstream never change.
+pub(crate) fn deep_to_rgba8_via_f16(samples: DeepSamples<'_>, dst: &mut [u8]) {
+    let (pixels, tail) = dst.as_chunks_mut::<4>();
+    debug_assert!(tail.is_empty(), "dst must hold exactly 4 bytes per pixel");
+    match samples {
+        DeepSamples::Rgb16(src) => {
+            debug_assert_eq!(src.len(), pixels.len() * 3);
+            for (px, s) in pixels.iter_mut().zip(src.as_chunks::<3>().0) {
+                *px = [
+                    u16_code_to_u8_via_f16(s[0]),
+                    u16_code_to_u8_via_f16(s[1]),
+                    u16_code_to_u8_via_f16(s[2]),
+                    255,
+                ];
+            }
+        }
+        DeepSamples::Rgba16(src) => {
+            debug_assert_eq!(src.len(), pixels.len() * 4);
+            for (px, s) in pixels.iter_mut().zip(src.as_chunks::<4>().0) {
+                *px = [
+                    u16_code_to_u8_via_f16(s[0]),
+                    u16_code_to_u8_via_f16(s[1]),
+                    u16_code_to_u8_via_f16(s[2]),
+                    u16_code_to_u8_via_f16(s[3]),
+                ];
+            }
+        }
+        DeepSamples::Luma16(src) => {
+            debug_assert_eq!(src.len(), pixels.len());
+            for (px, s) in pixels.iter_mut().zip(src) {
+                let y = u16_code_to_u8_via_f16(*s);
+                *px = [y, y, y, 255];
+            }
+        }
+        DeepSamples::LumaA16(src) => {
+            debug_assert_eq!(src.len(), pixels.len() * 2);
+            for (px, s) in pixels.iter_mut().zip(src.as_chunks::<2>().0) {
+                let y = u16_code_to_u8_via_f16(s[0]);
+                *px = [y, y, y, u16_code_to_u8_via_f16(s[1])];
+            }
+        }
+    }
+}
+
 /// The decoded frame as pure memory (#76, ADR 0002 D3): top-down 32bpp
 /// BGRA, exactly `width * height * 4` bytes, alpha forced opaque (the
 /// invariant `composite_over_background_in_place` and the clipboard DIB
@@ -129,6 +295,13 @@ pub(crate) struct PixelFrame {
     pub(crate) pixels: Box<[u8]>,
     pub(crate) width: u32,
     pub(crate) height: u32,
+    /// Which pipeline owns the frame (#140, ADR 0003 D1): plain 8-bit
+    /// sRGB BGRA (`Srgb`, the 8-bit era's only space) or the FP16
+    /// master's interim 8-bit reading (`F16Srgb` — the BYTES stay
+    /// BGRA8 until #141 lands the f16 storage; the mark is the
+    /// master-content gate's verdict, carried so the cache-key and
+    /// seam-dispatch consumers wire up without re-deriving it).
+    pub(crate) content_space: ContentSpace,
 }
 
 impl PixelFrame {
@@ -146,20 +319,31 @@ impl PixelFrame {
     /// allocation failure is a process-level abort, not a load failure;
     /// the worker-side GDI allocation errors this replaces were the
     /// system-level failures that could still happen at decode).
-    pub(crate) fn from_rgba(width: u32, height: u32, mut rgba: Vec<u8>) -> Self {
+    pub(crate) fn from_rgba(
+        width: u32,
+        height: u32,
+        mut rgba: Vec<u8>,
+        content_space: ContentSpace,
+    ) -> Self {
         debug_assert_eq!(rgba.len(), width as usize * height as usize * 4);
         rgba8_to_bgra_in_place(&mut rgba);
-        Self::from_bgra(width, height, rgba)
+        Self::from_bgra(width, height, rgba, content_space)
     }
 
     /// The BGRA-native entry (the clipboard DIB parser already emits
     /// this layout, #66): boxed as-is, no swizzle pass.
-    pub(crate) fn from_bgra(width: u32, height: u32, bgra: Vec<u8>) -> Self {
+    pub(crate) fn from_bgra(
+        width: u32,
+        height: u32,
+        bgra: Vec<u8>,
+        content_space: ContentSpace,
+    ) -> Self {
         debug_assert_eq!(bgra.len(), width as usize * height as usize * 4);
         PixelFrame {
             pixels: bgra.into_boxed_slice(),
             width,
             height,
+            content_space,
         }
     }
 
@@ -338,7 +522,12 @@ mod tests {
     fn pixelframe_from_rgba_swizzles_and_boxes() {
         // RGBA [10,20,30,255 | 1,2,3,255] becomes BGRA [30,20,10,255 |
         // 3,2,1,255], owned as a boxed slice.
-        let frame = PixelFrame::from_rgba(2, 1, vec![10, 20, 30, 255, 1, 2, 3, 255]);
+        let frame = PixelFrame::from_rgba(
+            2,
+            1,
+            vec![10, 20, 30, 255, 1, 2, 3, 255],
+            ContentSpace::Srgb,
+        );
         assert_eq!(&frame.pixels[..], &[30, 20, 10, 255, 3, 2, 1, 255]);
     }
 
@@ -346,14 +535,15 @@ mod tests {
     fn pixelframe_from_bgra_keeps_bytes_and_dimensions() {
         // The BGRA-native entry boxes the bytes as-is; the dimensions
         // ride along for the load protocol's test surface.
-        let frame = PixelFrame::from_bgra(1, 2, vec![1, 2, 3, 255, 4, 5, 6, 255]);
+        let frame =
+            PixelFrame::from_bgra(1, 2, vec![1, 2, 3, 255, 4, 5, 6, 255], ContentSpace::Srgb);
         assert_eq!(&frame.pixels[..], &[1, 2, 3, 255, 4, 5, 6, 255]);
         assert_eq!(frame.dims(), (1, 2));
     }
 
     #[test]
     fn pixelframe_stride_is_width_times_four() {
-        let frame = PixelFrame::from_bgra(7, 3, vec![0u8; 7 * 3 * 4]);
+        let frame = PixelFrame::from_bgra(7, 3, vec![0u8; 7 * 3 * 4], ContentSpace::Srgb);
         assert_eq!(frame.stride(), 28);
         assert_eq!(frame.pixels.len(), frame.stride() * 3);
     }
@@ -403,5 +593,114 @@ mod tests {
         // Negative coordinates.
         assert_eq!(sample_bgra(&px, 3, -1, 0), None);
         assert_eq!(sample_bgra(&px, 3, 0, -1), None);
+    }
+
+    // ---- FP16 conversion (#140, ADR 0003 D2; #137 probe 1 landed) ----
+
+    #[test]
+    fn f16_conversion_matches_ieee_reference_points() {
+        let cases: &[(f32, u16)] = &[
+            (0.0, 0x0000),
+            (-0.0, 0x8000),
+            (1.0, 0x3c00),
+            (-1.0, 0xbc00),
+            (0.5, 0x3800),
+            (0.25, 0x3400),
+            (2.0, 0x4000),
+            (65504.0, 0x7bff),            // largest finite half
+            (1.0 / 16384.0, 0x0400),      // 2^-14, smallest normal half
+            (1.0 / 16_777_216.0, 0x0001), // 2^-24, smallest subnormal half
+        ];
+        for (v, h) in cases {
+            assert_eq!(f32_to_f16_bits(*v), *h, "f32_to_f16_bits({v})");
+            assert_eq!(f16_bits_to_f32(*h), *v, "f16_bits_to_f32({h:04x})");
+        }
+        assert_eq!(f32_to_f16_bits(f32::INFINITY), 0x7c00);
+        assert_eq!(f32_to_f16_bits(65520.0), 0x7c00, "rounds up to infinity");
+        assert!(f16_bits_to_f32(0x7c00).is_infinite());
+        assert!(f16_bits_to_f32(0x7e00).is_nan());
+    }
+
+    #[test]
+    fn srgb8_codes_round_trip_through_f16_losslessly() {
+        // Probe 1's verdict, pinned: every one of the 256 sRGB code
+        // values survives f32 -> f16 -> f32 (the whole premise of the
+        // gamma-sRGB-f16 master — an 8-bit image loses NOTHING).
+        for k in 0u8..=255 {
+            let v = f32::from(k) / 255.0;
+            let back = f16_bits_to_f32(f32_to_f16_bits(v));
+            let k2 = (back * 255.0).round();
+            assert_eq!(k2 as u8, k, "code {k} came back as {k2}");
+        }
+    }
+
+    #[test]
+    fn f16_round_trip_error_stays_under_half_an_srgb_step() {
+        // The probe measured max 2.432e-4 at code 239 — an eighth of a
+        // half-step; the pin is the half-step bound itself, so a future
+        // conversion change fails loudly before it can cost a code.
+        let mut max_err = 0f32;
+        for k in 0u8..=255 {
+            let v = f32::from(k) / 255.0;
+            let back = f16_bits_to_f32(f32_to_f16_bits(v));
+            max_err = max_err.max((back - v).abs());
+        }
+        assert!(
+            max_err < 0.5 / 255.0,
+            "max error {max_err:.3e} must stay under half an 8-bit step {:.3e}",
+            0.5 / 255.0
+        );
+    }
+
+    #[test]
+    fn sixteen_bit_codes_read_back_through_the_f16_master() {
+        // Endpoints and the loader's 16-bit PNG fixture values (the
+        // apng_16bit test's 0xC700/0x3C00/0x0A00 triple): the f16 master
+        // reads them back as the same 8-bit codes the old direct
+        // quantization produced — the interim landing is byte-stable on
+        // real fixture data.
+        assert_eq!(u16_code_to_u8_via_f16(0x0000), 0);
+        assert_eq!(u16_code_to_u8_via_f16(0xFFFF), 255);
+        assert_eq!(
+            u16_code_to_u8_via_f16(0x8000),
+            128,
+            "0.5000076 -> f16 0.5 -> 127.5 rounds up"
+        );
+        assert_eq!(u16_code_to_u8_via_f16(0xC700), 198);
+        assert_eq!(u16_code_to_u8_via_f16(0x3C00), 60);
+        assert_eq!(u16_code_to_u8_via_f16(0x0A00), 10);
+    }
+
+    #[test]
+    fn deep_rgb16_expands_with_opaque_alpha() {
+        let src = [0x0000u16, 0x8000, 0xFFFF];
+        let mut dst = [0u8; 4];
+        deep_to_rgba8_via_f16(DeepSamples::Rgb16(&src), &mut dst);
+        assert_eq!(dst, [0, 128, 255, 255]);
+    }
+
+    #[test]
+    fn deep_rgba16_carries_alpha_through_the_f16_master() {
+        let src = [0xFFFFu16, 0x0000, 0x8000, 0x4000];
+        let mut dst = [0u8; 4];
+        deep_to_rgba8_via_f16(DeepSamples::Rgba16(&src), &mut dst);
+        // 0x4000 = 16384/65535 = 0.2500076 -> f16 0.25 -> 63.75 -> 64.
+        assert_eq!(dst, [255, 0, 128, 64]);
+    }
+
+    #[test]
+    fn deep_luma16_replicates_the_code_across_rgb() {
+        let src = [0xC700u16, 0xFFFF];
+        let mut dst = [0u8; 8];
+        deep_to_rgba8_via_f16(DeepSamples::Luma16(&src), &mut dst);
+        assert_eq!(dst, [198, 198, 198, 255, 255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn deep_luma_a16_replicates_and_carries_alpha() {
+        let src = [0x8000u16, 0xFFFF, 0x0000, 0x0000];
+        let mut dst = [0u8; 8];
+        deep_to_rgba8_via_f16(DeepSamples::LumaA16(&src), &mut dst);
+        assert_eq!(dst, [128, 128, 128, 255, 0, 0, 0, 0]);
     }
 }
