@@ -147,8 +147,9 @@ struct PathInfo {
     target_id: u32,
     /// The GDI device name ("\\\\.\\DISPLAY1") from
     /// `DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME` — `None` when the
-    /// query failed (probe P1: the whole `DisplayConfigGetDeviceInfo`
-    /// family returns ERROR_GEN_FAILURE in agent contexts).
+    /// query failed (the family works in-process — #134's P1 probe
+    /// corrected #127 P1's family-level-failure verdict to a
+    /// PS-context artifact; see `advanced_color_state`'s doc).
     source_name: Option<String>,
 }
 
@@ -415,9 +416,11 @@ fn active_paths() -> Option<Vec<PathInfo>> {
     )
 }
 
-/// The canonical per-path GDI device name. Probe P1: this API family
-/// returns ERROR_GEN_FAILURE across the board in agent contexts — the
-/// caller's ladder treats a failure as "no name" and falls through.
+/// The canonical per-path GDI device name — the caller's ladder
+/// treats a failure as "no name" and falls through. The family works
+/// in-process: #134's P1 probe corrected #127 P1's
+/// family-level-failure verdict to a PS-context artifact (see
+/// `advanced_color_state`'s doc).
 fn source_name(adapter: LUID, source: u32) -> Option<String> {
     let mut info = DISPLAYCONFIG_SOURCE_DEVICE_NAME::default();
     info.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;

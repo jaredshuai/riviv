@@ -226,14 +226,6 @@ function Profile-Of($stageLine) {
     }
     return ''
 }
-function Ac-Of($stageLine) {
-    # Same line shape -> the ac word (<off|on|unknown>), '' when absent.
-    if ($stageLine -match '^riviv: display-stage=\S+ profile=.* backend=\S+ ac=(\S+)$') {
-        return $Matches[1]
-    }
-    return ''
-}
-
 # One adopt -> mid-action -> WM_CLOSE dump instance. $midAction receives
 # the main window handle after adoption; returns the closed instance.
 function Run-Case($argStr, $outName, $errName, $midAction) {
