@@ -41,8 +41,9 @@ use windows::Win32::Foundation::{
     WIN32_ERROR, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
-    COLOR_BTNFACE, GetMonitorInfoW, HBRUSH, InvalidateRect, MONITOR_DEFAULTTOPRIMARY, MONITORINFO,
-    MonitorFromPoint, MonitorFromRect, MonitorFromWindow, PtInRect, ScreenToClient, UpdateWindow,
+    COLOR_BTNFACE, GetMonitorInfoW, HBRUSH, InvalidateRect, MONITOR_DEFAULTTONEAREST,
+    MONITOR_DEFAULTTOPRIMARY, MONITORINFO, MonitorFromPoint, MonitorFromRect, MonitorFromWindow,
+    PtInRect, ScreenToClient, UpdateWindow,
 };
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoCreateInstance,
@@ -94,14 +95,15 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetForegroundWindow, SetMenu, SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowTextW,
     ShowCursor, ShowWindow, TPM_CENTERALIGN, TPM_LEFTBUTTON, TPM_VCENTERALIGN, TrackPopupMenu,
     TranslateMessage, USER_TIMER_MINIMUM, WINDOW_EX_STYLE, WINDOW_STYLE, WM_ACTIVATE, WM_CLOSE,
-    WM_COMMAND, WM_CONTEXTMENU, WM_COPYDATA, WM_DESTROY, WM_DPICHANGED, WM_DROPFILES,
-    WM_ENDSESSION, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_INITMENU, WM_KEYDOWN, WM_LBUTTONDBLCLK,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_MOVE, WM_NCCREATE, WM_NCDESTROY, WM_NCLBUTTONDOWN, WM_NCXBUTTONDBLCLK, WM_NCXBUTTONDOWN,
-    WM_NOTIFY, WM_NULL, WM_PAINT, WM_PASTE, WM_QUERYENDSESSION, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN,
-    WM_RBUTTONUP, WM_SIZE, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_TIMER, WM_XBUTTONDBLCLK,
-    WM_XBUTTONDOWN, WNDCLASSEXW, WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN, WS_EX_ACCEPTFILES,
-    WS_OVERLAPPEDWINDOW, WS_POPUP, WS_SYSMENU, WS_THICKFRAME, WS_VISIBLE, WindowFromPoint,
+    WM_COMMAND, WM_CONTEXTMENU, WM_COPYDATA, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED,
+    WM_DROPFILES, WM_ENDSESSION, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_INITMENU, WM_KEYDOWN,
+    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE,
+    WM_MOUSEWHEEL, WM_MOVE, WM_NCCREATE, WM_NCDESTROY, WM_NCLBUTTONDOWN, WM_NCXBUTTONDBLCLK,
+    WM_NCXBUTTONDOWN, WM_NOTIFY, WM_NULL, WM_PAINT, WM_PASTE, WM_QUERYENDSESSION, WM_RBUTTONDBLCLK,
+    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SIZE, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_TIMER,
+    WM_XBUTTONDBLCLK, WM_XBUTTONDOWN, WNDCLASSEXW, WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN,
+    WS_EX_ACCEPTFILES, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_SYSMENU, WS_THICKFRAME, WS_VISIBLE,
+    WindowFromPoint,
 };
 use windows::core::{HSTRING, PCSTR, PCWSTR, PWSTR, w};
 
@@ -459,8 +461,16 @@ pub(crate) struct WindowState {
     /// #130: the display judge's latest outcome — the query value plus
     /// the profile path/bytes the effect and the fingerprint consume.
     /// Refreshed at every output-decision establishment (with the
-    /// identity); event-driven refresh is the hot-reload phase's.
+    /// identity); the #132 freshness channel (WM_DISPLAYCHANGE arm, the
+    /// 2s timer, and the WM_MOVE monitor check) re-establishes it
+    /// mid-session when the judge's raw name or monitor actually moves.
     pub(crate) display_query: crate::display_profile::DisplayQueryOutcome,
+    /// #132: the viewport's monitor as last seen by the WM_MOVE arm —
+    /// the cross-monitor half of hot reload (the judge answers per
+    /// window monitor). `None` until the first check records one; a
+    /// monitor change re-establishes the identity even when both
+    /// monitors run the same profile name (the path/LUID inputs moved).
+    pub(crate) display_monitor: Option<windows::Win32::Graphics::Gdi::HMONITOR>,
     /// #130: the display segment's consecutive application failures (the
     /// quality ratchet, `transform_stage::stage_degrades`): counted per
     /// frame failure, cleared on every clean frame, latching at
@@ -1333,6 +1343,14 @@ fn renderer_request(state: &WindowState) -> RendererKind {
 /// the next gen, and the dump channel prints the stored generation.
 fn establish_output_identity(state: &mut WindowState) {
     state.display_query = crate::display_profile::query(state.viewport);
+    // #132: the judge's monitor baseline for the WM_MOVE arm — recorded
+    // at the same decision point so a window that never moved still has
+    // the right `Some` when its first real crossing happens (a
+    // record-on-first-move would swallow exactly that crossing).
+    // SAFETY: read-only monitor query on the live viewport we own;
+    // MONITOR_DEFAULTTONEAREST cannot answer a null monitor.
+    state.display_monitor =
+        Some(unsafe { MonitorFromWindow(state.viewport, MONITOR_DEFAULTTONEAREST) });
     identify_output(state);
 }
 
@@ -1405,6 +1423,91 @@ fn backend_label(backend: crate::transform_stage::Backend) -> &'static str {
     match backend {
         crate::transform_stage::Backend::Hardware => "hw",
         crate::transform_stage::Backend::Warp => "warp",
+    }
+}
+
+/// The WM_TIMER id for the #132 display-freshness poll (anim=1,
+/// cursor=2, slideshow=3, status=4 before it).
+const DISPLAY_REFRESH_TIMER_ID: usize = 5;
+/// The freshness poll's period (#132 design): 2000 ms — the name-level
+/// getter re-ask is a registry-read-cost call, so the cadence is
+/// imperceptible overhead while a profile switch lands within ~2s (a
+/// user switching profiles looks away from riviv for longer than that).
+const DISPLAY_REFRESH_INTERVAL_MS: u32 = 2000;
+
+/// The #132 hot-reload freshness check: re-ask only the judge's raw
+/// profile name (the cheap prefix of the query chain — no bytes read,
+/// no equivalence probe) and, against the raw name the current identity
+/// was established with, decide whether the full establishment must
+/// re-run. A change re-establishes (the #130 channel: same fingerprint
+/// keeps its gen, a new fingerprint mints the next — A→B→A returns A's
+/// gen) and repaints, so the effect graph rebuilds lazily on the next
+/// paint through `sync_display_intent`. No change is zero action and
+/// zero breadcrumbs — the timer must not spam the smoke channel.
+///
+/// Load-bearing rationale (probe #132 P5): profile writes broadcast
+/// nothing observable in the probe context while the getter flips
+/// instantly, so THIS poll is the reliable channel; the WM_DISPLAYCHANGE
+/// arm is the free early kick for the topology changes it does document.
+fn display_freshness(owner: HWND) {
+    // SAFETY: the borrow spans the guard read, the name compare, and the
+    // establishment tail; nothing here pumps (repaint only queues).
+    let Some(state) = (unsafe { state_of(owner) }) else {
+        return;
+    };
+    if state.gpu.is_none() {
+        return; // no output decision to refresh yet (stack-creation
+        // establishment queries fresh anyway)
+    }
+    let fresh = crate::display_profile::current_profile_name(state.viewport);
+    if crate::display_profile::profile_name_changed(
+        state.display_query.name.as_deref(),
+        fresh.as_deref(),
+    ) {
+        establish_output_identity(state);
+        repaint(owner);
+    }
+}
+
+/// The WM_MOVE arm's cross-monitor decision (#132, pure): `None` is the
+/// first record (no establishment — the startup decision is already
+/// fresh), a different handle is a real move (the judge answers per
+/// window monitor, so the identity re-establishes even when both
+/// monitors run the same profile name), the same handle is nothing.
+fn monitor_relevant_change(
+    recorded: Option<windows::Win32::Graphics::Gdi::HMONITOR>,
+    current: windows::Win32::Graphics::Gdi::HMONITOR,
+) -> bool {
+    match recorded {
+        Some(old) => old != current,
+        None => false,
+    }
+}
+
+/// The #132 cross-monitor half: track the viewport's monitor on WM_MOVE
+/// (the judge is per-window-monitor, #130) and re-establish the output
+/// identity when it actually moves. The handle compare is itself the
+/// throttle — WM_MOVE fires per drag pixel, the compare is cheap
+/// monitor-rect math, and only a crossing re-runs the full query.
+fn display_monitor_check(owner: HWND) {
+    // SAFETY: the borrow spans the guard read, the monitor query, and
+    // the establishment tail; nothing here pumps (repaint only queues).
+    let Some(state) = (unsafe { state_of(owner) }) else {
+        return;
+    };
+    if state.gpu.is_none() {
+        return; // the startup establishment is still ahead of us
+    }
+    let view = state.viewport;
+    // SAFETY: read-only monitor query on a live window we own;
+    // MONITOR_DEFAULTTONEAREST makes the null-monitor case impossible.
+    let monitor = unsafe { MonitorFromWindow(view, MONITOR_DEFAULTTONEAREST) };
+    if monitor_relevant_change(state.display_monitor, monitor) {
+        state.display_monitor = Some(monitor);
+        establish_output_identity(state);
+        repaint(owner);
+    } else {
+        state.display_monitor = Some(monitor);
     }
 }
 
@@ -7686,6 +7789,26 @@ unsafe extern "system" fn wnd_proc(
                 state.config.x = rect.left;
                 state.config.y = rect.top;
             }
+            // #132: the cross-monitor half of hot reload — the display
+            // judge answers per window monitor, so a crossing
+            // re-establishes the output identity. Runs regardless of the
+            // iconic/zoomed/fullscreen gates above: those govern position
+            // TRACKING, while the monitor question is live in every
+            // geometry mode (an unplug can move a maximized window).
+            display_monitor_check(hwnd);
+            LRESULT(0)
+        }
+        WM_DISPLAYCHANGE => {
+            // #132: a display-config change (resolution/bit-depth/
+            // topology) can move the judge's inputs. The probe (P5)
+            // showed profile WRITES broadcast nothing observable in the
+            // probe context while the getter flips instantly — so this
+            // arm is the free early kick for the changes it does cover,
+            // and the 2s freshness timer (DISPLAY_REFRESH_TIMER_ID) is
+            // the load-bearing channel. The freshness check itself is a
+            // no-op while the raw name is unchanged (no breadcrumbs, no
+            // gen churn).
+            display_freshness(hwnd);
             LRESULT(0)
         }
         WM_GETMINMAXINFO => {
@@ -7935,6 +8058,12 @@ unsafe extern "system" fn wnd_proc(
                 // clear the text; the refresh inside restores the verdict
                 // chain to the main part.
                 status_set_temp_text(hwnd, None);
+                LRESULT(0)
+            } else if wparam.0 == DISPLAY_REFRESH_TIMER_ID {
+                // #132: the display-freshness poll — the load-bearing
+                // hot-reload channel (name-level getter compare; a change
+                // re-establishes the identity and repaints).
+                display_freshness(hwnd);
                 LRESULT(0)
             } else {
                 // SAFETY: hwnd/msg are exactly what this callback received;
@@ -8566,6 +8695,7 @@ pub(crate) fn run() -> Result<(), String> {
         output_tracker: crate::transform_stage::OutputTracker::default(),
         output_identity: None,
         display_query: crate::display_profile::DisplayQueryOutcome::default(),
+        display_monitor: None,
         stage_failures: 0,
         stage_latched: false,
     };
@@ -8815,6 +8945,22 @@ pub(crate) fn run() -> Result<(), String> {
         state.gpu_kind = effective;
         establish_output_identity(state);
     }
+    // #132: arm the display-freshness timer — the load-bearing hot-reload
+    // channel (probe P5: profile writes broadcast nothing observable
+    // here, the getter flips instantly, so a 2s name-level poll is the
+    // reliable signal; the WM_DISPLAYCHANGE arm is the early kick).
+    // Fail-soft like upstream's unchecked SetTimer calls (viv.c:11757) —
+    // a missing poll degrades hot reload to decision-point freshness,
+    // never the app; the timer dies with its window.
+    // SAFETY: hwnd is live and owned by this thread.
+    let _ = unsafe {
+        SetTimer(
+            Some(hwnd),
+            DISPLAY_REFRESH_TIMER_ID,
+            DISPLAY_REFRESH_INTERVAL_MS,
+            None,
+        )
+    };
     // The always-on stderr breadcrumb (#80 design §8): renderer=<request>
     // backend=<effective> — the automation assertion channel and the
     // stderr-redirected ticket evidence, zero UI parity risk. The stack is
@@ -8947,6 +9093,28 @@ pub(crate) fn run() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_cross_monitor_decision_treats_first_record_as_baseline() {
+        // #132: `None` (pre-establishment) records without re-establishing
+        // — the startup decision is fresh; the same handle is a no-op (the
+        // WM_MOVE arm fires per drag pixel); only a different handle is a
+        // real crossing. Dummy handles are fine: the decision is pure
+        // handle equality, never dereferenced.
+        use windows::Win32::Graphics::Gdi::HMONITOR;
+        let a = HMONITOR(std::ptr::dangling_mut());
+        let b = HMONITOR(std::ptr::dangling_mut::<core::ffi::c_void>().wrapping_add(1));
+        assert!(
+            !monitor_relevant_change(None, a),
+            "first record is baseline"
+        );
+        assert!(!monitor_relevant_change(Some(a), a), "same monitor is idle");
+        assert!(
+            monitor_relevant_change(Some(a), b),
+            "a crossing re-establishes"
+        );
+        assert!(monitor_relevant_change(Some(b), a), "both directions");
+    }
 
     #[test]
     fn rebuilds_reissue_the_config_request_until_warp_is_pinned() {

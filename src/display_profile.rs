@@ -33,6 +33,13 @@
 //! profile PATH (the D2D effect loads the ICC from the file) and BYTES
 //! (the output fingerprint's digest term) alongside the table's query
 //! value, so one call feeds decision, effect, and identity.
+//!
+//! #132 adds the hot-reload freshness half: `current_profile_name`
+//! re-asks just the getter's raw name (the cheap, heavy-tail-free
+//! prefix of this same chain), and `profile_name_changed` decides
+//! whether the full query must re-run — the establishment channel on
+//! the window side owns the cadence (a WM_DISPLAYCHANGE arm plus the
+//! 2s freshness timer).
 
 use std::path::Path;
 use std::path::PathBuf;
@@ -85,6 +92,15 @@ pub(crate) struct DisplayQueryOutcome {
     pub query: DisplayProfileQuery,
     pub path: Option<PathBuf>,
     pub bytes: Option<Vec<u8>>,
+    /// The getter's RAW answer (bare name or path, exactly as returned) —
+    /// the #132 freshness key. `None` iff the chain broke at or before
+    /// the getter (the Unknown-from-failure shape); an empty-but-successful
+    /// answer is `Some("")` (the NoProfile signal); a profile the
+    /// downstream classification then fails on KEEPS `Some(raw)` — the
+    /// freshness compare must key on the raw name so a
+    /// classification-failing machine (whose raw name is stable) never
+    /// loops on the full query.
+    pub name: Option<String>,
 }
 
 impl Default for DisplayQueryOutcome {
@@ -95,6 +111,7 @@ impl Default for DisplayQueryOutcome {
             query: DisplayProfileQuery::Unknown,
             path: None,
             bytes: None,
+            name: None,
         }
     }
 }
@@ -136,6 +153,7 @@ pub(crate) fn query(view: HWND) -> DisplayQueryOutcome {
             query: DisplayProfileQuery::NoProfile,
             path: None,
             bytes: None,
+            name: Some(String::new()),
         };
     }
     let full = resolve_profile_path(&name);
@@ -147,7 +165,7 @@ pub(crate) fn query(view: HWND) -> DisplayQueryOutcome {
                 "riviv: display profile {}: unreadable ({e}) — display judge falls to unknown",
                 full.display()
             );
-            return unknown();
+            return unclassifiable(name);
         }
     };
     let shown = full
@@ -159,15 +177,17 @@ pub(crate) fn query(view: HWND) -> DisplayQueryOutcome {
             query: DisplayProfileQuery::Profile(DisplayProfileSpace::SrgbEquivalent),
             path: Some(full),
             bytes: Some(bytes),
+            name: Some(name),
         },
         Some(EquivalenceProbe::Different(_)) => DisplayQueryOutcome {
             query: DisplayProfileQuery::Profile(DisplayProfileSpace::Custom),
             path: Some(full),
             bytes: Some(bytes),
+            name: Some(name),
         },
         // The equivalence ladder failed on a profile the OS handed us:
         // not classifiable is not transformable — Unknown, never a guess.
-        None => unknown(),
+        None => unclassifiable(name),
     }
 }
 
@@ -176,7 +196,45 @@ fn unknown() -> DisplayQueryOutcome {
         query: DisplayProfileQuery::Unknown,
         path: None,
         bytes: None,
+        name: None,
     }
+}
+
+/// The judge's answer with the getter's raw name attached but everything
+/// downstream failed (bytes unreadable, or the equivalence ladder
+/// refused): the query is Unknown, while the freshness key stays the raw
+/// name so the hot-reload compare (below) sees a STABLE key on such a
+/// machine instead of flip-flopping into a full-query loop.
+fn unclassifiable(name: String) -> DisplayQueryOutcome {
+    DisplayQueryOutcome {
+        query: DisplayProfileQuery::Unknown,
+        path: None,
+        bytes: None,
+        name: Some(name),
+    }
+}
+
+/// The #132 freshness check's cheap half: re-ask ONLY the getter's raw
+/// name for the window's monitor — no bytes read, no equivalence probe
+/// (the full query's heavy tail is reserved for an actual change). Breaks
+/// anywhere in the chain answer `None`, the same Unknown-from-failure
+/// shape `query` produces, so a broken chain compares stable against a
+/// broken establishment.
+pub(crate) fn current_profile_name(view: HWND) -> Option<String> {
+    let paths = active_paths()?;
+    let device = monitor_device_name(view);
+    let path = choose_path(&paths, device.as_deref())?;
+    let getter = display_default_getter()?;
+    call_display_default(getter, path.adapter_luid, path.source_id)
+}
+
+/// The freshness predicate (#132, pure): has the judge's raw name
+/// actually changed? `None` on either side means the chain broke there —
+/// a break appearing or healing counts as a change (the judge's answer
+/// genuinely moved), while two equal `Some`s (including two `Some("")`
+/// OS-managed answers) are stable.
+pub(crate) fn profile_name_changed(old: Option<&str>, fresh: Option<&str>) -> bool {
+    old != fresh
 }
 
 /// The window's monitor as a GDI device name, the canonical match key
@@ -464,6 +522,41 @@ mod tests {
             path(2, 3, Some(r"\\.\DISPLAY2")),
         ];
         assert!(choose_path(&paths, Some(r"\\.\DISPLAY7")).is_none());
+    }
+
+    #[test]
+    fn the_freshness_predicate_keys_on_the_raw_name_only() {
+        // Stable shapes: the two nulls (a broken chain against a broken
+        // establishment) and two equal raw names — including the
+        // OS-managed empty answer and a name whose downstream
+        // classification fails (the unclassifiable shape keeps Some).
+        assert!(!profile_name_changed(None, None));
+        assert!(!profile_name_changed(Some("panel.icm"), Some("panel.icm")));
+        assert!(!profile_name_changed(Some(""), Some("")));
+        // Changes: a real profile switch, both switch directions, a
+        // break appearing (Some -> None) and healing (None -> Some),
+        // and the OS-managed edge flipping either way.
+        assert!(profile_name_changed(Some("adobe.icm"), Some("srgb.icm")));
+        assert!(profile_name_changed(Some("srgb.icm"), Some("adobe.icm")));
+        assert!(profile_name_changed(Some("adobe.icm"), None));
+        assert!(profile_name_changed(None, Some("adobe.icm")));
+        assert!(profile_name_changed(Some(""), Some("adobe.icm")));
+        assert!(profile_name_changed(Some("adobe.icm"), Some("")));
+    }
+
+    #[test]
+    fn the_outcome_name_field_separates_broken_chain_from_failed_classification() {
+        // The freshness key's two None/Some shapes: a chain broken at or
+        // before the getter carries None (the default and every failure
+        // path), while a getter answer the downstream classification
+        // then fails on keeps the raw name — stable, so a
+        // classification-failing machine never loops the full query.
+        assert_eq!(DisplayQueryOutcome::default().name, None);
+        assert_eq!(unknown().name, None);
+        let unclassified = unclassifiable("panel.icm".to_string());
+        assert_eq!(unclassified.query, DisplayProfileQuery::Unknown);
+        assert_eq!(unclassified.name, Some("panel.icm".to_string()));
+        assert!(unclassified.path.is_none() && unclassified.bytes.is_none());
     }
 
     #[test]
