@@ -687,6 +687,14 @@ fn sink_static<D: ImageDecoder>(
     // radiance) variants keep `into_rgba8()` — radiance is linear
     // light, not code values, and the crate's tonemap stays theirs;
     // they report 8 bits to the gate for the same reason.
+    //
+    // Interim seam, deliberate (Codex P2 on PR #145, acknowledged): a
+    // 16-bit source WITH a live ICC transform still hands the transform
+    // these quantized 8-bit rows — same 8-bit-into-mscms shape the
+    // 8-bit era had, no worse — and its `F16Srgb` mark says which
+    // pipeline OWNS the frame, not that the deep bits survived yet.
+    // #142's `BM_16b_RGB` chain (16-bit transform src AND dst) is what
+    // actually keeps them.
     let deep = match &img {
         image::DynamicImage::ImageRgb16(p) => Some((DeepSamples::Rgb16(p.as_raw()), 16)),
         image::DynamicImage::ImageRgba16(p) => Some((DeepSamples::Rgba16(p.as_raw()), 16)),
