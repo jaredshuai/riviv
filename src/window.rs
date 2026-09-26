@@ -459,11 +459,13 @@ pub(crate) struct WindowState {
     /// path, which needs a live stack).
     pub(crate) output_identity: Option<crate::transform_stage::OutputIdentity>,
     /// #130: the display judge's latest outcome — the query value plus
-    /// the profile path/bytes the effect and the fingerprint consume.
-    /// Refreshed at every output-decision establishment (with the
-    /// identity); the #132 freshness channel (WM_DISPLAYCHANGE arm, the
-    /// 2s timer, and the WM_MOVE monitor check) re-establishes it
-    /// mid-session when the judge's raw name or monitor actually moves.
+    /// the profile path/bytes the effect and the fingerprint consume,
+    /// and since #134 the ACM diagnostic the fingerprint's `ac` term
+    /// reads. Refreshed at every output-decision establishment (with
+    /// the identity); the #132/#134 freshness channel (WM_DISPLAYCHANGE
+    /// arm, the 2s timer, and the WM_MOVE monitor check) re-establishes
+    /// it mid-session when the judge's raw name, the ACM diagnostic, or
+    /// the monitor actually moves.
     pub(crate) display_query: crate::display_profile::DisplayQueryOutcome,
     /// #132: the viewport's monitor as last seen by the WM_MOVE arm —
     /// the cross-monitor half of hot reload (the judge answers per
@@ -1339,8 +1341,9 @@ fn renderer_request(state: &WindowState) -> RendererKind {
 /// judge (the WCS query over the window's monitor — cheap, and the
 /// identity stays fresh per decision), then mints the identity. A
 /// same-decision rebuild re-identifies the same fingerprint idempotently
-/// (same gen), any real input change (backend, judge answer, latch) mints
-/// the next gen, and the dump channel prints the stored generation.
+/// (same gen); any real input change (backend, judge answer, latch, and
+/// since #134 the ACM diagnostic) mints the next gen, and the dump
+/// channel prints the stored generation.
 fn establish_output_identity(state: &mut WindowState) {
     state.display_query = crate::display_profile::query(state.viewport);
     // #132: the judge's monitor baseline for the WM_MOVE arm — recorded
@@ -1362,8 +1365,9 @@ fn identify_output(state: &mut WindowState) {
     let query = state.display_query.query;
     let latched = state.stage_latched;
     let bytes = state.display_query.bytes.clone();
+    let ac = state.display_query.ac;
     let fingerprint =
-        crate::transform_stage::fingerprint_for(backend, query, latched, bytes.as_deref());
+        crate::transform_stage::fingerprint_for(backend, query, latched, bytes.as_deref(), ac);
     state.output_identity = Some(state.output_tracker.identify(fingerprint));
     let stage = crate::transform_stage::effective_stage(
         crate::transform_stage::desired_stage(backend, query),
@@ -1377,10 +1381,11 @@ fn identify_output(state: &mut WindowState) {
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "none".to_string());
     eprintln!(
-        "riviv: display-stage={} profile={} backend={}",
+        "riviv: display-stage={} profile={} backend={} ac={}",
         stage_label(stage),
         profile,
-        backend_label(backend)
+        backend_label(backend),
+        ac_label(ac)
     );
 }
 
@@ -1426,34 +1431,50 @@ fn backend_label(backend: crate::transform_stage::Backend) -> &'static str {
     }
 }
 
+/// The breadcrumb's ac word (#134; the ACM diagnostic's three states —
+/// the type 9 bit-1 read, `unknown` on any failed read. A LABEL for the
+/// human watching stderr: it explains the stage, it never is one).
+fn ac_label(ac: crate::transform_stage::AcState) -> &'static str {
+    match ac {
+        crate::transform_stage::AcState::Off => "off",
+        crate::transform_stage::AcState::On => "on",
+        crate::transform_stage::AcState::Unknown => "unknown",
+    }
+}
+
 /// The WM_TIMER id for the #132 display-freshness poll (anim=1,
 /// cursor=2, slideshow=3, status=4 before it).
 const DISPLAY_REFRESH_TIMER_ID: usize = 5;
-/// The freshness poll's period (#132 design): 2000 ms — the name-level
-/// getter re-ask is a registry-read-cost call, so the cadence is
-/// imperceptible overhead while a profile switch lands within ~2s (a
-/// user switching profiles looks away from riviv for longer than that).
+/// The freshness poll's period (#132 design): 2000 ms — the name+ac
+/// freshness re-ask is a registry-read-cost call pair (#134: the type 9
+/// read is the same single-`DisplayConfigGetDeviceInfo` cost class), so
+/// the cadence is imperceptible overhead while a profile switch or an
+/// ACM toggle lands within ~2s (a user flipping either looks away from
+/// riviv for longer than that).
 const DISPLAY_REFRESH_INTERVAL_MS: u32 = 2000;
 
-/// The #132 hot-reload freshness check: re-ask only the judge's raw
-/// profile name (the cheap prefix of the query chain — no bytes read,
-/// no equivalence probe) and, against the raw name the current identity
-/// was established with, decide whether the full establishment must
-/// re-run. A change re-establishes (the #130 channel: every fingerprint
-/// TRANSITION mints the next gen — A→B→A walks 1,2,3, the dump
-/// channel's change-signal contract; the fingerprint itself stays the
-/// reuse key, PR #128's division of labor) and repaints, so the effect
-/// graph rebuilds lazily on the next paint through
-/// `sync_display_intent`. No change is zero action and zero
-/// breadcrumbs — the timer must not spam the smoke channel.
+/// The #132 hot-reload freshness check, widened by #134: re-ask the
+/// judge's cheap inputs off ONE ladder walk — the raw profile name and
+/// the type 9 ACM diagnostic (no bytes read, no equivalence probe) —
+/// and, against the values the current identity was established with,
+/// decide whether the full establishment must re-run. A change
+/// re-establishes (the #130 channel: every fingerprint TRANSITION mints
+/// the next gen — A→B→A walks 1,2,3, the dump channel's change-signal
+/// contract; the fingerprint itself stays the reuse key, PR #128's
+/// division of labor) and repaints, so the effect graph rebuilds lazily
+/// on the next paint through `sync_display_intent`. No change is zero
+/// action and zero breadcrumbs — the timer must not spam the smoke
+/// channel. #134's widening: a bare ACM flip (the name standing still —
+/// the toggle can flip the type 9 bit in place, WM_DISPLAYCHANGE's
+/// documented bit-depth class) reaches the same establishment.
 ///
 /// Load-bearing rationale (probe #132 P5): profile writes broadcast
 /// nothing observable in the probe context while the getter flips
 /// instantly, so THIS poll is the reliable channel; the WM_DISPLAYCHANGE
 /// arm is the free early kick for the topology changes it does document.
 fn display_freshness(owner: HWND) {
-    // SAFETY: the borrow spans the guard read, the name compare, and the
-    // establishment tail; nothing here pumps (repaint only queues).
+    // SAFETY: the borrow spans the guard read, the fresh-input probe, and
+    // the establishment tail; nothing here pumps (repaint only queues).
     let Some(state) = (unsafe { state_of(owner) }) else {
         return;
     };
@@ -1461,10 +1482,12 @@ fn display_freshness(owner: HWND) {
         return; // no output decision to refresh yet (stack-creation
         // establishment queries fresh anyway)
     }
-    let fresh = crate::display_profile::current_profile_name(state.viewport);
-    if crate::display_profile::profile_name_changed(
+    let fresh = crate::display_profile::current_freshness_inputs(state.viewport);
+    if crate::display_profile::freshness_changed(
         state.display_query.name.as_deref(),
-        fresh.as_deref(),
+        fresh.name.as_deref(),
+        state.display_query.ac,
+        fresh.ac,
     ) {
         establish_output_identity(state);
         repaint(owner);
@@ -7814,14 +7837,17 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         WM_DISPLAYCHANGE => {
-            // #132: a display-config change (resolution/bit-depth/
-            // topology) can move the judge's inputs. The probe (P5)
-            // showed profile WRITES broadcast nothing observable in the
-            // probe context while the getter flips instantly — so this
-            // arm is the free early kick for the changes it does cover,
-            // and the 2s freshness timer (DISPLAY_REFRESH_TIMER_ID) is
-            // the load-bearing channel. The freshness check itself is a
-            // no-op while the raw name is unchanged (no breadcrumbs, no
+            // #132/#134: a display-config change (resolution/bit-depth/
+            // topology) can move the judge's inputs — and an ACM/HDR
+            // toggle is exactly the documented bit-depth class, so the
+            // free early kick now serves the ac half of the freshness
+            // check too. The probe (P5) showed profile WRITES broadcast
+            // nothing observable in the probe context while the getter
+            // flips instantly — so this arm is the early kick for the
+            // changes it does cover, and the 2s freshness timer
+            // (DISPLAY_REFRESH_TIMER_ID) is the load-bearing channel.
+            // The freshness check itself is a no-op while the raw name
+            // AND the ACM diagnostic stand unchanged (no breadcrumbs, no
             // gen churn).
             display_freshness(hwnd);
             LRESULT(0)
@@ -8075,9 +8101,9 @@ unsafe extern "system" fn wnd_proc(
                 status_set_temp_text(hwnd, None);
                 LRESULT(0)
             } else if wparam.0 == DISPLAY_REFRESH_TIMER_ID {
-                // #132: the display-freshness poll — the load-bearing
-                // hot-reload channel (name-level getter compare; a change
-                // re-establishes the identity and repaints).
+                // #132/#134: the display-freshness poll — the load-bearing
+                // hot-reload channel (name-or-ac freshness compare; a
+                // change re-establishes the identity and repaints).
                 display_freshness(hwnd);
                 LRESULT(0)
             } else {
@@ -8960,11 +8986,11 @@ pub(crate) fn run() -> Result<(), String> {
         state.gpu_kind = effective;
         establish_output_identity(state);
     }
-    // #132: arm the display-freshness timer — the load-bearing hot-reload
-    // channel (probe P5: profile writes broadcast nothing observable
-    // here, the getter flips instantly, so a 2s name-level poll is the
-    // reliable signal; the WM_DISPLAYCHANGE arm is the early kick).
-    // A failed arm is REPORTED, not fatal (Codex P2, PR #133): losing
+    // #132/#134: arm the display-freshness timer — the load-bearing
+    // hot-reload channel (probe P5: profile writes broadcast nothing
+    // observable here, the getter flips instantly, so a 2s name-or-ac
+    // freshness poll is the reliable signal; the WM_DISPLAYCHANGE arm is
+    // the early kick). A failed arm is REPORTED, not fatal (Codex P2, PR #133): losing
     // the poll degrades hot reload to decision-point freshness — never
     // the app — but the loss must be visible on stderr (ADR 0001), the
     // same breadcrumb-only posture as the quality ratchet. The timer

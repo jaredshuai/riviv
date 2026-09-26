@@ -19,21 +19,25 @@
 # appear - this smoke pins the Custom-profile contract and FAILS honestly
 # elsewhere rather than skipping silently.
 #
-# The observed stderr surface (exact forms, src/window.rs):
-#   riviv: display-stage=<none|cpu|gpu_effect|dwm_acm> profile=<name|none> backend=<hw|warp>
+# The observed stderr surface (exact forms, src/window.rs; the ac field
+# is the #134 ACM diagnostic - a label, machine-dependent, and CONSTANT
+# within this matrix because no ACM toggle is ever forced here):
+#   riviv: display-stage=<none|cpu|gpu_effect|dwm_acm> profile=<name|none> backend=<hw|warp> ac=<off|on|unknown>
 #   riviv: dump-viewport output_gen=<n>
 #   riviv: display effect failure #<n>: <detail>   (ratchet, never here)
 #
 # Scenarios:
 #   S0  stage the exe; FATAL-exit 3 when a FOREIGN riviv is alive (#109).
 #   S1  hw arm (-renderer d2d): exit 0, display-stage=gpu_effect
-#       profile=<name> backend=hw (name parsed and kept), dump
-#       output_gen=1, viewport-sized PNG, the profile file resolvable
-#       under the color spool directory.
+#       profile=<name> backend=hw ac=<word> (name parsed and kept, the ac
+#       word present and in vocabulary), dump output_gen=1,
+#       viewport-sized PNG, the profile file resolvable under the color
+#       spool directory.
 #   S2  warp arm (-renderer warp): display-stage=none profile=<same>
-#       backend=warp (the mutual exclusion), dump gen=1, PNG exists; a
-#       second warp run dumps a whole-file SHA256-identical PNG (warp
-#       determinism survives #130).
+#       backend=warp ac=<same word as S1 - no ACM switch happened>
+#       (the mutual exclusion), dump gen=1, PNG exists; a second warp run
+#       dumps a whole-file SHA256-identical PNG (warp determinism
+#       survives #130).
 #   S3  the correctness core: the warp dump (S2) pushed through an mscms
 #       sRGB->display ICC transform (C# Add-Type P/Invoke; the numeric
 #       constants are the ones src/icm.rs links via windows-rs 0.62) is
@@ -340,10 +344,12 @@ function Get-Line($err, $prefix) {
 }
 # The FIRST display-stage line matching a stage/backend pair ('' when
 # absent). $stage/$backend are exact words (gpu_effect/none x hw/warp).
+# #134: the line carries a trailing ' ac=<word>' diagnostic field, so
+# the tail anchors on the ac= prefix after the backend word.
 function Get-Stage-Line($err, $stage, $backend) {
     if ($null -eq $err) { return '' }
     $want = ('riviv: display-stage=' + $stage + ' profile=')
-    $tail = (' backend=' + $backend)
+    $tail = (' backend=' + $backend + ' ac=')
     foreach ($ln in ($err -split "`n")) {
         $t = $ln.TrimEnd("`r")
         if ($t.StartsWith($want) -and $t.EndsWith($tail)) { return $t }
@@ -351,9 +357,16 @@ function Get-Stage-Line($err, $stage, $backend) {
     return ''
 }
 function Profile-Of($stageLine) {
-    # 'riviv: display-stage=<stage> profile=<name> backend=<backend>' ->
-    # <name>. Greedy .* is safe: ' backend=' terminates the line.
-    if ($stageLine -match '^riviv: display-stage=\S+ profile=(.*) backend=\S+$') {
+    # 'riviv: display-stage=<stage> profile=<name> backend=<backend> ac=<ac>' ->
+    # <name>. Greedy .* is safe: ' backend=' terminates the name.
+    if ($stageLine -match '^riviv: display-stage=\S+ profile=(.*) backend=\S+ ac=\S+$') {
+        return $Matches[1]
+    }
+    return ''
+}
+function Ac-Of($stageLine) {
+    # Same line shape -> the ac word (<off|on|unknown>), '' when absent.
+    if ($stageLine -match '^riviv: display-stage=\S+ profile=.* backend=\S+ ac=(\S+)$') {
         return $Matches[1]
     }
     return ''
@@ -422,7 +435,9 @@ if ($pngOk1) {
     $dims1 = "$($q1.W)x$($q1.H)"
     $sizeOk1 = ($q1.W -eq $r1.Vs[0]) -and ($q1.H -eq $r1.Vs[1])
 }
-Check 'S1a hw arm: exit 0, adopted, display-stage=gpu_effect profile=<name> backend=hw, profile name non-empty' (($r1.Code -eq 0) -and $r1.Adopted -and ($stageLine1 -ne '') -and ($profName -ne '')) "exit=$($r1.Code) adopted=$($r1.Adopted) stageLine=[$stageLine1] stderr=[$($r1.Err.Trim())]"
+Check 'S1a hw arm: exit 0, adopted, display-stage=gpu_effect profile=<name> backend=hw ac=<word>, profile name non-empty' (($r1.Code -eq 0) -and $r1.Adopted -and ($stageLine1 -ne '') -and ($profName -ne '')) "exit=$($r1.Code) adopted=$($r1.Adopted) stageLine=[$stageLine1] stderr=[$($r1.Err.Trim())]"
+$acWord1 = Ac-Of $stageLine1
+Check 'S1d ac word present and one of off|on|unknown (the #134 diagnostic field, in vocabulary)' (($acWord1 -ceq 'off') -or ($acWord1 -ceq 'on') -or ($acWord1 -ceq 'unknown')) "ac=[$acWord1] stageLine=[$stageLine1]"
 Check 'S1b dump: PNG exists, viewport-sized, output_gen=1' ($pngOk1 -and $sizeOk1 -and ($genLine1 -ceq 'riviv: dump-viewport output_gen=1')) "png=$pngOk1 dims=$dims1 viewport=$($r1.Vs[0])x$($r1.Vs[1]) gen=[$genLine1]"
 
 # Resolve the profile file for the S3 reference transform. The judge's path
@@ -445,11 +460,16 @@ Reset-Ini ''
 # S2: the warp arm. The decision table is warp -> none (mutual exclusion);
 # warp dumps stay deterministic across runs (whole-file SHA256).
 # ---------------------------------------------------------------------------
-$expectedWarpLine = 'riviv: display-stage=none profile=' + $profName + ' backend=warp'
+# The exact warp-arm line. The ac word is machine-dependent (off|on|
+# unknown) but CONSTANT within the matrix (no ACM toggle is ever forced
+# here - the #134 design comment's regression note), so S1's observed
+# word is the honest expectation for both warp arms: it pins the field's
+# presence AND its stability without hardcoding the machine's ACM state.
+$expectedWarpLine = 'riviv: display-stage=none profile=' + $profName + ' backend=warp ac=' + $acWord1
 $r2a = Run-Dump ("`"$hash300`" -renderer warp -dump-viewport `"$(Join-Path $Stage 's2-warp-a.png')`"") 's2-warp-a.png' 's2a.err'
 $stageLine2a = Get-Stage-Line $r2a.Err 'none' 'warp'
 $genLine2a = Get-Line $r2a.Err 'riviv: dump-viewport output_gen='
-Check 'S2a warp arm: exit 0, adopted, display-stage=none profile=<same> backend=warp, gen=1, PNG' (($r2a.Code -eq 0) -and $r2a.Adopted -and ($stageLine2a -ceq $expectedWarpLine) -and ($genLine2a -ceq 'riviv: dump-viewport output_gen=1') -and (Test-Path $r2a.Out)) "exit=$($r2a.Code) adopted=$($r2a.Adopted) stageLine=[$stageLine2a] expected=[$expectedWarpLine] gen=[$genLine2a] png=$(Test-Path $r2a.Out) stderr=[$($r2a.Err.Trim())]"
+Check 'S2a warp arm: exit 0, adopted, display-stage=none profile=<same> backend=warp ac=<same as S1>, gen=1, PNG' (($r2a.Code -eq 0) -and $r2a.Adopted -and ($stageLine2a -ceq $expectedWarpLine) -and ($genLine2a -ceq 'riviv: dump-viewport output_gen=1') -and (Test-Path $r2a.Out)) "exit=$($r2a.Code) adopted=$($r2a.Adopted) stageLine=[$stageLine2a] expected=[$expectedWarpLine] gen=[$genLine2a] png=$(Test-Path $r2a.Out) stderr=[$($r2a.Err.Trim())]"
 $r2b = Run-Dump ("`"$hash300`" -renderer warp -dump-viewport `"$(Join-Path $Stage 's2-warp-b.png')`"") 's2-warp-b.png' 's2b.err'
 $stageLine2b = Get-Stage-Line $r2b.Err 'none' 'warp'
 Check 'S2b second warp arm: exit 0, adopted, same display-stage line, PNG' (($r2b.Code -eq 0) -and $r2b.Adopted -and ($stageLine2b -ceq $expectedWarpLine) -and (Test-Path $r2b.Out)) "exit=$($r2b.Code) adopted=$($r2b.Adopted) stageLine=[$stageLine2b] png=$(Test-Path $r2b.Out) stderr=[$($r2b.Err.Trim())]"

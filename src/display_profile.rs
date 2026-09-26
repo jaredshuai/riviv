@@ -34,19 +34,24 @@
 //! (the output fingerprint's digest term) alongside the table's query
 //! value, so one call feeds decision, effect, and identity.
 //!
-//! #132 adds the hot-reload freshness half: `current_profile_name`
-//! re-asks just the getter's raw name (the cheap, heavy-tail-free
-//! prefix of this same chain), and `profile_name_changed` decides
-//! whether the full query must re-run — the establishment channel on
-//! the window side owns the cadence (a WM_DISPLAYCHANGE arm plus the
-//! 2s freshness timer).
+//! #132 adds the hot-reload freshness half: one cheap probe re-asks the
+//! getter's raw name (the heavy-tail-free prefix of this same chain) and
+//! a pure predicate decides whether the full query must re-run — the
+//! establishment channel on the window side owns the cadence (a
+//! WM_DISPLAYCHANGE arm plus the 2s freshness timer). #134 joins the ACM
+//! diagnostic (type 9 bit 1 — the output fingerprint's last placeholder)
+//! to the same walk: `current_freshness_inputs` answers BOTH inputs off
+//! one path resolution, and the predicate's contract widens to "name OR
+//! ac moved", so a bare ACM flip re-establishes too.
 
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
+use windows::Win32::Devices::Display::DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO;
 use windows::Win32::Devices::Display::DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
 use windows::Win32::Devices::Display::DISPLAYCONFIG_DEVICE_INFO_HEADER;
+use windows::Win32::Devices::Display::DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO;
 use windows::Win32::Devices::Display::DISPLAYCONFIG_MODE_INFO;
 use windows::Win32::Devices::Display::DISPLAYCONFIG_PATH_INFO;
 use windows::Win32::Devices::Display::DISPLAYCONFIG_SOURCE_DEVICE_NAME;
@@ -78,6 +83,7 @@ use windows::core::w;
 
 use crate::icm::EquivalenceProbe;
 use crate::icm::probe_equivalence;
+use crate::transform_stage::AcState;
 use crate::transform_stage::DisplayProfileQuery;
 use crate::transform_stage::DisplayProfileSpace;
 
@@ -102,26 +108,43 @@ pub(crate) struct DisplayQueryOutcome {
     /// `Some(raw)` — the refusal is a verdict, stable by design, so a
     /// classification-failing machine never loops the full query.
     pub name: Option<String>,
+    /// The ACM diagnostic off the resolved path's TARGET (#134): the
+    /// type 9 `advancedColorEnabled` bit — a label for the output
+    /// fingerprint, never a decision input (D3). `Unknown` whenever the
+    /// monitor ladder did not resolve (no active paths / no matchable
+    /// monitor) or the type 9 read failed; a path that RESOLVED keeps
+    /// its ac answer even when the profile chain below it breaks (the
+    /// ac read keys on the monitor, not on the profile getter).
+    pub ac: AcState,
 }
 
 impl Default for DisplayQueryOutcome {
-    /// The pre-judge posture: unreachable judge, no material — the
-    /// window state's zero value before the first establishment.
+    /// The pre-judge posture: unreachable judge, no material, no ACM
+    /// answer — the window state's zero value before the first
+    /// establishment.
     fn default() -> Self {
         Self {
             query: DisplayProfileQuery::Unknown,
             path: None,
             bytes: None,
             name: None,
+            ac: AcState::Unknown,
         }
     }
 }
 
 /// One active display path, reduced to the judge's inputs plus the
-/// canonical matching key.
+/// canonical matching key. The profile getter keys on the TARGET
+/// adapter + SOURCE id (icm.h), the #134 ACM read keys on the TARGET
+/// adapter + TARGET id (wingdi.h) — the path carries both axes.
+#[derive(Clone)]
 struct PathInfo {
     adapter_luid: LUID,
     source_id: u32,
+    /// The TARGET side's id (`targetInfo.id`, e.g. 0x800050 on the P1
+    /// probe's single path) — the `header.id` of a
+    /// DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO request.
+    target_id: u32,
     /// The GDI device name ("\\\\.\\DISPLAY1") from
     /// `DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME` — `None` when the
     /// query failed (probe P1: the whole `DisplayConfigGetDeviceInfo`
@@ -132,22 +155,24 @@ struct PathInfo {
 /// The judge entry point, called once per output-decision point (stack
 /// creation and every rebuild) on the UI thread. Failures degrade to
 /// `Unknown` — the table's never-on-a-guess row — never to a guess.
-/// The prefix this walks (paths → device → path choice → getter) is
-/// shared with `current_profile_name`'s freshness probe — see that
-/// function's LOCKSTEP CONTRACT note before changing either side.
+/// The prefix this walks (paths → device → path choice) is the shared
+/// `chosen_path` helper, also walked by the freshness probe — see the
+/// LOCKSTEP CONTRACT note there before changing either side.
 pub(crate) fn query(view: HWND) -> DisplayQueryOutcome {
-    let Some(paths) = active_paths() else {
-        return unknown();
+    let Some(path) = chosen_path(view) else {
+        return unknown(AcState::Unknown);
     };
-    let device = monitor_device_name(view);
-    let Some(path) = choose_path(&paths, device.as_deref()) else {
-        return unknown();
-    };
+    // #134: the ACM diagnostic rides the SAME resolved path (its TARGET
+    // side, the wingdi.h keying), so one query feeds decision, effect,
+    // and identity — and a profile-chain break below keeps the ac answer
+    // the monitor did give (the ac read keys on the monitor, not the
+    // profile getter).
+    let ac = advanced_color_state(path.adapter_luid, path.target_id);
     let Some(getter) = display_default_getter() else {
-        return unknown();
+        return unknown(ac);
     };
     let Some(name) = call_display_default(getter, path.adapter_luid, path.source_id) else {
-        return unknown();
+        return unknown(ac);
     };
     if name.is_empty() {
         // A successful answer with no name: the OS owns the display
@@ -158,6 +183,7 @@ pub(crate) fn query(view: HWND) -> DisplayQueryOutcome {
             path: None,
             bytes: None,
             name: Some(String::new()),
+            ac,
         };
     }
     let full = resolve_profile_path(&name);
@@ -178,7 +204,7 @@ pub(crate) fn query(view: HWND) -> DisplayQueryOutcome {
                 "riviv: display profile {}: unreadable ({e}) — display judge falls to unknown (will retry)",
                 full.display()
             );
-            return unknown();
+            return unknown(ac);
         }
     };
     let shown = full
@@ -191,25 +217,28 @@ pub(crate) fn query(view: HWND) -> DisplayQueryOutcome {
             path: Some(full),
             bytes: Some(bytes),
             name: Some(name),
+            ac,
         },
         Some(EquivalenceProbe::Different(_)) => DisplayQueryOutcome {
             query: DisplayProfileQuery::Profile(DisplayProfileSpace::Custom),
             path: Some(full),
             bytes: Some(bytes),
             name: Some(name),
+            ac,
         },
         // The equivalence ladder failed on a profile the OS handed us:
         // not classifiable is not transformable — Unknown, never a guess.
-        None => unclassifiable(name),
+        None => unclassifiable(name, ac),
     }
 }
 
-fn unknown() -> DisplayQueryOutcome {
+fn unknown(ac: AcState) -> DisplayQueryOutcome {
     DisplayQueryOutcome {
         query: DisplayProfileQuery::Unknown,
         path: None,
         bytes: None,
         name: None,
+        ac,
     }
 }
 
@@ -219,46 +248,89 @@ fn unknown() -> DisplayQueryOutcome {
 /// while the freshness key stays the raw name so the hot-reload compare
 /// sees a STABLE key instead of looping the full query. The other
 /// name-carrying failure — an unreadable FILE — deliberately does NOT
-/// come here: it answers `unknown()` (name=None) because a read is
+/// come here: it answers `unknown(ac)` (name=None) because a read is
 /// retryable (Codex P2, PR #133); a classification refusal is not.
-fn unclassifiable(name: String) -> DisplayQueryOutcome {
+fn unclassifiable(name: String, ac: AcState) -> DisplayQueryOutcome {
     DisplayQueryOutcome {
         query: DisplayProfileQuery::Unknown,
         path: None,
         bytes: None,
         name: Some(name),
+        ac,
     }
 }
 
-/// The #132 freshness check's cheap half: re-ask ONLY the getter's raw
-/// name for the window's monitor — no bytes read, no equivalence probe
-/// (the full query's heavy tail is reserved for an actual change). Breaks
-/// anywhere in the chain answer `None`, the same Unknown-from-failure
-/// shape `query` produces, so a broken chain compares stable against a
-/// broken establishment.
-///
-/// LOCKSTEP CONTRACT (pre-review P3): this walks the exact prefix
-/// `query` walks (`active_paths` → `monitor_device_name` → `choose_path`
-/// → getter) and MUST stay in lockstep with it — if one side's chain
-/// ever changes asymmetrically, the compare degenerates into a permanent
-/// mismatch and the timer re-runs the full query every 2s (the loop the
-/// freshness design forbids). Change them together or factor the shared
-/// prefix.
-pub(crate) fn current_profile_name(view: HWND) -> Option<String> {
-    let paths = active_paths()?;
-    let device = monitor_device_name(view);
-    let path = choose_path(&paths, device.as_deref())?;
-    let getter = display_default_getter()?;
-    call_display_default(getter, path.adapter_luid, path.source_id)
+/// The freshness gate's two inputs off ONE ladder walk (#132's name,
+/// #134's ac): the getter's raw answer (`None` = the chain broke at or
+/// before the getter, the Unknown-from-failure shape) and the ACM
+/// diagnostic (`Unknown` = the path ladder or the type 9 read failed).
+/// Both come from the same path resolution so one tick can never
+/// straddle a topology change between its two answers.
+#[derive(Debug)]
+pub(crate) struct FreshnessInputs {
+    pub(crate) name: Option<String>,
+    pub(crate) ac: AcState,
 }
 
-/// The freshness predicate (#132, pure): has the judge's raw name
-/// actually changed? `None` on either side means the chain broke there —
-/// a break appearing or healing counts as a change (the judge's answer
-/// genuinely moved), while two equal `Some`s (including two `Some("")`
-/// OS-managed answers) are stable.
+/// The freshness probe's cheap half (#132, widened by #134): re-ask ONLY
+/// the getter's raw name AND the type 9 ACM bit for the window's monitor
+/// — no bytes read, no equivalence probe (the full query's heavy tail is
+/// reserved for an actual change). Breaks anywhere in the chain answer
+/// the same Unknown-from-failure shapes `query` produces, so a broken
+/// chain compares stable against a broken establishment (the ac half:
+/// two `Unknown`s, like two `None`s, are stable).
+///
+/// LOCKSTEP CONTRACT (pre-review P3, now per its own "factor the shared
+/// prefix" branch): this and `query` walk ONE shared prefix —
+/// `chosen_path` — so their idea of "the window's monitor" cannot drift
+/// apart; do not re-inline the ladder in either walker.
+pub(crate) fn current_freshness_inputs(view: HWND) -> FreshnessInputs {
+    let Some(path) = chosen_path(view) else {
+        return FreshnessInputs {
+            name: None,
+            ac: AcState::Unknown,
+        };
+    };
+    let ac = advanced_color_state(path.adapter_luid, path.target_id);
+    let name = display_default_getter()
+        .and_then(|getter| call_display_default(getter, path.adapter_luid, path.source_id));
+    FreshnessInputs { name, ac }
+}
+
+/// The freshness predicate's NAME half (#132, pure): has the judge's raw
+/// name actually changed? `None` on either side means the chain broke
+/// there — a break appearing or healing counts as a change (the judge's
+/// answer genuinely moved), while two equal `Some`s (including two
+/// `Some("")` OS-managed answers) are stable.
 pub(crate) fn profile_name_changed(old: Option<&str>, fresh: Option<&str>) -> bool {
     old != fresh
+}
+
+/// The freshness predicate, widened by #134: the gate re-establishes on
+/// a NAME move or an ACM move. A bare ac flip with the name standing
+/// still must reach the establishment and mint a gen (an ACM/HDR toggle
+/// can flip the type 9 bit in place — WM_DISPLAYCHANGE's documented
+/// bit-depth class — without touching the profile name); two equal
+/// (name, ac) pairs are stable, including two broken chains and two
+/// stable `Unknown`s.
+pub(crate) fn freshness_changed(
+    old_name: Option<&str>,
+    fresh_name: Option<&str>,
+    old_ac: AcState,
+    fresh_ac: AcState,
+) -> bool {
+    profile_name_changed(old_name, fresh_name) || old_ac != fresh_ac
+}
+
+/// The shared ladder prefix of every judge walk (`query` and
+/// `current_freshness_inputs`): the active paths, the window's monitor
+/// as a GDI device name, and the one chosen path — `None` anywhere is
+/// the Unknown shape (nothing to judge against). The owned copy lets
+/// each walker carry the path's inputs without borrowing the locals.
+fn chosen_path(view: HWND) -> Option<PathInfo> {
+    let paths = active_paths()?;
+    let device = monitor_device_name(view);
+    choose_path(&paths, device.as_deref()).cloned()
 }
 
 /// The window's monitor as a GDI device name, the canonical match key
@@ -326,6 +398,11 @@ fn active_paths() -> Option<Vec<PathInfo>> {
             .map(|p| PathInfo {
                 adapter_luid: p.targetInfo.adapterId,
                 source_id: p.sourceInfo.id,
+                // The TARGET side's id: the #134 ACM read's header.id
+                // (wingdi.h keys GET_ADVANCED_COLOR_INFO on the target),
+                // distinct from the getter's (target adapter + SOURCE id)
+                // and the name query's (source adapter + source id) axes.
+                target_id: p.targetInfo.id,
                 // The source-name request keys on the SOURCE side
                 // (sourceInfo.adapterId + sourceInfo.id); the getter below
                 // keys on the TARGET side (targetInfo.adapterId + the
@@ -361,6 +438,70 @@ fn source_name(adapter: LUID, source: u32) -> Option<String> {
         .position(|&c| c == 0)
         .unwrap_or(info.viewGdiDeviceName.len());
     Some(String::from_utf16_lossy(&info.viewGdiDeviceName[..len]))
+}
+
+/// wingdi.h 26100 lines 3167-3186, transcribed (the docs page is gone —
+/// probe P1's SDK copy, the same pin the `AcState` doc carries). The
+/// #134 request: type 9 over a path's TARGET, 32 bytes total.
+///
+/// ```c
+/// typedef struct DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO {
+///   DISPLAYCONFIG_DEVICE_INFO_HEADER header; // type 9 = GET_ADVANCED_COLOR_INFO
+///   union {
+///     struct {
+///       UINT32 advancedColorSupported     : 1;  // bit 0
+///       UINT32 advancedColorEnabled       : 1;  // bit 1 <- "ACM in effect"
+///       UINT32 wideColorEnforced          : 1;  // bit 2
+///       UINT32 advancedColorForceDisabled : 1;  // bit 3
+///     } DUMMYSTRUCTNAME;
+///     UINT32 value;
+///   } DUMMYUNIONNAME;
+///   DISPLAYCONFIG_COLOR_ENCODING colorEncoding; // probe machine: 0 (RGB)
+///   UINT32 bitsPerColorChannel;                 // probe machine: 10
+/// } DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO;      // sizeof = 32
+/// ```
+///
+/// Probe P1 evidence (2026-09-26, in-riviv-process `#[cfg(test)]` probe,
+/// cargo test context): rc = 0, byte-stable across three repeats, flags
+/// = 0x3 (supported | enabled), colorEncoding RGB, 10 bpc — and the
+/// #127 P1 "whole family ERROR_GEN_FAILURE" verdict is hereby corrected
+/// to a PS-context/marshaling artifact, not an API absence (the type 1
+/// GET_SOURCE_NAME control answered `\\.\DISPLAY1` the same run).
+fn advanced_color_state(target_adapter: LUID, target_id: u32) -> AcState {
+    let mut info = DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO::default();
+    info.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO;
+    info.header.size = std::mem::size_of::<DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO>() as u32;
+    info.header.adapterId = target_adapter;
+    info.header.id = target_id;
+    // SAFETY: `info` is a valid request packet of the exact type/size its
+    // header declares (the wingdi.h-26100 layout transcribed above);
+    // DisplayConfigGetDeviceInfo writes back into the same buffer only.
+    let rc = unsafe {
+        DisplayConfigGetDeviceInfo(&mut info.header as *mut DISPLAYCONFIG_DEVICE_INFO_HEADER)
+    };
+    // SAFETY: reads the union's `value` arm the call above just filled
+    // (both arms are the same 4 bytes — no provenance question, and
+    // nothing else touches `info` afterwards).
+    let flags = unsafe { info.Anonymous.value };
+    advanced_color_state_from_call(rc, flags)
+}
+
+/// The ACM read's pure half (#134): a successful type 9 answer maps bit
+/// 1 — `advancedColorEnabled`, the transcription above's "ACM in effect"
+/// bit — to On/Off, and ANY nonzero return code (the WIN32 error the API
+/// returns directly: ERROR_GEN_FAILURE, ERROR_ACCESS_DENIED, ...) maps
+/// to `Unknown` (D3: the table already covers it — the read is a
+/// diagnostic label, never a decision input, so a failed read degrades
+/// to the honest label instead of a guess or a stale latch).
+fn advanced_color_state_from_call(rc: i32, flags: u32) -> AcState {
+    if rc != 0 {
+        return AcState::Unknown;
+    }
+    if flags & 0b10 != 0 {
+        AcState::On
+    } else {
+        AcState::Off
+    }
 }
 
 /// The monitor-matching ladder (the wiring's one decision left to
@@ -492,13 +633,14 @@ fn resolve_profile_path(name: &str) -> PathBuf {
 mod tests {
     use super::*;
 
-    fn path(luid_low: u32, source: u32, name: Option<&str>) -> PathInfo {
+    fn path(luid_low: u32, source: u32, target: u32, name: Option<&str>) -> PathInfo {
         PathInfo {
             adapter_luid: LUID {
                 LowPart: luid_low,
                 HighPart: 0,
             },
             source_id: source,
+            target_id: target,
             source_name: name.map(str::to_string),
         }
     }
@@ -508,8 +650,8 @@ mod tests {
         // Interactive shape: names are readable and one matches the
         // window's monitor — the matched path, regardless of order.
         let paths = vec![
-            path(1, 0, Some(r"\\.\DISPLAY1")),
-            path(2, 3, Some(r"\\.\DISPLAY2")),
+            path(1, 0, 0x800001, Some(r"\\.\DISPLAY1")),
+            path(2, 3, 0x800002, Some(r"\\.\DISPLAY2")),
         ];
         let hit = choose_path(&paths, Some(r"\\.\DISPLAY2")).unwrap();
         assert_eq!(hit.adapter_luid.LowPart, 2);
@@ -521,7 +663,7 @@ mod tests {
         // The agent-context shape (probe P1: the name query fails; probe
         // P2: the path enumeration still works): one monitor is
         // unambiguous, with or without a readable name or device key.
-        let paths = vec![path(7, 1, None)];
+        let paths = vec![path(7, 1, 0x800003, None)];
         assert!(choose_path(&paths, Some(r"\\.\DISPLAY9")).is_some());
         assert!(choose_path(&paths, None).is_some());
         assert!(choose_path(&paths, Some(r"\\.\DISPLAY1")).is_some());
@@ -532,7 +674,7 @@ mod tests {
         // Multi-monitor with the name family dead: which path is the
         // window's monitor is a coin flip — Unknown (None) is the only
         // honest answer.
-        let paths = vec![path(1, 0, None), path(2, 0, None)];
+        let paths = vec![path(1, 0, 0x800004, None), path(2, 0, 0x800005, None)];
         assert!(choose_path(&paths, None).is_none());
         assert!(choose_path(&paths, Some(r"\\.\DISPLAY1")).is_none());
     }
@@ -542,8 +684,8 @@ mod tests {
         // A stale device name against a healthy multi-monitor desktop:
         // the single-path fallback must NOT fire (len > 1) — no guess.
         let paths = vec![
-            path(1, 0, Some(r"\\.\DISPLAY1")),
-            path(2, 3, Some(r"\\.\DISPLAY2")),
+            path(1, 0, 0x800001, Some(r"\\.\DISPLAY1")),
+            path(2, 3, 0x800002, Some(r"\\.\DISPLAY2")),
         ];
         assert!(choose_path(&paths, Some(r"\\.\DISPLAY7")).is_none());
     }
@@ -569,6 +711,69 @@ mod tests {
     }
 
     #[test]
+    fn the_ac_read_is_bit_one_and_any_failed_call_is_unknown() {
+        // #134's decode contract (the wingdi.h 26100 transcription over
+        // advanced_color_state): bit 1 = advancedColorEnabled is THE "ACM
+        // in effect" bit; every other bit is decoration for this purpose.
+        // 0x3 is the probe machine's measured value (supported | enabled,
+        // P1 evidence), so it must read On.
+        assert_eq!(advanced_color_state_from_call(0, 0x3), AcState::On);
+        assert_eq!(advanced_color_state_from_call(0, 0x2), AcState::On);
+        assert_eq!(advanced_color_state_from_call(0, 0x1), AcState::Off);
+        assert_eq!(advanced_color_state_from_call(0, 0x0), AcState::Off);
+        assert_eq!(
+            advanced_color_state_from_call(0, 0x9),
+            AcState::Off,
+            "force-disabled with bit 1 clear is still Off"
+        );
+        // ANY nonzero rc is a failed read: Unknown, whatever the packet
+        // happens to hold (ERROR_GEN_FAILURE = 31, ERROR_ACCESS_DENIED = 5).
+        assert_eq!(advanced_color_state_from_call(31, 0x3), AcState::Unknown);
+        assert_eq!(advanced_color_state_from_call(5, 0x0), AcState::Unknown);
+    }
+
+    #[test]
+    fn the_widened_freshness_predicate_fires_on_a_bare_ac_move_and_stays_stable_when_both_stand() {
+        // #134's gate contract: name OR ac. A name flip with equal acs
+        // fires (the #132 shape); a bare ac flip with the name standing
+        // still — including two Nones (a broken chain on both sides) and
+        // the Unknown-after-failure shape — fires; two equal (name, ac)
+        // pairs never do (the smoke132 idempotence contract).
+        assert!(freshness_changed(
+            Some("a.icm"),
+            Some("b.icm"),
+            AcState::Off,
+            AcState::Off
+        ));
+        assert!(freshness_changed(
+            Some("a.icm"),
+            Some("a.icm"),
+            AcState::Off,
+            AcState::On
+        ));
+        assert!(freshness_changed(
+            Some("a.icm"),
+            None,
+            AcState::Unknown,
+            AcState::Unknown
+        ));
+        assert!(freshness_changed(None, None, AcState::Off, AcState::On));
+        assert!(!freshness_changed(None, None, AcState::Off, AcState::Off));
+        assert!(!freshness_changed(
+            Some(""),
+            Some(""),
+            AcState::On,
+            AcState::On
+        ));
+        assert!(!freshness_changed(
+            Some("a.icm"),
+            Some("a.icm"),
+            AcState::Unknown,
+            AcState::Unknown
+        ));
+    }
+
+    #[test]
     fn the_outcome_name_field_separates_broken_chain_from_failed_classification() {
         // The freshness key's None/Some shapes: a chain broken at or
         // before the getter — or an UNREADABLE FILE, the retryable
@@ -578,10 +783,20 @@ mod tests {
         // refuses keeps the raw name — a stable verdict that must not
         // loop the full query every 2s.
         assert_eq!(DisplayQueryOutcome::default().name, None);
-        assert_eq!(unknown().name, None);
-        let unclassified = unclassifiable("panel.icm".to_string());
+        assert_eq!(
+            DisplayQueryOutcome::default().ac,
+            AcState::Unknown,
+            "the pre-establishment posture has no ACM answer either"
+        );
+        assert_eq!(unknown(AcState::Unknown).name, None);
+        let unclassified = unclassifiable("panel.icm".to_string(), AcState::On);
         assert_eq!(unclassified.query, DisplayProfileQuery::Unknown);
         assert_eq!(unclassified.name, Some("panel.icm".to_string()));
+        assert_eq!(
+            unclassified.ac,
+            AcState::On,
+            "a classification refusal keeps the monitor's ACM answer"
+        );
         assert!(unclassified.path.is_none() && unclassified.bytes.is_none());
     }
 

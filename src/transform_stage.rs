@@ -24,8 +24,10 @@
 //! #130 wired the judge (`display_profile.rs`: the modern getter via
 //! dynamic mscms resolution, per output-decision point) and the static
 //! gpu_effect application; `fingerprint_for` consumes the REAL query,
-//! bytes, and latch. What stays future work: the profile hot reload
-//! (event-driven re-query) and the ACM diagnostic read.
+//! bytes, and latch. #132 added the event-driven hot reload, and #134
+//! swapped the last placeholder: the ACM diagnostic (type 9 bit 1) now
+//! rides the fingerprint's `ac` term, a label that never feeds a
+//! decision (D3, pinned by test below).
 //!
 //! WARP never runs the gpu_effect (hard exclusion, ticket) and never
 //! runs the CPU pass either (probe P3: a WCS viewport transform
@@ -229,12 +231,14 @@ pub(crate) struct OutputPolicy {
 /// transcription; the docs page is gone): bit 0 =
 /// advancedColorSupported, bit 1 = advancedColorEnabled, bit 2 =
 /// wideColorEnforced, bit 3 = advancedColorForceDisabled. `Unknown`
-/// covers every read failure (probe P1 saw the whole API family
-/// return ERROR_GEN_FAILURE in agent contexts on build 26200).
-/// Off/On stay dead in the non-test build until the ACM read's own
-/// phase wires them into `fingerprint_for`.
+/// covers every read failure — #134's P1 probe corrected the old
+/// "whole family fails in agent contexts" verdict to a PS-context
+/// artifact: in-process the type 9 call answers reliably (rc = 0,
+/// byte-stable, flags 0x3 on the probe machine), and any nonzero rc
+/// still lands here honestly. #134's ACM read (`display_profile.rs`,
+/// the type 9 target read) is what produces Off/On; they ride
+/// `fingerprint_for` as the `ac` term and nothing else.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[allow(dead_code)]
 pub(crate) enum AcState {
     Off,
     On,
@@ -280,29 +284,31 @@ pub(crate) fn profile_hash(bytes: &[u8]) -> u64 {
     h
 }
 
-/// The wiring fingerprint (#126 established it, #130 swapped the
-/// placeholders for real inputs): what the output actually went through.
-/// The judge — the WCS display-profile query — is REAL here (the modern
-/// getter, resolved per output-decision point); the stage term is the
-/// EFFECTIVE stage (`desired_stage` clamped by the session latch — a
-/// latched degrade switches the segment off, and the flip is a
-/// fingerprint transition the tracker mints a new generation for); the
-/// profile bytes are the real destination profile's (`None` = the query
-/// carries none — Unknown, NoProfile, or an unreadable file — and the
-/// digest is the empty profile's, pinned so an absent term never
-/// drifts). The ONE remaining placeholder is the ACM diagnostic (its own
-/// later phase); each future swap stays a visible transition through the
-/// dump channel's `output_gen` line.
+/// The wiring fingerprint (#126 established it, #130 swapped the first
+/// placeholders for real inputs, #134 swapped the last): what the output
+/// actually went through. The judge — the WCS display-profile query — is
+/// REAL here (the modern getter, resolved per output-decision point);
+/// the stage term is the EFFECTIVE stage (`desired_stage` clamped by the
+/// session latch — a latched degrade switches the segment off, and the
+/// flip is a fingerprint transition the tracker mints a new generation
+/// for); the profile bytes are the real destination profile's (`None` =
+/// the query carries none — Unknown, NoProfile, or an unreadable file —
+/// and the digest is the empty profile's, pinned so an absent term never
+/// drifts); and `ac` is the REAL ACM diagnostic off the judged monitor's
+/// target (type 9 bit 1 — a label for the dump reader, never a stage
+/// input; every read failure is `Unknown` per D3). Every term is a
+/// visible transition through the dump channel's `output_gen` line.
 pub(crate) fn fingerprint_for(
     backend: Backend,
     query: DisplayProfileQuery,
     degraded_latched: bool,
     profile_bytes: Option<&[u8]>,
+    ac: AcState,
 ) -> OutputFingerprint {
     OutputFingerprint {
         stage: effective_stage(desired_stage(backend, query), degraded_latched),
         profile_hash: profile_hash(profile_bytes.unwrap_or(&[])),
-        ac: AcState::Unknown,
+        ac,
         backend,
         policy: OutputPolicy {
             intent: RenderIntent::RelativeColorimetric,
@@ -595,29 +601,34 @@ mod tests {
 
     #[test]
     fn the_real_input_fingerprint_pins_every_cell() {
-        // #130's constructor (see its doc): the judge is real, the stage
-        // is the EFFECTIVE one (the latch clamps GpuEffect down to None),
+        // The constructor (see its doc): the judge is real, the stage is
+        // the EFFECTIVE one (the latch clamps GpuEffect down to None),
         // the digest is the real bytes' (or the pinned empty one when the
-        // query carries none), and the ACM placeholder stays Unknown
-        // until its own phase. Every cell pinned so a later phase's swap
-        // is a visible transition, not a drift.
+        // query carries none), and since #134 the ACM term is the REAL
+        // type 9 read passed through verbatim — every input state lands
+        // in the field, so the read's swap is a visible transition, not
+        // a drift. Every cell pinned for exactly that.
         let bytes: &[u8] = &[0xab, 0xcd, 0xef];
         for backend in both_backends() {
             for query in all_queries() {
                 for latched in [false, true] {
-                    let fp = fingerprint_for(backend, query, latched, Some(bytes));
-                    let expected_stage = effective_stage(desired_stage(backend, query), latched);
-                    assert_eq!(fp.stage, expected_stage, "{backend:?}/{query:?}/{latched}");
-                    assert_eq!(fp.profile_hash, profile_hash(bytes));
-                    assert_eq!(fp.ac, AcState::Unknown);
-                    assert_eq!(fp.backend, backend);
-                    assert_eq!(fp.policy.intent, RenderIntent::RelativeColorimetric);
-                    assert_eq!(fp.policy.quality, RenderQuality::Best);
+                    for ac in [AcState::Off, AcState::On, AcState::Unknown] {
+                        let fp = fingerprint_for(backend, query, latched, Some(bytes), ac);
+                        let expected_stage =
+                            effective_stage(desired_stage(backend, query), latched);
+                        assert_eq!(fp.stage, expected_stage, "{backend:?}/{query:?}/{latched}");
+                        assert_eq!(fp.profile_hash, profile_hash(bytes));
+                        assert_eq!(fp.ac, ac, "the ac diagnostic passes through verbatim");
+                        assert_eq!(fp.backend, backend);
+                        assert_eq!(fp.policy.intent, RenderIntent::RelativeColorimetric);
+                        assert_eq!(fp.policy.quality, RenderQuality::Best);
 
-                    // No bytes to hash: the pinned empty digest — an
-                    // absent term must never drift.
-                    let fp_empty = fingerprint_for(backend, query, latched, None);
-                    assert_eq!(fp_empty.profile_hash, profile_hash(b""));
+                        // No bytes to hash: the pinned empty digest — an
+                        // absent term must never drift.
+                        let fp_empty =
+                            fingerprint_for(backend, query, latched, None, AcState::Unknown);
+                        assert_eq!(fp_empty.profile_hash, profile_hash(b""));
+                    }
                 }
             }
         }
@@ -625,26 +636,46 @@ mod tests {
 
     #[test]
     fn backend_latch_and_bytes_transitions_mint_new_gens_through_the_real_constructor() {
-        // The erratum semantics (Codex P2, PR #128) through #130's REAL
-        // constructor: today the live terms are backend, stage (via the
-        // latch and the judge), and the profile bytes — each flip is a
+        // The erratum semantics (Codex P2, PR #128) through the REAL
+        // constructor: the live terms are backend, stage (via the latch
+        // and the judge), and the profile bytes — each flip is a
         // fingerprint transition, so the dump channel sees a new gen;
-        // re-identifying an unchanged decision stays idempotent.
+        // re-identifying an unchanged decision stays idempotent. The ac
+        // term is held constant here (On throughout) because the bare-ac
+        // transition gets its own constructor pin below.
         use DisplayProfileQuery::Profile;
         use DisplayProfileSpace::Custom;
         use TransformStage::{GpuEffect, None as NoStage};
         let adobe = b"TPLCD_8BAF_AdobeRGB.icm-bytes".as_slice();
         let mut tracker = OutputTracker::default();
         // hw + custom + unlatched: the effect stage.
-        let hw_effect = fingerprint_for(Backend::Hardware, Profile(Custom), false, Some(adobe));
+        let hw_effect = fingerprint_for(
+            Backend::Hardware,
+            Profile(Custom),
+            false,
+            Some(adobe),
+            AcState::On,
+        );
         assert_eq!(hw_effect.stage, GpuEffect);
         assert_eq!(tracker.identify(hw_effect).output_gen, 1);
         // The session latch flips the effective stage: a transition.
-        let hw_latched = fingerprint_for(Backend::Hardware, Profile(Custom), true, Some(adobe));
+        let hw_latched = fingerprint_for(
+            Backend::Hardware,
+            Profile(Custom),
+            true,
+            Some(adobe),
+            AcState::On,
+        );
         assert_eq!(hw_latched.stage, NoStage);
         assert_eq!(tracker.identify(hw_latched).output_gen, 2);
         // A backend flip on top: another transition.
-        let warp = fingerprint_for(Backend::Warp, Profile(Custom), false, Some(adobe));
+        let warp = fingerprint_for(
+            Backend::Warp,
+            Profile(Custom),
+            false,
+            Some(adobe),
+            AcState::On,
+        );
         assert_eq!(warp.stage, NoStage, "the WARP hard exclusion");
         assert_eq!(tracker.identify(warp).output_gen, 3);
         // New profile bytes under the same decision shape: the digest is
@@ -654,11 +685,83 @@ mod tests {
             Profile(Custom),
             false,
             Some(b"a-different-display-profile".as_slice()),
+            AcState::On,
         );
         assert_eq!(tracker.identify(other).output_gen, 4);
         // An ordinary same-decision re-identify (a same-kind rebuild):
         // idempotent, same gen.
         assert_eq!(tracker.identify(other).output_gen, 4);
+    }
+
+    #[test]
+    fn a_bare_ac_flip_mints_a_new_generation_through_the_real_constructor() {
+        // #134's "the last placeholder is real" pin: with the name-level
+        // judge's inputs (backend, query, latch, bytes) all standing
+        // still, an ACM toggle alone is a fingerprint transition — the
+        // freshness gate feeds exactly this shape, so a bare ac flip
+        // reaches the establishment and walks the dump channel's gen
+        // (A→B→A style, every transition mints).
+        let bytes: &[u8] = &[0xde, 0xad, 0xbe, 0xef];
+        let query = DisplayProfileQuery::Profile(DisplayProfileSpace::Custom);
+        let mut tracker = OutputTracker::default();
+        let off = fingerprint_for(Backend::Hardware, query, false, Some(bytes), AcState::Off);
+        assert_eq!(tracker.identify(off).output_gen, 1);
+        let on = fingerprint_for(Backend::Hardware, query, false, Some(bytes), AcState::On);
+        let on_identity = tracker.identify(on);
+        assert_ne!(
+            on_identity.fingerprint, off,
+            "the ac term is part of the fingerprint, so the flip moves it"
+        );
+        assert_eq!(on_identity.output_gen, 2);
+        // Back to Off: a new gen again (transition semantics, not memo).
+        assert_eq!(
+            tracker.identify(off).output_gen,
+            3,
+            "the Off→On→Off round trip walks gens 1, 2, 3"
+        );
+        // A read failure joining the mix is a third state, also a move.
+        let unknown = fingerprint_for(
+            Backend::Hardware,
+            query,
+            false,
+            Some(bytes),
+            AcState::Unknown,
+        );
+        assert_eq!(tracker.identify(unknown).output_gen, 4);
+    }
+
+    #[test]
+    fn the_ac_label_never_feeds_the_stage_decision_in_any_cell() {
+        // The "declaration = no declaration" behavior pin (D3): the ACM
+        // diagnostic is a fingerprint LABEL, never an input of the
+        // decision — across the whole (backend, query, latch) space, all
+        // three ac states produce the IDENTICAL effective stage (and the
+        // identical non-ac fingerprint terms), so the picture a user sees
+        // never moves when the ACM bit alone moves.
+        let bytes: &[u8] = &[0xab, 0xcd, 0xef];
+        for backend in both_backends() {
+            for query in all_queries() {
+                for latched in [false, true] {
+                    let stages: Vec<_> = [AcState::Off, AcState::On, AcState::Unknown]
+                        .iter()
+                        .map(|&ac| fingerprint_for(backend, query, latched, Some(bytes), ac).stage)
+                        .collect();
+                    assert!(
+                        stages[0] == stages[1] && stages[1] == stages[2],
+                        "stage must not move with ac: {backend:?}/{query:?}/{latched} -> {stages:?}"
+                    );
+                    // And the rest of the fingerprint agrees too: equal
+                    // except for the ac term itself.
+                    let a = fingerprint_for(backend, query, latched, Some(bytes), AcState::Off);
+                    let b = fingerprint_for(backend, query, latched, Some(bytes), AcState::On);
+                    assert_eq!(a.stage, b.stage);
+                    assert_eq!(a.profile_hash, b.profile_hash);
+                    assert_eq!(a.backend, b.backend);
+                    assert_eq!(a.policy, b.policy);
+                    assert_ne!(a, b, "only the ac term differs");
+                }
+            }
+        }
     }
 
     // ---- R2 / D5 pins ----
