@@ -40,6 +40,7 @@ use windows::Win32::System::Ole::{CF_BITMAP, CF_DIB, CF_DIBV5, CF_HDROP, CF_UNIC
 use windows::Win32::UI::Shell::HDROP;
 use windows::core::w;
 
+use crate::pixels::master_gdi_bgra;
 use crate::surface::create_bgra_dib;
 use crate::window::{apply_drop_files, request_open_clipboard, state_of};
 
@@ -135,8 +136,11 @@ pub(crate) fn copy_current(hwnd: HWND, cut: bool) {
                 entry.path,
                 state.image.as_ref().map(|i| {
                     let master = i.surface().master();
+                    // The direct-read dispatch (#141): the master's 8-bit
+                    // BGRA reading — GDI has no f16 (ADR 0003 后果节); on
+                    // the interim master both dispatch arms coincide.
                     (
-                        master.pixels.to_vec(),
+                        master_gdi_bgra(master),
                         master.width as i32,
                         master.height as i32,
                     )
@@ -215,8 +219,10 @@ pub(crate) fn copy_image(hwnd: HWND) {
         }
         state.image.as_ref().map(|i| {
             let master = i.surface().master();
+            // The direct-read dispatch (#141), as in `copy_current`: the
+            // master's 8-bit BGRA reading for a GDI bitmap.
             (
-                master.pixels.to_vec(),
+                master_gdi_bgra(master),
                 master.width as i32,
                 master.height as i32,
             )
@@ -493,6 +499,13 @@ pub(crate) fn dib_family_available() -> bool {
 /// (open, copy, close — nothing parsed under the lock). `Ok(None)` = no
 /// image format on the clipboard; `Err` = the clipboard would not open
 /// (busy). Both are user-level failures upstream of here.
+///
+/// #141's seam ruling: this read side never touches riviv's master —
+/// the bytes are the OTHER process's DIB, and the loader turns them
+/// into a fresh `Srgb` frame (loader.rs's DIB path) — so there is no
+/// direct-read dispatch here; the paste family's only master reads
+/// would be a later copy of what it displayed, which lands in
+/// `copy_current`/`copy_image` like any other frame.
 pub(crate) fn read_clipboard_dib() -> Result<Option<Vec<u8>>, String> {
     // SAFETY: the caller owns the threading contract (the detached reader
     // below). OpenClipboard(None) associates the session with the calling

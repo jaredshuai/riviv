@@ -122,7 +122,7 @@ use crate::loadthread::{
 };
 use crate::loc;
 use crate::menu;
-use crate::pixels::{PixelFrame, sample_bgra};
+use crate::pixels::{PixelFrame, sample_master_rgb};
 use crate::playlist::{self, Playlist, PlaylistEntry};
 use crate::preload::{self, AdoptDecision, LastCache, PreloadSlot, PreloadState};
 use crate::shell;
@@ -686,14 +686,17 @@ fn update_src_pixel(hwnd: HWND, force: bool, update_statusbar: bool) -> bool {
             // samples the sRGB master BEFORE the display-segment
             // transform, whatever `transform_stage` resolves to;
             // semi-transparent pixels read with their composited
-            // background baked in.
+            // background baked in. #141 routes the read through the
+            // direct-read dispatch (`sample_master_rgb`): an F16Srgb
+            // master reads through the quantizer, the Srgb bytes pass
+            // through untouched.
             let master = image.surface().master();
             // Out-of-bounds maps to the CLR_INVALID read-through the
             // unchecked GetRValue chain produced (255, 255, 255) — the
             // coordinate math keeps new_pt in-frame by construction, so
             // this arm is defensive parity, same as upstream's.
-            state.src_rgb = sample_bgra(&master.pixels, master.width as i32, new_pt.0, new_pt.1)
-                .unwrap_or((255, 255, 255));
+            state.src_rgb =
+                sample_master_rgb(master, new_pt.0, new_pt.1).unwrap_or((255, 255, 255));
         }
         update_statusbar
     })
@@ -1883,6 +1886,7 @@ fn dump_via_gpu(hwnd: HWND, view: HWND) -> Result<(u32, u32, Vec<u8>), String> {
             frame_gen,
             master.width,
             master.height,
+            master.content_space,
             master,
         )
     });
@@ -1898,7 +1902,7 @@ fn dump_via_gpu(hwnd: HWND, view: HWND) -> Result<(u32, u32, Vec<u8>), String> {
     };
     gpu.sync_display_intent(want_effect, display_profile.as_deref());
     match prepared {
-        Some((plan, frame_gen, wide, high, master)) => {
+        Some((plan, frame_gen, wide, high, space, master)) => {
             let mut src = crate::gpu::MasterLevels {
                 master: Some(master),
                 cache: levels,
@@ -1909,7 +1913,7 @@ fn dump_via_gpu(hwnd: HWND, view: HWND) -> Result<(u32, u32, Vec<u8>), String> {
                     cw,
                     ch,
                     bg: plan.bg,
-                    frame: Some((frame_gen, wide, high)),
+                    frame: Some((frame_gen, wide, high, space)),
                     plan: Some(plan),
                 },
                 crate::gpu::Diagnostics { tile_edge },

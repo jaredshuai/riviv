@@ -64,6 +64,7 @@ use windows::core::Interface;
 
 use crate::config::RendererKind;
 use crate::paint::scene_rect;
+use crate::transform_stage::ContentSpace;
 use crate::window::{fatal, state_of};
 
 // ---------------------------------------------------------------------------
@@ -177,9 +178,10 @@ pub(crate) trait LevelSource {
     /// `cpu_source` class.
     fn cpu_bytes(&self) -> u64;
 
-    /// Rebind to the frame generation about to draw, dropping any cached
-    /// level of a previous frame (see [`crate::mip::LevelCache::rebind`]).
-    fn rebind(&mut self, frame_gen: u64);
+    /// Rebind to the frame about to draw — its generation AND its content
+    /// space (#141) — dropping any cached level of a previous frame (see
+    /// [`crate::mip::LevelCache::rebind`]).
+    fn rebind(&mut self, frame_gen: u64, content_space: ContentSpace);
 
     /// Levels built so far (each is a full source pass) — the ledger's
     /// `mip_builds`, and the evidence line's proof that a giant's overview
@@ -210,6 +212,7 @@ impl LevelSource for MasterLevels<'_> {
             master.width,
             master.height,
             self.frame_gen,
+            master.content_space,
             &master.pixels,
         )
     }
@@ -222,9 +225,9 @@ impl LevelSource for MasterLevels<'_> {
         self.cache.builds
     }
 
-    fn rebind(&mut self, frame_gen: u64) {
+    fn rebind(&mut self, frame_gen: u64, content_space: ContentSpace) {
         self.frame_gen = frame_gen;
-        self.cache.rebind(frame_gen);
+        self.cache.rebind(frame_gen, content_space);
     }
 }
 
@@ -259,13 +262,13 @@ pub(crate) struct Diagnostics {
 }
 
 /// One dump request: the viewport, its background, and the frame to render
-/// (with the plan it was measured for). `frame: None` = the blank
-/// letterbox dump.
+/// (its generation, dimensions and content space — #141 — with the plan it
+/// was measured for). `frame: None` = the blank letterbox dump.
 pub(crate) struct DumpRequest {
     pub(crate) cw: u32,
     pub(crate) ch: u32,
     pub(crate) bg: [u8; 3],
-    pub(crate) frame: Option<(u64, u32, u32)>,
+    pub(crate) frame: Option<(u64, u32, u32, ContentSpace)>,
     pub(crate) plan: Option<DrawPlan>,
 }
 
@@ -482,6 +485,44 @@ struct DisplaySegment {
     failure: Option<String>,
 }
 
+/// The base bitmap's residency key (#141, ADR 0003 D1's upload-key
+/// layer): the frame generation, the master content space its bytes
+/// belong to, the level, and the level's dimensions. Any term changing
+/// re-uploads from the CPU level source. The content-space term keeps a
+/// same-session 8-bit/FP16 pair's bitmaps apart — the keys never compare
+/// equal across spaces, which is what makes the two regimes safe to
+/// alternate before (and after) #143 gives their uploads different
+/// formats.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct UploadKey {
+    pub(crate) frame_gen: u64,
+    pub(crate) content_space: ContentSpace,
+    pub(crate) level: u32,
+    pub(crate) wide: u32,
+    pub(crate) high: u32,
+}
+
+impl UploadKey {
+    /// The pure key construction — every term is a plain copy, so the
+    /// residency decision stays a pure comparison ([`GpuStack::ensure_base`]
+    /// only equality-checks against the resident key).
+    pub(crate) fn new(
+        frame_gen: u64,
+        content_space: ContentSpace,
+        level: u32,
+        wide: u32,
+        high: u32,
+    ) -> Self {
+        Self {
+            frame_gen,
+            content_space,
+            level,
+            wide,
+            high,
+        }
+    }
+}
+
 pub(crate) struct GpuStack {
     // Field order IS the drop order (COM wrappers Release in declaration
     // order, design §3; the Drop impl above enforces the first, critical
@@ -514,14 +555,14 @@ pub(crate) struct GpuStack {
     /// per paint: a level whose dimensions fit is drawn as ONE bitmap, a
     /// larger one is tiled (#82).
     max_bitmap: u32,
-    /// The (frame_gen, level, w, h) quartet resident in `bitmap`; a paint
-    /// whose quartet differs re-uploads from the CPU level source (no
-    /// re-decode, design §5).
-    uploaded: Option<(u64, u32, u32, u32)>,
-    /// The frame generation the tile cache belongs to: a new generation
-    /// (a new image, a rotate, an edit) drops every tile — they can never
-    /// be drawn again.
-    tile_gen: Option<u64>,
+    /// The frame residency the base bitmap carries ([`UploadKey`]): a
+    /// paint whose key differs re-uploads from the CPU level source (no
+    /// re-decode, design §5). #141 added the content-space term.
+    uploaded: Option<UploadKey>,
+    /// The (frame generation, content space) the tile cache belongs to: a
+    /// change to either drops every tile — they can never be drawn again
+    /// (#141: the space joins the generation, the way LevelCache rebinds).
+    tile_owner: Option<(u64, ContentSpace)>,
     /// The resident tiles' bitmaps, keyed like the LRU beside them. A
     /// HashMap (was a `Vec` of pairs, #90): lookup/evict/clear are O(1)
     /// hash operations instead of O(n) `find`/`retain` scans — a forced
@@ -765,7 +806,7 @@ pub(crate) fn create(
         backend: backend_label(effective != RendererKind::Warp),
         max_bitmap,
         uploaded: None,
-        tile_gen: None,
+        tile_owner: None,
         tiles: std::collections::HashMap::new(),
         tile_lru: crate::tile::Lru::new(cap_bytes),
         cap_bytes,
@@ -818,27 +859,22 @@ fn create_d3d_device(warp: bool) -> Result<ID3D11Device, String> {
 }
 
 impl GpuStack {
-    /// (Re)create the base bitmap when the displayed `(gen, level, w, h)`
-    /// differs from the resident one — the CPU level's bytes upload in the
-    /// same step (one CreateBitmap with source data, no intermediate
-    /// surface, design §5). The pitch is the tightly-packed invariant
-    /// `width * 4` (pixels.rs). Level 0 is the master; level ≥ 1 is a
-    /// giant's prefiltered overview.
-    fn ensure_base(
-        &mut self,
-        frame_gen: u64,
-        level: u32,
-        wide: u32,
-        high: u32,
-        pixels: &[u8],
-    ) -> Result<(), String> {
-        if self.uploaded == Some((frame_gen, level, wide, high)) {
+    /// (Re)create the base bitmap when the displayed [`UploadKey`] differs
+    /// from the resident one — the CPU level's bytes upload in the same
+    /// step (one CreateBitmap with source data, no intermediate surface,
+    /// design §5). The pitch is the tightly-packed invariant `width * 4`
+    /// (pixels.rs). Level 0 is the master; level ≥ 1 is a giant's
+    /// prefiltered overview.
+    fn ensure_base(&mut self, key: UploadKey, pixels: &[u8]) -> Result<(), String> {
+        if self.uploaded == Some(key) {
             return Ok(());
         }
         // Drop the old bitmap first: the context holds no other reference
         // and the creation below copies synchronously.
         self.bitmap = None;
         self.uploaded = None;
+        let wide = key.wide;
+        let high = key.high;
         let pitch = wide
             .checked_mul(4)
             .ok_or_else(|| format!("frame {wide}x{high} pitch overflows"))?;
@@ -866,7 +902,7 @@ impl GpuStack {
             .map_err(|e| format!("cast frame bitmap to ID2D1Bitmap failed: {e}"))?;
         drop(bitmap); // the base-interface reference keeps the object alive
         self.bitmap = Some(bitmap_base);
-        self.uploaded = Some((frame_gen, level, wide, high));
+        self.uploaded = Some(key);
         Ok(())
     }
 
@@ -945,6 +981,11 @@ impl GpuStack {
     /// device-side allocation happens here, so the scene pass itself is
     /// only draw commands.
     ///
+    /// `content_space` is the master's own mark (#141, ADR 0003 D1) — the
+    /// key term every layer below (LevelCache, upload key, tiles) carries
+    /// alongside `frame_gen`; the caller reads it off the same master it
+    /// hands the [`LevelSource`], so the two can never disagree.
+    ///
     /// `forced_edge` is the `-tile` diagnostic, synced from the window
     /// state per paint — so it also reaches a stack built before the
     /// switch was applied (a single-instance handoff), and `None`/0 always
@@ -953,6 +994,7 @@ impl GpuStack {
         &mut self,
         frame_gen: u64,
         master: (u32, u32),
+        content_space: ContentSpace,
         plan: &DrawPlan,
         diag: Diagnostics,
         src: &mut dyn LevelSource,
@@ -963,19 +1005,22 @@ impl GpuStack {
         // scene in the close-time stats line (external review AI3 P3).
         self.scene = Scene::Clear;
         // A new frame generation invalidates every tile and every cached
-        // CPU level (their pixels can never be drawn again).
-        src.rebind(frame_gen);
-        if self.tile_gen != Some(frame_gen) {
+        // CPU level (their pixels can never be drawn again); a content-
+        // space change does the same (#141) — a different space's bytes
+        // are a different master's.
+        src.rebind(frame_gen, content_space);
+        if self.tile_owner != Some((frame_gen, content_space)) {
             for key in self.tile_lru.clear() {
                 self.tiles.remove(&key);
             }
-            self.tile_gen = Some(frame_gen);
+            self.tile_owner = Some((frame_gen, content_space));
         }
         let dest = crate::tile::Rect::new(plan.dx, plan.dy, plan.rw, plan.rh);
         let viewport = crate::tile::Rect::new(0, 0, plan.cw, plan.ch);
         let frame_plan = {
             crate::tile::plan_frame(
                 frame_gen,
+                content_space,
                 crate::tile::FrameGeometry {
                     master: (master.0 as i32, master.1 as i32),
                     render: (plan.rw, plan.rh),
@@ -1003,7 +1048,8 @@ impl GpuStack {
                 let (wide, high, pixels) = src
                     .level(level)
                     .ok_or_else(|| format!("level {level} source is unavailable"))?;
-                self.ensure_base(frame_gen, level, wide, high, pixels)?;
+                let key = UploadKey::new(frame_gen, content_space, level, wide, high);
+                self.ensure_base(key, pixels)?;
                 // The overview bitmap counts against the same cap the tile
                 // LRU fills: a giant panned at 1:1 (LRU near cap) then
                 // zoomed out to fit would otherwise report — and hold —
@@ -1688,8 +1734,8 @@ impl GpuStack {
         // list through the same ladder the paint uses; nothing at all means
         // the blank letterbox dump.
         match (frame, plan) {
-            (Some((frame_gen, wide, high)), Some(plan)) => {
-                self.prepare(frame_gen, (wide, high), &plan, diag, src)?;
+            (Some((frame_gen, wide, high, content_space)), Some(plan)) => {
+                self.prepare(frame_gen, (wide, high), content_space, &plan, diag, src)?;
             }
             _ => self.scene = Scene::Clear,
         }
@@ -1924,14 +1970,22 @@ pub(crate) fn paint_d2d(view: HWND, owner: HWND) -> PaintOutcome {
         };
         let frame_gen = state.frame_gen;
         // The master facts before the mutable borrow (Copy values — the
-        // shared borrow ends here).
+        // shared borrow ends here). The content space rides along (#141):
+        // prepare stamps it into every cache key below the master.
         let dims = state.image.as_ref().map(|img| {
             let master = img.surface().master();
-            (master.width, master.height)
+            (master.width, master.height, master.content_space)
         });
         // The plan reads the whole state — computed before the mutable gpu
         // borrow (plain data, the borrow ends here).
-        let plan = dims.map(|(mw, mh)| (draw_plan(state, cw, ch, mw as i32, mh as i32), mw, mh));
+        let plan = dims.map(|(mw, mh, space)| {
+            (
+                draw_plan(state, cw, ch, mw as i32, mh as i32),
+                mw,
+                mh,
+                space,
+            )
+        });
         // #130: the display segment's intent, synced before the mutable
         // gpu borrow (the same computation the dump path runs).
         let (want_effect, display_profile) = crate::window::display_intent(state);
@@ -1957,7 +2011,7 @@ pub(crate) fn paint_d2d(view: HWND, owner: HWND) -> PaintOutcome {
         // alike), so even the blank-letterbox arm stays in the segment.
         gpu.sync_display_intent(want_effect, display_profile.as_deref());
         let outcome = match (&plan, state.image.as_ref()) {
-            (Some((plan, mw, mh)), Some(image)) => {
+            (Some((plan, mw, mh, space)), Some(image)) => {
                 // The CPU level source (master + mip cache) — a disjoint
                 // field borrow from `gpu`; the window state owns the
                 // pixels, the stack only uploads them (#82).
@@ -1969,7 +2023,7 @@ pub(crate) fn paint_d2d(view: HWND, owner: HWND) -> PaintOutcome {
                 let diag = crate::gpu::Diagnostics {
                     tile_edge: state.tile_edge,
                 };
-                match gpu.prepare(frame_gen, (*mw, *mh), plan, diag, &mut levels) {
+                match gpu.prepare(frame_gen, (*mw, *mh), *space, plan, diag, &mut levels) {
                     Ok(()) => gpu.draw_frame(plan),
                     Err(e) => {
                         // Upload trouble: blank this frame (the previous
@@ -2274,6 +2328,39 @@ mod tests {
     fn backend_labels_distinguish_hardware_from_warp() {
         assert_eq!(backend_label(true), "d2d/hw");
         assert_eq!(backend_label(false), "d2d/warp");
+    }
+
+    // ---- the upload key (#141, ADR 0003 D1) ----
+
+    #[test]
+    fn the_base_bitmap_reuploads_when_the_generation_or_the_space_moves() {
+        // The residency comparison `ensure_base` runs: the same key hits
+        // (no re-upload), and a change in EITHER the frame generation or
+        // the content space misses — a same-session 8-bit/FP16 pair's
+        // bitmaps can never stand in for each other. The level and
+        // dimension terms were the pre-#141 quartet and keep their roles.
+        let base = UploadKey::new(7, ContentSpace::Srgb, 0, 1920, 1080);
+        assert_eq!(base, UploadKey::new(7, ContentSpace::Srgb, 0, 1920, 1080));
+        assert_ne!(
+            base,
+            UploadKey::new(8, ContentSpace::Srgb, 0, 1920, 1080),
+            "a new generation re-uploads"
+        );
+        assert_ne!(
+            base,
+            UploadKey::new(7, ContentSpace::F16Srgb, 0, 1920, 1080),
+            "a content-space change re-uploads"
+        );
+        assert_ne!(
+            base,
+            UploadKey::new(7, ContentSpace::Srgb, 1, 1920, 1080),
+            "a new level re-uploads"
+        );
+        assert_ne!(
+            base,
+            UploadKey::new(7, ContentSpace::Srgb, 0, 960, 540),
+            "new dimensions re-upload"
+        );
     }
 
     #[test]

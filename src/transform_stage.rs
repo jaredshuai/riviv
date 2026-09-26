@@ -194,10 +194,13 @@ pub(crate) fn effective_stage(desired: TransformStage, degraded: bool) -> Transf
 /// segment — master, LevelCache, uploads, tiles. `Srgb` is the 8-bit
 /// era's single space (D10's known limitation: wide-gamut sources are
 /// clipped through it); `F16Srgb` is L1's FP16 master (ADR 0003: the
-/// sRGB EOTF encoding values held as f16, gamma domain). #140 added
-/// the variant and the gating; the cache-key and seam-read consumers
-/// land with #141.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// sRGB EOTF encoding values held as f16, gamma domain). #140 added the
+/// variant and the gating; #141 landed the consumers — the LevelCache,
+/// upload and tile keys carry the mark (a master-side property, part of
+/// every key per ADR 0003 D1), and the direct-read seams dispatch on it.
+/// The ordering/hash derives ride the key structs (`TileKey` orders by
+/// field order, the tile HashMap hashes by it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) enum ContentSpace {
     Srgb,
     F16Srgb,
@@ -811,17 +814,24 @@ mod tests {
     #[test]
     fn tile_keys_stay_output_blind() {
         // D5 (the R7 contraction): the four-layer cache — master,
-        // LevelCache, upload keys, tiles — is display-independent. A
-        // TileKey is exactly {frame_gen, level, tx, ty}; this
-        // exhaustive struct literal stops compiling if anyone adds an
-        // output-identity field to it (the mistake R7 originally
-        // feared: invalidating tiles on a profile change). Two
-        // different output identities below, one untouched tile key.
+        // LevelCache, upload keys, tiles — is display-independent.
+        // #141 extended TileKey with the master's content space (ADR
+        // 0003 D1: a master-side property, part of the key so a
+        // same-session 8-bit/FP16 pair never reads each other's
+        // bitmaps — the #127 "output-blind" ruling only ever excluded
+        // the OUTPUT identity, which a tile must still never see). The
+        // exhaustive struct literal below now pins TileKey to exactly
+        // {frame_gen, content_space, level, tx, ty}: adding an
+        // output-identity field stops compiling (the mistake R7
+        // originally feared: invalidating tiles on a profile change),
+        // while the space field stays mandatory. Two different output
+        // identities below, one untouched tile key.
         let mut tracker = OutputTracker::default();
         let _out1 = tracker.identify(fingerprint(TransformStage::None, 1));
         let _out2 = tracker.identify(fingerprint(TransformStage::GpuEffect, 2));
         let key = TileKey {
             frame_gen: 7,
+            content_space: ContentSpace::F16Srgb,
             level: 2,
             tx: 3,
             ty: 4,
@@ -830,6 +840,7 @@ mod tests {
             key,
             TileKey {
                 frame_gen: 7,
+                content_space: ContentSpace::F16Srgb,
                 level: 2,
                 tx: 3,
                 ty: 4
