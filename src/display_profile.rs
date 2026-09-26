@@ -131,6 +131,9 @@ struct PathInfo {
 /// The judge entry point, called once per output-decision point (stack
 /// creation and every rebuild) on the UI thread. Failures degrade to
 /// `Unknown` — the table's never-on-a-guess row — never to a guess.
+/// The prefix this walks (paths → device → path choice → getter) is
+/// shared with `current_profile_name`'s freshness probe — see that
+/// function's LOCKSTEP CONTRACT note before changing either side.
 pub(crate) fn query(view: HWND) -> DisplayQueryOutcome {
     let Some(paths) = active_paths() else {
         return unknown();
@@ -220,6 +223,14 @@ fn unclassifiable(name: String) -> DisplayQueryOutcome {
 /// anywhere in the chain answer `None`, the same Unknown-from-failure
 /// shape `query` produces, so a broken chain compares stable against a
 /// broken establishment.
+///
+/// LOCKSTEP CONTRACT (pre-review P3): this walks the exact prefix
+/// `query` walks (`active_paths` → `monitor_device_name` → `choose_path`
+/// → getter) and MUST stay in lockstep with it — if one side's chain
+/// ever changes asymmetrically, the compare degenerates into a permanent
+/// mismatch and the timer re-runs the full query every 2s (the loop the
+/// freshness design forbids). Change them together or factor the shared
+/// prefix.
 pub(crate) fn current_profile_name(view: HWND) -> Option<String> {
     let paths = active_paths()?;
     let device = monitor_device_name(view);

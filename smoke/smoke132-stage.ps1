@@ -85,14 +85,6 @@ function Check($name, $ok, $detail) {
     if ($ok) { $script:pass++; Write-Host ('PASS ' + $name + ' -- ' + $detail) }
     else { $script:fail++; Write-Host ('FAIL ' + $name + ' -- ' + $detail) }
 }
-function Wait-Until($sb, $ms) {
-    $deadline = [DateTime]::UtcNow.AddMilliseconds($ms)
-    while ([DateTime]::UtcNow -lt $deadline) {
-        if (& $sb) { return $true }
-        Start-Sleep -Milliseconds 100
-    }
-    return (& $sb)
-}
 
 $WM_CLOSE = 0x0010
 $WM_COMMAND = 0x0111

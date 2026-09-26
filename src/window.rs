@@ -1439,11 +1439,13 @@ const DISPLAY_REFRESH_INTERVAL_MS: u32 = 2000;
 /// profile name (the cheap prefix of the query chain — no bytes read,
 /// no equivalence probe) and, against the raw name the current identity
 /// was established with, decide whether the full establishment must
-/// re-run. A change re-establishes (the #130 channel: same fingerprint
-/// keeps its gen, a new fingerprint mints the next — A→B→A returns A's
-/// gen) and repaints, so the effect graph rebuilds lazily on the next
-/// paint through `sync_display_intent`. No change is zero action and
-/// zero breadcrumbs — the timer must not spam the smoke channel.
+/// re-run. A change re-establishes (the #130 channel: every fingerprint
+/// TRANSITION mints the next gen — A→B→A walks 1,2,3, the dump
+/// channel's change-signal contract; the fingerprint itself stays the
+/// reuse key, PR #128's division of labor) and repaints, so the effect
+/// graph rebuilds lazily on the next paint through
+/// `sync_display_intent`. No change is zero action and zero
+/// breadcrumbs — the timer must not spam the smoke channel.
 ///
 /// Load-bearing rationale (probe #132 P5): profile writes broadcast
 /// nothing observable in the probe context while the getter flips
@@ -1489,7 +1491,17 @@ fn monitor_relevant_change(
 /// identity when it actually moves. The handle compare is itself the
 /// throttle — WM_MOVE fires per drag pixel, the compare is cheap
 /// monitor-rect math, and only a crossing re-runs the full query.
+/// Minimized windows are excluded (pre-review P2): an iconic window's
+/// rect parks at (-32000,-32000), so TONEAREST would resolve the
+/// monitor nearest the virtual-desktop corner — on a multi-monitor
+/// desktop that is the WRONG monitor, and every minimize/restore cycle
+/// would spurious-establish twice against it; the restore's own
+/// non-iconic WM_MOVE re-records the real monitor anyway.
 fn display_monitor_check(owner: HWND) {
+    // SAFETY: read-only iconic query on the live window we own.
+    if unsafe { IsIconic(owner) }.as_bool() {
+        return;
+    }
     // SAFETY: the borrow spans the guard read, the monitor query, and
     // the establishment tail; nothing here pumps (repaint only queues).
     let Some(state) = (unsafe { state_of(owner) }) else {
@@ -7792,9 +7804,12 @@ unsafe extern "system" fn wnd_proc(
             // #132: the cross-monitor half of hot reload — the display
             // judge answers per window monitor, so a crossing
             // re-establishes the output identity. Runs regardless of the
-            // iconic/zoomed/fullscreen gates above: those govern position
-            // TRACKING, while the monitor question is live in every
-            // geometry mode (an unplug can move a maximized window).
+            // zoomed/fullscreen gates in the position tracking above:
+            // those govern position TRACKING, while the monitor question
+            // is live in every non-iconic geometry mode (an unplug can
+            // move a maximized window). MINIMIZED windows are excluded
+            // inside display_monitor_check — see its doc for the iconic
+            // rect trap (pre-review P2).
             display_monitor_check(hwnd);
             LRESULT(0)
         }
