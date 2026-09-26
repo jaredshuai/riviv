@@ -35,6 +35,8 @@
 //! vertically magnified that mip (upstream does the same). #82's tiering
 //! inherits these properties if it reuses the loop.
 
+use crate::transform_stage::ContentSpace;
+
 /// Size of mipmap `level` for an `image_wide x image_high` frame. Level 0
 /// is the frame itself. Each dimension rounds `(dim+1)/2^k` down and clamps
 /// at 1 (viv.c:14158-14169/14264-14275).
@@ -121,9 +123,12 @@ pub(crate) const LEVEL_CACHE_BYTES: u64 = 128 << 20;
 /// frame (the caller's `LevelSource` handles that).
 #[derive(Debug)]
 pub(crate) struct LevelCache {
-    /// The frame generation the entries belong to; a new generation clears
-    /// them (the build reads that frame's pixels).
-    frame_gen: u64,
+    /// The (frame generation, content space) the entries belong to; a
+    /// change to EITHER clears them (the build reads that frame's pixels
+    /// in that space — #141, ADR 0003 D1: the content-space mark joins the
+    /// generation so a same-session 8-bit/FP16 pair never serves one
+    /// master's levels for the other's).
+    owner: (u64, ContentSpace),
     /// Up to a handful of levels, coldest evicted first — the same pure
     /// LRU policy the tile cache uses.
     lru: crate::tile::Lru<u32>,
@@ -135,21 +140,27 @@ pub(crate) struct LevelCache {
 impl LevelCache {
     pub(crate) fn new(cap: u64) -> Self {
         Self {
-            frame_gen: u64::MAX,
+            // The sentinel generation: a real frame_gen never reaches
+            // u64::MAX (the counter starts at 0), so the first rebind
+            // always clears; the space half is arbitrary next to it.
+            owner: (u64::MAX, ContentSpace::Srgb),
             lru: crate::tile::Lru::new(cap),
             entries: Vec::new(),
             builds: 0,
         }
     }
 
-    /// Rebind to a frame generation, dropping the previous frame's levels
-    /// — a caller that never asks for a level of the new frame (an ordinary
-    /// image after a giant) would otherwise keep the old frame's bytes
-    /// resident AND counted into the ledger's source class.
-    pub(crate) fn rebind(&mut self, frame_gen: u64) {
-        if self.frame_gen != frame_gen {
+    /// Rebind to a (frame generation, content space) owner, dropping the
+    /// previous frame's levels — a caller that never asks for a level of
+    /// the new frame (an ordinary image after a giant) would otherwise
+    /// keep the old frame's bytes resident AND counted into the ledger's
+    /// source class. The space is half the comparison since #141: two
+    /// frames of the same generation never occur, but the key shape must
+    /// not depend on that (a same-gen space flip clears like a new frame).
+    pub(crate) fn rebind(&mut self, frame_gen: u64, space: ContentSpace) {
+        if self.owner != (frame_gen, space) {
             self.clear();
-            self.frame_gen = frame_gen;
+            self.owner = (frame_gen, space);
             self.builds = 0;
         }
     }
@@ -167,19 +178,21 @@ impl LevelCache {
     }
 
     /// `level` of `image_w x image_h`, built from `src` on first use.
-    /// `None` when the level's bytes exceed the whole cap (the caller then
-    /// degrades — refusing is the honest answer; the ladder's coarser
-    /// levels are the intended response and they are 4× smaller each
-    /// step).
+    /// `frame_gen` + `space` are the owning frame's key (#141): a change
+    /// to either drops the previous owner's levels first. `None` when the
+    /// level's bytes exceed the whole cap (the caller then degrades —
+    /// refusing is the honest answer; the ladder's coarser levels are the
+    /// intended response and they are 4× smaller each step).
     pub(crate) fn get_or_build(
         &mut self,
         level: u32,
         image_w: u32,
         image_h: u32,
         frame_gen: u64,
+        space: ContentSpace,
         src: &[u8],
     ) -> Option<(u32, u32, &[u8])> {
-        self.rebind(frame_gen);
+        self.rebind(frame_gen, space);
         let (wide, high) = mip_size(image_w as i32, image_h as i32, level);
         if let Some(idx) = self.entries.iter().position(|(l, _)| *l == level) {
             self.lru.touch(&level);
@@ -480,12 +493,16 @@ mod tests {
     fn the_level_cache_builds_once_and_serves_the_same_bytes_afterwards() {
         let src = level_fixture();
         let mut cache = LevelCache::new(LEVEL_CACHE_BYTES);
-        let first = cache.get_or_build(1, 4, 4, 7, &src).expect("level 1");
+        let first = cache
+            .get_or_build(1, 4, 4, 7, ContentSpace::Srgb, &src)
+            .expect("level 1");
         let (w, h) = (first.0, first.1);
         let first_bytes = first.2.to_vec();
         assert_eq!((w, h), (2, 2), "level 1 of 4x4 is 2x2");
         assert_eq!(cache.builds, 1, "the first ask builds");
-        let again = cache.get_or_build(1, 4, 4, 7, &src).expect("level 1 again");
+        let again = cache
+            .get_or_build(1, 4, 4, 7, ContentSpace::Srgb, &src)
+            .expect("level 1 again");
         assert_eq!(
             again.2,
             &first_bytes[..],
@@ -501,10 +518,12 @@ mod tests {
         // them rather than serve the previous image's bytes.
         let src = level_fixture();
         let mut cache = LevelCache::new(LEVEL_CACHE_BYTES);
-        cache.get_or_build(1, 4, 4, 7, &src).expect("level 1");
+        cache
+            .get_or_build(1, 4, 4, 7, ContentSpace::Srgb, &src)
+            .expect("level 1");
         assert!(cache.bytes() > 0);
         let rebuilt = cache
-            .get_or_build(1, 4, 4, 8, &src)
+            .get_or_build(1, 4, 4, 8, ContentSpace::Srgb, &src)
             .expect("level 1 of the new frame");
         assert_eq!(rebuilt.0, 2);
         assert_eq!(cache.builds, 1, "the counter restarts with the frame");
@@ -518,7 +537,11 @@ mod tests {
         // bitmap — the caller deepens instead of drawing garbage.
         let src = level_fixture();
         let mut cache = LevelCache::new(4);
-        assert!(cache.get_or_build(1, 4, 4, 7, &src).is_none());
+        assert!(
+            cache
+                .get_or_build(1, 4, 4, 7, ContentSpace::Srgb, &src)
+                .is_none()
+        );
         assert_eq!(cache.builds, 0, "a refused level is not built");
         assert_eq!(cache.bytes(), 0);
     }
@@ -531,23 +554,58 @@ mod tests {
         // is asked for again.
         let src = level_fixture();
         let mut cache = LevelCache::new(80);
-        cache.get_or_build(1, 4, 4, 7, &src).expect("level 1");
-        cache.get_or_build(0, 4, 4, 7, &src).expect("level 0");
+        cache
+            .get_or_build(1, 4, 4, 7, ContentSpace::Srgb, &src)
+            .expect("level 1");
+        cache
+            .get_or_build(0, 4, 4, 7, ContentSpace::Srgb, &src)
+            .expect("level 0");
         assert_eq!(cache.bytes(), 80, "16 + 64");
-        cache.get_or_build(1, 4, 4, 7, &src).expect("level 1 hit");
+        cache
+            .get_or_build(1, 4, 4, 7, ContentSpace::Srgb, &src)
+            .expect("level 1 hit");
         assert_eq!(cache.builds, 2, "the re-ask was a hit");
         let small = cache
-            .get_or_build(2, 4, 4, 7, &src)
+            .get_or_build(2, 4, 4, 7, ContentSpace::Srgb, &src)
             .expect("level 2 admits");
         assert_eq!((small.0, small.1), (1, 1));
         assert_eq!(cache.builds, 3);
         assert_eq!(cache.bytes(), 20, "level 0 (coldest) was evicted");
-        let hit = cache.get_or_build(1, 4, 4, 7, &src).expect("level 1 hit");
+        let hit = cache
+            .get_or_build(1, 4, 4, 7, ContentSpace::Srgb, &src)
+            .expect("level 1 hit");
         assert_eq!(hit.0, 2);
         assert_eq!(cache.builds, 3, "level 1 survived the eviction");
         cache
-            .get_or_build(0, 4, 4, 7, &src)
+            .get_or_build(0, 4, 4, 7, ContentSpace::Srgb, &src)
             .expect("level 0 rebuild");
         assert_eq!(cache.builds, 4, "the evicted level rebuilds on demand");
+    }
+
+    #[test]
+    fn a_content_space_change_clears_the_cached_levels_even_at_the_same_generation() {
+        // #141 (ADR 0003 D1): the cache's owner is the (generation,
+        // content space) pair — a same-session 8-bit image and an FP16
+        // image must never serve each other's levels, so a space flip on
+        // the same generation clears exactly like a new frame, in both
+        // directions (the FP16 frame leaving and the 8-bit one returning).
+        let src = level_fixture();
+        let mut cache = LevelCache::new(LEVEL_CACHE_BYTES);
+        cache
+            .get_or_build(1, 4, 4, 7, ContentSpace::Srgb, &src)
+            .expect("level 1 of the 8-bit frame");
+        assert!(cache.bytes() > 0);
+        let deep = cache
+            .get_or_build(1, 4, 4, 7, ContentSpace::F16Srgb, &src)
+            .expect("level 1 of the f16 frame");
+        assert_eq!(deep.0, 2);
+        assert_eq!(cache.builds, 1, "the space flip rebuilt, not reused");
+        assert_eq!(cache.bytes(), 2 * 2 * 4, "one level, not two");
+        let back = cache
+            .get_or_build(1, 4, 4, 7, ContentSpace::Srgb, &src)
+            .expect("level 1 of the 8-bit frame again");
+        assert_eq!(back.0, 2);
+        assert_eq!(cache.builds, 1, "the flip back rebuilt, not reused");
+        assert_eq!(cache.bytes(), 2 * 2 * 4);
     }
 }

@@ -201,12 +201,14 @@ pub(crate) fn f16_bits_to_f32(h: u16) -> f32 {
     }
 }
 
-/// The f16 master's 8-bit reading (#140's interim landing, #141's seam
-/// reads): sRGB gamma code = round-half-up(v * 255), clamped to
+/// The f16 master's 8-bit reading (#140's interim landing; #141 made it
+/// pub(crate) as the direct-read seams' ONLY quantize-read point — the
+/// dispatch in [`master_pixel_bgra8`] routes every master-byte consumer
+/// through it): sRGB gamma code = round-half-up(v * 255), clamped to
 /// [0, 255]. L1's gamma arm keeps values in [0,1], but the read stays
 /// defined for ANY half (out-of-range clamps — the same reading the
 /// composite and dump channels would make of it).
-fn f16_bits_to_u8_code(h: u16) -> u8 {
+pub(crate) fn f16_bits_to_u8_code(h: u16) -> u8 {
     let scaled = f16_bits_to_f32(h) * 255.0;
     if scaled <= 0.0 {
         0
@@ -355,20 +357,101 @@ impl PixelFrame {
     }
 }
 
+// ---------------------------------------------------------------------
+// Direct-read seams (#141, ADR 0003 D1): the master-byte consumers that
+// bypass the GPU pipeline — the status RGB readout, the clipboard image
+// copy — all read through ONE dispatch so the f16 era's quantize-read
+// semantics live in exactly one place.
+// ---------------------------------------------------------------------
+
+/// The direct-read seams' single dispatch (#141, ADR 0003 D1): one BGRA
+/// pixel of the master as the 8-bit BGRA its GDI-era consumers show.
+///
+/// `Srgb` passes the master's own bytes through — the 8-bit era's byte
+/// path, untouched. `F16Srgb` reads through the master's own quantizer
+/// ([`f16_bits_to_u8_code`]). While the interim seam stands
+/// (`loader.rs`'s "Interim seam": #142 has not landed the f16 storage
+/// yet), an `F16Srgb` master's bytes ARE the already-quantized 8-bit
+/// reading, and re-reading them through the quantizer — f16(k/255) ->
+/// round(v * 255) — is the exact identity (probe 1's lossless 256-code
+/// round trip, pinned in the tests). Both arms therefore return the same
+/// bytes today: the dispatch is STRUCTURALLY in place for #142's stored
+/// halves — when they land, only this arm's input changes from the
+/// interim byte to the half bits — not yet behaviorally visible.
+fn master_pixel_bgra8(space: ContentSpace, px: [u8; 4]) -> [u8; 4] {
+    match space {
+        ContentSpace::Srgb => px,
+        ContentSpace::F16Srgb => {
+            px.map(|b| f16_bits_to_u8_code(f32_to_f16_bits(f32::from(b) / 255.0)))
+        }
+    }
+}
+
+/// One pixel of a top-down tightly-packed BGRA buffer as its raw
+/// [B, G, R, A] quadruple — the shared shape of [`sample_bgra`] and
+/// [`sample_master_rgb`]. `None` for any out-of-bounds coordinate (the
+/// same bounds [`sample_bgra`]'s doc pins).
+fn sample_bgra_pixel(pixels: &[u8], width: i32, x: i32, y: i32) -> Option<[u8; 4]> {
+    if x < 0 || y < 0 || x >= width {
+        return None;
+    }
+    let idx = (y as usize * width as usize + x as usize) * 4;
+    let px = pixels.get(idx..idx + 4)?;
+    Some([px[0], px[1], px[2], px[3]])
+}
+
 /// Read one pixel of a top-down tightly-packed BGRA buffer as an
 /// (R, G, B) triple (#76; replaces the #47 status readout's `GetPixel`
 /// on the frame's memory DC). `width` is the buffer's pixel width (the
 /// row stride); `None` for any out-of-bounds coordinate — the caller
 /// maps that to the `CLR_INVALID` read-through (255, 255, 255) the
 /// unchecked GDI path produced, preserving the failure arm byte for
-/// byte.
+/// byte. The production read (#141) is [`sample_master_rgb`]'s
+/// dispatched entry; this raw form stays the test surface for the
+/// sampling bounds and the Srgb arm's byte path.
+#[cfg(test)]
 pub(crate) fn sample_bgra(pixels: &[u8], width: i32, x: i32, y: i32) -> Option<(u8, u8, u8)> {
-    if x < 0 || y < 0 || x >= width {
-        return None;
+    let [b, g, r, _] = sample_bgra_pixel(pixels, width, x, y)?;
+    Some((r, g, b))
+}
+
+/// The status RGB readout's sampling entry (#141; the R2 contract's
+/// "sRGB-normalized reading" — transform_stage.rs's contract block,
+/// surface.rs and text.rs all state it the same way): one pixel of the
+/// MASTER frame as the (R, G, B) triple the status bar shows, dispatched
+/// on the master's content space like every direct read. `None` for
+/// out-of-bounds coordinates — the caller maps it to the (255, 255, 255)
+/// `CLR_INVALID` read-through, exactly as the raw [`sample_bgra`] did.
+pub(crate) fn sample_master_rgb(frame: &PixelFrame, x: i32, y: i32) -> Option<(u8, u8, u8)> {
+    let px = sample_bgra_pixel(&frame.pixels, frame.width as i32, x, y)?;
+    let [b, g, r, _] = master_pixel_bgra8(frame.content_space, px);
+    Some((r, g, b))
+}
+
+/// The clipboard image copy's source bytes (#141; the ADR 0003
+/// 后果节 arm of the dispatch — GDI has no f16, so the CF_BITMAP copy
+/// chain (`clipboard.rs`'s `set_clipboard_image` feed) reads the whole
+/// master as the 8-bit top-down BGRA a GDI bitmap carries, the same
+/// shape the 8-bit era produced). The `Srgb` arm is the plain clone the
+/// copy always made; the `F16Srgb` arm reads every pixel through
+/// [`master_pixel_bgra8`], which returns the same bytes on the interim
+/// master (see there for why both arms coincide until #142).
+pub(crate) fn master_gdi_bgra(frame: &PixelFrame) -> Vec<u8> {
+    match frame.content_space {
+        ContentSpace::Srgb => frame.pixels.to_vec(),
+        ContentSpace::F16Srgb => {
+            debug_assert_eq!(
+                frame.pixels.len() % 4,
+                0,
+                "the master holds exactly 4 bytes per pixel"
+            );
+            let mut out = Vec::with_capacity(frame.pixels.len());
+            for px in frame.pixels.as_chunks::<4>().0 {
+                out.extend_from_slice(&master_pixel_bgra8(frame.content_space, *px));
+            }
+            out
+        }
     }
-    let idx = (y as usize * width as usize + x as usize) * 4;
-    let px = pixels.get(idx..idx + 4)?;
-    Some((px[2], px[1], px[0]))
 }
 
 #[cfg(test)]
@@ -702,5 +785,89 @@ mod tests {
         let mut dst = [0u8; 8];
         deep_to_rgba8_via_f16(DeepSamples::LumaA16(&src), &mut dst);
         assert_eq!(dst, [128, 128, 128, 255, 0, 0, 0, 0]);
+    }
+
+    // ---- direct-read seams (#141, ADR 0003 D1) ----
+
+    #[test]
+    fn requantizing_the_interim_f16srgb_byte_is_the_exact_identity() {
+        // The interim seam's load-bearing fact: an F16Srgb master's bytes
+        // are the ALREADY-quantized 8-bit reading (loader.rs's Interim
+        // seam — #142 has not landed the f16 storage), and reading one
+        // back through the master's own quantizer — f16(k/255) ->
+        // round(v * 255), the exact math `master_pixel_bgra8`'s F16Srgb
+        // arm runs — gives back the same code for every one of the 256
+        // inputs. When #142 swaps the arm's input to stored halves this
+        // identity stops being exercised, but until then it is what keeps
+        // the two dispatch arms byte-identical.
+        for k in 0u8..=255 {
+            let read = f16_bits_to_u8_code(f32_to_f16_bits(f32::from(k) / 255.0));
+            assert_eq!(read, k, "interim byte {k} must re-read as {k}");
+        }
+    }
+
+    #[test]
+    fn sample_master_rgb_matches_the_direct_sample_on_a_pure_srgb_master() {
+        // Zero-regression pin for the Srgb arm: the status readout's
+        // dispatched entry reads EXACTLY what the raw sample read before
+        // #141 — including the out-of-bounds None the caller maps to the
+        // CLR_INVALID white.
+        let frame = PixelFrame::from_bgra(
+            3,
+            2,
+            vec![
+                1, 2, 3, 255, 4, 5, 6, 255, 7, 8, 9, 255, 10, 11, 12, 255, 13, 14, 15, 255, 16, 17,
+                18, 255,
+            ],
+            ContentSpace::Srgb,
+        );
+        for (x, y) in [(0i32, 0i32), (2, 0), (0, 1), (2, 1), (1, 1)] {
+            assert_eq!(
+                sample_master_rgb(&frame, x, y),
+                sample_bgra(&frame.pixels, frame.width as i32, x, y),
+                "({x}, {y}) must not move"
+            );
+        }
+        assert_eq!(sample_master_rgb(&frame, 3, 0), None);
+        assert_eq!(sample_master_rgb(&frame, -1, 0), None);
+        assert_eq!(sample_master_rgb(&frame, 0, 2), None);
+    }
+
+    #[test]
+    fn an_f16srgb_marked_master_reads_the_same_pixels_the_interim_bytes_carry() {
+        // The dispatch's structural guarantee, observed at the status
+        // readout: while the interim seam stands, a frame marked F16Srgb
+        // (the #140 loader's mark for deep/transformed sources) reads
+        // back the same RGB the bytes carry — the two content spaces'
+        // reads coincide until #142's stored halves arrive.
+        let bytes = vec![30, 20, 10, 255, 3, 2, 1, 255];
+        let srgb = PixelFrame::from_bgra(2, 1, bytes.clone(), ContentSpace::Srgb);
+        let f16 = PixelFrame::from_bgra(2, 1, bytes, ContentSpace::F16Srgb);
+        for (x, y) in [(0i32, 0i32), (1, 0)] {
+            assert_eq!(
+                sample_master_rgb(&f16, x, y),
+                sample_master_rgb(&srgb, x, y),
+                "({x}, {y}): the F16Srgb mark must not change the interim read"
+            );
+        }
+        // And the byte path underneath: every pixel of the marked frame
+        // re-reads as its own bytes.
+        for px in f16.pixels.as_chunks::<4>().0 {
+            assert_eq!(master_pixel_bgra8(ContentSpace::F16Srgb, *px), *px);
+        }
+    }
+
+    #[test]
+    fn the_clipboard_source_of_an_f16srgb_master_matches_its_interim_bytes() {
+        // The clipboard seam (ADR 0003 后果节: GDI has no f16 — the copy
+        // quantizes back to 8-bit, "与现产字节同形"): on the interim
+        // master the quantize read returns the master's own bytes, so the
+        // F16Srgb source equals both the bytes and the Srgb clone the
+        // 8-bit era produced.
+        let bytes = vec![7u8, 8, 9, 255, 200, 150, 100, 255];
+        let srgb = PixelFrame::from_bgra(2, 1, bytes.clone(), ContentSpace::Srgb);
+        let f16 = PixelFrame::from_bgra(2, 1, bytes, ContentSpace::F16Srgb);
+        assert_eq!(master_gdi_bgra(&f16), f16.pixels.to_vec());
+        assert_eq!(master_gdi_bgra(&f16), master_gdi_bgra(&srgb));
     }
 }

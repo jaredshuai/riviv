@@ -38,6 +38,7 @@
 //! owns the bitmaps, the LRU and the ledger; this module only decides.
 
 use crate::mip;
+use crate::transform_stage::ContentSpace;
 
 /// Default source edge of one tile, in pixels *at the drawn level*: a
 /// 1024² tile is 4 MiB of BGRA — small enough that the LRU's granularity
@@ -339,13 +340,20 @@ pub(crate) fn detail_level(master_w: i32, master_h: i32, render_w: i32, render_h
     best
 }
 
-/// One tile's identity in the cache: the frame it was cut from, the level
-/// it was cut at, and its grid cell. The frame generation is part of the
-/// key, so a new image (or a rotate, which bumps the generation) can never
-/// read a previous image's pixels.
+/// One tile's identity in the cache: the frame it was cut from — its
+/// generation AND its content space (#141, ADR 0003 D1: the mark is a
+/// master-side property and part of the key, so a same-session 8-bit /
+/// FP16 pair never reads each other's bitmaps; the #127 ruling this
+/// extends only ever excluded the OUTPUT identity, which a tile must
+/// stay blind to — transform_stage's `tile_keys_stay_output_blind` pins
+/// that half with the same exhaustive literal) — the level it was cut
+/// at, and its grid cell. The frame generation is part of the key, so a
+/// new image (or a rotate, which bumps the generation) can never read a
+/// previous image's pixels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct TileKey {
     pub(crate) frame_gen: u64,
+    pub(crate) content_space: ContentSpace,
     pub(crate) level: u32,
     pub(crate) tx: i32,
     pub(crate) ty: i32,
@@ -436,6 +444,7 @@ pub(crate) struct FrameGeometry {
 /// caller's pre-touch pass makes the LRU respect it at draw time).
 pub(crate) fn plan_frame(
     frame_gen: u64,
+    content_space: ContentSpace,
     geometry: FrameGeometry,
     max_bitmap: u32,
     cap_bytes: u64,
@@ -486,7 +495,15 @@ pub(crate) fn plan_frame(
         }
         if cpu_fits {
             let edge = forced.unwrap_or(TILE_EDGE);
-            let tiles = tile_requests(frame_gen, level, (level_w, level_h), &dest, &vis, edge);
+            let tiles = tile_requests(
+                frame_gen,
+                content_space,
+                level,
+                (level_w, level_h),
+                &dest,
+                &vis,
+                edge,
+            );
             // The budget is charged for the frame's WHOLE working set —
             // resident tiles included, not just the fresh uploads. With the
             // caller marking every already-resident frame key hot BEFORE
@@ -519,6 +536,7 @@ pub(crate) fn plan_frame(
 /// cell whose interior is empty contributes nothing.
 fn tile_requests(
     frame_gen: u64,
+    content_space: ContentSpace,
     level: u32,
     level_dims: (i32, i32),
     dest: &Rect,
@@ -574,6 +592,7 @@ fn tile_requests(
             tiles.push(TileRequest {
                 key: TileKey {
                     frame_gen,
+                    content_space,
                     level,
                     tx,
                     ty,
@@ -870,6 +889,7 @@ mod tests {
         // (Base at a deep level, a few KB), not the 16385-tile level 0.
         let plan = plan_frame(
             1,
+            ContentSpace::Srgb,
             geom(
                 (16777217, 1),
                 (974, 1),
@@ -913,6 +933,7 @@ mod tests {
             };
             let plan = plan_frame(
                 1,
+                ContentSpace::Srgb,
                 geom((mw, mh), (rw, rh), dest, viewport),
                 1 << 23,
                 u64::MAX,
@@ -999,7 +1020,7 @@ mod tests {
         let (mw, mh, rw, rh) = (900i32, 600i32, 583, 389);
         let scene = Rect::new(153, 0, rw, rh);
         let vis = visible_dest(&scene, &Rect::new(0, 0, 674, 246)).expect("visible");
-        let tiles = tile_requests(1, 0, (mw, mh), &scene, &vis, 256);
+        let tiles = tile_requests(1, ContentSpace::Srgb, 0, (mw, mh), &scene, &vis, 256);
         assert!(tiles.len() >= 4);
         let global = f64::from(rw) / f64::from(mw);
         for t in &tiles {
@@ -1028,6 +1049,7 @@ mod tests {
         let viewport = Rect::new(0, 0, 1920, 1080);
         let plan = plan_frame(
             1,
+            ContentSpace::Srgb,
             geom((16777217, 1), (16777217, 1), dest, viewport),
             1 << 23,
             u64::MAX,
@@ -1063,6 +1085,7 @@ mod tests {
         // enumeration would be a hang rather than a slow paint).
         let plan = plan_frame(
             7,
+            ContentSpace::Srgb,
             geom(
                 (16777217, 1),
                 (16777217, 1),
@@ -1081,6 +1104,7 @@ mod tests {
         // Scrolled far right, the window follows (never back to column 0).
         let plan = plan_frame(
             7,
+            ContentSpace::Srgb,
             geom(
                 (16777217, 1),
                 (16777217, 1),
@@ -1106,6 +1130,7 @@ mod tests {
         let dest = Rect::new(0, 0, 8192, 1024);
         let plan = plan_frame(
             1,
+            ContentSpace::Srgb,
             geom(
                 (8192, 1024),
                 (8192, 1024),
@@ -1159,6 +1184,7 @@ mod tests {
     fn the_halo_bytes_are_the_bitmap_cost() {
         let plan = plan_frame(
             1,
+            ContentSpace::Srgb,
             geom(
                 (4096, 4096),
                 (4096, 4096),
@@ -1190,6 +1216,7 @@ mod tests {
         // full master through the prefiltered cubic, not a box level).
         let plan = plan_frame(
             1,
+            ContentSpace::Srgb,
             geom(
                 (3000, 2000),
                 (1500, 1000),
@@ -1205,6 +1232,7 @@ mod tests {
         assert_eq!(
             plan_frame(
                 1,
+                ContentSpace::Srgb,
                 geom(
                     (3000, 2000),
                     (3000, 2000),
@@ -1222,6 +1250,7 @@ mod tests {
         // a single bitmap too (no tiles at all).
         let plan = plan_frame(
             1,
+            ContentSpace::Srgb,
             geom(
                 (40000, 40000),
                 (2160, 2160),
@@ -1247,6 +1276,7 @@ mod tests {
         // 40000x256 on a 16384 device: level 0 does not fit → tiles.
         let plan = plan_frame(
             2,
+            ContentSpace::Srgb,
             geom(
                 (40000, 256),
                 (40000, 256),
@@ -1273,6 +1303,7 @@ mod tests {
         // fits as ONE bitmap instead of drawing a half-tiled frame.
         let plan = plan_frame(
             3,
+            ContentSpace::Srgb,
             geom(
                 (40000, 40000),
                 (30000, 30000),
@@ -1306,6 +1337,7 @@ mod tests {
         let args = (40000, 40000, 40000, 40000);
         let probe = plan_frame(
             4,
+            ContentSpace::Srgb,
             geom((args.0, args.1), (args.2, args.3), dest, viewport),
             16384,
             u64::MAX,
@@ -1319,6 +1351,7 @@ mod tests {
         // Cap that holds the working set: stays tiled, zero uploads needed.
         let plan = plan_frame(
             4,
+            ContentSpace::Srgb,
             geom((args.0, args.1), (args.2, args.3), dest, viewport),
             16384,
             working_set,
@@ -1333,6 +1366,7 @@ mod tests {
         // half-covered frame.
         let plan = plan_frame(
             4,
+            ContentSpace::Srgb,
             geom((args.0, args.1), (args.2, args.3), dest, viewport),
             16384,
             working_set - 1,
@@ -1359,6 +1393,7 @@ mod tests {
         let budget = crate::mip::LEVEL_CACHE_BYTES;
         let onetoone = plan_frame(
             1,
+            ContentSpace::Srgb,
             geom(
                 (8000, 5000),
                 (8000, 5000),
@@ -1373,6 +1408,7 @@ mod tests {
         assert_eq!(onetoone, FramePlan::Base { level: 0 });
         let shrink = plan_frame(
             1,
+            ContentSpace::Srgb,
             geom(
                 (8000, 5000),
                 (4000, 2500),
@@ -1438,6 +1474,7 @@ mod tests {
         // the SAME image and transform.
         let plan = plan_frame(
             5,
+            ContentSpace::Srgb,
             geom(
                 (3000, 2000),
                 (3000, 2000),
@@ -1467,6 +1504,7 @@ mod tests {
         assert_eq!(
             plan_frame(
                 1,
+                ContentSpace::Srgb,
                 geom(
                     (100, 100),
                     (100, 100),
@@ -1483,6 +1521,7 @@ mod tests {
         assert_eq!(
             plan_frame(
                 1,
+                ContentSpace::Srgb,
                 geom(
                     (0, 0),
                     (0, 0),
@@ -1690,6 +1729,7 @@ mod tests {
         // vertically, where a gap would be a horizontal seam.
         let plan = plan_frame(
             3,
+            ContentSpace::Srgb,
             geom(
                 (4096, 8192),
                 (4096, 8192),
@@ -1757,6 +1797,7 @@ mod tests {
         // source rect).
         let plan = plan_frame(
             1,
+            ContentSpace::Srgb,
             geom(
                 (8192, 512),
                 (8192, 512),
@@ -1790,6 +1831,7 @@ mod tests {
         let budget = 128u64 << 20;
         let plan = plan_frame(
             1,
+            ContentSpace::Srgb,
             geom(
                 (16389, 8189),
                 (8194, 4094),
@@ -1815,6 +1857,7 @@ mod tests {
         // blanket coarsening.
         let ample = plan_frame(
             1,
+            ContentSpace::Srgb,
             geom(
                 (16389, 8189),
                 (8194, 4094),
@@ -1830,5 +1873,80 @@ mod tests {
             panic!("expected Base");
         };
         assert!(deep < level, "an ample budget plans the deeper level");
+    }
+
+    // ---- content-space keys (#141, ADR 0003 D1) ----
+
+    #[test]
+    fn tile_keys_of_different_content_spaces_never_collide() {
+        // The same grid cell of the same generation, cut from an 8-bit
+        // master and from an FP16 master, is TWO tiles: the cache
+        // HashMap's hash and equality must separate them, or a
+        // same-session 8-bit/FP16 pair would draw each other's bytes.
+        let srgb = TileKey {
+            frame_gen: 7,
+            content_space: ContentSpace::Srgb,
+            level: 2,
+            tx: 3,
+            ty: 4,
+        };
+        let f16 = TileKey {
+            frame_gen: 7,
+            content_space: ContentSpace::F16Srgb,
+            level: 2,
+            tx: 3,
+            ty: 4,
+        };
+        assert_ne!(srgb, f16);
+        let mut cache = std::collections::HashMap::new();
+        cache.insert(srgb, "srgb");
+        cache.insert(f16, "f16");
+        assert_eq!(cache.get(&srgb), Some(&"srgb"));
+        assert_eq!(cache.get(&f16), Some(&"f16"));
+        // The ordering stays total across the space term (the LRU beside
+        // the HashMap relies on the derived Ord being a proper order).
+        assert!((srgb < f16) != (srgb > f16));
+        assert!(srgb == srgb.max(f16) || f16 == srgb.max(f16));
+    }
+
+    #[test]
+    fn a_plan_stamps_its_masters_content_space_into_every_tile_key() {
+        // Two plans over the same geometry and generation but different
+        // masters produce disjoint key sets: the space rides the key from
+        // plan_frame through every TileRequest, so the upload path never
+        // has to re-derive it.
+        let keys = |space| match plan_frame(
+            5,
+            space,
+            geom(
+                (40000, 256),
+                (40000, 256),
+                Rect::new(0, 0, 40000, 256),
+                Rect::new(0, 0, 974, 484),
+            ),
+            1 << 23,
+            u64::MAX,
+            u64::MAX,
+            Some(1024),
+        ) {
+            FramePlan::Tiles { tiles, .. } => tiles.into_iter().map(|t| t.key).collect::<Vec<_>>(),
+            other => panic!("expected tiles, got {other:?}"),
+        };
+        let srgb = keys(ContentSpace::Srgb);
+        let f16 = keys(ContentSpace::F16Srgb);
+        assert!(!srgb.is_empty(), "the geometry plans tiles");
+        assert_eq!(
+            srgb.len(),
+            f16.len(),
+            "the geometry, not the space, shapes the plan"
+        );
+        for (a, b) in srgb.iter().zip(&f16) {
+            assert_eq!(
+                (a.frame_gen, a.level, a.tx, a.ty),
+                (b.frame_gen, b.level, b.tx, b.ty),
+                "same grid cell"
+            );
+            assert_ne!(a, b, "same cell, different spaces — never one key");
+        }
     }
 }
