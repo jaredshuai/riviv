@@ -135,6 +135,9 @@ impl Surface {
             pixels: rotated.into_boxed_slice(),
             width: high as u32,
             height: wide as u32,
+            // Rotation moves geometry, not encoding — the rotated frame
+            // stays in its master's content space (#140).
+            content_space: self.master.content_space,
         };
         true
     }

@@ -36,9 +36,11 @@ use image::{AnimationDecoder, Frames, GenericImageView, ImageDecoder, ImageForma
 use crate::anim::{self, FrameScheduler, gif_delay_ms};
 use crate::icm;
 use crate::pixels::{
-    PixelFrame, composite_over_background_bgra_in_place, composite_over_background_in_place,
+    DeepSamples, PixelFrame, composite_over_background_bgra_in_place,
+    composite_over_background_in_place, deep_to_rgba8_via_f16,
 };
 use crate::surface::Surface;
+use crate::transform_stage::{ContentSpace, master_content_space};
 
 /// Cumulative decoded-frame budget. Without a total cap a hostile file
 /// could declare an unbounded frame stream and exhaust memory — streaming
@@ -201,7 +203,7 @@ pub(crate) fn decode_dib_to_sink(payload: &[u8], env: DecodeEnv, sink: &mut dyn 
     let outcome = (|| -> Result<(), Stop> {
         let dib = crate::dib::parse_dib(payload, env.background, MAX_TOTAL_FRAME_BYTES)
             .map_err(|e| Stop::User(format!("{CLIPBOARD_SHOWN_NAME}: {e}")))?;
-        let frame = PixelFrame::from_bgra(dib.width, dib.height, dib.bgra);
+        let frame = PixelFrame::from_bgra(dib.width, dib.height, dib.bgra, ContentSpace::Srgb);
         sink(LoadReply::FirstFrame { frame, delay_ms: 0 });
         Ok(())
     })();
@@ -265,23 +267,36 @@ fn prepare_transform<D: ImageDecoder>(
 /// the composite runs on that BGRA output. A refused transform pass
 /// falls back to the untransformed path for the frame; the
 /// `transform=None` path is byte-for-byte the pre-#77 one (composite
-/// RGBA, `from_rgba` swizzles).
+/// RGBA, `from_rgba` swizzles). #140 adds the L1 master's content gate
+/// (ADR 0003 D1): the frame carries which pipeline owns it — a
+/// >8-bit source or an applied transform earns `F16Srgb`.
 fn assemble_frame(
     width: u32,
     height: u32,
     mut rgba: Vec<u8>,
     env: &DecodeEnv,
     transform: Option<&icm::Transform>,
+    source_bits_per_sample: u16,
 ) -> PixelFrame {
     if let Some(transform) = transform {
         let mut bgra = vec![0u8; rgba.len()];
         if transform.apply(width, height, &rgba, &mut bgra) {
             composite_over_background_bgra_in_place(&mut bgra, env.background);
-            return PixelFrame::from_bgra(width, height, bgra);
+            return PixelFrame::from_bgra(
+                width,
+                height,
+                bgra,
+                master_content_space(source_bits_per_sample, true),
+            );
         }
     }
     composite_over_background_in_place(&mut rgba, env.background);
-    PixelFrame::from_rgba(width, height, rgba)
+    PixelFrame::from_rgba(
+        width,
+        height,
+        rgba,
+        master_content_space(source_bits_per_sample, false),
+    )
 }
 
 /// The shared decode dispatch once a format-guessing reader exists —
@@ -582,7 +597,16 @@ fn stream_animation(
         // _viv_orientate_hbitmap per frame, viv.c:10615-10623).
         let mut img = image::DynamicImage::ImageRgba8(frame.into_buffer());
         img.apply_orientation(orientation);
-        let buffer = img.into_rgba8();
+        // The animation iterators yield 8-bit RGBA only (the crate's
+        // animation side has no deep path — 16-bit APNG degrades to
+        // static before this loop), so the old `into_rgba8()` here was
+        // an identity move, never a truncation; #140 makes that explicit
+        // — the defensive second arm keeps a future deep iterator from
+        // silently truncating again.
+        let buffer = match img {
+            image::DynamicImage::ImageRgba8(buffer) => buffer,
+            deep => deep.into_rgba8(),
+        };
         let (w, h) = buffer.dimensions();
         if w == 0 || h == 0 {
             return Err(user("empty frame".to_string()));
@@ -604,7 +628,7 @@ fn stream_animation(
         // since #90 there are none. (The decode-side mip pre-generation
         // decision upstream threads through the same slot,
         // viv.c:10302/10316, was retired with #81.)
-        let frame = assemble_frame(w, h, buffer.into_raw(), &env, icm);
+        let frame = assemble_frame(w, h, buffer.into_raw(), &env, icm, 8);
         if emitted == 0 {
             sink(LoadReply::FirstFrame { frame, delay_ms });
             // The first-frame paint handshake (#76): hold frame 1's decode
@@ -654,11 +678,43 @@ fn sink_static<D: ImageDecoder>(
     if w == 0 || h == 0 {
         return Err(user("empty image".to_string()));
     }
+    // #140 (ADR 0003 D6, the direct path): >8-bit code-value sources no
+    // longer truncate through `into_rgba8()` — the 16-bit variants
+    // convert through the f16 master encoding (u16 -> f32 -> f16 -> the
+    // 8-bit reading, no mscms on this path) until #141 lands the f16
+    // master storage, so the conversion semantics the later tickets
+    // carry downstream are already the master's. The 32-bit float (HDR
+    // radiance) variants keep `into_rgba8()` — radiance is linear
+    // light, not code values, and the crate's tonemap stays theirs;
+    // they report 8 bits to the gate for the same reason.
+    //
+    // Interim seam, deliberate (Codex P2 on PR #145, acknowledged): a
+    // 16-bit source WITH a live ICC transform still hands the transform
+    // these quantized 8-bit rows — same 8-bit-into-mscms shape the
+    // 8-bit era had, no worse — and its `F16Srgb` mark says which
+    // pipeline OWNS the frame, not that the deep bits survived yet.
+    // #142's `BM_16b_RGB` chain (16-bit transform src AND dst) is what
+    // actually keeps them.
+    let deep = match &img {
+        image::DynamicImage::ImageRgb16(p) => Some((DeepSamples::Rgb16(p.as_raw()), 16)),
+        image::DynamicImage::ImageRgba16(p) => Some((DeepSamples::Rgba16(p.as_raw()), 16)),
+        image::DynamicImage::ImageLuma16(p) => Some((DeepSamples::Luma16(p.as_raw()), 16)),
+        image::DynamicImage::ImageLumaA16(p) => Some((DeepSamples::LumaA16(p.as_raw()), 16)),
+        _ => None,
+    };
+    let (rgba, source_bits) = match deep {
+        Some((samples, bits)) => {
+            let mut converted = vec![0u8; w as usize * h as usize * 4];
+            deep_to_rgba8_via_f16(samples, &mut converted);
+            (converted, bits)
+        }
+        None => (img.into_rgba8().into_raw(), 8),
+    };
     // ICM -> composite -> PixelFrame (#77/ADR 0002 D2): transparent
     // regions resolve against the sRGB background AFTER the color
     // transform, never before it. (Upstream pre-generates stills' mips at
     // the same slot, viv.c:10749; retired with #81.)
-    let frame = assemble_frame(w, h, img.into_rgba8().into_raw(), &env, transform.as_ref());
+    let frame = assemble_frame(w, h, rgba, &env, transform.as_ref(), source_bits);
     // A static image is a one-frame stream: first frame, then Complete from
     // decode_to_sink. delay_ms is unused (no second frame ever follows).
     sink(LoadReply::FirstFrame { frame, delay_ms: 0 });
@@ -2642,6 +2698,67 @@ mod apng_tests {
             other => panic!("expected FirstFrame, got {other:?}"),
         }
         assert!(matches!(replies[1], LoadReply::Complete));
+    }
+
+    /// A 1x1 static PNG at the given depth, raw sample bytes as the PNG
+    /// spec orders them (16-bit rows are big-endian pairs) — the #140
+    /// fixture family for the deep-source gate.
+    fn png_static_raw(color: png::ColorType, depth: png::BitDepth, raw: &[u8]) -> Vec<u8> {
+        let mut info = png::Info::with_size(1, 1);
+        info.color_type = color;
+        info.bit_depth = depth;
+        let mut out = Vec::new();
+        let enc = png::Encoder::with_info(&mut out, info).expect("with_info");
+        let mut writer = enc.write_header().expect("write_header");
+        writer.write_image_data(raw).expect("image data");
+        writer.finish().expect("finish");
+        out
+    }
+
+    /// The first frame of a static decode, straight out of the reply
+    /// stream (this module's shape of the stdin module's helper).
+    fn static_first_frame(bytes: &[u8]) -> PixelFrame {
+        let replies = decode_all(bytes, env());
+        match replies.into_iter().next() {
+            Some(LoadReply::FirstFrame { frame, .. }) => frame,
+            other => panic!("expected a first frame, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn deep_static_png_earns_the_f16_master_mark() {
+        // #140 (ADR 0003 D1/D6): the 16-bit static PNG is the direct
+        // path — no truncation through `into_rgba8()` anymore, the
+        // samples convert through the f16 master encoding, and the
+        // frame carries the F16Srgb mark (the gate's verdict; #141
+        // wires the mark into the cache keys). The fixture triple reads
+        // back 198/60/10 — the same codes the old quantization produced
+        // (the interim 8-bit landing is byte-stable where f16 costs
+        // nothing).
+        let samples = [0xC700u16, 0x3C00, 0x0A00, 0xFFFF];
+        let mut raw = Vec::with_capacity(samples.len() * 2);
+        for s in samples {
+            raw.extend_from_slice(&s.to_be_bytes());
+        }
+        let png16 = png_static_raw(png::ColorType::Rgba, png::BitDepth::Sixteen, &raw);
+        let frame = static_first_frame(&png16);
+        assert_eq!(frame.content_space, ContentSpace::F16Srgb);
+        assert_eq!(rgb_at(&frame, 0, 0), (198, 60, 10));
+    }
+
+    #[test]
+    fn plain_8bit_png_stays_in_the_srgb_master() {
+        // The gate's zero-change arm, end to end: the untagged 8-bit
+        // majority keeps the Srgb master byte-identically (it has
+        // nothing for f16 to keep).
+        let png8 = png_static_raw(
+            png::ColorType::Rgba,
+            png::BitDepth::Eight,
+            &[198, 60, 10, 255],
+        );
+        let frame = static_first_frame(&png8);
+        assert_eq!(frame.content_space, ContentSpace::Srgb);
+        assert_eq!(rgb_at(&frame, 0, 0), (198, 60, 10));
     }
 
     // ------------------------------------------------------------------
