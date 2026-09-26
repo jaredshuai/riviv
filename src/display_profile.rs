@@ -33,6 +33,13 @@
 //! profile PATH (the D2D effect loads the ICC from the file) and BYTES
 //! (the output fingerprint's digest term) alongside the table's query
 //! value, so one call feeds decision, effect, and identity.
+//!
+//! #132 adds the hot-reload freshness half: `current_profile_name`
+//! re-asks just the getter's raw name (the cheap, heavy-tail-free
+//! prefix of this same chain), and `profile_name_changed` decides
+//! whether the full query must re-run — the establishment channel on
+//! the window side owns the cadence (a WM_DISPLAYCHANGE arm plus the
+//! 2s freshness timer).
 
 use std::path::Path;
 use std::path::PathBuf;
@@ -85,6 +92,16 @@ pub(crate) struct DisplayQueryOutcome {
     pub query: DisplayProfileQuery,
     pub path: Option<PathBuf>,
     pub bytes: Option<Vec<u8>>,
+    /// The getter's RAW answer (bare name or path, exactly as returned) —
+    /// the #132 freshness key. `None` iff the chain broke at or before
+    /// the getter (the Unknown-from-failure shape) OR the profile file
+    /// was unreadable (a RETRYABLE failure — the next tick re-runs the
+    /// full query until the file opens; Codex P2, PR #133); an
+    /// empty-but-successful answer is `Some("")` (the NoProfile signal);
+    /// a profile the downstream classification then REFUSES keeps
+    /// `Some(raw)` — the refusal is a verdict, stable by design, so a
+    /// classification-failing machine never loops the full query.
+    pub name: Option<String>,
 }
 
 impl Default for DisplayQueryOutcome {
@@ -95,6 +112,7 @@ impl Default for DisplayQueryOutcome {
             query: DisplayProfileQuery::Unknown,
             path: None,
             bytes: None,
+            name: None,
         }
     }
 }
@@ -114,6 +132,9 @@ struct PathInfo {
 /// The judge entry point, called once per output-decision point (stack
 /// creation and every rebuild) on the UI thread. Failures degrade to
 /// `Unknown` — the table's never-on-a-guess row — never to a guess.
+/// The prefix this walks (paths → device → path choice → getter) is
+/// shared with `current_profile_name`'s freshness probe — see that
+/// function's LOCKSTEP CONTRACT note before changing either side.
 pub(crate) fn query(view: HWND) -> DisplayQueryOutcome {
     let Some(paths) = active_paths() else {
         return unknown();
@@ -136,6 +157,7 @@ pub(crate) fn query(view: HWND) -> DisplayQueryOutcome {
             query: DisplayProfileQuery::NoProfile,
             path: None,
             bytes: None,
+            name: Some(String::new()),
         };
     }
     let full = resolve_profile_path(&name);
@@ -143,8 +165,17 @@ pub(crate) fn query(view: HWND) -> DisplayQueryOutcome {
     let bytes = match bytes {
         Ok(bytes) => bytes,
         Err(e) => {
+            // The read is RETRYABLE (Codex P2, PR #133): a switch window can
+            // hold the file locked exactly when the freshness timer's first
+            // tick lands, and caching the name against a failed read would
+            // pin Unknown forever (same name compares stable forever after).
+            // Answering name=None makes the next tick's Some(name) a change
+            // again — the full query retries every 2s while unreadable,
+            // each attempt just one registry read plus one failed file read
+            // (the heavy equivalence probe never runs on this path), and
+            // the retry loop self-heals the moment the file opens.
             eprintln!(
-                "riviv: display profile {}: unreadable ({e}) — display judge falls to unknown",
+                "riviv: display profile {}: unreadable ({e}) — display judge falls to unknown (will retry)",
                 full.display()
             );
             return unknown();
@@ -159,15 +190,17 @@ pub(crate) fn query(view: HWND) -> DisplayQueryOutcome {
             query: DisplayProfileQuery::Profile(DisplayProfileSpace::SrgbEquivalent),
             path: Some(full),
             bytes: Some(bytes),
+            name: Some(name),
         },
         Some(EquivalenceProbe::Different(_)) => DisplayQueryOutcome {
             query: DisplayProfileQuery::Profile(DisplayProfileSpace::Custom),
             path: Some(full),
             bytes: Some(bytes),
+            name: Some(name),
         },
         // The equivalence ladder failed on a profile the OS handed us:
         // not classifiable is not transformable — Unknown, never a guess.
-        None => unknown(),
+        None => unclassifiable(name),
     }
 }
 
@@ -176,7 +209,56 @@ fn unknown() -> DisplayQueryOutcome {
         query: DisplayProfileQuery::Unknown,
         path: None,
         bytes: None,
+        name: None,
     }
+}
+
+/// The judge's answer with the getter's raw name attached but the
+/// DOWNSTREAM CLASSIFICATION refused (the equivalence ladder rejected
+/// the profile — a verdict, stable by machine): the query is Unknown,
+/// while the freshness key stays the raw name so the hot-reload compare
+/// sees a STABLE key instead of looping the full query. The other
+/// name-carrying failure — an unreadable FILE — deliberately does NOT
+/// come here: it answers `unknown()` (name=None) because a read is
+/// retryable (Codex P2, PR #133); a classification refusal is not.
+fn unclassifiable(name: String) -> DisplayQueryOutcome {
+    DisplayQueryOutcome {
+        query: DisplayProfileQuery::Unknown,
+        path: None,
+        bytes: None,
+        name: Some(name),
+    }
+}
+
+/// The #132 freshness check's cheap half: re-ask ONLY the getter's raw
+/// name for the window's monitor — no bytes read, no equivalence probe
+/// (the full query's heavy tail is reserved for an actual change). Breaks
+/// anywhere in the chain answer `None`, the same Unknown-from-failure
+/// shape `query` produces, so a broken chain compares stable against a
+/// broken establishment.
+///
+/// LOCKSTEP CONTRACT (pre-review P3): this walks the exact prefix
+/// `query` walks (`active_paths` → `monitor_device_name` → `choose_path`
+/// → getter) and MUST stay in lockstep with it — if one side's chain
+/// ever changes asymmetrically, the compare degenerates into a permanent
+/// mismatch and the timer re-runs the full query every 2s (the loop the
+/// freshness design forbids). Change them together or factor the shared
+/// prefix.
+pub(crate) fn current_profile_name(view: HWND) -> Option<String> {
+    let paths = active_paths()?;
+    let device = monitor_device_name(view);
+    let path = choose_path(&paths, device.as_deref())?;
+    let getter = display_default_getter()?;
+    call_display_default(getter, path.adapter_luid, path.source_id)
+}
+
+/// The freshness predicate (#132, pure): has the judge's raw name
+/// actually changed? `None` on either side means the chain broke there —
+/// a break appearing or healing counts as a change (the judge's answer
+/// genuinely moved), while two equal `Some`s (including two `Some("")`
+/// OS-managed answers) are stable.
+pub(crate) fn profile_name_changed(old: Option<&str>, fresh: Option<&str>) -> bool {
+    old != fresh
 }
 
 /// The window's monitor as a GDI device name, the canonical match key
@@ -464,6 +546,43 @@ mod tests {
             path(2, 3, Some(r"\\.\DISPLAY2")),
         ];
         assert!(choose_path(&paths, Some(r"\\.\DISPLAY7")).is_none());
+    }
+
+    #[test]
+    fn the_freshness_predicate_keys_on_the_raw_name_only() {
+        // Stable shapes: the two nulls (a broken chain against a broken
+        // establishment) and two equal raw names — including the
+        // OS-managed empty answer and a name whose downstream
+        // classification fails (the unclassifiable shape keeps Some).
+        assert!(!profile_name_changed(None, None));
+        assert!(!profile_name_changed(Some("panel.icm"), Some("panel.icm")));
+        assert!(!profile_name_changed(Some(""), Some("")));
+        // Changes: a real profile switch, both switch directions, a
+        // break appearing (Some -> None) and healing (None -> Some),
+        // and the OS-managed edge flipping either way.
+        assert!(profile_name_changed(Some("adobe.icm"), Some("srgb.icm")));
+        assert!(profile_name_changed(Some("srgb.icm"), Some("adobe.icm")));
+        assert!(profile_name_changed(Some("adobe.icm"), None));
+        assert!(profile_name_changed(None, Some("adobe.icm")));
+        assert!(profile_name_changed(Some(""), Some("adobe.icm")));
+        assert!(profile_name_changed(Some("adobe.icm"), Some("")));
+    }
+
+    #[test]
+    fn the_outcome_name_field_separates_broken_chain_from_failed_classification() {
+        // The freshness key's None/Some shapes: a chain broken at or
+        // before the getter — or an UNREADABLE FILE, the retryable
+        // failure (Codex P2, PR #133) — carries None (the default and
+        // the failure paths; the next tick retries the full query),
+        // while a getter answer the downstream classification then
+        // refuses keeps the raw name — a stable verdict that must not
+        // loop the full query every 2s.
+        assert_eq!(DisplayQueryOutcome::default().name, None);
+        assert_eq!(unknown().name, None);
+        let unclassified = unclassifiable("panel.icm".to_string());
+        assert_eq!(unclassified.query, DisplayProfileQuery::Unknown);
+        assert_eq!(unclassified.name, Some("panel.icm".to_string()));
+        assert!(unclassified.path.is_none() && unclassified.bytes.is_none());
     }
 
     #[test]

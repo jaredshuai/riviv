@@ -83,6 +83,33 @@ profile=TPLCD_8BAF_AdobeRGB.icm(Custom 类)才全绿——sRGB 等价 profile
 在相对色码下不变,S2a/S2b 检测恢复精确),smoke98 颜色窗/parity 臂改
 warp(断言语义渲染器无关)。
 
+## smoke132-stage.ps1(#132 M8-4 profile 热重载:新鲜度通道幂等)
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File smoke\smoke132-stage.ps1 [-Exe <path>]
+```
+
+场景(5 检查;S0 前置门同 smoke130 退出 3;机器钉同 smoke130——本机
+Custom profile 才有 hw 臂 gpu_effect 行)。**热重载的「真切换」路径不
+冒烟**(改机器显示 profile 侵入性大):其证据=issue #132 设计评论的
+P5 探针(getter 即时翻转 + 写侧零广播),人工验收走 QA 清单;本脚本
+钉的是**判据输入不变时新鲜度通道必须零动作**(恰好一条 display-stage
+面包屑 + `output_gen=1` + 棘轮无噪音):
+
+- **S1** hw 臂:会话中向主窗投递合成 `WM_DISPLAYCHANGE`(0x7E)→ 面包屑
+  恰 1 条、gen=1(事件臂对未变名字 no-op)。
+- **S2** hw 臂闲置 5s(≥2 个 2000ms 计时器周期)→ 同上 + 无
+  `display effect failure`(计时器臂不刷屏、不喂棘轮)。
+- **S3** hw 臂同屏平移(`SetWindowPos(+80,+80)`,SWP_NOSIZE|
+  NOZORDER|NOACTIVATE)→ 窗口实测位移 +80(投递证)且 **ini 落
+  x=140 y=140**(WM_MOVE 臂确实跑了)但面包屑仍 1 条、gen=1(同屏
+  监视器比对不重建立)。
+- **S4** warp 臂复跑 S1(`display-stage=none` 前提)。
+
+工程注:S1/S4 的合成消息走 PostMessage(handler 异步在消息泵消费,
+固定等 1.5s);S3 用 ini 落盘证 WM_MOVE 投递而非仅凭窗口位移(config
+回写在 WM_CLOSE,场景间 ini 重写防串染)。
+
 ## smoke98-apng.ps1(#98 APNG 动画接入)
 
 ```powershell
