@@ -8964,11 +8964,13 @@ pub(crate) fn run() -> Result<(), String> {
     // channel (probe P5: profile writes broadcast nothing observable
     // here, the getter flips instantly, so a 2s name-level poll is the
     // reliable signal; the WM_DISPLAYCHANGE arm is the early kick).
-    // Fail-soft like upstream's unchecked SetTimer calls (viv.c:11757) —
-    // a missing poll degrades hot reload to decision-point freshness,
-    // never the app; the timer dies with its window.
+    // A failed arm is REPORTED, not fatal (Codex P2, PR #133): losing
+    // the poll degrades hot reload to decision-point freshness — never
+    // the app — but the loss must be visible on stderr (ADR 0001), the
+    // same breadcrumb-only posture as the quality ratchet. The timer
+    // dies with its window either way.
     // SAFETY: hwnd is live and owned by this thread.
-    let _ = unsafe {
+    let timer = unsafe {
         SetTimer(
             Some(hwnd),
             DISPLAY_REFRESH_TIMER_ID,
@@ -8976,6 +8978,15 @@ pub(crate) fn run() -> Result<(), String> {
             None,
         )
     };
+    if timer == 0 {
+        // SAFETY: read-only last-error query; the value is only used for
+        // the breadcrumb below.
+        let gle = unsafe { GetLastError() };
+        eprintln!(
+            "riviv: display-freshness timer unavailable (GLE={}) — hot reload degraded to output-decision points for this session",
+            gle.0
+        );
+    }
     // The always-on stderr breadcrumb (#80 design §8): renderer=<request>
     // backend=<effective> — the automation assertion channel and the
     // stderr-redirected ticket evidence, zero UI parity risk. The stack is

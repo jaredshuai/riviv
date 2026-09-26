@@ -94,12 +94,13 @@ pub(crate) struct DisplayQueryOutcome {
     pub bytes: Option<Vec<u8>>,
     /// The getter's RAW answer (bare name or path, exactly as returned) —
     /// the #132 freshness key. `None` iff the chain broke at or before
-    /// the getter (the Unknown-from-failure shape); an empty-but-successful
-    /// answer is `Some("")` (the NoProfile signal); a profile the
-    /// downstream classification then fails on KEEPS `Some(raw)` — the
-    /// freshness compare must key on the raw name so a
-    /// classification-failing machine (whose raw name is stable) never
-    /// loops on the full query.
+    /// the getter (the Unknown-from-failure shape) OR the profile file
+    /// was unreadable (a RETRYABLE failure — the next tick re-runs the
+    /// full query until the file opens; Codex P2, PR #133); an
+    /// empty-but-successful answer is `Some("")` (the NoProfile signal);
+    /// a profile the downstream classification then REFUSES keeps
+    /// `Some(raw)` — the refusal is a verdict, stable by design, so a
+    /// classification-failing machine never loops the full query.
     pub name: Option<String>,
 }
 
@@ -164,11 +165,20 @@ pub(crate) fn query(view: HWND) -> DisplayQueryOutcome {
     let bytes = match bytes {
         Ok(bytes) => bytes,
         Err(e) => {
+            // The read is RETRYABLE (Codex P2, PR #133): a switch window can
+            // hold the file locked exactly when the freshness timer's first
+            // tick lands, and caching the name against a failed read would
+            // pin Unknown forever (same name compares stable forever after).
+            // Answering name=None makes the next tick's Some(name) a change
+            // again — the full query retries every 2s while unreadable,
+            // each attempt just one registry read plus one failed file read
+            // (the heavy equivalence probe never runs on this path), and
+            // the retry loop self-heals the moment the file opens.
             eprintln!(
-                "riviv: display profile {}: unreadable ({e}) — display judge falls to unknown",
+                "riviv: display profile {}: unreadable ({e}) — display judge falls to unknown (will retry)",
                 full.display()
             );
-            return unclassifiable(name);
+            return unknown();
         }
     };
     let shown = full
@@ -203,11 +213,14 @@ fn unknown() -> DisplayQueryOutcome {
     }
 }
 
-/// The judge's answer with the getter's raw name attached but everything
-/// downstream failed (bytes unreadable, or the equivalence ladder
-/// refused): the query is Unknown, while the freshness key stays the raw
-/// name so the hot-reload compare (below) sees a STABLE key on such a
-/// machine instead of flip-flopping into a full-query loop.
+/// The judge's answer with the getter's raw name attached but the
+/// DOWNSTREAM CLASSIFICATION refused (the equivalence ladder rejected
+/// the profile — a verdict, stable by machine): the query is Unknown,
+/// while the freshness key stays the raw name so the hot-reload compare
+/// sees a STABLE key instead of looping the full query. The other
+/// name-carrying failure — an unreadable FILE — deliberately does NOT
+/// come here: it answers `unknown()` (name=None) because a read is
+/// retryable (Codex P2, PR #133); a classification refusal is not.
 fn unclassifiable(name: String) -> DisplayQueryOutcome {
     DisplayQueryOutcome {
         query: DisplayProfileQuery::Unknown,
@@ -557,11 +570,13 @@ mod tests {
 
     #[test]
     fn the_outcome_name_field_separates_broken_chain_from_failed_classification() {
-        // The freshness key's two None/Some shapes: a chain broken at or
-        // before the getter carries None (the default and every failure
-        // path), while a getter answer the downstream classification
-        // then fails on keeps the raw name — stable, so a
-        // classification-failing machine never loops the full query.
+        // The freshness key's None/Some shapes: a chain broken at or
+        // before the getter — or an UNREADABLE FILE, the retryable
+        // failure (Codex P2, PR #133) — carries None (the default and
+        // the failure paths; the next tick retries the full query),
+        // while a getter answer the downstream classification then
+        // refuses keeps the raw name — a stable verdict that must not
+        // loop the full query every 2s.
         assert_eq!(DisplayQueryOutcome::default().name, None);
         assert_eq!(unknown().name, None);
         let unclassified = unclassifiable("panel.icm".to_string());
