@@ -209,13 +209,12 @@ function Count-Lines($err, $prefix) {
 }
 function Get-Stage-Line($err, $stage, $backend) {
     if ($null -eq $err) { return '' }
-    $want = ('riviv: display-stage=' + $stage + ' profile=')
     # #134: the line ends with a trailing ' ac=<off|on|unknown>' field, so
-    # the tail anchors on the ac= prefix after the backend word.
-    $tail = (' backend=' + $backend + ' ac=')
+    # the tail anchors on the ac= VALUE: a line-end-anchored match requires
+    # ' backend=<word> ac=' followed by a non-empty value.
     foreach ($ln in ($err -split "`n")) {
         $t = $ln.TrimEnd("`r")
-        if ($t.StartsWith($want) -and $t.EndsWith($tail)) { return $t }
+        if ($t -match ('^riviv: display-stage=' + $stage + ' profile=.* backend=' + $backend + ' ac=\S+$')) { return $t }
     }
     return ''
 }

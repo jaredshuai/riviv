@@ -344,15 +344,14 @@ function Get-Line($err, $prefix) {
 }
 # The FIRST display-stage line matching a stage/backend pair ('' when
 # absent). $stage/$backend are exact words (gpu_effect/none x hw/warp).
-# #134: the line carries a trailing ' ac=<word>' diagnostic field, so
-# the tail anchors on the ac= prefix after the backend word.
+# #134: the line carries a trailing ' ac=<word>' diagnostic field, so the
+# tail anchors on the ac= VALUE: a line-end-anchored match requires
+# ' backend=<word> ac=' followed by a non-empty value.
 function Get-Stage-Line($err, $stage, $backend) {
     if ($null -eq $err) { return '' }
-    $want = ('riviv: display-stage=' + $stage + ' profile=')
-    $tail = (' backend=' + $backend + ' ac=')
     foreach ($ln in ($err -split "`n")) {
         $t = $ln.TrimEnd("`r")
-        if ($t.StartsWith($want) -and $t.EndsWith($tail)) { return $t }
+        if ($t -match ('^riviv: display-stage=' + $stage + ' profile=.* backend=' + $backend + ' ac=\S+$')) { return $t }
     }
     return ''
 }
