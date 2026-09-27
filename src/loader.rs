@@ -54,9 +54,11 @@ use crate::transform_stage::{ContentSpace, master_content_space};
 /// (master) bytes — the only frame memory there is since #90 removed the
 /// GDI face derivation (#76's on-demand DIBs used to sit outside this
 /// budget; the D2D uploads copy out of the master without a standing CPU
-/// twin). Since #142 the gate books the 8-bit canvas (`w * h * 4`) while
-/// an F16Srgb master holds `w * h * 8` — an accepted 2× under-booking on
-/// the f16 arm until the budget re-derivation lands (#144).
+/// twin). Since #142 an F16Srgb master holds `w * h * 8`, and the
+/// animation gate charges that actual size ([`charged_frame_bytes`] —
+/// Codex P1 on PR #147: counting the decoded buffer would let a
+/// transformed stream hold twice the cap); the cap VALUES'
+/// re-derivation for the f16 era is #144's.
 pub(crate) const MAX_TOTAL_FRAME_BYTES: usize = 512 * 1024 * 1024;
 
 /// Frame-count budget: a hostile file can pack an unbounded COUNT of tiny
@@ -587,13 +589,32 @@ fn apng_canvas_fits_animation_budget(per_frame_bytes: usize) -> bool {
     per_frame_bytes.saturating_mul(4) <= MAX_TOTAL_FRAME_BYTES
 }
 
+/// The budget's per-frame charge for an animation a transform will hold
+/// as f16 masters (#142, Codex P1 on PR #147): the decode-side canvas
+/// cost (`w * h * 4`) doubles to the F16Srgb master's actual `w * h * 8`
+/// retained bytes, keeping the gate honest against the memory the UI
+/// side really holds — the contract `MAX_TOTAL_FRAME_BYTES` documents
+/// (master bytes, not decode bytes). A frame whose 16-bit pass fell back
+/// to the 8-bit chain is over-charged thereby (4 real bytes for 8
+/// booked) — conservative by design; the cap re-derivation is #144's.
+fn charged_frame_bytes(canvas_bytes: usize, transform: Option<&icm::Transform>) -> usize {
+    if transform.is_some() {
+        canvas_bytes * 2
+    } else {
+        canvas_bytes
+    }
+}
+
 /// Decode one frame at a time of an animation, replying per frame
 /// (upstream first frame + additional frames, viv.c:10304/10318/10719-10751).
 ///
 /// `normalize_delay` maps the image crate's reported delay (ms) to the delay
 /// we schedule with; it carries the per-format fallback rules.
-/// `per_frame_bytes` is the canvas cost of one frame (`w * h * 4`), known
-/// from the decoder header before any frame is decoded.
+/// `per_frame_bytes` is the decode-side canvas cost of one frame (`w * h *
+/// 4`), known from the decoder header before any frame is decoded; the
+/// gate charges each frame at the master's actual width for the stream
+/// ([`charged_frame_bytes`] — a transformed stream's frames land as f16
+/// masters).
 #[allow(clippy::too_many_arguments)]
 fn stream_animation(
     mut frames: Frames<'_>,
@@ -607,6 +628,7 @@ fn stream_animation(
     sink: &mut dyn FnMut(LoadReply),
 ) -> Result<(), Stop> {
     let user = |msg: String| Stop::User(msg);
+    let per_frame_bytes = charged_frame_bytes(per_frame_bytes, icm);
     let mut emitted = 0usize;
     let mut canvas: Option<(u32, u32)> = None;
     let mut total_frame_bytes: usize = 0;
@@ -2108,6 +2130,22 @@ mod stdin_bytes_tests {
         decode_bytes_to_sink(&out, env(), &terminate, None, &mut |r| replies.push(r));
         assert_eq!(replies.len(), 4097, "4096 frames + Complete");
         assert!(matches!(replies.last(), Some(LoadReply::Complete)));
+    }
+
+    #[test]
+    fn a_transformed_animation_is_charged_at_its_f16_master_bytes() {
+        // Codex P1 on PR #147: an ICC animation's frames land as F16Srgb
+        // masters (8 bytes per pixel of retained UI-side memory), so the
+        // budget gate must charge the master's size — the decode canvas
+        // cost doubled — or a hostile transformed stream holds ~2x the
+        // cap while the gate believes it is under. The untagged stream's
+        // charge stays the decode canvas itself (the pin the 4096-frame
+        // edge above relies on).
+        crate::icm::test_fixtures::require_srgb();
+        let t = crate::icm::prepare(true, Some(crate::icm::test_fixtures::adobe_like_icc()), "t")
+            .expect("an AdobeRGB-like profile transforms");
+        assert_eq!(charged_frame_bytes(100, Some(&t)), 200);
+        assert_eq!(charged_frame_bytes(100, None), 100);
     }
 
     fn first_frame_pixels(bytes: &[u8], icm: bool) -> PixelFrame {
