@@ -652,9 +652,14 @@ pub(crate) fn f16_rgba_halves_to_bgra8(px: [u16; 4]) -> [u8; 4] {
     ]
 }
 
-/// The whole-frame bulk of [`f16_rgba_halves_to_bgra8`] (the upload and
-/// clipboard seams' quantize, #142): `pixels` holds the master's
-/// 8-byte-per-pixel halves, `dst` the 4-byte-per-pixel BGRA reading.
+/// The whole-frame bulk of [`f16_rgba_halves_to_bgra8`] (the clipboard
+/// seam's quantize, #142): `pixels` holds the master's 8-byte-per-pixel
+/// halves, `dst` the 4-byte-per-pixel BGRA reading. The upload seam this
+/// bulk once served quantizes no more — #143 uploads the halves into an
+/// `R16G16B16A16_FLOAT` bitmap byte-for-byte — so the remaining callers
+/// are the clipboard's GDI-face copy (`master_gdi_bgra`, the one
+/// direct-read seam with no f16 surface to hand the data to) and its
+/// test.
 pub(crate) fn f16_halves_to_bgra8_bulk(pixels: &[u8], dst: &mut [u8]) {
     let (src, src_tail) = pixels.as_chunks::<8>();
     debug_assert!(
