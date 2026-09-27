@@ -131,13 +131,15 @@ impl Surface {
         // The pixel width follows the master's own storage convention
         // (#142): 4 bytes per pixel in the Srgb era, 8 for the f16
         // master's half quadruples — rotation moves geometry, not
-        // encoding, so the halves ride along as opaque blocks.
+        // encoding, so the halves ride along as opaque blocks. #154:
+        // the wide container (F16P3) shares the halves layout byte for
+        // byte (ADR 0004 D2), so it rides the same 8-byte arms.
         let mut rotated = vec![
             0u8;
             wide * high
                 * match self.master.content_space {
                     ContentSpace::Srgb => 4,
-                    ContentSpace::F16Srgb => 8,
+                    ContentSpace::F16Srgb | ContentSpace::F16P3 => 8,
                 }
         ];
         match (self.master.content_space, clockwise) {
@@ -147,10 +149,10 @@ impl Surface {
             (ContentSpace::Srgb, false) => {
                 rotate_bgra_270_cw(&self.master.pixels, wide, high, &mut rotated);
             }
-            (ContentSpace::F16Srgb, true) => {
+            (ContentSpace::F16Srgb | ContentSpace::F16P3, true) => {
                 rotate_f16_90_cw(&self.master.pixels, wide, high, &mut rotated);
             }
-            (ContentSpace::F16Srgb, false) => {
+            (ContentSpace::F16Srgb | ContentSpace::F16P3, false) => {
                 rotate_f16_270_cw(&self.master.pixels, wide, high, &mut rotated);
             }
         }

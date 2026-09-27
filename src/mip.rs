@@ -236,7 +236,8 @@ impl LevelCache {
     /// intended response and they are 4× smaller each step).
     ///
     /// The entry's byte cost follows the space (#142): 4 bytes per pixel
-    /// for an Srgb level, 8 for an F16Srgb one. #144 re-derived the
+    /// for an Srgb level, 8 for an F16Srgb one — and for F16P3, which
+    /// shares the halves layout (ADR 0004 D2, #154). #144 re-derived the
     /// budgets and kept every value: the cap is a byte cap, an F16Srgb
     /// level's 8-byte charge is the honest price, and the earlier
     /// eviction is what ADR 0003's consequences section already ruled
@@ -259,7 +260,9 @@ impl LevelCache {
         }
         let bytes_per_px = match space {
             ContentSpace::Srgb => 4u64,
-            ContentSpace::F16Srgb => 8,
+            // F16P3 rides the f16 price (ADR 0004 D2: the same halves
+            // layout, so every #144 budget derivation holds).
+            ContentSpace::F16Srgb | ContentSpace::F16P3 => 8,
         };
         let bytes = wide as u64 * high as u64 * bytes_per_px;
         if bytes > self.lru.cap() {
@@ -267,7 +270,12 @@ impl LevelCache {
         }
         let data = match space {
             ContentSpace::Srgb => downscale_box(src, image_w as i32, image_h as i32, level),
-            ContentSpace::F16Srgb => downscale_box_f16(src, image_w as i32, image_h as i32, level),
+            // The box filter operates on encoded half values — the same
+            // semantics the F16Srgb arm has always had (the P3 TRC is
+            // an sRGB-shaped curve, ADR 0004 D2).
+            ContentSpace::F16Srgb | ContentSpace::F16P3 => {
+                downscale_box_f16(src, image_w as i32, image_h as i32, level)
+            }
         };
         for evicted in self.lru.insert(level, bytes) {
             self.entries.retain(|(l, _)| *l != evicted);
@@ -675,6 +683,27 @@ mod tests {
         assert_eq!(back.0, 2);
         assert_eq!(cache.builds, 1, "the flip back rebuilt, not reused");
         assert_eq!(cache.bytes(), 2 * 2 * 4);
+    }
+
+    #[test]
+    fn an_f16p3_level_is_priced_and_built_like_an_f16srgb_one() {
+        // ADR 0004 D2 (#154): the wide container's master is the same
+        // 8-bytes-per-pixel halves layout, so a level's byte charge —
+        // and with it every #144 budget derivation — holds unchanged;
+        // the build arm is the same box filter over encoded halves (the
+        // P3 TRC is an sRGB-shaped curve). Pinned through the real
+        // build path: the level comes back at half the edge and costs
+        // exactly what an F16Srgb level of the same shape costs.
+        let mut cache = LevelCache::new(LEVEL_CACHE_BYTES);
+        let built = cache
+            .get_or_build(1, 4, 4, 7, ContentSpace::F16P3, &f16_canvas(4, 4, 0x3800))
+            .expect("level 1 of the wide-container frame");
+        assert_eq!(built.0, 2);
+        assert_eq!(
+            cache.bytes(),
+            2 * 2 * 8,
+            "the wide container pays the f16 price, not a new one"
+        );
     }
 
     // ---- f16 levels (#142) ----

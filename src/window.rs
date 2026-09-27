@@ -1345,8 +1345,12 @@ fn renderer_request(state: &WindowState) -> RendererKind {
 /// identity stays fresh per decision), then mints the identity. A
 /// same-decision rebuild re-identifies the same fingerprint idempotently
 /// (same gen); any real input change (backend, judge answer, latch, and
-/// since #134 the ACM diagnostic) mints the next gen, and the dump
-/// channel prints the stored generation.
+/// since #134 the ACM diagnostic; since #154 the display content's
+/// class, through the table's third dimension) mints the next gen, and
+/// the dump channel prints the stored generation. Unconditional by
+/// design — the decision points below already know something changed;
+/// the CONTENT edges go through the gated
+/// [`reidentify_output_on_transition`] instead.
 fn establish_output_identity(state: &mut WindowState) {
     state.display_query = crate::display_profile::query(state.viewport);
     // #132: the judge's monitor baseline for the WM_MOVE arm — recorded
@@ -1364,18 +1368,15 @@ fn establish_output_identity(state: &mut WindowState) {
 /// every later non-display change (same-decision rebuilds included) walk
 /// exactly this — the query result is already on the state.
 fn identify_output(state: &mut WindowState) {
+    mint_output_identity(state);
     let backend = crate::transform_stage::Backend::from_effective(state.gpu_kind);
     let query = state.display_query.query;
     let latched = state.stage_latched;
-    let bytes = state.display_query.bytes.clone();
-    let ac = state.display_query.ac;
-    let fingerprint =
-        crate::transform_stage::fingerprint_for(backend, query, latched, bytes.as_deref(), ac);
-    state.output_identity = Some(state.output_tracker.identify(fingerprint));
     let stage = crate::transform_stage::effective_stage(
         crate::transform_stage::desired_stage(backend, query),
         latched,
     );
+    let ac = state.display_query.ac;
     let profile = state
         .display_query
         .path
@@ -1392,11 +1393,97 @@ fn identify_output(state: &mut WindowState) {
     );
 }
 
+/// `identify_output`'s mint without the breadcrumb: recompute the
+/// fingerprint from the CURRENT state (real class included) and store
+/// the tracker's answer. Split out for the transition gate's silent
+/// arm below (Codex R1 P2, PR #158): a class-only flip must refresh
+/// the identity's content-space record WITHOUT minting a generation —
+/// the gen channel is the OUTPUT-decision change signal (#126/#128's
+/// contract), and a narrow-class flip changes no output decision.
+fn mint_output_identity(state: &mut WindowState) {
+    let content_class = current_content_class(state);
+    let fingerprint = current_output_fingerprint(state);
+    state.output_identity = Some(state.output_tracker.identify(fingerprint, content_class));
+}
+
+/// The content space of what is on display RIGHT NOW (#154, ADR 0004
+/// D4): the master's own space, `Srgb` when the display is blank — the
+/// 8-bit default, the same stand-in a no-image session has always
+/// carried (a blank display has no wide content to protect, and
+/// `master_content_space` never answers F16P3 before #155 anyway).
+fn current_content_class(state: &WindowState) -> crate::transform_stage::ContentSpace {
+    state
+        .image
+        .as_ref()
+        .map(|image| image.surface().master().content_space)
+        .unwrap_or(crate::transform_stage::ContentSpace::Srgb)
+}
+
+/// The output fingerprint for the CURRENT state — the shared
+/// computation behind `identify_output` and the transition gate below
+/// (#154): the same real inputs as before (#130/#134 — backend, judge,
+/// latch, profile bytes, ACM diagnostic) plus the display content's
+/// real class, the third dimension's input (ADR 0004 D4).
+fn current_output_fingerprint(state: &WindowState) -> crate::transform_stage::OutputFingerprint {
+    crate::transform_stage::fingerprint_for(
+        crate::transform_stage::Backend::from_effective(state.gpu_kind),
+        state.display_query.query,
+        state.stage_latched,
+        state.display_query.bytes.as_deref(),
+        state.display_query.ac,
+        current_content_class(state),
+    )
+}
+
+/// The transition-gated re-identity (#154): recompute the output
+/// fingerprint from the CURRENT state and hand it to `identify_output`
+/// only when it differs from the stored one. A display-content edge
+/// changes the decision table's content-class input (ADR 0004 D4), so
+/// the output decision must be re-checked at exactly the point the new
+/// content becomes visible. The gate is why this is invisible today:
+/// both narrow classes fingerprint identically (Legacy surface, the
+/// same stage), so every today edge recomputes to the stored
+/// fingerprint — zero new generations, zero extra breadcrumbs (the
+/// smoke132 "exactly one display-stage line per session" count stays
+/// exact). After #155, an Srgb↔F16P3 switch on an AC machine flips the
+/// surface arm and the flip mints a gen (the accepted churn, ADR 0004
+/// 已裁项 4 — identity transitions are the change signal). A
+/// fingerprint-UNCHANGED class flip (narrow↔narrow, the only kind
+/// possible today) takes the silent arm: the identity's class record
+/// refreshes, the gen does not move. A `None`
+/// identity (no establishment yet — the startup establishment runs in
+/// the create flow, before any load reply or blank can arrive) is left
+/// alone on purpose: minting here would fingerprint the DEFAULT
+/// display query, a placeholder read #134's anti-placeholder rule
+/// forbids; the establishment owns the first mint.
+fn reidentify_output_on_transition(state: &mut WindowState) {
+    let fingerprint = current_output_fingerprint(state);
+    let Some(identity) = state.output_identity else {
+        return;
+    };
+    if identity.fingerprint != fingerprint {
+        identify_output(state);
+    } else if identity.content_space != current_content_class(state) {
+        // Codex R1 P2's staleness half (PR #158), fixed WITHOUT the
+        // mint it asked for: a class-only flip (narrow↔narrow — the
+        // only kind possible before #155) leaves the fingerprint
+        // identical, so the gen channel must NOT move (#126/#128: the
+        // gen is the output-decision change signal; ADR 0004 已裁项 4
+        // scopes the accepted churn to the AC-ARM class switch, whose
+        // surface flip changes the fingerprint and mints naturally).
+        // The identity's class RECORD, though, is refreshable for
+        // free: idempotent identify, same gen, silent.
+        mint_output_identity(state);
+    }
+}
+
 /// The display segment's application intent for the CURRENT state
 /// (#130): the EFFECTIVE stage (the table's answer clamped by the session
 /// latch) says whether the two-phase effect pass runs; the judge's
 /// profile is its destination. Computed before the mutable gpu borrow on
-/// both consumers — the paint (gpu.rs) and the dump (below).
+/// both consumers — the paint (gpu.rs) and the dump (below). The sRGB
+/// rows' draw consumption is all this computes: the wide stages' draw
+/// wiring (what a GpuEffectP3To* pass feeds) is #156's scope.
 pub(crate) fn display_intent(state: &WindowState) -> (bool, Option<std::path::PathBuf>) {
     let backend = crate::transform_stage::Backend::from_effective(state.gpu_kind);
     let stage = crate::transform_stage::effective_stage(
@@ -1415,12 +1502,17 @@ pub(crate) fn display_intent(state: &WindowState) -> (bool, Option<std::path::Pa
 }
 
 /// The stderr breadcrumb's stage word (the ticket's vocabulary:
-/// none | cpu | gpu_effect | dwm_acm).
+/// none | cpu | gpu_effect | dwm_acm, widened by #154 with the wide
+/// arms' words — unreachable at runtime until #155/#156 produce wide
+/// masters and wire their draw; #156's smoke is the first consumer).
 fn stage_label(stage: crate::transform_stage::TransformStage) -> &'static str {
     match stage {
         crate::transform_stage::TransformStage::None => "none",
         crate::transform_stage::TransformStage::Cpu => "cpu",
         crate::transform_stage::TransformStage::GpuEffect => "gpu_effect",
+        crate::transform_stage::TransformStage::GpuEffectP3ToSrgb => "p3_to_srgb",
+        crate::transform_stage::TransformStage::GpuEffectP3ToDisplay => "p3_to_display",
+        crate::transform_stage::TransformStage::GpuEffectP3ToScRgb => "p3_to_scrgb",
         crate::transform_stage::TransformStage::DwmAcm => "dwm_acm",
     }
 }
@@ -3421,6 +3513,15 @@ enum DisplayEdge {
 /// the state standing through a cleared display (a blank renders nothing,
 /// and the surviving anchor lets the next image continue the carry chain).
 /// The option off reproduces upstream bit-for-bit: reset at every edge.
+/// #154: this is the single convergence point of every display-content
+/// edge (a swap, a clear, the load-reply path — all land here), so the
+/// output-identity transition gate runs at the tail: the display
+/// content's class is an input of the output decision (ADR 0004 D4's
+/// third dimension), and a content change that moves the fingerprint
+/// must re-identify exactly once, here. The gate fires only on a real
+/// fingerprint change — today that is never (both narrow classes
+/// fingerprint alike), so smoke132's "exactly one display-stage line
+/// per session" count is untouched.
 fn view_edge(hwnd: HWND, state: &mut WindowState, edge: DisplayEdge) {
     if state.config.keep_zoom == 0 {
         state.view.reset();
@@ -3429,6 +3530,7 @@ fn view_edge(hwnd: HWND, state: &mut WindowState, edge: DisplayEdge) {
         let fit = fit_policy(state);
         state.view.carry(src.0, src.1, vp, fit);
     }
+    reidentify_output_on_transition(state);
 }
 
 /// See [`DisplayEdge`] — the shared marks tail of every `_viv_clear` edge:

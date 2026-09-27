@@ -171,12 +171,14 @@ impl Rect {
 /// `Srgb` bitmap is BGRA8, 4 bytes per pixel; an F16Srgb bitmap is
 /// `R16G16B16A16_FLOAT`, 8 bytes per pixel — the level cache's own #142
 /// pricing, so the plan can never offer a level the cache would refuse.
+/// `F16P3` shares the f16 bitmap's layout and price (ADR 0004 D2,
+/// #154: 8 B/px — every #144 budget derivation holds unchanged).
 /// Saturating: the doubled charge must not wrap (#142 Codex R3's lesson
 /// from the same defect shape).
 pub(crate) fn resident_bytes(space: ContentSpace, pixels: i64) -> u64 {
     let per_pixel = match space {
         ContentSpace::Srgb => 4u64,
-        ContentSpace::F16Srgb => 8,
+        ContentSpace::F16Srgb | ContentSpace::F16P3 => 8,
     };
     (pixels.max(0) as u64).saturating_mul(per_pixel)
 }
@@ -1998,6 +2000,23 @@ mod tests {
             resident_bytes(ContentSpace::Srgb, 7) * 2,
             "the f16 charge is exactly the doubled BGRA charge"
         );
+    }
+
+    #[test]
+    fn resident_bytes_charges_the_wide_container_like_the_f16_one() {
+        // ADR 0004 D2 (#154): an F16P3 bitmap is the same
+        // R16G16B16A16 halves layout at 8 bytes per pixel — every #144
+        // budget derivation holds unchanged, pinned cell for cell
+        // against the F16Srgb charge across the price-relevant counts
+        // (empty, one pixel, an odd remnant, a megapixel).
+        for pixels in [0i64, 1, 7, 1000 * 1000] {
+            assert_eq!(
+                resident_bytes(ContentSpace::F16P3, pixels),
+                resident_bytes(ContentSpace::F16Srgb, pixels),
+                "the wide container pays the f16 price at {pixels} pixels"
+            );
+        }
+        assert_eq!(resident_bytes(ContentSpace::F16P3, 1000 * 1000), 8_000_000);
     }
 
     #[test]

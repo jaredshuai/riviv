@@ -428,20 +428,25 @@ const SWAPCHAIN_FORMAT: DXGI_FORMAT = DXGI_FORMAT_B8G8R8A8_UNORM;
 /// `R16G16B16A16_FLOAT` describes — the upload is a zero-conversion
 /// memcpy, no quantize (the output surface stays frozen, see
 /// [`SWAPCHAIN_FORMAT`]; the #137 probe proved CreateBitmap + DrawBitmap
-/// on this format into a BGRA8 target).
+/// on this format into a BGRA8 target). #154: the wide container's
+/// `F16P3` master carries the SAME halves layout (ADR 0004 D2 — 8 B/px,
+/// the #144 budgets hold), so it rides the f16 arm verbatim; the
+/// swapchain's own dual arms are #156's scope, `SWAPCHAIN_FORMAT` above
+/// stays the one legacy face.
 fn upload_format(space: ContentSpace) -> DXGI_FORMAT {
     match space {
         ContentSpace::Srgb => DXGI_FORMAT_B8G8R8A8_UNORM,
-        ContentSpace::F16Srgb => DXGI_FORMAT_R16G16B16A16_FLOAT,
+        ContentSpace::F16Srgb | ContentSpace::F16P3 => DXGI_FORMAT_R16G16B16A16_FLOAT,
     }
 }
 
 /// The bytes per pixel of [`upload_format`]'s layout — the pitch math's
-/// input (4 for BGRA8, 8 for the half quadruple).
+/// input (4 for BGRA8, 8 for the half quadruple; `F16P3` shares the
+/// half-quadruple layout, ADR 0004 D2).
 fn upload_bpp(space: ContentSpace) -> u32 {
     match space {
         ContentSpace::Srgb => 4,
-        ContentSpace::F16Srgb => 8,
+        ContentSpace::F16Srgb | ContentSpace::F16P3 => 8,
     }
 }
 
@@ -2530,6 +2535,14 @@ mod tests {
             SWAPCHAIN_FORMAT,
             "f16 lives in input surfaces; the output face stays BGRA8 UNORM"
         );
+        // #154 (ADR 0004 D2): the wide container rides the f16 arm —
+        // the same halves layout, the same zero-conversion upload; the
+        // swapchain's own arms stay frozen until #156.
+        assert_eq!(
+            upload_format(ContentSpace::F16P3),
+            DXGI_FORMAT_R16G16B16A16_FLOAT,
+            "F16P3 shares the f16 halves layout byte for byte"
+        );
     }
 
     #[test]
@@ -2539,6 +2552,9 @@ mod tests {
         // storage (pixels.rs) and the level cache (#142) already use.
         assert_eq!(upload_bpp(ContentSpace::Srgb), 4);
         assert_eq!(upload_bpp(ContentSpace::F16Srgb), 8);
+        // #154 (ADR 0004 D2): the wide container pays the same 8 B/px —
+        // every #144 budget derivation holds unchanged.
+        assert_eq!(upload_bpp(ContentSpace::F16P3), 8);
     }
 
     #[test]
