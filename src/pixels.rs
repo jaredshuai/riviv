@@ -12,6 +12,12 @@
 //! `surface::Surface` also derived a UI-thread GDI face from it — that
 //! derivation died with the GDI render arm (#90); the Surface is now
 //! the master's plain holder.
+//!
+//! #142 (ADR 0003 D2/D6) gives the frame two storage layouts under the
+//! content-space mark: the 8-bit era's BGRA bytes (`Srgb`) and the f16
+//! master's four little-endian RGBA half quadruples per pixel
+//! (`F16Srgb`) — plus the CPU transcoding between the CMM's 16-bit
+//! output and that storage.
 
 use crate::transform_stage::ContentSpace;
 
@@ -84,6 +90,35 @@ pub(crate) fn composite_over_background_bgra_in_place(bgra: &mut [u8], bg: [u8; 
     composite_over_background_in_place(bgra, [bg[2], bg[1], bg[0]]);
 }
 
+/// The shared rotation core (`bpp` bytes per pixel — the 4-byte BGRA arms
+/// and #142's 8-byte f16 arm share one geometry; the pixel moves as an
+/// opaque `bpp`-byte block, so the encoding rides along untouched).
+fn rotate_90_cw_block(src: &[u8], wide: usize, high: usize, bpp: usize, dst: &mut [u8]) {
+    debug_assert_eq!(src.len(), wide * high * bpp);
+    debug_assert_eq!(dst.len(), wide * high * bpp);
+    for y in 0..wide {
+        for x in 0..high {
+            let src_idx = (y + (high - x - 1) * wide) * bpp;
+            let dst_idx = (x + y * high) * bpp;
+            dst[dst_idx..dst_idx + bpp].copy_from_slice(&src[src_idx..src_idx + bpp]);
+        }
+    }
+}
+
+/// The counterclockwise sibling of [`rotate_90_cw_block`] (see the public
+/// arms for the mapping's provenance).
+fn rotate_270_cw_block(src: &[u8], wide: usize, high: usize, bpp: usize, dst: &mut [u8]) {
+    debug_assert_eq!(src.len(), wide * high * bpp);
+    debug_assert_eq!(dst.len(), wide * high * bpp);
+    for y in 0..wide {
+        for x in 0..high {
+            let src_idx = ((wide - y - 1) + x * wide) * bpp;
+            let dst_idx = (x + y * high) * bpp;
+            dst[dst_idx..dst_idx + bpp].copy_from_slice(&src[src_idx..src_idx + bpp]);
+        }
+    }
+}
+
 /// Rotate a top-down 32bpp BGRA buffer 90° clockwise (#43; upstream
 /// `_viv_orientate_hbitmap` orientation 6, viv.c:13810-13819: the Edit →
 /// Rotate Clockwise in-memory pass). `src` holds `wide * high` pixels of 4
@@ -92,15 +127,7 @@ pub(crate) fn composite_over_background_bgra_in_place(bgra: &mut [u8], bg: [u8; 
 /// - x) * wide]`, i.e. old(row r, col c) lands at new(col `high - 1 - r`,
 /// row `c`) — the top-left corner moves to the top-right.
 pub(crate) fn rotate_bgra_90_cw(src: &[u8], wide: usize, high: usize, dst: &mut [u8]) {
-    debug_assert_eq!(src.len(), wide * high * 4);
-    debug_assert_eq!(dst.len(), wide * high * 4);
-    for y in 0..wide {
-        for x in 0..high {
-            let src_idx = (y + (high - x - 1) * wide) * 4;
-            let dst_idx = (x + y * high) * 4;
-            dst[dst_idx..dst_idx + 4].copy_from_slice(&src[src_idx..src_idx + 4]);
-        }
-    }
+    rotate_90_cw_block(src, wide, high, 4, dst);
 }
 
 /// Rotate 90° counterclockwise — upstream orientation 8 (viv.c:13841-13850,
@@ -108,15 +135,19 @@ pub(crate) fn rotate_bgra_90_cw(src: &[u8], wide: usize, high: usize, dst: &mut 
 /// + x * wide]`, i.e. old(row r, col c) lands at new(col `r`, row
 /// `wide - 1 - c`) — the top-left corner moves to the bottom-left.
 pub(crate) fn rotate_bgra_270_cw(src: &[u8], wide: usize, high: usize, dst: &mut [u8]) {
-    debug_assert_eq!(src.len(), wide * high * 4);
-    debug_assert_eq!(dst.len(), wide * high * 4);
-    for y in 0..wide {
-        for x in 0..high {
-            let src_idx = ((wide - y - 1) + x * wide) * 4;
-            let dst_idx = (x + y * high) * 4;
-            dst[dst_idx..dst_idx + 4].copy_from_slice(&src[src_idx..src_idx + 4]);
-        }
-    }
+    rotate_270_cw_block(src, wide, high, 4, dst);
+}
+
+/// The f16 master's rotation arms (#142): upstream's verbatim geometry at
+/// 8 bytes per pixel — each stored half quadruple moves as one opaque
+/// block, so halves keep their bits and only their coordinates change.
+pub(crate) fn rotate_f16_90_cw(src: &[u8], wide: usize, high: usize, dst: &mut [u8]) {
+    rotate_90_cw_block(src, wide, high, 8, dst);
+}
+
+/// The f16 counterclockwise sibling of [`rotate_f16_90_cw`].
+pub(crate) fn rotate_f16_270_cw(src: &[u8], wide: usize, high: usize, dst: &mut [u8]) {
+    rotate_270_cw_block(src, wide, high, 8, dst);
 }
 
 // ---------------------------------------------------------------------
@@ -201,13 +232,13 @@ pub(crate) fn f16_bits_to_f32(h: u16) -> f32 {
     }
 }
 
-/// The f16 master's 8-bit reading (#140's interim landing; #141 made it
-/// pub(crate) as the direct-read seams' ONLY quantize-read point — the
-/// dispatch in [`master_pixel_bgra8`] routes every master-byte consumer
-/// through it): sRGB gamma code = round-half-up(v * 255), clamped to
-/// [0, 255]. L1's gamma arm keeps values in [0,1], but the read stays
-/// defined for ANY half (out-of-range clamps — the same reading the
-/// composite and dump channels would make of it).
+/// The f16 master's 8-bit reading — the direct-read seams' ONLY
+/// quantize-read point (#141 made it pub(crate); every master-byte
+/// consumer routes through it, directly or via
+/// [`f16_rgba_halves_to_bgra8`]): sRGB gamma code = round-half-up(v *
+/// 255), clamped to [0, 255]. L1's gamma arm keeps values in [0,1], but
+/// the read stays defined for ANY half (out-of-range clamps — the same
+/// reading the composite and dump channels would make of it).
 pub(crate) fn f16_bits_to_u8_code(h: u16) -> u8 {
     let scaled = f16_bits_to_f32(h) * 255.0;
     if scaled <= 0.0 {
@@ -219,16 +250,29 @@ pub(crate) fn f16_bits_to_u8_code(h: u16) -> u8 {
     }
 }
 
+/// The f16 encoding of 1.0 (probe 1's IEEE reference point) — the master's
+/// opaque alpha: the composite's skip value, the `BM_16b_RGB` output
+/// format's alpha default, and the f16 alpha every opaque deep layout
+/// lands on. Pinned by the reference-point test.
+pub(crate) const F16_OPAQUE: u16 = 0x3C00;
+
+/// One 16-bit code-value sample (full scale 65535) as an f16 half: the
+/// master's own quantization (u16 -> f32 -> f16, ADR 0003 D2).
+fn u16_code_to_f16(code: u16) -> u16 {
+    f32_to_f16_bits(f32::from(code) / 65535.0)
+}
+
 /// One 16-bit code-value sample (full scale 65535) through the f16
 /// master encoding: u16 -> f32 -> f16 -> 8-bit reading.
 fn u16_code_to_u8_via_f16(code: u16) -> u8 {
-    f16_bits_to_u8_code(f32_to_f16_bits(f32::from(code) / 65535.0))
+    f16_bits_to_u8_code(u16_code_to_f16(code))
 }
 
 /// The >8-bit `DynamicImage` sample layouts the direct path converts
 /// (#140): 16-bit code-value samples. The 32-bit float (HDR radiance)
 /// variants stay out — radiance is linear light, not code values; the
 /// crate's tonemapped `into_rgba8()` remains their path.
+#[derive(Clone, Copy)]
 pub(crate) enum DeepSamples<'a> {
     Rgb16(&'a [u16]),
     Rgba16(&'a [u16]),
@@ -237,11 +281,11 @@ pub(crate) enum DeepSamples<'a> {
 }
 
 /// Convert one frame of 16-bit samples to RGBA8 through the f16 master
-/// encoding (ADR 0003 D6's direct path, no mscms): u16 -> f32 (code /
-/// 65535) -> f16 (the master's own quantization, D2) -> 8-bit reading.
-/// Until #141 lands the f16 master storage this is the interim 8-bit
-/// landing — the conversion semantics are the master's, so the bytes
-/// the later tickets carry downstream never change.
+/// encoding: u16 -> f32 (code / 65535) -> f16 -> 8-bit reading. Since #142
+/// this is the FALLBACK path's source quantizer (ADR 0003 D5): a deep
+/// frame whose `BM_16b_RGB` transform failed quantizes through it into
+/// the 8-bit chain — the primary deep paths land in the master's own
+/// halves via [`deep_to_f16_halves`] instead.
 pub(crate) fn deep_to_rgba8_via_f16(samples: DeepSamples<'_>, dst: &mut [u8]) {
     let (pixels, tail) = dst.as_chunks_mut::<4>();
     debug_assert!(tail.is_empty(), "dst must hold exactly 4 bytes per pixel");
@@ -285,35 +329,229 @@ pub(crate) fn deep_to_rgba8_via_f16(samples: DeepSamples<'_>, dst: &mut [u8]) {
     }
 }
 
-/// The decoded frame as pure memory (#76, ADR 0002 D3): top-down 32bpp
-/// BGRA, exactly `width * height * 4` bytes, alpha forced opaque (the
-/// invariant `composite_over_background_in_place` and the clipboard DIB
-/// parser's three copy paths pin). This is the source of truth — the
-/// D2D upload reads it, and device-loss recovery (#80) re-uploads from
-/// these bytes without re-decoding (the #76-era GDI face derived from
-/// them too, until #90 deleted the arm).
+/// The deep layouts' own alpha samples, one per pixel (`None` for the
+/// opaque layouts) — what the transform path's alpha restore needs after
+/// [`deep_to_bgr_u16`] dropped it (the `BM_16b_RGB` format has no alpha
+/// channel to carry it through the CMM).
+pub(crate) fn deep_source_alpha(samples: &DeepSamples<'_>) -> Option<Vec<u16>> {
+    match samples {
+        DeepSamples::Rgb16(_) | DeepSamples::Luma16(_) => None,
+        DeepSamples::Rgba16(src) => Some(src.as_chunks::<4>().0.iter().map(|p| p[3]).collect()),
+        DeepSamples::LumaA16(src) => Some(src.as_chunks::<2>().0.iter().map(|p| p[1]).collect()),
+    }
+}
+
+/// The direct deep path's landing (#142, ADR 0003 D6): 16-bit code-value
+/// samples straight into the f16 master's RGBA half storage — u16 -> f32
+/// (code / 65535) -> f16, no 8-bit detour at any point. Alpha: the
+/// layouts that carry it (Rgba16/LumaA16) convert their own sample, the
+/// opaque ones land at the composite default ([`F16_OPAQUE`]).
+pub(crate) fn deep_to_f16_halves(samples: DeepSamples<'_>, dst: &mut [u16]) {
+    let (px, tail) = dst.as_chunks_mut::<4>();
+    debug_assert!(tail.is_empty(), "dst must hold exactly 4 halves per pixel");
+    match samples {
+        DeepSamples::Rgb16(src) => {
+            debug_assert_eq!(src.len(), px.len() * 3);
+            for (p, s) in px.iter_mut().zip(src.as_chunks::<3>().0) {
+                *p = [
+                    u16_code_to_f16(s[0]),
+                    u16_code_to_f16(s[1]),
+                    u16_code_to_f16(s[2]),
+                    F16_OPAQUE,
+                ];
+            }
+        }
+        DeepSamples::Rgba16(src) => {
+            debug_assert_eq!(src.len(), px.len() * 4);
+            for (p, s) in px.iter_mut().zip(src.as_chunks::<4>().0) {
+                *p = [
+                    u16_code_to_f16(s[0]),
+                    u16_code_to_f16(s[1]),
+                    u16_code_to_f16(s[2]),
+                    u16_code_to_f16(s[3]),
+                ];
+            }
+        }
+        DeepSamples::Luma16(src) => {
+            debug_assert_eq!(src.len(), px.len());
+            for (p, &s) in px.iter_mut().zip(src) {
+                let y = u16_code_to_f16(s);
+                *p = [y, y, y, F16_OPAQUE];
+            }
+        }
+        DeepSamples::LumaA16(src) => {
+            debug_assert_eq!(src.len(), px.len() * 2);
+            for (p, s) in px.iter_mut().zip(src.as_chunks::<2>().0) {
+                let y = u16_code_to_f16(s[0]);
+                *p = [y, y, y, u16_code_to_f16(s[1])];
+            }
+        }
+    }
+}
+
+/// The deep source as the CMM's own input shape (ADR 0003 D6's 16-bit
+/// transform path): per-pixel [B, G, R] u16 triplets — the decoder's RGB
+/// sample order reversed into `BM_16b_RGB`'s BGR order, values copied
+/// verbatim (the CMM consumes code values, not normalized floats). Alpha
+/// is dropped here (the format has none); the caller restores it from
+/// [`deep_source_alpha`] after the transform.
+pub(crate) fn deep_to_bgr_u16(samples: DeepSamples<'_>, dst: &mut [u16]) {
+    let (px, tail) = dst.as_chunks_mut::<3>();
+    debug_assert!(tail.is_empty(), "dst must hold exactly 3 u16 per pixel");
+    match samples {
+        DeepSamples::Rgb16(src) => {
+            debug_assert_eq!(src.len(), px.len() * 3);
+            for (p, s) in px.iter_mut().zip(src.as_chunks::<3>().0) {
+                *p = [s[2], s[1], s[0]];
+            }
+        }
+        DeepSamples::Rgba16(src) => {
+            debug_assert_eq!(src.len(), px.len() * 4);
+            for (p, s) in px.iter_mut().zip(src.as_chunks::<4>().0) {
+                *p = [s[2], s[1], s[0]];
+            }
+        }
+        DeepSamples::Luma16(src) => {
+            debug_assert_eq!(src.len(), px.len());
+            for (p, &y) in px.iter_mut().zip(src) {
+                *p = [y, y, y];
+            }
+        }
+        DeepSamples::LumaA16(src) => {
+            debug_assert_eq!(src.len(), px.len() * 2);
+            for (p, s) in px.iter_mut().zip(src.as_chunks::<2>().0) {
+                *p = [s[0], s[0], s[0]];
+            }
+        }
+    }
+}
+
+/// The Stage-1 CMM's 16-bit gamma output (`BM_16b_RGB`: [B,G,R] u16
+/// triplets, full scale 65535) into the f16 master's RGBA half layout
+/// (ADR 0003 D6's CPU transcode — the CMM emits BGR order, the master
+/// stores RGBA). One f16 per channel through the master's own encoding;
+/// alpha is the format default [`F16_OPAQUE`] — restoring a source's
+/// real alpha is the caller's job (the output format carries none).
+pub(crate) fn bgr_u16_to_f16_rgba(src: &[u16], dst: &mut [u16]) {
+    let (px, tail) = src.as_chunks::<3>();
+    debug_assert!(tail.is_empty(), "src must hold exactly 3 u16 per pixel");
+    let (out, out_tail) = dst.as_chunks_mut::<4>();
+    debug_assert!(
+        out_tail.is_empty(),
+        "dst must hold exactly 4 halves per pixel"
+    );
+    debug_assert_eq!(px.len(), out.len(), "one BGR triplet per RGBA quadruple");
+    for (d, s) in out.iter_mut().zip(px) {
+        *d = [
+            u16_code_to_f16(s[2]), // R — the CMM's BGR order reversed
+            u16_code_to_f16(s[1]), // G
+            u16_code_to_f16(s[0]), // B
+            F16_OPAQUE,
+        ];
+    }
+}
+
+/// The f16 master's composite sibling of
+/// [`composite_over_background_in_place`]: RGBA half pixels over `bg`
+/// ([R, G, B] u8, DecodeEnv's shape — the half layout is RGBA, so no
+/// swizzle like the BGRA sibling needs), upstream's blend formula in
+/// float: `out = bg + (src - bg) * a`. Identity for a == 1.0 (the master's
+/// composite default), applied unconditionally like the 8-bit one; alpha
+/// lands at [`F16_OPAQUE`] after the pass (the master's opaque invariant).
+pub(crate) fn composite_over_background_f16_in_place(halves: &mut [u16], bg: [u8; 3]) {
+    let (px, tail) = halves.as_chunks_mut::<4>();
+    debug_assert!(
+        tail.is_empty(),
+        "the f16 master holds exactly 4 halves per pixel"
+    );
+    let bg_f = bg.map(|b| f32::from(b) / 255.0);
+    for px in px {
+        let a = f16_bits_to_f32(px[3]);
+        if a == 1.0 {
+            continue;
+        }
+        for (c, b) in px[..3].iter_mut().zip(bg_f) {
+            *c = f32_to_f16_bits(b + (f16_bits_to_f32(*c) - b) * a);
+        }
+        px[3] = F16_OPAQUE;
+    }
+}
+
+/// Restore the source's 8-bit alpha into the f16 master's alpha halves:
+/// the `BM_16b_RGB` output format carries no alpha channel, so a
+/// transformed frame's halves arrive at the format default — a source
+/// with real transparency needs its alpha back before the composite (the
+/// same restore the 8-bit `apply` runs on the BGRA quads' x byte). One
+/// alpha byte per pixel, `a / 255` through the master's own encoding.
+pub(crate) fn restore_alpha_f16_from_u8(halves: &mut [u16], alpha: &[u8]) {
+    let (px, tail) = halves.as_chunks_mut::<4>();
+    debug_assert!(
+        tail.is_empty(),
+        "the f16 master holds exactly 4 halves per pixel"
+    );
+    debug_assert_eq!(px.len(), alpha.len(), "one alpha byte per pixel");
+    for (px, &a) in px.iter_mut().zip(alpha) {
+        px[3] = f32_to_f16_bits(f32::from(a) / 255.0);
+    }
+}
+
+/// The 16-bit sibling of [`restore_alpha_f16_from_u8`]: one alpha u16
+/// (full scale 65535) per pixel.
+pub(crate) fn restore_alpha_f16_from_u16(halves: &mut [u16], alpha: &[u16]) {
+    let (px, tail) = halves.as_chunks_mut::<4>();
+    debug_assert!(
+        tail.is_empty(),
+        "the f16 master holds exactly 4 halves per pixel"
+    );
+    debug_assert_eq!(px.len(), alpha.len(), "one alpha sample per pixel");
+    for (px, &a) in px.iter_mut().zip(alpha) {
+        px[3] = u16_code_to_f16(a);
+    }
+}
+
+/// The RGBA byte rows' alpha channel, one byte per pixel — the shape
+/// [`restore_alpha_f16_from_u8`] consumes after an 8-bit decode fed the
+/// 16-bit CMM chain (the interleaved rows themselves do not).
+pub(crate) fn rgba8_alpha(rgba: &[u8]) -> Vec<u8> {
+    rgba.as_chunks::<4>().0.iter().map(|p| p[3]).collect()
+}
+
+/// The decoded frame as pure memory (#76, ADR 0002 D3): a top-down,
+/// tightly packed pixel buffer whose layout the content space decides
+/// (#142) — `Srgb` holds the 8-bit era's 32bpp BGRA (`width * height * 4`
+/// bytes, alpha forced opaque), `F16Srgb` holds the f16 master's four
+/// little-endian u16 halves per pixel in RGBA order (`width * height * 8`
+/// bytes). This is the source of truth — the D2D upload reads it, and
+/// device-loss recovery (#80) re-uploads from these bytes without
+/// re-decoding (the #76-era GDI face derived from them too, until #90
+/// deleted the arm).
 #[derive(Debug)]
 pub(crate) struct PixelFrame {
     pub(crate) pixels: Box<[u8]>,
     pub(crate) width: u32,
     pub(crate) height: u32,
-    /// Which pipeline owns the frame (#140, ADR 0003 D1): plain 8-bit
-    /// sRGB BGRA (`Srgb`, the 8-bit era's only space) or the FP16
-    /// master's interim 8-bit reading (`F16Srgb` — the BYTES stay
-    /// BGRA8 until #141 lands the f16 storage; the mark is the
-    /// master-content gate's verdict, carried so the cache-key and
-    /// seam-dispatch consumers wire up without re-deriving it).
+    /// Which pipeline owns the frame — and with it the storage convention
+    /// of `pixels` (#140/#142, ADR 0003 D1/D2): `Srgb` = the 8-bit era's
+    /// BGRA bytes; `F16Srgb` = the f16 master's RGBA halves (RGB carrying
+    /// sRGB EOTF encoded values, gamma domain; alpha the composite default
+    /// [`F16_OPAQUE`]). The byte buffer is NEVER reinterpreted as an
+    /// aligned `&[u16]` — a `Box<[u8]>` is align-1 — every half goes
+    /// through `u16::from_le_bytes`/`to_le_bytes`.
     pub(crate) content_space: ContentSpace,
 }
 
 impl PixelFrame {
-    /// Row stride in bytes — the invariant `width * 4` (top-down,
-    /// tightly packed), expressed as a method rather than a stored field
-    /// so it can never drift from `width`. Test-only until the D2D
-    /// upload path (#80) consumes it.
+    /// Row stride in bytes — the space's own invariant (`width * 4` for
+    /// [`ContentSpace::Srgb`], `width * 8` for [`ContentSpace::F16Srgb`]),
+    /// expressed as a method rather than a stored field so it can never
+    /// drift from `width`. Test-only: the production seams branch on the
+    /// content space, never on a stored stride.
     #[cfg(test)]
     pub(crate) fn stride(&self) -> usize {
-        self.width as usize * 4
+        match self.content_space {
+            ContentSpace::Srgb => self.width as usize * 4,
+            ContentSpace::F16Srgb => self.width as usize * 8,
+        }
     }
 
     /// `rgba` holds exactly `width * height * 4` bytes; converted to
@@ -328,6 +566,11 @@ impl PixelFrame {
         content_space: ContentSpace,
     ) -> Self {
         debug_assert_eq!(rgba.len(), width as usize * height as usize * 4);
+        debug_assert_eq!(
+            content_space,
+            ContentSpace::Srgb,
+            "the byte constructors carry the 8-bit era's BGRA layout — an f16 master builds through from_f16_halves"
+        );
         rgba8_to_bgra_in_place(&mut rgba);
         Self::from_bgra(width, height, rgba, content_space)
     }
@@ -341,11 +584,40 @@ impl PixelFrame {
         content_space: ContentSpace,
     ) -> Self {
         debug_assert_eq!(bgra.len(), width as usize * height as usize * 4);
+        debug_assert_eq!(
+            content_space,
+            ContentSpace::Srgb,
+            "the byte constructors carry the 8-bit era's BGRA layout — an f16 master builds through from_f16_halves"
+        );
         PixelFrame {
             pixels: bgra.into_boxed_slice(),
             width,
             height,
             content_space,
+        }
+    }
+
+    /// The f16 master's native entry (#142): `halves` holds exactly
+    /// `width * height * 4` u16 values (four per pixel, RGBA order),
+    /// packed little-endian into the byte buffer. Infallible like the
+    /// byte constructors (an allocation failure is a process-level
+    /// abort); the space is always [`ContentSpace::F16Srgb`] — these
+    /// ARE the f16 master's own bytes.
+    pub(crate) fn from_f16_halves(width: u32, height: u32, halves: Vec<u16>) -> Self {
+        debug_assert_eq!(
+            halves.len(),
+            width as usize * height as usize * 4,
+            "four halves per pixel"
+        );
+        let mut pixels = Vec::with_capacity(halves.len() * 2);
+        for h in halves {
+            pixels.extend_from_slice(&h.to_le_bytes());
+        }
+        PixelFrame {
+            pixels: pixels.into_boxed_slice(),
+            width,
+            height,
+            content_space: ContentSpace::F16Srgb,
         }
     }
 
@@ -364,33 +636,54 @@ impl PixelFrame {
 // semantics live in exactly one place.
 // ---------------------------------------------------------------------
 
-/// The direct-read seams' single dispatch (#141, ADR 0003 D1): one BGRA
-/// pixel of the master as the 8-bit BGRA its GDI-era consumers show.
-///
-/// `Srgb` passes the master's own bytes through — the 8-bit era's byte
-/// path, untouched. `F16Srgb` reads through the master's own quantizer
-/// ([`f16_bits_to_u8_code`]). While the interim seam stands
-/// (`loader.rs`'s "Interim seam": #142 has not landed the f16 storage
-/// yet), an `F16Srgb` master's bytes ARE the already-quantized 8-bit
-/// reading, and re-reading them through the quantizer — f16(k/255) ->
-/// round(v * 255) — is the exact identity (probe 1's lossless 256-code
-/// round trip, pinned in the tests). Both arms therefore return the same
-/// bytes today: the dispatch is STRUCTURALLY in place for #142's stored
-/// halves — when they land, only this arm's input changes from the
-/// interim byte to the half bits — not yet behaviorally visible.
-fn master_pixel_bgra8(space: ContentSpace, px: [u8; 4]) -> [u8; 4] {
-    match space {
-        ContentSpace::Srgb => px,
-        ContentSpace::F16Srgb => {
-            px.map(|b| f16_bits_to_u8_code(f32_to_f16_bits(f32::from(b) / 255.0)))
-        }
+/// The direct-read seams' single quantize read (#141/#142, ADR 0003 D1):
+/// one pixel of the master as the 8-bit BGRA its GDI-era consumers show.
+/// The two spaces store different byte widths (`Srgb` a BGRA quad,
+/// `F16Srgb` a half quadruple), so each seam samples its own shape and
+/// routes the F16Srgb arm through [`f16_rgba_halves_to_bgra8`] — whose
+/// only quantize-read point is [`f16_bits_to_u8_code`]. The Srgb arm is
+/// the byte passthrough the 8-bit era always was.
+pub(crate) fn f16_rgba_halves_to_bgra8(px: [u16; 4]) -> [u8; 4] {
+    [
+        f16_bits_to_u8_code(px[2]), // B
+        f16_bits_to_u8_code(px[1]), // G
+        f16_bits_to_u8_code(px[0]), // R
+        255,
+    ]
+}
+
+/// The whole-frame bulk of [`f16_rgba_halves_to_bgra8`] (the upload and
+/// clipboard seams' quantize, #142): `pixels` holds the master's
+/// 8-byte-per-pixel halves, `dst` the 4-byte-per-pixel BGRA reading.
+pub(crate) fn f16_halves_to_bgra8_bulk(pixels: &[u8], dst: &mut [u8]) {
+    let (src, src_tail) = pixels.as_chunks::<8>();
+    debug_assert!(
+        src_tail.is_empty(),
+        "the f16 master holds exactly 8 bytes per pixel"
+    );
+    let (out, dst_tail) = dst.as_chunks_mut::<4>();
+    debug_assert!(
+        dst_tail.is_empty(),
+        "dst must hold exactly 4 bytes per pixel"
+    );
+    debug_assert_eq!(src.len(), out.len(), "one half quadruple per BGRA quad");
+    let halves = |b: &[u8; 8]| {
+        [
+            u16::from_le_bytes([b[0], b[1]]),
+            u16::from_le_bytes([b[2], b[3]]),
+            u16::from_le_bytes([b[4], b[5]]),
+            u16::from_le_bytes([b[6], b[7]]),
+        ]
+    };
+    for (d, s) in out.iter_mut().zip(src) {
+        *d = f16_rgba_halves_to_bgra8(halves(s));
     }
 }
 
 /// One pixel of a top-down tightly-packed BGRA buffer as its raw
-/// [B, G, R, A] quadruple — the shared shape of [`sample_bgra`] and
-/// [`sample_master_rgb`]. `None` for any out-of-bounds coordinate (the
-/// same bounds [`sample_bgra`]'s doc pins).
+/// [B, G, R, A] quadruple — the shared shape of [`sample_bgra`] and the
+/// Srgb arm of [`sample_master_rgb`]. `None` for any out-of-bounds
+/// coordinate (the same bounds [`sample_bgra`]'s doc pins).
 fn sample_bgra_pixel(pixels: &[u8], width: i32, x: i32, y: i32) -> Option<[u8; 4]> {
     if x < 0 || y < 0 || x >= width {
         return None;
@@ -398,6 +691,20 @@ fn sample_bgra_pixel(pixels: &[u8], width: i32, x: i32, y: i32) -> Option<[u8; 4
     let idx = (y as usize * width as usize + x as usize) * 4;
     let px = pixels.get(idx..idx + 4)?;
     Some([px[0], px[1], px[2], px[3]])
+}
+
+/// One pixel of a top-down tightly-packed f16 master buffer (8 bytes per
+/// pixel: four LE u16 halves, RGBA order) as its RGBA half quadruple —
+/// the F16Srgb arm's sampling shape. `None` for any out-of-bounds
+/// coordinate (the same bounds [`sample_bgra_pixel`] pins).
+fn sample_f16_pixel(pixels: &[u8], width: i32, x: i32, y: i32) -> Option<[u16; 4]> {
+    if x < 0 || y < 0 || x >= width {
+        return None;
+    }
+    let idx = (y as usize * width as usize + x as usize) * 8;
+    let b = pixels.get(idx..idx + 8)?;
+    let half = |o: usize| u16::from_le_bytes([b[o], b[o + 1]]);
+    Some([half(0), half(2), half(4), half(6)])
 }
 
 /// Read one pixel of a top-down tightly-packed BGRA buffer as an
@@ -419,12 +726,18 @@ pub(crate) fn sample_bgra(pixels: &[u8], width: i32, x: i32, y: i32) -> Option<(
 /// "sRGB-normalized reading" — transform_stage.rs's contract block,
 /// surface.rs and text.rs all state it the same way): one pixel of the
 /// MASTER frame as the (R, G, B) triple the status bar shows, dispatched
-/// on the master's content space like every direct read. `None` for
+/// on the master's content space like every direct read — each arm
+/// samples its own storage shape (`Srgb` the BGRA quad, `F16Srgb` the
+/// half quadruple through [`f16_rgba_halves_to_bgra8`]). `None` for
 /// out-of-bounds coordinates — the caller maps it to the (255, 255, 255)
 /// `CLR_INVALID` read-through, exactly as the raw [`sample_bgra`] did.
 pub(crate) fn sample_master_rgb(frame: &PixelFrame, x: i32, y: i32) -> Option<(u8, u8, u8)> {
-    let px = sample_bgra_pixel(&frame.pixels, frame.width as i32, x, y)?;
-    let [b, g, r, _] = master_pixel_bgra8(frame.content_space, px);
+    let [b, g, r, _] = match frame.content_space {
+        ContentSpace::Srgb => sample_bgra_pixel(&frame.pixels, frame.width as i32, x, y)?,
+        ContentSpace::F16Srgb => {
+            f16_rgba_halves_to_bgra8(sample_f16_pixel(&frame.pixels, frame.width as i32, x, y)?)
+        }
+    };
     Some((r, g, b))
 }
 
@@ -433,22 +746,14 @@ pub(crate) fn sample_master_rgb(frame: &PixelFrame, x: i32, y: i32) -> Option<(u
 /// chain (`clipboard.rs`'s `set_clipboard_image` feed) reads the whole
 /// master as the 8-bit top-down BGRA a GDI bitmap carries, the same
 /// shape the 8-bit era produced). The `Srgb` arm is the plain clone the
-/// copy always made; the `F16Srgb` arm reads every pixel through
-/// [`master_pixel_bgra8`], which returns the same bytes on the interim
-/// master (see there for why both arms coincide until #142).
+/// copy always made; the `F16Srgb` arm quantizes every stored half
+/// quadruple through the bulk of [`f16_rgba_halves_to_bgra8`].
 pub(crate) fn master_gdi_bgra(frame: &PixelFrame) -> Vec<u8> {
     match frame.content_space {
         ContentSpace::Srgb => frame.pixels.to_vec(),
         ContentSpace::F16Srgb => {
-            debug_assert_eq!(
-                frame.pixels.len() % 4,
-                0,
-                "the master holds exactly 4 bytes per pixel"
-            );
-            let mut out = Vec::with_capacity(frame.pixels.len());
-            for px in frame.pixels.as_chunks::<4>().0 {
-                out.extend_from_slice(&master_pixel_bgra8(frame.content_space, *px));
-            }
+            let mut out = vec![0u8; frame.pixels.len() / 2];
+            f16_halves_to_bgra8_bulk(&frame.pixels, &mut out);
             out
         }
     }
@@ -625,10 +930,31 @@ mod tests {
     }
 
     #[test]
-    fn pixelframe_stride_is_width_times_four() {
-        let frame = PixelFrame::from_bgra(7, 3, vec![0u8; 7 * 3 * 4], ContentSpace::Srgb);
-        assert_eq!(frame.stride(), 28);
-        assert_eq!(frame.pixels.len(), frame.stride() * 3);
+    fn pixelframe_stride_follows_the_content_space_pixel_width() {
+        // #142: the stride is the space's own invariant — 4 bytes per
+        // pixel for the Srgb BGRA era, 8 for the f16 halves — so a
+        // buffer-length consumer can never size an f16 master like an
+        // 8-bit one.
+        let srgb = PixelFrame::from_bgra(7, 3, vec![0u8; 7 * 3 * 4], ContentSpace::Srgb);
+        assert_eq!(srgb.stride(), 28);
+        assert_eq!(srgb.pixels.len(), srgb.stride() * 3);
+        let f16 = PixelFrame::from_f16_halves(7, 3, vec![F16_OPAQUE; 7 * 3 * 4]);
+        assert_eq!(f16.stride(), 56);
+        assert_eq!(f16.pixels.len(), f16.stride() * 3);
+        assert_eq!(f16.content_space, ContentSpace::F16Srgb);
+    }
+
+    #[test]
+    fn from_f16_halves_packs_the_halves_little_endian() {
+        // The storage contract's byte view: each u16 half lands as its LE
+        // byte pair, RGBA halves contiguous per pixel. Read back through
+        // the seam's own LE decoder, not an aligned cast (Box<[u8]> is
+        // align-1 by contract).
+        let frame = PixelFrame::from_f16_halves(1, 1, vec![0x1234, 0xABCD, 0x0001, F16_OPAQUE]);
+        assert_eq!(
+            &frame.pixels[..],
+            &[0x34, 0x12, 0xCD, 0xAB, 0x01, 0x00, 0x00, 0x3C]
+        );
     }
 
     #[test]
@@ -740,8 +1066,7 @@ mod tests {
         // Endpoints and the loader's 16-bit PNG fixture values (the
         // apng_16bit test's 0xC700/0x3C00/0x0A00 triple): the f16 master
         // reads them back as the same 8-bit codes the old direct
-        // quantization produced — the interim landing is byte-stable on
-        // real fixture data.
+        // quantization produced — byte-stable on real fixture data.
         assert_eq!(u16_code_to_u8_via_f16(0x0000), 0);
         assert_eq!(u16_code_to_u8_via_f16(0xFFFF), 255);
         assert_eq!(
@@ -787,23 +1112,37 @@ mod tests {
         assert_eq!(dst, [128, 128, 128, 255, 0, 0, 0, 0]);
     }
 
-    // ---- direct-read seams (#141, ADR 0003 D1) ----
+    // ---- direct-read seams (#141/#142, ADR 0003 D1) ----
+
+    /// An F16Srgb frame built from explicit halves: one white pixel
+    /// (R=G=B=0x3C00) and one half-grey pixel (0x3800 = 0.5), alpha
+    /// opaque. The seams' read-back pins below decode it.
+    fn f16_frame_2x1() -> PixelFrame {
+        PixelFrame::from_f16_halves(
+            2,
+            1,
+            vec![
+                0x3C00, 0x3C00, 0x3C00, F16_OPAQUE, 0x3800, 0x3800, 0x3800, F16_OPAQUE,
+            ],
+        )
+    }
 
     #[test]
-    fn requantizing_the_interim_f16srgb_byte_is_the_exact_identity() {
-        // The interim seam's load-bearing fact: an F16Srgb master's bytes
-        // are the ALREADY-quantized 8-bit reading (loader.rs's Interim
-        // seam — #142 has not landed the f16 storage), and reading one
-        // back through the master's own quantizer — f16(k/255) ->
-        // round(v * 255), the exact math `master_pixel_bgra8`'s F16Srgb
-        // arm runs — gives back the same code for every one of the 256
-        // inputs. When #142 swaps the arm's input to stored halves this
-        // identity stops being exercised, but until then it is what keeps
-        // the two dispatch arms byte-identical.
-        for k in 0u8..=255 {
-            let read = f16_bits_to_u8_code(f32_to_f16_bits(f32::from(k) / 255.0));
-            assert_eq!(read, k, "interim byte {k} must re-read as {k}");
-        }
+    fn sample_master_rgb_on_an_f16srgb_master_reads_the_stored_halves() {
+        // The seam's #142 shape: an F16Srgb master stores half bits, and
+        // the status readout reads THEM — pixel 0 through the white half
+        // 0x3C00 (255 on every channel), pixel 1 through 0x3800 (0.5 ->
+        // 127.5 -> 128, the round-half-up the quantizer pins). Both match
+        // the per-channel f16_bits_to_u8_code expectation — the only
+        // quantize read there is.
+        let frame = f16_frame_2x1();
+        assert_eq!(sample_master_rgb(&frame, 0, 0), Some((255, 255, 255)));
+        assert_eq!(sample_master_rgb(&frame, 1, 0), Some((128, 128, 128)));
+        // The Srgb arm's None-for-out-of-bounds contract holds on the
+        // f16 arm too (8-byte pixels, same pixel bounds).
+        assert_eq!(sample_master_rgb(&frame, 2, 0), None);
+        assert_eq!(sample_master_rgb(&frame, -1, 0), None);
+        assert_eq!(sample_master_rgb(&frame, 0, 1), None);
     }
 
     #[test]
@@ -834,40 +1173,301 @@ mod tests {
     }
 
     #[test]
-    fn an_f16srgb_marked_master_reads_the_same_pixels_the_interim_bytes_carry() {
-        // The dispatch's structural guarantee, observed at the status
-        // readout: while the interim seam stands, a frame marked F16Srgb
-        // (the #140 loader's mark for deep/transformed sources) reads
-        // back the same RGB the bytes carry — the two content spaces'
-        // reads coincide until #142's stored halves arrive.
-        let bytes = vec![30, 20, 10, 255, 3, 2, 1, 255];
-        let srgb = PixelFrame::from_bgra(2, 1, bytes.clone(), ContentSpace::Srgb);
-        let f16 = PixelFrame::from_bgra(2, 1, bytes, ContentSpace::F16Srgb);
-        for (x, y) in [(0i32, 0i32), (1, 0)] {
-            assert_eq!(
-                sample_master_rgb(&f16, x, y),
-                sample_master_rgb(&srgb, x, y),
-                "({x}, {y}): the F16Srgb mark must not change the interim read"
+    fn f16_half_pixels_quantize_through_the_one_read_point() {
+        // The seam contract in its smallest form: f16_rgba_halves_to_bgra8
+        // reverses the half order into BGRA bytes, each channel through
+        // f16_bits_to_u8_code, alpha forced opaque.
+        assert_eq!(
+            f16_rgba_halves_to_bgra8([0x3C00, 0x3800, 0x0000, 0x3C00]),
+            [0, 128, 255, 255]
+        );
+    }
+
+    #[test]
+    fn the_clipboard_source_of_an_f16srgb_master_is_the_bulk_quantize() {
+        // The clipboard seam (ADR 0003 后果节: GDI has no f16 — the copy
+        // quantizes back to 8-bit, "与现产字节同形"): the whole-frame read
+        // equals the per-pixel seam read at every pixel — one quantize
+        // path, two granularities.
+        let frame = f16_frame_2x1();
+        let bulk = master_gdi_bgra(&frame);
+        assert_eq!(bulk.len(), frame.pixels.len() / 2, "4 bytes per pixel");
+        for (x, px) in bulk.as_chunks::<4>().0.iter().enumerate() {
+            let expected = f16_rgba_halves_to_bgra8(
+                sample_f16_pixel(&frame.pixels, frame.width as i32, x as i32, 0)
+                    .expect("in-bounds pixel"),
             );
+            assert_eq!(*px, expected, "pixel {x}");
         }
-        // And the byte path underneath: every pixel of the marked frame
-        // re-reads as its own bytes.
-        for px in f16.pixels.as_chunks::<4>().0 {
-            assert_eq!(master_pixel_bgra8(ContentSpace::F16Srgb, *px), *px);
+        // The f16 bulk quantize of a white frame is the 8-bit era's white.
+        let white = PixelFrame::from_f16_halves(
+            2,
+            1,
+            vec![
+                0x3C00, 0x3C00, 0x3C00, F16_OPAQUE, 0x3C00, 0x3C00, 0x3C00, F16_OPAQUE,
+            ],
+        );
+        assert_eq!(
+            master_gdi_bgra(&white),
+            vec![255, 255, 255, 255, 255, 255, 255, 255]
+        );
+    }
+
+    // ---- CPU transcode (#142, ADR 0003 D6) ----
+
+    #[test]
+    fn bgr_u16_to_f16_reverses_the_cmm_channel_order() {
+        // The CMM's BM_16b_RGB emits [B, G, R]; the master stores [R, G,
+        // B, A]. An asymmetric color is the discriminator — a symmetric
+        // one (grey) could not tell reversal from a passthrough.
+        let mut dst = [0u16; 4];
+        bgr_u16_to_f16_rgba(&[0x0A00, 0x3C00, 0xC700], &mut dst);
+        // R takes the third triplet slot (0xC700), B the first (0x0A00).
+        assert_eq!(
+            (dst[0], dst[1], dst[2], dst[3]),
+            (
+                f32_to_f16_bits(f32::from(0xC700u16) / 65535.0),
+                f32_to_f16_bits(f32::from(0x3C00u16) / 65535.0),
+                f32_to_f16_bits(f32::from(0x0A00u16) / 65535.0),
+                F16_OPAQUE
+            )
+        );
+    }
+
+    #[test]
+    fn bgr_u16_endpoints_and_midpoint_land_on_the_reference_halves() {
+        // 0 -> black (0x0000), 65535 -> full (1.0 = 0x3C00), and the
+        // 32768 case the loader's 16-bit fixture family leans on:
+        // 0.5000076 is nearer 0.5 than the next half up, so it rounds to
+        // 0x3800 — no code value drifts past the master's quantization.
+        for (code, half) in [(0u16, 0x0000u16), (65535, 0x3C00), (32768, 0x3800)] {
+            let mut dst = [0u16; 4];
+            bgr_u16_to_f16_rgba(&[code, code, code], &mut dst);
+            assert_eq!(dst[0], half, "R half of {code}");
+            assert_eq!(dst[1], half, "G half of {code}");
+            assert_eq!(dst[2], half, "B half of {code}");
         }
     }
 
     #[test]
-    fn the_clipboard_source_of_an_f16srgb_master_matches_its_interim_bytes() {
-        // The clipboard seam (ADR 0003 后果节: GDI has no f16 — the copy
-        // quantizes back to 8-bit, "与现产字节同形"): on the interim
-        // master the quantize read returns the master's own bytes, so the
-        // F16Srgb source equals both the bytes and the Srgb clone the
-        // 8-bit era produced.
-        let bytes = vec![7u8, 8, 9, 255, 200, 150, 100, 255];
-        let srgb = PixelFrame::from_bgra(2, 1, bytes.clone(), ContentSpace::Srgb);
-        let f16 = PixelFrame::from_bgra(2, 1, bytes, ContentSpace::F16Srgb);
-        assert_eq!(master_gdi_bgra(&f16), f16.pixels.to_vec());
-        assert_eq!(master_gdi_bgra(&f16), master_gdi_bgra(&srgb));
+    fn bgr_u16_to_f16_sets_alpha_opaque_and_tracks_lengths() {
+        // The output format has no alpha channel: every pixel's A half is
+        // the composite default, and the 3-to-4 halves-per-pixel ratio is
+        // asserted (a caller mixing up u16 and byte counts cannot pass).
+        let src = [0xFFFFu16; 9]; // three pixels
+        let mut dst = [0u16; 12];
+        bgr_u16_to_f16_rgba(&src, &mut dst);
+        assert_eq!(dst[3], F16_OPAQUE);
+        assert_eq!(dst[7], F16_OPAQUE);
+        assert_eq!(dst[11], F16_OPAQUE);
+    }
+
+    #[test]
+    fn the_f16_composite_lands_a_transparent_pixel_on_the_background() {
+        // The M1 bug's f16 sibling: a=0 hides the source RGB entirely.
+        let mut px = vec![0x3C00, 0x0000, 0x3800, 0x0000]; // RGBA halves, a=0
+        composite_over_background_f16_in_place(&mut px, [10, 20, 30]);
+        assert_eq!(
+            (px[0], px[1], px[2], px[3]),
+            (
+                f32_to_f16_bits(10.0 / 255.0),
+                f32_to_f16_bits(20.0 / 255.0),
+                f32_to_f16_bits(30.0 / 255.0),
+                F16_OPAQUE
+            )
+        );
+    }
+
+    #[test]
+    fn the_f16_composite_leaves_opaque_pixels_untouched() {
+        let src = vec![
+            0x1234, 0x5678, 0x9ABC, F16_OPAQUE, 0x0000, 0x3C00, 0x0A00, F16_OPAQUE,
+        ];
+        let mut px = src.clone();
+        composite_over_background_f16_in_place(&mut px, [200, 200, 200]);
+        assert_eq!(px, src, "a == 1.0 is the composite's skip value");
+    }
+
+    #[test]
+    fn the_f16_composite_stays_within_one_code_of_the_8bit_formula() {
+        // The two composites must agree where both are defined: half
+        // alpha over a midtone background, every channel within one 8-bit
+        // code of upstream's integer blend `bg + (src - bg) * a / 255`
+        // (viv.c:10166-10168). The f16 arm's extra precision may land one
+        // code off the truncating integer result, never further.
+        let (r8, g8, b8, a8) = (200u8, 60u8, 10u8, 128u8);
+        let bg = [80u8, 80, 80];
+        let src8 = [r8, g8, b8];
+        let mut px = vec![
+            f32_to_f16_bits(f32::from(r8) / 255.0),
+            f32_to_f16_bits(f32::from(g8) / 255.0),
+            f32_to_f16_bits(f32::from(b8) / 255.0),
+            f32_to_f16_bits(f32::from(a8) / 255.0),
+        ];
+        composite_over_background_f16_in_place(&mut px, bg);
+        for (i, &half) in px[..3].iter().enumerate() {
+            let expected =
+                i32::from(bg[i]) + ((i32::from(src8[i]) - i32::from(bg[i])) * i32::from(a8)) / 255;
+            let read = f16_bits_to_u8_code(half);
+            assert!(
+                (i32::from(read) - expected).abs() <= 1,
+                "channel {i}: f16 read {read} vs integer formula {expected}"
+            );
+        }
+        assert_eq!(px[3], F16_OPAQUE);
+    }
+
+    #[test]
+    fn restoring_8bit_alpha_encodes_the_same_fraction_the_8bit_era_carried() {
+        // a/255 through the master's encoding: 128 -> f16(128/255) — read
+        // back it is the same fraction, so the composite downstream sees
+        // the transparency the decoder produced.
+        let mut px = vec![0u16; 8];
+        restore_alpha_f16_from_u8(&mut px, &[128, 0]);
+        assert_eq!(px[3], f32_to_f16_bits(f32::from(128u8) / 255.0));
+        assert_eq!(px[7], 0x0000, "a=0 stays fully transparent");
+    }
+
+    #[test]
+    fn restoring_16bit_alpha_spans_the_full_scale() {
+        // 0xFFFF -> 1.0 (0x3C00), 0x0000 -> 0: the endpoints the deep
+        // fixture family leans on.
+        let mut px = vec![0u16; 8];
+        restore_alpha_f16_from_u16(&mut px, &[0xFFFF, 0x0000]);
+        assert_eq!(px[3], F16_OPAQUE);
+        assert_eq!(px[7], 0x0000);
+    }
+
+    #[test]
+    fn deep_samples_land_in_f16_halves_without_an_8bit_detour() {
+        // The direct deep path's storage: the fixture triple reads back
+        // the same 8-bit codes the old quantization produced (198/60/10),
+        // but now as stored HALVES — and 0xC700's half is NOT the f16 of
+        // its 8-bit read (198/255), which is the >8-bit information the
+        // old truncation destroyed.
+        let src = [0xC700u16, 0x3C00, 0x0A00, 0xFFFF];
+        let mut dst = [0u16; 4];
+        deep_to_f16_halves(DeepSamples::Rgba16(&src), &mut dst);
+        assert_eq!(f16_bits_to_u8_code(dst[0]), 198);
+        assert_eq!(f16_bits_to_u8_code(dst[1]), 60);
+        assert_eq!(f16_bits_to_u8_code(dst[2]), 10);
+        assert_eq!(dst[3], F16_OPAQUE, "0xFFFF alpha -> opaque");
+        assert_ne!(dst[0], f32_to_f16_bits(198.0 / 255.0));
+    }
+
+    #[test]
+    fn deep_opaque_layouts_default_alpha_to_the_composite_value() {
+        // Rgb16/Luma16 have no alpha samples: their halves land at the
+        // format default, and luma replicates across RGB.
+        let mut dst = [0u16; 8];
+        deep_to_f16_halves(DeepSamples::Luma16(&[0x8000, 0xFFFF]), &mut dst);
+        assert_eq!(dst[0], dst[1]);
+        assert_eq!(dst[1], dst[2]);
+        assert_eq!(dst[3], F16_OPAQUE);
+        assert_eq!(dst[7], F16_OPAQUE);
+    }
+
+    #[test]
+    fn deep_samples_feed_the_cmm_as_bgr_triplets() {
+        // deep_to_bgr_u16 is the CMM's input builder: RGB sample order
+        // reversed into BM_16b_RGB's BGR, values verbatim, alpha dropped
+        // (restored separately), luma triplicated.
+        let mut dst = [0u16; 3];
+        deep_to_bgr_u16(DeepSamples::Rgb16(&[0x0A00, 0x3C00, 0xC700]), &mut dst);
+        assert_eq!(dst, [0xC700, 0x3C00, 0x0A00], "B, G, R");
+        let mut dst = [0u16; 3];
+        deep_to_bgr_u16(
+            DeepSamples::Rgba16(&[0x0A00, 0x3C00, 0xC700, 0x1234]),
+            &mut dst,
+        );
+        assert_eq!(dst, [0xC700, 0x3C00, 0x0A00], "alpha dropped");
+        let mut dst = [0u16; 6];
+        deep_to_bgr_u16(
+            DeepSamples::LumaA16(&[0x8000, 0xFFFF, 0x0000, 0x0000]),
+            &mut dst,
+        );
+        assert_eq!(dst, [0x8000, 0x8000, 0x8000, 0x0000, 0x0000, 0x0000]);
+    }
+
+    #[test]
+    fn deep_source_alpha_is_pulled_only_from_the_layouts_that_carry_it() {
+        // The transform path's restore needs the samples' own alpha back:
+        // Rgba16 takes slot 3, LumaA16 slot 1, the opaque layouts none.
+        let rgba = [0xFFFFu16, 0, 0, 0x8000, 0, 0xFFFF, 0, 0x4000];
+        assert_eq!(
+            deep_source_alpha(&DeepSamples::Rgba16(&rgba)),
+            Some(vec![0x8000, 0x4000])
+        );
+        let la = [0x1234u16, 0x8000, 0x5678, 0xFFFF];
+        assert_eq!(
+            deep_source_alpha(&DeepSamples::LumaA16(&la)),
+            Some(vec![0x8000, 0xFFFF])
+        );
+        assert_eq!(deep_source_alpha(&DeepSamples::Rgb16(&[0; 3])), None);
+        assert_eq!(deep_source_alpha(&DeepSamples::Luma16(&[0])), None);
+    }
+
+    #[test]
+    fn the_f16_bulk_quantize_matches_the_per_pixel_seam_read() {
+        // The upload seam's whole-frame staging (#142) must produce
+        // exactly the pixels the per-pixel seam would read — one
+        // quantize, no second opinion.
+        let frame = f16_frame_2x1();
+        let mut bulk = vec![0u8; frame.pixels.len() / 2];
+        f16_halves_to_bgra8_bulk(&frame.pixels, &mut bulk);
+        for x in 0..2i32 {
+            let [b, g, r, a] = f16_rgba_halves_to_bgra8(
+                sample_f16_pixel(&frame.pixels, frame.width as i32, x, 0).expect("in-bounds"),
+            );
+            assert_eq!(&bulk[x as usize * 4..x as usize * 4 + 4], &[b, g, r, a]);
+        }
+    }
+
+    // ---- f16 rotation (#142) ----
+
+    /// The 2x3 f16 twin of the byte ramp below: pixel i carries the half
+    /// value 0x0400 + i in every channel (an index tag that survives as
+    /// bits), alpha opaque.
+    fn f16_ramp_2x3() -> Vec<u8> {
+        let mut halves = Vec::with_capacity(2 * 3 * 4);
+        for i in 0..6u16 {
+            for _ in 0..4 {
+                halves.push(0x0400 + i);
+            }
+        }
+        let mut bytes = Vec::with_capacity(halves.len() * 2);
+        for h in halves {
+            bytes.extend_from_slice(&h.to_le_bytes());
+        }
+        bytes
+    }
+
+    #[test]
+    fn f16_rotation_moves_whole_half_quadruples_with_the_8bit_geometry() {
+        // Same fixture shape as the BGRA rotation pin: the 2x3 f16 ramp
+        // rotates into a 3x2 result with the pixel mapping unchanged —
+        // old(row r, col c) -> new(col high-1-r, row c) — and the half
+        // BITS ride along untouched (rotation is geometry, not encoding).
+        let src = f16_ramp_2x3();
+        let mut dst = vec![0u8; src.len()];
+        rotate_f16_90_cw(&src, 2, 3, &mut dst);
+        let px = |i: usize| -> u16 {
+            // Read the moved pixel's first channel half back (LE).
+            u16::from_le_bytes([dst[i * 8], dst[i * 8 + 1]])
+        };
+        // The 8-bit pin's mapping, at half granularity: new row 0 holds
+        // old pixels 4, 2, 0; new row 1 holds 5, 3, 1.
+        assert_eq!((px(0), px(1), px(2)), (0x0404, 0x0402, 0x0400));
+        assert_eq!((px(3), px(4), px(5)), (0x0405, 0x0403, 0x0401));
+    }
+
+    #[test]
+    fn f16_clockwise_and_counterclockwise_are_inverses() {
+        let src = f16_ramp_2x3();
+        let mut cw = vec![0u8; src.len()];
+        rotate_f16_90_cw(&src, 2, 3, &mut cw);
+        let mut back = vec![0u8; src.len()];
+        rotate_f16_270_cw(&cw, 3, 2, &mut back);
+        assert_eq!(back, src, "90 + 270 restores every half bit for bit");
     }
 }

@@ -22,7 +22,10 @@ use windows::Win32::Graphics::Gdi::{
     HGDIOBJ,
 };
 
-use crate::pixels::{PixelFrame, rotate_bgra_90_cw, rotate_bgra_270_cw};
+use crate::pixels::{
+    PixelFrame, rotate_bgra_90_cw, rotate_bgra_270_cw, rotate_f16_90_cw, rotate_f16_270_cw,
+};
+use crate::transform_stage::ContentSpace;
 
 /// Create a bare top-down 32bpp BGRA DIB section of `width x height` and
 /// hand back the handle plus its bit pointer — the GDI allocation
@@ -125,11 +128,31 @@ impl Surface {
         if wide == 0 || high == 0 {
             return false;
         }
-        let mut rotated = vec![0u8; wide * high * 4];
-        if clockwise {
-            rotate_bgra_90_cw(&self.master.pixels, wide, high, &mut rotated);
-        } else {
-            rotate_bgra_270_cw(&self.master.pixels, wide, high, &mut rotated);
+        // The pixel width follows the master's own storage convention
+        // (#142): 4 bytes per pixel in the Srgb era, 8 for the f16
+        // master's half quadruples — rotation moves geometry, not
+        // encoding, so the halves ride along as opaque blocks.
+        let mut rotated = vec![
+            0u8;
+            wide * high
+                * match self.master.content_space {
+                    ContentSpace::Srgb => 4,
+                    ContentSpace::F16Srgb => 8,
+                }
+        ];
+        match (self.master.content_space, clockwise) {
+            (ContentSpace::Srgb, true) => {
+                rotate_bgra_90_cw(&self.master.pixels, wide, high, &mut rotated);
+            }
+            (ContentSpace::Srgb, false) => {
+                rotate_bgra_270_cw(&self.master.pixels, wide, high, &mut rotated);
+            }
+            (ContentSpace::F16Srgb, true) => {
+                rotate_f16_90_cw(&self.master.pixels, wide, high, &mut rotated);
+            }
+            (ContentSpace::F16Srgb, false) => {
+                rotate_f16_270_cw(&self.master.pixels, wide, high, &mut rotated);
+            }
         }
         self.master = PixelFrame {
             pixels: rotated.into_boxed_slice(),

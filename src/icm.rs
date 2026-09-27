@@ -10,6 +10,15 @@
 //! output (the sRGB background is never transformed) and
 //! `PixelFrame::from_bgra` boxes it.
 //!
+//! #142 (ADR 0003 D6) promoted the chain to 16-bit output: the same
+//! source shapes now translate into `BM_16b_RGB` (16-bit gamma
+//! fixed-point [B,G,R] triplets, full scale 65535) and CPU-transcode
+//! into the f16 master's RGBA halves — `apply_f16`, the frames' primary
+//! path. The 8-bit `apply` stays as the fallback arm (ADR 0003 D5: a
+//! refused 16-bit pass downgrades that frame to the 8-bit chain,
+//! breadcrumb once, load unaffected); the equivalence probe still runs
+//! in the 8-bit domain on `translate`, its tolerance calibrated there.
+//!
 //! sRGB equivalence is detected BEFORE trusting the transform, because
 //! the CMM's own sRGB->sRGB pass drifts a few LSBs (observed max 4/255 —
 //! Microsoft's "precision errors" warning is real). Two gates: a
@@ -36,10 +45,10 @@ use std::sync::OnceLock;
 use windows::Win32::Foundation::GetLastError;
 use windows::Win32::Storage::FileSystem::OPEN_EXISTING;
 use windows::Win32::UI::ColorSystem::{
-    BEST_MODE, BM_xBGRQUADS, BM_xRGBQUADS, CloseColorProfile, CreateMultiProfileTransform,
-    DeleteColorTransform, GetStandardColorSpaceProfileW, INDEX_DONT_CARE,
-    INTENT_RELATIVE_COLORIMETRIC, LCS_sRGB, OpenColorProfileW, PROFILE, PROFILE_MEMBUFFER,
-    PROFILE_READ, TranslateBitmapBits, USE_RELATIVE_COLORIMETRIC,
+    BEST_MODE, BM_16b_RGB, BM_xBGRQUADS, BM_xRGBQUADS, CloseColorProfile,
+    CreateMultiProfileTransform, DeleteColorTransform, GetStandardColorSpaceProfileW,
+    INDEX_DONT_CARE, INTENT_RELATIVE_COLORIMETRIC, LCS_sRGB, OpenColorProfileW, PROFILE,
+    PROFILE_MEMBUFFER, PROFILE_READ, TranslateBitmapBits, USE_RELATIVE_COLORIMETRIC,
 };
 use windows::core::{PCWSTR, PWSTR};
 
@@ -229,6 +238,16 @@ fn create_transform(src: &ProfileHandle, dst: &ProfileHandle) -> Result<isize, u
     }
 }
 
+/// The source-side bitmap format of one frame for the 16-bit output chain
+/// (ADR 0003 D6): the 8-bit decode path hands RGBA byte quads
+/// (`BM_xBGRQUADS`, what the decoder produces), the deep path hands the
+/// CMM's own `BM_16b_RGB` shape ([B,G,R] u16 triplets — the probe-verified
+/// 16→16 form). The destination is always `BM_16b_RGB`.
+pub(crate) enum FrameSrc<'a> {
+    Rgba8(&'a [u8]),
+    Bgr16(&'a [u16]),
+}
+
 /// A prepared ICC->sRGB transform: one per decode job, applied to every
 /// frame of the image exactly once (upstream applies ICM at load time
 /// the same way — `GdipLoadImageFromStreamICM`). Created, used, and
@@ -247,6 +266,11 @@ pub(crate) struct Transform {
     _src_profile: ProfileHandle,
     /// Same hold for the destination (system sRGB) profile.
     _dst_profile: ProfileHandle,
+    /// Test hook for the D5 fallback (#142): force every `translate16`
+    /// call to fail so the fallback chains can be exercised without a
+    /// CMM that actually refuses `BM_16b_RGB`.
+    #[cfg(test)]
+    pub(crate) force16_fail: Cell<bool>,
 }
 
 impl Drop for Transform {
@@ -303,6 +327,76 @@ impl Transform {
         }
     }
 
+    /// The 16-bit output chain's FFI pass (ADR 0003 D6): whatever the
+    /// source shape, the destination is always `BM_16b_RGB` — 16-bit
+    /// gamma fixed-point [B,G,R] triplets, full scale 65535, stride
+    /// `width * 6` bytes. `Err` carries the GLE for the caller's
+    /// breadcrumb; no logging — callers decide what a failure means.
+    fn translate16(
+        &self,
+        width: u32,
+        height: u32,
+        src: FrameSrc<'_>,
+        dst_bgr16: &mut [u16],
+    ) -> Result<(), u32> {
+        #[cfg(test)]
+        if self.force16_fail.get() {
+            return Err(50); // ERROR_NOT_SUPPORTED — the injected refusal
+        }
+        debug_assert_eq!(
+            dst_bgr16.len(),
+            width as usize * height as usize * 3,
+            "three u16 triplets per destination pixel"
+        );
+        let (src_ptr, src_format, src_stride) = match src {
+            FrameSrc::Rgba8(bytes) => {
+                debug_assert_eq!(bytes.len(), width as usize * height as usize * 4);
+                (
+                    bytes.as_ptr().cast(),
+                    BM_xBGRQUADS, // the decoder's [R,G,B,x] rows
+                    width * 4,
+                )
+            }
+            FrameSrc::Bgr16(samples) => {
+                debug_assert_eq!(samples.len(), width as usize * height as usize * 3);
+                (
+                    samples.as_ptr().cast(),
+                    BM_16b_RGB, // the deep path's own [B,G,R] u16 triplets
+                    width * 6,
+                )
+            }
+        };
+        let dst_stride = width * 6;
+        // SAFETY: the source pointer spans exactly the source format's
+        // `width*height` pixels (debug asserts above, callers construct
+        // the buffers from the same dimensions) and the destination
+        // `width*height*3` u16 values; the two are distinct allocations,
+        // matching the API's non-in-place contract; the transform handle
+        // is borrowed live via &self.
+        let ok = unsafe {
+            TranslateBitmapBits(
+                self.xform,
+                src_ptr,
+                src_format,
+                width,
+                height,
+                src_stride,
+                dst_bgr16.as_mut_ptr().cast(),
+                BM_16b_RGB, // the 16-bit gamma output, always
+                dst_stride,
+                None,
+                None,
+            )
+        }
+        .as_bool();
+        if ok {
+            Ok(())
+        } else {
+            // SAFETY: thread error slot read immediately after the failed call.
+            Err(unsafe { GetLastError() }.0)
+        }
+    }
+
     /// One decoded frame: RGBA in, BGRA out. `false` = the CMM refused
     /// the pass — the caller falls back to the untransformed RGBA path
     /// for the frame (breadcrumb once per transform, not per frame).
@@ -338,6 +432,30 @@ impl Transform {
             dst[3] = src[3];
         }
         true
+    }
+
+    /// The 16-bit output chain (ADR 0003 D6): `src` through the CMM into
+    /// `BM_16b_RGB`, then CPU-transcoded into the f16 master's RGBA half
+    /// layout ([`crate::pixels::bgr_u16_to_f16_rgba`] — the CMM emits BGR
+    /// order, the master stores RGBA). Alpha is the output format's
+    /// default (1.0); a source with real transparency is the CALLER's to
+    /// restore before the composite. `None` = the CMM refused the 16-bit
+    /// pass — the caller falls back to the 8-bit chain (`apply`) for the
+    /// frame (breadcrumb once per transform, not per frame; ADR 0003 D5).
+    pub(crate) fn apply_f16(&self, width: u32, height: u32, src: FrameSrc<'_>) -> Option<Vec<u16>> {
+        let mut bgr = vec![0u16; width as usize * height as usize * 3];
+        if let Err(gle) = self.translate16(width, height, src, &mut bgr) {
+            if !self.apply_failed.replace(true) {
+                eprintln!(
+                    "riviv: icm: {}: TranslateBitmapBits(BM_16b_RGB) failed (GLE={gle}) — frames fall back to the 8-bit path",
+                    self.shown
+                );
+            }
+            return None;
+        }
+        let mut halves = vec![0u16; width as usize * height as usize * 4];
+        crate::pixels::bgr_u16_to_f16_rgba(&bgr, &mut halves);
+        Some(halves)
     }
 }
 
@@ -424,6 +542,8 @@ pub(crate) fn probe_equivalence(
         apply_failed: Cell::new(false),
         _src_profile: src,
         _dst_profile: dst,
+        #[cfg(test)]
+        force16_fail: Cell::new(false),
     };
     // A different blob can still encode the sRGB space (the byte
     // compare above only catches the identical one). Probe the built
@@ -771,5 +891,118 @@ mod tests {
     fn non_rgb_and_malformed_blobs_are_downgraded() {
         assert!(prepare(true, Some(header(b"CMYK", 2, b"acsp")), "t").is_none());
         assert!(prepare(true, Some(vec![0u8; 16]), "t").is_none());
+    }
+
+    // ---- the 16-bit output chain (#142, ADR 0003 D6) ----
+
+    #[test]
+    fn the_mixed_8bit_source_to_16bit_destination_pass_transforms_pixels() {
+        // The MIXED-format shape the #137 probes never ran (8-bit
+        // BM_xBGRQUADS source into the BM_16b_RGB destination): this test
+        // IS the empirical verdict — if mscms refuses it, the design
+        // reroutes 8-bit sources to the "always widen" form and this pin
+        // flips with it. Pure red under the wider gamut reads back full
+        // R with B/G near zero (the 8-bit arm's asymmetric-color pin,
+        // through the master's own quantizer).
+        let _ = require_srgb();
+        let t = prepare(true, Some(adobe_like_icc()), "t")
+            .expect("an AdobeRGB-like profile transforms");
+        let src = [255u8, 0, 0, 255, 128, 128, 128, 255];
+        let Some(halves) = t.apply_f16(2, 1, FrameSrc::Rgba8(&src)) else {
+            panic!("mscms refused the mixed 8-bit-src -> BM_16b_RGB-dst pass");
+        };
+        let red = crate::pixels::f16_rgba_halves_to_bgra8(
+            halves[0..4].try_into().expect("one half quadruple"),
+        );
+        assert_eq!(red[2], 255, "pure red keeps a full R channel");
+        assert!(red[0] <= 2, "pure red keeps B near zero, got {}", red[0]);
+        assert!(red[1] <= 2, "pure red keeps G near zero, got {}", red[1]);
+        // The grey pixel moved off identity (the CMM ran at all).
+        let grey = crate::pixels::f16_rgba_halves_to_bgra8(
+            halves[4..8].try_into().expect("one half quadruple"),
+        );
+        assert_ne!(grey[2], 128, "the CMM moved the midtone");
+    }
+
+    #[test]
+    fn the_16bit_source_shape_transforms_through_the_verified_form() {
+        // The Bgr16 source is the #137 probe's verified 16→16 shape: the
+        // deep path's [B,G,R] triplets in, halves out. Pure red as
+        // [B=0, G=0, R=0xFFFF] must land R full and B/G near zero — a
+        // format that failed to honor the BGR order would put the value
+        // in the wrong channel.
+        let _ = require_srgb();
+        let t = prepare(true, Some(adobe_like_icc()), "t")
+            .expect("an AdobeRGB-like profile transforms");
+        let src = [0u16, 0, 0xFFFF, 0x8000, 0x8000, 0x8000];
+        let halves = t
+            .apply_f16(2, 1, FrameSrc::Bgr16(&src))
+            .expect("the probe-verified 16->16 form must pass");
+        let red = crate::pixels::f16_rgba_halves_to_bgra8(
+            halves[0..4].try_into().expect("one half quadruple"),
+        );
+        assert_eq!(red[2], 255, "pure red keeps a full R channel");
+        assert!(red[0] <= 2, "pure red keeps B near zero, got {}", red[0]);
+        assert!(red[1] <= 2, "pure red keeps G near zero, got {}", red[1]);
+    }
+
+    #[test]
+    fn the_16bit_chain_moves_midtones_like_the_8bit_arm() {
+        // The linLike discriminator through the 16-bit chain, judged in
+        // the read-back domain (the same criterion the 8-bit arm pins):
+        // a linear-gamma profile's [128,128,128] must land far from
+        // where it started.
+        let _ = require_srgb();
+        let t = prepare(true, Some(lin_like_icc()), "t").expect("linLike transforms");
+        let src = [128u8, 128, 128, 255];
+        let halves = t
+            .apply_f16(1, 1, FrameSrc::Rgba8(&src))
+            .expect("the 16-bit chain takes the mixed shape");
+        let read = crate::pixels::f16_rgba_halves_to_bgra8(
+            halves[0..4].try_into().expect("one half quadruple"),
+        );
+        let moved = (read[2] as i32 - 128).abs();
+        assert!(moved >= 30, "midtone must move nontrivially, got {moved}");
+    }
+
+    #[test]
+    fn apply_f16_leaves_alpha_at_the_format_default() {
+        // BM_16b_RGB carries no alpha channel: even a semi-transparent
+        // source comes out with the halves' default 1.0 — restoring the
+        // source's own alpha is the loader's job after the pass (the
+        // same division the 8-bit arm's x-byte restore follows).
+        let _ = require_srgb();
+        let t = prepare(true, Some(adobe_like_icc()), "t")
+            .expect("an AdobeRGB-like profile transforms");
+        let src = [200u8, 60, 10, 128];
+        let halves = t
+            .apply_f16(1, 1, FrameSrc::Rgba8(&src))
+            .expect("the 16-bit chain takes the mixed shape");
+        assert_eq!(halves[3], crate::pixels::F16_OPAQUE);
+    }
+
+    #[test]
+    fn the_injected_16bit_failure_falls_back_to_the_8bit_chain() {
+        // The D5 fallback's return-value shape, with the CMM forced to
+        // refuse the 16-bit pass: apply_f16 is None (and no panic — the
+        // breadcrumb is the eprintln channel), and the SAME transform's
+        // 8-bit apply still succeeds on the next call. The one-time
+        // apply_failed latch means the fallback adds no second failure
+        // breadcrumb of its own kind.
+        let _ = require_srgb();
+        let t = prepare(true, Some(adobe_like_icc()), "t")
+            .expect("an AdobeRGB-like profile transforms");
+        t.force16_fail.set(true);
+        assert!(
+            t.apply_f16(1, 1, FrameSrc::Rgba8(&[255u8, 0, 0, 255]))
+                .is_none()
+        );
+        t.force16_fail.set(false);
+        let mut dst = [0u8; 4];
+        assert!(
+            t.apply(1, 1, &[255u8, 0, 0, 255], &mut dst),
+            "the 8-bit chain still runs"
+        );
+        assert_eq!(dst[2], 255, "the 8-bit transform's own pin still holds");
     }
 }
