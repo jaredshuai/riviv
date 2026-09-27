@@ -1,7 +1,7 @@
 # ADR 0004: AC-aware 宽色域输出面(L2)——F16 宽域中间格式 + scRGB 声明输出
 
 - 日期: 2026-09-27(草案同日过审)
-- 状态: 已接受并过线(用户 2026-09-27 过审裁毕开放项;P-A~P-F 探针电池同日全数执行:P-A/B/C/E PASS、P-D 带 D4 FINDING 已记档修订、P-F 设计记档结案——实现票族照「影响面」清单开)
+- 状态: 已接受并过线(用户 2026-09-27 过审裁毕开放项;P-A~F 探针电池同日执行:**P-A/B/C/E PASS;P-D 当前态断言过线 + D4 FINDING 记档修订——其两态对照(SDR-WCG vs HDR)与兼容助手两态转 QA 人工项,「bit1 sufficient」结论限当前态**;P-F 设计记档结案——实现票族照「影响面」清单开)
 - 范围: master 宽域编码、Stage 1 目的地、决策表第三维(输出面)、交换链格式与色彩空间声明、失败回退、验收口径;**不含** HDR 峰值亮度输入面(PQ/gain map = L3/#138)、AVIF、HDR10 路线
 - 上游权威: #136 处置(L2 = 独立 ADR + 用户拍板门;type 15 是否转消费在此定)、ADR 0003(D4 域半留档 + D2 升级路径三断点)、#127 处置表 D1–D10(M8 核心表,本 ADR 重设计其前提)、#134(ac 位钉测)、ADR 0002(渲染栈)
 
@@ -82,7 +82,7 @@ WARP 无 effect(#127 硬互斥)→ F16P3 在 WARP 上无人可映射(P3 halves �
 - **P-A PASS**:自建 P3-D65 ICC v2(TRC = sRGB 形 1024 项 curv 表;para 形态被 mscms 拒 GLE=2011)作 `BM_16b_RGB` 目的地——超 sRGB 源色落容器内部(承重样点距 65535 余量 ~2982 LSB;同色 sRGB 目的地钉边界=现产裁剪复现);P3→P3 恒等往返 ≥65523;**实现注意**:icm.rs fixture 的 P3 原色是未适配 D65 值,生产须存 Bradford-D50 适配值(与 Apple DisplayP3 已知值一致)。
 - **P-B PASS**:两臂(hw/WARP)首试即成,规范形态无需 fallback;CreateColorContext 回读 6672 字节逐字节一致;数值 vs 纯 Rust 参考 max 8.213e-4 线性(≈1.71 f16 ULP),hw≡warp 逐位同;**超域值端到端无钳制**(>1.0 保留 4 通道、负值 7 通道、boundary-pinned=0)——scRGB 臂承重前提成立。
 - **P-C PASS**:ACM/HDR 开发态 FP16 交换链 + `SetColorSpace1(scRGB)` 全链首试 rc=0;屏采双臂(scRGB 线性填值 vs legacy sRGB 编码填值)逐位同(255/188/118,两跑字节一致)——SDR 白零漂;实证两条隐含契约:D2D 对 FP16 target 直写线性值(无二次线性化)、DWM 映射用精确 sRGB OETF。**dumpbin:dxgi.dll 不在静态导入表**(QI/SetColorSpace1/Present 全 COM vtable,经 d3d11 传递加载)——零新增 DLL 导入,平台地板无扰动。
-- **P-D(D1/D2/D3/D5 PASS,D4 FINDING)**:type 9/15 全字段与 #134 基线逐位一致、5/5 稳定;bit1 两 API 同真(单门 sufficient 实证;type 15 bit1 义为 active,与 type 9 enabled 同名不同义)。**FINDING:ACM+HDR 态 getter 非空**(TPLCD AdobeRGB @subtype 7 + HDR 校准 profile @subtype 8)——「getter 空 ⟺ OS 代管」在本机形态不成立,处置与影响面见 D4 记档;SDR-WCG/HDR 真切换 + 兼容助手两态 = QA 人工项(`%TEMP%\riviv-l2\pd\pd-report.md` 一键复跑配方)。
+- **P-D(部分过线:D1/D2/D3/D5 PASS 于当前 ACM+HDR 态,D4 FINDING;判据的两态对照与兼容助手两态**未执行**,转 QA 人工项)**:type 9/15 全字段与 #134 基线逐位一致、5/5 稳定;bit1 两 API 同真(**当前态**单门 sufficient 实证;type 15 bit1 义为 active,与 type 9 enabled 同名不同义)。**FINDING:ACM+HDR 态 getter 非空**(TPLCD AdobeRGB @subtype 7 + HDR 校准 profile @subtype 8)——「getter 空 ⟺ OS 代管」在本机形态不成立,处置与影响面见 D4 记档;SDR-WCG/HDR 真切换 + 兼容助手两态 = QA 人工项(`%TEMP%\riviv-l2\pd\pd-report.md` 一键复跑配方)。
 - **P-E PASS**:E4 整链热路径 @1080p median **3.998 ms** ≤8 ms 阈(三完整跑 2.218/4.000/3.998,≥2× 余量;sanity 断言证明计时打在真 effect 图上——AC p3-red 实测 +1.2246 与 P-B 参考跨针一致);E5 legacy 恒通行 0.007 ms(几乎免费);热上传臂与 #137 基线重合(+2%/−4%,环境可比);**计时口径注意:本机驱动 EndDraw 之后 Flush 返 D2DERR_WRONG_STATE,有效形态 = BeginDraw→Draw→Flush→EndDraw(实现票照此)**;4K 整链 36.5 ms(66 MB 主图上传主导,记录无门)。
 - **P-F 设计记档结案(无新实测,成本数字引 #137 探针③)**:后端迁移走 #90 既有 ladder latch;翻转时 F16P3 master 失效、当屏图经既有重载通道重派生一次;成本 = 一次重解码 + 9.35 ms/1080p 帧转码,罕见路径(10s 内 3 次设备失败才触发)有界。
 
