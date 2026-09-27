@@ -1368,9 +1368,7 @@ fn establish_output_identity(state: &mut WindowState) {
 /// every later non-display change (same-decision rebuilds included) walk
 /// exactly this — the query result is already on the state.
 fn identify_output(state: &mut WindowState) {
-    let content_class = current_content_class(state);
-    let fingerprint = current_output_fingerprint(state);
-    state.output_identity = Some(state.output_tracker.identify(fingerprint, content_class));
+    mint_output_identity(state);
     let backend = crate::transform_stage::Backend::from_effective(state.gpu_kind);
     let query = state.display_query.query;
     let latched = state.stage_latched;
@@ -1393,6 +1391,19 @@ fn identify_output(state: &mut WindowState) {
         backend_label(backend),
         ac_label(ac)
     );
+}
+
+/// `identify_output`'s mint without the breadcrumb: recompute the
+/// fingerprint from the CURRENT state (real class included) and store
+/// the tracker's answer. Split out for the transition gate's silent
+/// arm below (Codex R1 P2, PR #158): a class-only flip must refresh
+/// the identity's content-space record WITHOUT minting a generation —
+/// the gen channel is the OUTPUT-decision change signal (#126/#128's
+/// contract), and a narrow-class flip changes no output decision.
+fn mint_output_identity(state: &mut WindowState) {
+    let content_class = current_content_class(state);
+    let fingerprint = current_output_fingerprint(state);
+    state.output_identity = Some(state.output_tracker.identify(fingerprint, content_class));
 }
 
 /// The content space of what is on display RIGHT NOW (#154, ADR 0004
@@ -1436,7 +1447,10 @@ fn current_output_fingerprint(state: &WindowState) -> crate::transform_stage::Ou
 /// smoke132 "exactly one display-stage line per session" count stays
 /// exact). After #155, an Srgb↔F16P3 switch on an AC machine flips the
 /// surface arm and the flip mints a gen (the accepted churn, ADR 0004
-/// 已裁项 4 — identity transitions are the change signal). A `None`
+/// 已裁项 4 — identity transitions are the change signal). A
+/// fingerprint-UNCHANGED class flip (narrow↔narrow, the only kind
+/// possible today) takes the silent arm: the identity's class record
+/// refreshes, the gen does not move. A `None`
 /// identity (no establishment yet — the startup establishment runs in
 /// the create flow, before any load reply or blank can arrive) is left
 /// alone on purpose: minting here would fingerprint the DEFAULT
@@ -1444,11 +1458,22 @@ fn current_output_fingerprint(state: &WindowState) -> crate::transform_stage::Ou
 /// forbids; the establishment owns the first mint.
 fn reidentify_output_on_transition(state: &mut WindowState) {
     let fingerprint = current_output_fingerprint(state);
-    if state
-        .output_identity
-        .is_some_and(|identity| identity.fingerprint != fingerprint)
-    {
+    let Some(identity) = state.output_identity else {
+        return;
+    };
+    if identity.fingerprint != fingerprint {
         identify_output(state);
+    } else if identity.content_space != current_content_class(state) {
+        // Codex R1 P2's staleness half (PR #158), fixed WITHOUT the
+        // mint it asked for: a class-only flip (narrow↔narrow — the
+        // only kind possible before #155) leaves the fingerprint
+        // identical, so the gen channel must NOT move (#126/#128: the
+        // gen is the output-decision change signal; ADR 0004 已裁项 4
+        // scopes the accepted churn to the AC-ARM class switch, whose
+        // surface flip changes the fingerprint and mints naturally).
+        // The identity's class RECORD, though, is refreshable for
+        // free: idempotent identify, same gen, silent.
+        mint_output_identity(state);
     }
 }
 
