@@ -57,8 +57,16 @@ use crate::transform_stage::{ContentSpace, master_content_space};
 /// twin). Since #142 an F16Srgb master holds `w * h * 8`, and the
 /// animation gate charges that actual size ([`charged_frame_bytes`] —
 /// Codex P1 on PR #147: counting the decoded buffer would let a
-/// transformed stream hold twice the cap); the cap VALUES'
-/// re-derivation for the f16 era is #144's.
+/// transformed stream hold twice the cap). #144 re-derived the cap for
+/// the f16 era and kept the value: the budget is a BYTE budget, so an
+/// f16 frame's doubled price simply halves the pixels the same pool
+/// holds (a 1080p f16 frame is 16.59 MB — ~31 fit where ~62 8-bit
+/// frames did; ADR 0003's consequences section ruled that acceptable,
+/// the gate admitting only benefiting images) — and the pool stays
+/// SINGLE: one load streams one file, so an f16 stream and an 8-bit
+/// stream never contend, and raising the cap for f16 would raise it
+/// just as much for a hostile f16 stream (an embedded ICC costs an
+/// attacker nothing).
 pub(crate) const MAX_TOTAL_FRAME_BYTES: usize = 512 * 1024 * 1024;
 
 /// Frame-count budget: a hostile file can pack an unbounded COUNT of tiny
@@ -66,6 +74,12 @@ pub(crate) const MAX_TOTAL_FRAME_BYTES: usize = 512 * 1024 * 1024;
 /// regardless of size (each displayed frame holds its full CPU master in
 /// the UI state until the image swaps). The pre-#90 rationale — GDI
 /// object exhaustion from one DC + DIB per face — died with the GDI arm.
+/// #144 re-derived the leg for the f16 era and kept the value: this leg
+/// exists for the byte-invisible tiny-frame stream, and charged pricing
+/// ([`charged_frame_bytes`]) does not change that — 4096 minimal 4×4
+/// frames book ~512 KiB against the 512 MiB byte cap, so the frame leg
+/// stays a tiny stream's only constraint and no f16-specific count is
+/// warranted.
 const MAX_FRAMES: usize = 4096;
 
 // ---------------------------------------------------------------------------
@@ -330,6 +344,22 @@ fn assemble_frame(
 /// chain makes of them (the fallback also gives the mixed
 /// 8-bit-src/16-bit-dst shape one retry through `assemble_frame`; when
 /// that lands, the quantized rows still earn a real f16 master).
+///
+/// Known limit, ruled at #144 (documented, not gated): the static arm's
+/// riviv-side allocations (`bgr` staging, the f16 `halves`) sit OUTSIDE
+/// the image crate's 512 MiB decode `Limits` — but bounded, since the
+/// Limits gate the SOURCE pixel count: the worst instantaneous footprint
+/// is the decode buffer plus the f16 master (8 B/px), i.e. 2× the decode
+/// buffer for an Rgba16 source, 4/3× for the common Rgb16, 4× for
+/// Luma16. A numeric gate (master ≤ 512 MiB → px ≤ 2^26) was declined:
+/// it would refuse deep panoramas that display legally today (a 16-bit
+/// 16384×8192 is a real camera product) — a behavior regression; the
+/// 8-bit era had the same shape (the plain master vec was never gated
+/// either — the into_rgba8 era's Luma16 already held a 1 GiB 8-bit
+/// master at the decode limit), so this is no new f16 class; and a
+/// static single frame buys the transient once, with none of an
+/// animation stream's cumulative amplification, so the hostile value is
+/// low.
 fn assemble_deep_frame(
     width: u32,
     height: u32,
@@ -598,6 +628,11 @@ fn apng_color_is_animatable(color: image::ColorType) -> bool {
 /// a transformed one — Codex P1 on PR #147 — so a transformed canvas
 /// under the 4-byte threshold cannot enter the animated path and break
 /// the bound with its decode canvases plus the first retained master).
+/// In pixels (#144): the wire's ceiling is `MAX_TOTAL_FRAME_BYTES / 16`
+/// = 2^25 px for a plain stream and charged pricing halves it to
+/// `MAX_TOTAL_FRAME_BYTES / 32` = 2^24 px for a transformed one — a
+/// 4096×4096 canvas just fits, one pixel more degrades — both lines
+/// pinned by boundary tests.
 /// Over the wire the load degrades to the static path, which affords one
 /// full-budget canvas (#98 R2: pre-#98 riviv, upstream GDI+, and any
 /// static viewer display such a file's first frame — failing it would be
@@ -613,7 +648,10 @@ fn apng_canvas_fits_animation_budget(per_frame_bytes: usize) -> bool {
 /// side really holds — the contract `MAX_TOTAL_FRAME_BYTES` documents
 /// (master bytes, not decode bytes). A frame whose 16-bit pass fell back
 /// to the 8-bit chain is over-charged thereby (4 real bytes for 8
-/// booked) — conservative by design; the cap re-derivation is #144's.
+/// booked) — conservative by design. #144 re-derived both legs under
+/// this charge and kept every cap value: the budget is a byte budget,
+/// the doubled charge is the honest price of a doubled master, and the
+/// same-pool choice stands (a per-load stream is never mixed-format).
 fn charged_frame_bytes(canvas_bytes: usize, transform: Option<&icm::Transform>) -> usize {
     if transform.is_some() {
         // Saturating, never wrapping (Codex P1 on PR #147, round 3): a
@@ -3205,10 +3243,12 @@ mod apng_tests {
 
     // ---- in-loop budget gate, cumulative edge (external review R7) ----
 
-    /// n full-canvas solid frames of a w×h RGBA8 APNG, 10 ms each.
-    fn apng_n_frames(w: u32, h: u32, n: u32, px: [u8; 4]) -> Vec<u8> {
+    /// n full-canvas solid frames of a w×h RGBA8 APNG, 10 ms each,
+    /// optionally carrying an embedded ICC profile through iCCP (the
+    /// #144 charged-boundary fixtures need the transformed stream).
+    fn apng_n_frames(w: u32, h: u32, n: u32, px: [u8; 4], icc: Option<&[u8]>) -> Vec<u8> {
         let mut out = Vec::new();
-        let mut enc = png::Encoder::with_info(&mut out, png_info(w, h, None)).expect("with_info");
+        let mut enc = png::Encoder::with_info(&mut out, png_info(w, h, icc)).expect("with_info");
         enc.set_animated(n, 0).expect("set_animated");
         {
             let mut writer = enc.write_header().expect("write_header");
@@ -3229,7 +3269,7 @@ mod apng_tests {
         // FailedUser cleared the display after the last one. The
         // confirming pull now sees the stream end and completes the load.
         // (Characterized pre-fix: 4097 replies with tail=FailedUser.)
-        let apng = apng_n_frames(4, 4, 4096, [200, 60, 10, 255]);
+        let apng = apng_n_frames(4, 4, 4096, [200, 60, 10, 255], None);
         let replies = decode_all(&apng, env());
         assert_eq!(replies.len(), 4097, "4096 frames + Complete");
         assert!(matches!(replies.last(), Some(LoadReply::Complete)));
@@ -3242,7 +3282,7 @@ mod apng_tests {
         // load still fails user-level, after exactly 4096 delivered
         // frames (the same reply count as the completing edge; only the
         // tail differs, so neither test can stand in for the other).
-        let apng = apng_n_frames(4, 4, 4097, [200, 60, 10, 255]);
+        let apng = apng_n_frames(4, 4, 4097, [200, 60, 10, 255], None);
         let replies = decode_all(&apng, env());
         assert_eq!(replies.len(), 4097, "4096 frames + FailedUser");
         assert!(matches!(replies.last(), Some(LoadReply::FailedUser(_))));
@@ -3255,7 +3295,7 @@ mod apng_tests {
         // exactly the 512 MB budget and the file ends — the delivered
         // total never exceeded the cap, so the load completes.
         // (Characterized pre-fix: 5 replies with tail=FailedUser.)
-        let apng = apng_n_frames(8192, 4096, 4, [200, 60, 10, 255]);
+        let apng = apng_n_frames(8192, 4096, 4, [200, 60, 10, 255], None);
         let replies = decode_all(&apng, env());
         assert_eq!(replies.len(), 5, "4 frames + Complete");
         assert!(matches!(replies.last(), Some(LoadReply::Complete)));
@@ -3267,10 +3307,107 @@ mod apng_tests {
         // FailedUser, the mid-stream budget shape unchanged (the
         // R7 fix only rescues files that END on the budget, never
         // files that keep going past it).
-        let apng = apng_n_frames(8192, 4096, 5, [200, 60, 10, 255]);
+        let apng = apng_n_frames(8192, 4096, 5, [200, 60, 10, 255], None);
         let replies = decode_all(&apng, env());
         assert_eq!(replies.len(), 5, "4 frames + FailedUser");
         assert!(matches!(replies.last(), Some(LoadReply::FailedUser(_))));
+    }
+
+    // ---- charged (f16) budget edges, #144: both legs re-derived ----
+
+    #[test]
+    fn transformed_budget_edge_exactly_4096_frames_completes() {
+        // #144's f16 side of the frame-leg edge: with an embedded ICC the
+        // frames land as F16Srgb masters and every canvas is charged at
+        // its doubled master size — yet the frame leg counts FRAMES, not
+        // bytes, so the transformed edge sits at the same frame number:
+        // all 4096 charged frames deliver, then the confirming pull sees
+        // the stream end and completes (the 512 KiB the charged tiny
+        // frames total never brings the byte leg into play).
+        crate::icm::test_fixtures::require_srgb();
+        let icc = crate::icm::test_fixtures::adobe_like_icc();
+        let apng = apng_n_frames(4, 4, 4096, [200, 60, 10, 255], Some(&icc));
+        let replies = decode_all(&apng, env_icm(true));
+        assert_eq!(replies.len(), 4097, "4096 charged frames + Complete");
+        assert!(matches!(replies.last(), Some(LoadReply::Complete)));
+    }
+
+    #[test]
+    fn over_budget_4097th_transformed_frame_still_fails() {
+        // The frame leg's other edge under charged pricing: a
+        // 4097-frame ICC stream still has a frame past the COUNT budget
+        // (the doubled charge per frame is the byte leg's business, not
+        // this one) — the load fails user-level after exactly 4096
+        // delivered frames, the same reply count as the completing edge
+        // with only the tail differing.
+        crate::icm::test_fixtures::require_srgb();
+        let icc = crate::icm::test_fixtures::adobe_like_icc();
+        let apng = apng_n_frames(4, 4, 4097, [200, 60, 10, 255], Some(&icc));
+        let replies = decode_all(&apng, env_icm(true));
+        assert_eq!(replies.len(), 4097, "4096 charged frames + FailedUser");
+        assert!(matches!(replies.last(), Some(LoadReply::FailedUser(_))));
+    }
+
+    #[test]
+    fn transformed_budget_edge_byte_exact_multiple_completes() {
+        // #144's re-derivation of the BYTE leg, pinned end to end: a
+        // transformed stream charges each canvas at its f16 master size
+        // (2x), so the byte-exact boundary canvas halves from the plain
+        // leg's 8192×4096 (2^25 px = 128 MiB per canvas) to 4096×4096 =
+        // 2^24 px — each frame charges 2^24 · 4 · 2 = 2^27 B = 128 MiB,
+        // four of them book exactly the 512 MiB cap, and the animation
+        // wire admits them on the same exact boundary (4 · 2^27 = the
+        // cap). The file ends on the budget, so the confirming pull
+        // completes the load — the plain edge's shape at half the
+        // pixels, which IS the f16 re-derivation of the leg.
+        crate::icm::test_fixtures::require_srgb();
+        let icc = crate::icm::test_fixtures::adobe_like_icc();
+        let apng = apng_n_frames(4096, 4096, 4, [200, 60, 10, 255], Some(&icc));
+        let replies = decode_all(&apng, env_icm(true));
+        assert_eq!(replies.len(), 5, "4 charged frames + Complete");
+        assert!(matches!(replies.last(), Some(LoadReply::Complete)));
+    }
+
+    #[test]
+    fn over_budget_fifth_transformed_byte_frame_still_fails() {
+        // The charged byte leg's other edge: a fifth 128 MiB (charged)
+        // frame really crosses the 512 MiB cap — 4 frames + FailedUser,
+        // the doubled charge keeping the mid-stream budget shape intact
+        // (the plain leg's five-frame shape at half the canvas).
+        crate::icm::test_fixtures::require_srgb();
+        let icc = crate::icm::test_fixtures::adobe_like_icc();
+        let apng = apng_n_frames(4096, 4096, 5, [200, 60, 10, 255], Some(&icc));
+        let replies = decode_all(&apng, env_icm(true));
+        assert_eq!(replies.len(), 5, "4 charged frames + FailedUser");
+        assert!(matches!(replies.last(), Some(LoadReply::FailedUser(_))));
+    }
+
+    #[test]
+    fn transformed_animation_wire_pixel_ceiling_is_half_the_plain() {
+        // #144's pixel form of the re-derived byte leg, on the pure
+        // predicate: under a real transform the wire's ceiling halves
+        // from the plain 2^25 px to 2^24 — a 2^24-px canvas books
+        // 2^26 B and charges 2^27 B (the f16 master's honest size), and
+        // 4 · 2^27 is exactly the budget, while 2^24 + 1 px charges one
+        // step over and the stream degrades. The same one-pixel-past
+        // canvas still fits PLAIN — the two lines side by side are the
+        // "half the plain" claim. (The plain-only edges live in
+        // `animation_wire_boundary_is_exactly_a_quarter_of_the_budget`.)
+        crate::icm::test_fixtures::require_srgb();
+        let t = crate::icm::prepare(true, Some(crate::icm::test_fixtures::adobe_like_icc()), "t")
+            .expect("an AdobeRGB-like profile transforms");
+        assert!(apng_canvas_fits_animation_budget(charged_frame_bytes(
+            16_777_216 * 4,
+            Some(&t)
+        )));
+        assert!(!apng_canvas_fits_animation_budget(charged_frame_bytes(
+            16_777_217 * 4,
+            Some(&t)
+        )));
+        assert!(
+            apng_canvas_fits_animation_budget(16_777_217 * 4),
+            "the same canvas plain-side still fits: the charged ceiling is half"
+        );
     }
 
     // ---- acTL/fcTL corner semantics (probe-characterized, 4x4) ----

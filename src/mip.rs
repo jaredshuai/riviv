@@ -236,10 +236,11 @@ impl LevelCache {
     /// intended response and they are 4× smaller each step).
     ///
     /// The entry's byte cost follows the space (#142): 4 bytes per pixel
-    /// for an Srgb level, 8 for an F16Srgb one — the LEVEL_CACHE_BYTES
-    /// cap itself is unchanged, so an f16 frame's levels simply fit fewer
-    /// to a cache (the budget re-derivation is #144's; the cap stays
-    /// until then).
+    /// for an Srgb level, 8 for an F16Srgb one. #144 re-derived the
+    /// budgets and kept every value: the cap is a byte cap, an F16Srgb
+    /// level's 8-byte charge is the honest price, and the earlier
+    /// eviction is what ADR 0003's consequences section already ruled
+    /// acceptable (the gate keeps non-benefiting images out).
     pub(crate) fn get_or_build(
         &mut self,
         level: u32,

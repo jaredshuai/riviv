@@ -506,7 +506,7 @@ pub(crate) fn plan_frame(
         // flat 4-byte estimate would plan a level the cache then refuses
         // — prepare fails and the frame blanks. This aligns the estimate
         // with the cache's own price; the cap's VALUE stays untouched
-        // (#144 owns budget numbers).
+        // (#144 re-derived the budgets and kept the values).
         let cpu_fits = level == 0
             || resident_bytes(content_space, i64::from(level_w) * i64::from(level_h))
                 <= level_budget_bytes;
@@ -2050,7 +2050,8 @@ mod tests {
         // set fits the cap, the F16 frame's doubled charge does not — the
         // ladder deepens instead of planning a frame it cannot hold
         // (#143). The cap sits between the Srgb charge and its double; the
-        // cap's VALUE is this test's, not the product's (#144).
+        // cap's VALUE is this test's own pin — the product-side verdict is
+        // #144's, and it kept every value.
         let dest = Rect::new(0, 0, 4000, 4000);
         let viewport = Rect::new(0, 0, 4000, 4000);
         // 8192² master on a 1024 device at a 4000² render: level 1
