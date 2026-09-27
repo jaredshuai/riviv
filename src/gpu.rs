@@ -902,6 +902,12 @@ impl GpuStack {
                 debug_assert_eq!(pixels.len(), wide as usize * high as usize * 8);
                 staging = vec![0u8; wide as usize * high as usize * 4];
                 crate::pixels::f16_halves_to_bgra8_bulk(pixels, &mut staging);
+                // The staging is the in-flight byte class exactly like a
+                // tile's (#82's ledger, Codex P2 on PR #147: an uncounted
+                // F16 upload underreports the true peak) — counted at its
+                // peak while the synchronous creation copies it, released
+                // on both exits below.
+                self.ledger.note_inflight(staging.len() as u64);
                 &staging
             }
         };
@@ -910,7 +916,7 @@ impl GpuStack {
         // F16Srgb arm's freshly quantized staging of that exact size)
         // and outlives this synchronous copy; the properties struct is a
         // valid stack temporary.
-        let bitmap = unsafe {
+        let bitmap = match unsafe {
             self.context.CreateBitmap(
                 D2D_SIZE_U {
                     width: wide,
@@ -920,8 +926,14 @@ impl GpuStack {
                 pitch,
                 &bitmap_properties(D2D1_BITMAP_OPTIONS_NONE),
             )
-        }
-        .map_err(|e| format!("D2D CreateBitmap({wide}x{high}) failed: {e}"))?;
+        } {
+            Ok(bitmap) => bitmap,
+            Err(e) => {
+                self.ledger.note_inflight(0);
+                return Err(format!("D2D CreateBitmap({wide}x{high}) failed: {e}"));
+            }
+        };
+        self.ledger.note_inflight(0);
         // DrawBitmap takes the parent ID2D1Bitmap (no auto upcast in 0.62)
         // — one QI per upload, none per frame.
         let bitmap_base: ID2D1Bitmap = bitmap
