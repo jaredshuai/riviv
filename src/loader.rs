@@ -616,7 +616,11 @@ fn apng_canvas_fits_animation_budget(per_frame_bytes: usize) -> bool {
 /// booked) — conservative by design; the cap re-derivation is #144's.
 fn charged_frame_bytes(canvas_bytes: usize, transform: Option<&icm::Transform>) -> usize {
     if transform.is_some() {
-        canvas_bytes * 2
+        // Saturating, never wrapping (Codex P1 on PR #147, round 3): a
+        // canvas over usize::MAX/2 doubles past the integer — a wrapped
+        // small charge would admit it through the gates; saturated, the
+        // charge simply cannot fit and the stream degrades.
+        canvas_bytes.saturating_mul(2)
     } else {
         canvas_bytes
     }
@@ -2168,6 +2172,19 @@ mod stdin_bytes_tests {
             .expect("an AdobeRGB-like profile transforms");
         assert_eq!(charged_frame_bytes(100, Some(&t)), 200);
         assert_eq!(charged_frame_bytes(100, None), 100);
+        // The saturation pin (Codex P1 round 3): a canvas past
+        // usize::MAX/2 must charge as unaffordable, never wrap small.
+        assert_eq!(charged_frame_bytes(usize::MAX, Some(&t)), usize::MAX);
+        assert_eq!(
+            charged_frame_bytes(usize::MAX / 2 + 1, Some(&t)),
+            usize::MAX
+        );
+        assert_eq!(
+            charged_frame_bytes(usize::MAX / 2, Some(&t)),
+            usize::MAX - 1,
+            "the largest exact double stays exact"
+        );
+        assert_eq!(charged_frame_bytes(usize::MAX, None), usize::MAX);
     }
 
     #[test]
