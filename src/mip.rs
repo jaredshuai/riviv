@@ -50,6 +50,17 @@ pub(crate) fn mip_size(image_w: i32, image_h: i32, level: u32) -> (i32, i32) {
     (w, h)
 }
 
+/// The box-filter's block edges for destination index `d` over a source
+/// of `source` pixels at `dest` width: integer floor boundaries that
+/// partition the source exactly (every source pixel lands in exactly one
+/// block) — the geometry [`downscale_box`] and [`downscale_box_f16`]
+/// share, extracted so the two arms can never drift apart.
+fn block_range(d: usize, dest: usize, source: usize) -> (usize, usize) {
+    let start = d * source / dest;
+    let end = ((d + 1) * source / dest).max(start + 1).min(source);
+    (start, end)
+}
+
 /// Box-downsample a top-down, tightly packed BGRA buffer to `level`
 /// ([`mip_size`]'s dimensions) — the CPU side of the #82 overview: a
 /// giant's frame that cannot be a single device bitmap still needs *some*
@@ -60,10 +71,10 @@ pub(crate) fn mip_size(image_w: i32, image_h: i32, level: u32) -> (i32, i32) {
 /// level — the `(w+1)>>k` from-original rule [`mip_size`] implements), so
 /// a deep level costs one source read, not k.
 ///
-/// Block edges are integer `floor(x*dim/level_dim)` boundaries, which
-/// partition the source exactly: every source pixel lands in exactly one
-/// block (the tiles-cover-everything property the seam standard leans on),
-/// with fractional-boundary area weighting deliberately not attempted —
+/// Block edges are integer `floor(x*dim/level_dim)` boundaries ([`block_range`]),
+/// which partition the source exactly: every source pixel lands in exactly
+/// one block (the tiles-cover-everything property the seam standard leans
+/// on), with fractional-boundary area weighting deliberately not attempted —
 /// upstream's own generation was a GDI HALFTONE StretchBlt, i.e. also a
 /// resampler's approximation, and the #82 contract for the overview is
 /// "uniform, prefiltered, no aliasing stripes", not "area-exact".
@@ -78,11 +89,9 @@ pub(crate) fn downscale_box(src: &[u8], image_w: i32, image_h: i32, level: u32) 
     let (sw, sh) = (image_w.max(1) as usize, image_h.max(1) as usize);
     let mut out = vec![0u8; dest_w as usize * dest_h as usize * 4];
     for dy in 0..dest_h as usize {
-        let y0 = dy * sh / dest_h as usize;
-        let y1 = ((dy + 1) * sh / dest_h as usize).max(y0 + 1).min(sh);
+        let (y0, y1) = block_range(dy, dest_h as usize, sh);
         for dx in 0..dest_w as usize {
-            let x0 = dx * sw / dest_w as usize;
-            let x1 = ((dx + 1) * sw / dest_w as usize).max(x0 + 1).min(sw);
+            let (x0, x1) = block_range(dx, dest_w as usize, sw);
             // u64 accumulators: zero cost, and immune to any future block
             // geometry (external review AI3 P3).
             let mut sum = [0u64; 4];
@@ -100,6 +109,48 @@ pub(crate) fn downscale_box(src: &[u8], image_w: i32, image_h: i32, level: u32) 
             let out_px = (dy * dest_w as usize + dx) * 4;
             for (c, s) in out[out_px..out_px + 4].iter_mut().zip(sum) {
                 *c = (s / count) as u8;
+            }
+        }
+    }
+    out
+}
+
+/// The f16 master's sibling of [`downscale_box`] (#142): the same box
+/// geometry (the shared [`block_range`]), accumulating in f32 through the
+/// halves' own decoding and re-encoding each channel mean through the
+/// master's encoding — a stored half never passes through an 8-bit
+/// landing. The master is opaque by construction, so the alpha block
+/// mean returns to the composite default on its own.
+pub(crate) fn downscale_box_f16(src: &[u8], image_w: i32, image_h: i32, level: u32) -> Vec<u8> {
+    let (dest_w, dest_h) = mip_size(image_w, image_h, level);
+    debug_assert_eq!(src.len(), image_w as usize * image_h as usize * 8);
+    let (sw, sh) = (image_w.max(1) as usize, image_h.max(1) as usize);
+    let mut out = vec![0u8; dest_w as usize * dest_h as usize * 8];
+    for dy in 0..dest_h as usize {
+        let (y0, y1) = block_range(dy, dest_h as usize, sh);
+        for dx in 0..dest_w as usize {
+            let (x0, x1) = block_range(dx, dest_w as usize, sw);
+            let mut sum = [0f32; 4];
+            let mut count = 0u64;
+            for y in y0..y1 {
+                let row = y * sw * 8;
+                for x in x0..x1 {
+                    let px = &src[row + x * 8..row + x * 8 + 8];
+                    // Four LE halves per pixel, RGBA order — never an
+                    // aligned reinterpretation (the master's byte buffer
+                    // is align-1 by contract).
+                    for (c, o) in sum.iter_mut().zip([0usize, 2, 4, 6]) {
+                        *c +=
+                            crate::pixels::f16_bits_to_f32(u16::from_le_bytes([px[o], px[o + 1]]));
+                    }
+                    count += 1;
+                }
+            }
+            let n = count as f32;
+            let out_px = (dy * dest_w as usize + dx) * 8;
+            for (i, s) in sum.iter().enumerate() {
+                let half = crate::pixels::f32_to_f16_bits(s / n);
+                out[out_px + i * 2..out_px + i * 2 + 2].copy_from_slice(&half.to_le_bytes());
             }
         }
     }
@@ -183,6 +234,12 @@ impl LevelCache {
     /// level's bytes exceed the whole cap (the caller then degrades —
     /// refusing is the honest answer; the ladder's coarser levels are the
     /// intended response and they are 4× smaller each step).
+    ///
+    /// The entry's byte cost follows the space (#142): 4 bytes per pixel
+    /// for an Srgb level, 8 for an F16Srgb one — the LEVEL_CACHE_BYTES
+    /// cap itself is unchanged, so an f16 frame's levels simply fit fewer
+    /// to a cache (the budget re-derivation is #144's; the cap stays
+    /// until then).
     pub(crate) fn get_or_build(
         &mut self,
         level: u32,
@@ -199,11 +256,18 @@ impl LevelCache {
             let (_, data) = &self.entries[idx];
             return Some((wide as u32, high as u32, data));
         }
-        let bytes = wide as u64 * high as u64 * 4;
+        let bytes_per_px = match space {
+            ContentSpace::Srgb => 4u64,
+            ContentSpace::F16Srgb => 8,
+        };
+        let bytes = wide as u64 * high as u64 * bytes_per_px;
         if bytes > self.lru.cap() {
             return None;
         }
-        let data = downscale_box(src, image_w as i32, image_h as i32, level);
+        let data = match space {
+            ContentSpace::Srgb => downscale_box(src, image_w as i32, image_h as i32, level),
+            ContentSpace::F16Srgb => downscale_box_f16(src, image_w as i32, image_h as i32, level),
+        };
         for evicted in self.lru.insert(level, bytes) {
             self.entries.retain(|(l, _)| *l != evicted);
         }
@@ -589,23 +653,145 @@ mod tests {
         // image must never serve each other's levels, so a space flip on
         // the same generation clears exactly like a new frame, in both
         // directions (the FP16 frame leaving and the 8-bit one returning).
+        // #142: each arm's src carries its own storage shape (the f16
+        // side 8 bytes per pixel), and its level is priced accordingly.
         let src = level_fixture();
+        let f16_src = f16_canvas(4, 4, 0x2800);
         let mut cache = LevelCache::new(LEVEL_CACHE_BYTES);
         cache
             .get_or_build(1, 4, 4, 7, ContentSpace::Srgb, &src)
             .expect("level 1 of the 8-bit frame");
         assert!(cache.bytes() > 0);
         let deep = cache
-            .get_or_build(1, 4, 4, 7, ContentSpace::F16Srgb, &src)
+            .get_or_build(1, 4, 4, 7, ContentSpace::F16Srgb, &f16_src)
             .expect("level 1 of the f16 frame");
         assert_eq!(deep.0, 2);
         assert_eq!(cache.builds, 1, "the space flip rebuilt, not reused");
-        assert_eq!(cache.bytes(), 2 * 2 * 4, "one level, not two");
+        assert_eq!(cache.bytes(), 2 * 2 * 8, "one f16 level, not two");
         let back = cache
             .get_or_build(1, 4, 4, 7, ContentSpace::Srgb, &src)
             .expect("level 1 of the 8-bit frame again");
         assert_eq!(back.0, 2);
         assert_eq!(cache.builds, 1, "the flip back rebuilt, not reused");
         assert_eq!(cache.bytes(), 2 * 2 * 4);
+    }
+
+    // ---- f16 levels (#142) ----
+
+    /// An opaque solid f16 canvas: every pixel the same [R, G, B] half,
+    /// alpha the composite default. The f16 twin of the 8-bit fixtures.
+    fn f16_canvas(w: usize, h: usize, rgb: u16) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(w * h * 8);
+        for _ in 0..w * h {
+            for half in [rgb, rgb, rgb, crate::pixels::F16_OPAQUE] {
+                bytes.extend_from_slice(&half.to_le_bytes());
+            }
+        }
+        bytes
+    }
+
+    /// One pixel's halves read back out of a packed f16 buffer.
+    fn f16_pixel(buf: &[u8], index: usize) -> [u16; 4] {
+        let px = &buf[index * 8..index * 8 + 8];
+        [
+            u16::from_le_bytes([px[0], px[1]]),
+            u16::from_le_bytes([px[2], px[3]]),
+            u16::from_le_bytes([px[4], px[5]]),
+            u16::from_le_bytes([px[6], px[7]]),
+        ]
+    }
+
+    #[test]
+    fn f16_box_downscale_leaves_a_uniform_opaque_master_uniform() {
+        // The composite invariant's f16 edition: a flat tone stays that
+        // tone at every depth, halves bit-identical, alpha back at the
+        // composite default (a f32 mean of 1.0 re-encodes exactly).
+        let src = f16_canvas(8, 8, 0x3800);
+        for level in 0..=3u32 {
+            let out = downscale_box_f16(&src, 8, 8, level);
+            assert!(!out.is_empty());
+            for i in 0..out.len() / 8 {
+                assert_eq!(
+                    f16_pixel(&out, i),
+                    [0x3800, 0x3800, 0x3800, crate::pixels::F16_OPAQUE],
+                    "level {level}, pixel {i} drifted"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn f16_box_downscale_averages_two_tones_to_the_exact_midpoint_half() {
+        // A 2x2 block of two pixels at 0.5 (0x3800) and two at 1.0
+        // (0x3C00): the f32 mean is exactly 0.75, and 0.75 is exactly
+        // representable — the re-encoded half must be 0x3A00, bit for
+        // bit, with no 8-bit landing in between.
+        let mut src = Vec::new();
+        for i in 0..4usize {
+            let rgb = if i % 2 == 0 { 0x3800u16 } else { 0x3C00 };
+            for half in [rgb, rgb, rgb, crate::pixels::F16_OPAQUE] {
+                src.extend_from_slice(&half.to_le_bytes());
+            }
+        }
+        let out = downscale_box_f16(&src, 2, 2, 1);
+        assert_eq!(out.len(), 8, "level 1 of 2x2 is 1x1");
+        assert_eq!(
+            f16_pixel(&out, 0)[0],
+            0x3A00,
+            "the mean of 0.5 and 1.0 is 0.75"
+        );
+        assert_eq!(f16_pixel(&out, 0)[3], crate::pixels::F16_OPAQUE);
+    }
+
+    #[test]
+    fn f16_box_downscale_partitions_like_the_8bit_arm() {
+        // The shared geometry, odd-tail edition (the 8-bit sibling pin
+        // `box_downscale_covers_the_odd_tail_dimension`): 5x1 -> level 1
+        // is 3 wide with blocks [0,1), [1,3), [3,5); the lit pixel at
+        // x=4 lands in the LAST block only — its mean over the two
+        // pixels {x=3 black, x=4 white} is 0.5 (0x3800), the other
+        // blocks stay zero.
+        let mut src = f16_canvas(5, 1, 0x0000);
+        // Light the whole pixel at x=4 to full white.
+        for i in 0..4usize {
+            let off = 4 * 8 + i * 2;
+            src[off..off + 2].copy_from_slice(&0x3C00u16.to_le_bytes());
+        }
+        let out = downscale_box_f16(&src, 5, 1, 1);
+        assert_eq!(out.len(), 3 * 8);
+        assert_eq!(f16_pixel(&out, 0)[0], 0x0000, "block [0,1)");
+        assert_eq!(f16_pixel(&out, 1)[0], 0x0000, "block [1,3)");
+        assert_eq!(
+            f16_pixel(&out, 2)[0],
+            0x3800,
+            "block [3,5): (1.0 + 0.0) / 2"
+        );
+    }
+
+    #[test]
+    fn the_f16_level_cache_prices_entries_at_double_bytes_and_reuses_them() {
+        // #142: an F16Srgb entry costs 8 bytes per pixel (the ledger's
+        // cpu_source and the LRU both see it), the cache builds it once
+        // and serves the same halves afterwards — the owner key
+        // (generation, F16Srgb) rides the same rebind contract.
+        let src = f16_canvas(4, 4, 0x3800);
+        let mut cache = LevelCache::new(LEVEL_CACHE_BYTES);
+        let first = cache
+            .get_or_build(1, 4, 4, 7, ContentSpace::F16Srgb, &src)
+            .expect("level 1");
+        assert_eq!((first.0, first.1), (2, 2));
+        assert_eq!(first.2.len(), 2 * 2 * 8, "the f16 level holds halves");
+        let first_bytes = first.2.to_vec();
+        assert_eq!(cache.bytes(), 2 * 2 * 8, "priced at 8 bytes per pixel");
+        assert_eq!(cache.builds, 1);
+        let again = cache
+            .get_or_build(1, 4, 4, 7, ContentSpace::F16Srgb, &src)
+            .expect("level 1 again");
+        assert_eq!(
+            again.2,
+            &first_bytes[..],
+            "the second ask serves the cached halves"
+        );
+        assert_eq!(cache.builds, 1, "and does not rebuild");
     }
 }

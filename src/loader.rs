@@ -37,7 +37,9 @@ use crate::anim::{self, FrameScheduler, gif_delay_ms};
 use crate::icm;
 use crate::pixels::{
     DeepSamples, PixelFrame, composite_over_background_bgra_in_place,
-    composite_over_background_in_place, deep_to_rgba8_via_f16,
+    composite_over_background_f16_in_place, composite_over_background_in_place, deep_source_alpha,
+    deep_to_bgr_u16, deep_to_f16_halves, deep_to_rgba8_via_f16, restore_alpha_f16_from_u8,
+    restore_alpha_f16_from_u16, rgba8_alpha,
 };
 use crate::surface::Surface;
 use crate::transform_stage::{ContentSpace, master_content_space};
@@ -52,7 +54,11 @@ use crate::transform_stage::{ContentSpace, master_content_space};
 /// (master) bytes — the only frame memory there is since #90 removed the
 /// GDI face derivation (#76's on-demand DIBs used to sit outside this
 /// budget; the D2D uploads copy out of the master without a standing CPU
-/// twin).
+/// twin). Since #142 an F16Srgb master holds `w * h * 8`, and the
+/// animation gate charges that actual size ([`charged_frame_bytes`] —
+/// Codex P1 on PR #147: counting the decoded buffer would let a
+/// transformed stream hold twice the cap); the cap VALUES'
+/// re-derivation for the f16 era is #144's.
 pub(crate) const MAX_TOTAL_FRAME_BYTES: usize = 512 * 1024 * 1024;
 
 /// Frame-count budget: a hostile file can pack an unbounded COUNT of tiny
@@ -260,16 +266,22 @@ fn prepare_transform<D: ImageDecoder>(
 }
 
 /// The shared post-decode frame pipeline — ADR 0002 D2's order
-/// (`decode(RGBA) -> ICM -> composite over bg -> BGRA`), identical for
-/// static and animated decodes (#77): when a transform was prepared,
-/// `TranslateBitmapBits` maps the RGBA decode buffer straight into the
-/// master's BGRA layout (the swizzle folded into its output format) and
-/// the composite runs on that BGRA output. A refused transform pass
-/// falls back to the untransformed path for the frame; the
+/// (`decode(RGBA) -> ICM -> composite over bg -> master`), identical for
+/// static and animated decodes (#77). #142 (ADR 0003 D6) promoted the
+/// transform arm to the 16-bit output chain: `apply_f16` maps the RGBA
+/// decode buffer through `BM_16b_RGB` into the f16 master's halves (the
+/// decoder's alpha restored — the output format carries none — then the
+/// composite over the sRGB background) and `PixelFrame::from_f16_halves`
+/// boxes it, the frame genuinely 8 bytes per pixel. A refused 16-bit
+/// pass (and only then) falls back to the 8-bit era's chain — the
+/// transform's `apply` on the same rows, the BGRA composite,
+/// `from_bgra` — marked `master_content_space(bits, false)`: a transform
+/// whose 16-bit output failed has left nothing for an f16 master to
+/// keep, so the mark is the bytes' own honest Srgb (ADR 0003 D5). The
 /// `transform=None` path is byte-for-byte the pre-#77 one (composite
-/// RGBA, `from_rgba` swizzles). #140 adds the L1 master's content gate
-/// (ADR 0003 D1): the frame carries which pipeline owns it — a
-/// >8-bit source or an applied transform earns `F16Srgb`.
+/// RGBA, `from_rgba` swizzles); #140's gate survives here as that
+/// fallback/no-transform mark, since the primary transform arm's mark is
+/// now the f16 storage itself (`from_f16_halves` pins `F16Srgb`).
 fn assemble_frame(
     width: u32,
     height: u32,
@@ -279,6 +291,12 @@ fn assemble_frame(
     source_bits_per_sample: u16,
 ) -> PixelFrame {
     if let Some(transform) = transform {
+        if let Some(mut halves) = transform.apply_f16(width, height, icm::FrameSrc::Rgba8(&rgba)) {
+            restore_alpha_f16_from_u8(&mut halves, &rgba8_alpha(&rgba));
+            composite_over_background_f16_in_place(&mut halves, env.background);
+            return PixelFrame::from_f16_halves(width, height, halves);
+        }
+        // D5 fallback: the 8-bit era chain on the same rows.
         let mut bgra = vec![0u8; rgba.len()];
         if transform.apply(width, height, &rgba, &mut bgra) {
             composite_over_background_bgra_in_place(&mut bgra, env.background);
@@ -286,7 +304,7 @@ fn assemble_frame(
                 width,
                 height,
                 bgra,
-                master_content_space(source_bits_per_sample, true),
+                master_content_space(source_bits_per_sample, false),
             );
         }
     }
@@ -297,6 +315,52 @@ fn assemble_frame(
         rgba,
         master_content_space(source_bits_per_sample, false),
     )
+}
+
+/// The deep (>8-bit) source's frame assembly (#142, ADR 0003 D6): the
+/// samples land in the f16 master's halves either directly (no
+/// transform) or through the CMM's 16-bit chain (`BM_16b_RGB` src AND
+/// dst — the interim seam's 8-bit-into-mscms detour is history). Alpha:
+/// the layouts that carry it are restored from the samples after the
+/// transform (the CMM's input shape has no alpha channel), the opaque
+/// layouts keep the format default. A refused 16-bit pass falls back to
+/// the 8-bit era: quantize through `deep_to_rgba8_via_f16` and run the
+/// shared `assemble_frame` on the quantized rows — passing the
+/// QUANTIZED depth (8) so the mark stays honest Srgb whatever the 8-bit
+/// chain makes of them (the fallback also gives the mixed
+/// 8-bit-src/16-bit-dst shape one retry through `assemble_frame`; when
+/// that lands, the quantized rows still earn a real f16 master).
+fn assemble_deep_frame(
+    width: u32,
+    height: u32,
+    samples: DeepSamples<'_>,
+    env: &DecodeEnv,
+    transform: Option<&icm::Transform>,
+) -> PixelFrame {
+    match transform {
+        None => {
+            let mut halves = vec![0u16; width as usize * height as usize * 4];
+            deep_to_f16_halves(samples, &mut halves);
+            composite_over_background_f16_in_place(&mut halves, env.background);
+            PixelFrame::from_f16_halves(width, height, halves)
+        }
+        Some(transform) => {
+            let mut bgr = vec![0u16; width as usize * height as usize * 3];
+            deep_to_bgr_u16(samples, &mut bgr);
+            if let Some(mut halves) = transform.apply_f16(width, height, icm::FrameSrc::Bgr16(&bgr))
+            {
+                if let Some(alpha) = deep_source_alpha(&samples) {
+                    restore_alpha_f16_from_u16(&mut halves, &alpha);
+                }
+                composite_over_background_f16_in_place(&mut halves, env.background);
+                PixelFrame::from_f16_halves(width, height, halves)
+            } else {
+                let mut converted = vec![0u8; width as usize * height as usize * 4];
+                deep_to_rgba8_via_f16(samples, &mut converted);
+                assemble_frame(width, height, converted, env, Some(transform), 8)
+            }
+        }
+    }
 }
 
 /// The shared decode dispatch once a format-guessing reader exists —
@@ -431,18 +495,30 @@ fn decode_reader<R: BufRead + Seek>(
                 .checked_mul(h as usize)
                 .and_then(|px| px.checked_mul(4))
                 .ok_or_else(|| user("canvas exceeds the addressable budget".to_string()))?;
+            // #77's while-the-decoder-is-alive rule — and, since #142's
+            // f16 masters, BEFORE the animation-wire gate below: a
+            // transformed stream's frames are 8-byte masters, so the
+            // gate must price the CHARGED size (Codex P1 on PR #147: a
+            // canvas just under the 4-byte threshold would otherwise
+            // enter the animated path while the four decode canvases
+            // plus the first retained master already break the bound).
+            let transform = prepare_transform(&mut decoder, &env, shown);
             // A file the animation path cannot take still fits the static
             // single-canvas path — degrade there instead of failing the
             // load (external review R2/R5: pre-#98, upstream GDI+, and
             // every static PNG viewer show such a file's first frame;
             // failing it would be a reachable regression). Two
             // independent lines: a canvas four buffers cannot afford
-            // (size), and a color depth the animation side cannot decode
-            // at all (16-bit — `.apng()` itself is infallible, the
-            // rejection lands at the first frame pull, after two canvas
+            // (size — priced at the stream's own charge since #142), and
+            // a color depth the animation side cannot decode at all
+            // (16-bit — `.apng()` itself is infallible, the rejection
+            // lands at the first frame pull, after two canvas
             // allocations).
             if !apng_color_is_animatable(decoder.color_type())
-                || !apng_canvas_fits_animation_budget(per_frame_bytes)
+                || !apng_canvas_fits_animation_budget(charged_frame_bytes(
+                    per_frame_bytes,
+                    transform.as_ref(),
+                ))
             {
                 // Support symmetry with the icc breadcrumb in
                 // prepare_transform: the degradation is silent on screen
@@ -459,11 +535,11 @@ fn decode_reader<R: BufRead + Seek>(
                 }
                 return sink_static(decoder, shown, env, sink);
             }
-            // ApngDecoder implements only AnimationDecoder, so orientation
-            // and the ICC profile must be taken from the PngDecoder before
-            // `.apng()` consumes it (#77's while-the-decoder-is-alive rule).
+            // ApngDecoder implements only AnimationDecoder, so the
+            // orientation must be taken from the PngDecoder before
+            // `.apng()` consumes it (the ICC transform was prepared
+            // above, ahead of the wire gate).
             let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
-            let transform = prepare_transform(&mut decoder, &env, shown);
             let decoder = decoder.apng().map_err(|e| user(e.to_string()))?;
             // APNG delays are the fcTL fraction num × 1000 / (den || 100) ms,
             // already computed by the iterator; zero delays pass through like
@@ -517,12 +593,37 @@ fn apng_color_is_animatable(color: image::ColorType) -> bool {
 /// image crate's compositing needs FOUR canvases inside the same 512 MB
 /// budget the static path spends on one (two persistent buffers plus the
 /// raw output and the subframe-RGBA transients — measured, external
-/// review R1). Over the wire the load degrades to the static path, which
-/// affords one full-budget canvas (#98 R2: pre-#98 riviv, upstream GDI+,
-/// and any static viewer display such a file's first frame — failing it
-/// would be a reachable regression).
+/// review R1). `per_frame_bytes` is the stream's own CHARGE (since #142:
+/// the decode canvas for a plain stream, the doubled f16-master size for
+/// a transformed one — Codex P1 on PR #147 — so a transformed canvas
+/// under the 4-byte threshold cannot enter the animated path and break
+/// the bound with its decode canvases plus the first retained master).
+/// Over the wire the load degrades to the static path, which affords one
+/// full-budget canvas (#98 R2: pre-#98 riviv, upstream GDI+, and any
+/// static viewer display such a file's first frame — failing it would be
+/// a reachable regression).
 fn apng_canvas_fits_animation_budget(per_frame_bytes: usize) -> bool {
     per_frame_bytes.saturating_mul(4) <= MAX_TOTAL_FRAME_BYTES
+}
+
+/// The budget's per-frame charge for an animation a transform will hold
+/// as f16 masters (#142, Codex P1 on PR #147): the decode-side canvas
+/// cost (`w * h * 4`) doubles to the F16Srgb master's actual `w * h * 8`
+/// retained bytes, keeping the gate honest against the memory the UI
+/// side really holds — the contract `MAX_TOTAL_FRAME_BYTES` documents
+/// (master bytes, not decode bytes). A frame whose 16-bit pass fell back
+/// to the 8-bit chain is over-charged thereby (4 real bytes for 8
+/// booked) — conservative by design; the cap re-derivation is #144's.
+fn charged_frame_bytes(canvas_bytes: usize, transform: Option<&icm::Transform>) -> usize {
+    if transform.is_some() {
+        // Saturating, never wrapping (Codex P1 on PR #147, round 3): a
+        // canvas over usize::MAX/2 doubles past the integer — a wrapped
+        // small charge would admit it through the gates; saturated, the
+        // charge simply cannot fit and the stream degrades.
+        canvas_bytes.saturating_mul(2)
+    } else {
+        canvas_bytes
+    }
 }
 
 /// Decode one frame at a time of an animation, replying per frame
@@ -530,8 +631,11 @@ fn apng_canvas_fits_animation_budget(per_frame_bytes: usize) -> bool {
 ///
 /// `normalize_delay` maps the image crate's reported delay (ms) to the delay
 /// we schedule with; it carries the per-format fallback rules.
-/// `per_frame_bytes` is the canvas cost of one frame (`w * h * 4`), known
-/// from the decoder header before any frame is decoded.
+/// `per_frame_bytes` is the decode-side canvas cost of one frame (`w * h *
+/// 4`), known from the decoder header before any frame is decoded; the
+/// gate charges each frame at the master's actual width for the stream
+/// ([`charged_frame_bytes`] — a transformed stream's frames land as f16
+/// masters).
 #[allow(clippy::too_many_arguments)]
 fn stream_animation(
     mut frames: Frames<'_>,
@@ -545,6 +649,7 @@ fn stream_animation(
     sink: &mut dyn FnMut(LoadReply),
 ) -> Result<(), Stop> {
     let user = |msg: String| Stop::User(msg);
+    let per_frame_bytes = charged_frame_bytes(per_frame_bytes, icm);
     let mut emitted = 0usize;
     let mut canvas: Option<(u32, u32)> = None;
     let mut total_frame_bytes: usize = 0;
@@ -621,7 +726,12 @@ fn stream_animation(
             }
             Some(_) => {}
         }
-        total_frame_bytes += buffer.len();
+        // Charge the frame at the gate's own rate (Codex P1 on PR #147,
+        // round 2): the canvas check above pins every frame to the same
+        // dimensions, so the charged `per_frame_bytes` IS this frame's
+        // retained size — accumulating the decode buffer instead would
+        // count a transformed stream's 8-byte masters at half price.
+        total_frame_bytes += per_frame_bytes;
         // ICM -> composite -> PixelFrame (#77/ADR 0002 D2). The frame
         // itself is pure memory since #76 — through #89 its GDI
         // derivations (and their failure class) lived on the UI thread;
@@ -678,43 +788,29 @@ fn sink_static<D: ImageDecoder>(
     if w == 0 || h == 0 {
         return Err(user("empty image".to_string()));
     }
-    // #140 (ADR 0003 D6, the direct path): >8-bit code-value sources no
-    // longer truncate through `into_rgba8()` — the 16-bit variants
-    // convert through the f16 master encoding (u16 -> f32 -> f16 -> the
-    // 8-bit reading, no mscms on this path) until #141 lands the f16
-    // master storage, so the conversion semantics the later tickets
-    // carry downstream are already the master's. The 32-bit float (HDR
-    // radiance) variants keep `into_rgba8()` — radiance is linear
-    // light, not code values, and the crate's tonemap stays theirs;
-    // they report 8 bits to the gate for the same reason.
-    //
-    // Interim seam, deliberate (Codex P2 on PR #145, acknowledged): a
-    // 16-bit source WITH a live ICC transform still hands the transform
-    // these quantized 8-bit rows — same 8-bit-into-mscms shape the
-    // 8-bit era had, no worse — and its `F16Srgb` mark says which
-    // pipeline OWNS the frame, not that the deep bits survived yet.
-    // #142's `BM_16b_RGB` chain (16-bit transform src AND dst) is what
-    // actually keeps them.
+    // #140/#142 (ADR 0003 D6): >8-bit code-value sources never truncate
+    // through `into_rgba8()` — the 16-bit variants flow through the f16
+    // master's own storage (`assemble_deep_frame`: direct halves, or the
+    // CMM's 16-bit chain when a transform is live, or — fallback only —
+    // the quantized 8-bit chain). The 32-bit float (HDR radiance)
+    // variants keep `into_rgba8()` — radiance is linear light, not code
+    // values, and the crate's tonemap stays theirs. The interim seam of
+    // #140/#141 (deep rows quantized to 8-bit before mscms) is gone:
+    // 16-bit src AND dst are the transform path's shape now.
     let deep = match &img {
-        image::DynamicImage::ImageRgb16(p) => Some((DeepSamples::Rgb16(p.as_raw()), 16)),
-        image::DynamicImage::ImageRgba16(p) => Some((DeepSamples::Rgba16(p.as_raw()), 16)),
-        image::DynamicImage::ImageLuma16(p) => Some((DeepSamples::Luma16(p.as_raw()), 16)),
-        image::DynamicImage::ImageLumaA16(p) => Some((DeepSamples::LumaA16(p.as_raw()), 16)),
+        image::DynamicImage::ImageRgb16(p) => Some(DeepSamples::Rgb16(p.as_raw())),
+        image::DynamicImage::ImageRgba16(p) => Some(DeepSamples::Rgba16(p.as_raw())),
+        image::DynamicImage::ImageLuma16(p) => Some(DeepSamples::Luma16(p.as_raw())),
+        image::DynamicImage::ImageLumaA16(p) => Some(DeepSamples::LumaA16(p.as_raw())),
         _ => None,
     };
-    let (rgba, source_bits) = match deep {
-        Some((samples, bits)) => {
-            let mut converted = vec![0u8; w as usize * h as usize * 4];
-            deep_to_rgba8_via_f16(samples, &mut converted);
-            (converted, bits)
+    let frame = match deep {
+        Some(samples) => assemble_deep_frame(w, h, samples, &env, transform.as_ref()),
+        None => {
+            let rgba = img.into_rgba8().into_raw();
+            assemble_frame(w, h, rgba, &env, transform.as_ref(), 8)
         }
-        None => (img.into_rgba8().into_raw(), 8),
     };
-    // ICM -> composite -> PixelFrame (#77/ADR 0002 D2): transparent
-    // regions resolve against the sRGB background AFTER the color
-    // transform, never before it. (Upstream pre-generates stills' mips at
-    // the same slot, viv.c:10749; retired with #81.)
-    let frame = assemble_frame(w, h, rgba, &env, transform.as_ref(), source_bits);
     // A static image is a one-frame stream: first frame, then Complete from
     // decode_to_sink. delay_ms is unused (no second frame ever follows).
     sink(LoadReply::FirstFrame { frame, delay_ms: 0 });
@@ -1981,9 +2077,11 @@ mod stdin_bytes_tests {
     }
 
     /// The first (and only) pixel of a PixelFrame as (R, G, B) — the
-    /// status-bar readout's view of the master buffer.
+    /// status-bar readout's view of the master buffer, through the
+    /// direct-read dispatch (#142: an F16Srgb master's stored halves
+    /// quantize through the same read point as its 8-bit sibling).
     fn first_rgb(frame: &PixelFrame) -> (u8, u8, u8) {
-        crate::pixels::sample_bgra(&frame.pixels, frame.width as i32, 0, 0).unwrap()
+        crate::pixels::sample_master_rgb(frame, 0, 0).expect("pixel (0,0) of a 4x4 frame")
     }
 
     /// A solid 4×4 PNG of an arbitrary pixel encoded in-memory,
@@ -2060,6 +2158,55 @@ mod stdin_bytes_tests {
         assert!(matches!(replies.last(), Some(LoadReply::Complete)));
     }
 
+    #[test]
+    fn a_transformed_animation_is_charged_at_its_f16_master_bytes() {
+        // Codex P1 on PR #147: an ICC animation's frames land as F16Srgb
+        // masters (8 bytes per pixel of retained UI-side memory), so the
+        // budget gate must charge the master's size — the decode canvas
+        // cost doubled — or a hostile transformed stream holds ~2x the
+        // cap while the gate believes it is under. The untagged stream's
+        // charge stays the decode canvas itself (the pin the 4096-frame
+        // edge above relies on).
+        crate::icm::test_fixtures::require_srgb();
+        let t = crate::icm::prepare(true, Some(crate::icm::test_fixtures::adobe_like_icc()), "t")
+            .expect("an AdobeRGB-like profile transforms");
+        assert_eq!(charged_frame_bytes(100, Some(&t)), 200);
+        assert_eq!(charged_frame_bytes(100, None), 100);
+        // The saturation pin (Codex P1 round 3): a canvas past
+        // usize::MAX/2 must charge as unaffordable, never wrap small.
+        assert_eq!(charged_frame_bytes(usize::MAX, Some(&t)), usize::MAX);
+        assert_eq!(
+            charged_frame_bytes(usize::MAX / 2 + 1, Some(&t)),
+            usize::MAX
+        );
+        assert_eq!(
+            charged_frame_bytes(usize::MAX / 2, Some(&t)),
+            usize::MAX - 1,
+            "the largest exact double stays exact"
+        );
+        assert_eq!(charged_frame_bytes(usize::MAX, None), usize::MAX);
+    }
+
+    #[test]
+    fn a_transformed_apng_canvas_is_admitted_at_the_charged_size() {
+        // Codex P1 on PR #147, round 2: the animation-wire gate prices
+        // the stream's own charge, so an ICC APNG's canvas crosses the
+        // wire at HALF the plain threshold (its frames are 8-byte f16
+        // masters) — over the wire the file degrades to a static decode
+        // instead of entering the animated path and breaking the bound.
+        crate::icm::test_fixtures::require_srgb();
+        let t = crate::icm::prepare(true, Some(crate::icm::test_fixtures::adobe_like_icc()), "t")
+            .expect("an AdobeRGB-like profile transforms");
+        let canvas = MAX_TOTAL_FRAME_BYTES / 5; // plain: *4 fits, *8 does not
+        assert!(apng_canvas_fits_animation_budget(charged_frame_bytes(
+            canvas, None
+        )));
+        assert!(!apng_canvas_fits_animation_budget(charged_frame_bytes(
+            canvas,
+            Some(&t)
+        )));
+    }
+
     fn first_frame_pixels(bytes: &[u8], icm: bool) -> PixelFrame {
         let terminate = AtomicBool::new(false);
         let mut replies = Vec::new();
@@ -2087,6 +2234,63 @@ mod stdin_bytes_tests {
         assert!(
             (r as i32 - 239).abs() <= 2 && (g as i32 - 57).abs() <= 2 && b <= 2,
             "got ({r},{g},{b}), expected the characterized mscms (239,57,0) ±2"
+        );
+    }
+
+    #[test]
+    fn a_tagged_8bit_png_builds_a_real_f16_master() {
+        // #142's structural pin end to end: a tagged 8-bit source through
+        // the 16-bit CMM chain lands as a GENUINE f16 master — 8 bytes
+        // per pixel of halves, never an 8-bit landing — and the status
+        // read's colors match the 8-bit era's characterized mscms output
+        // within its tolerance.
+        crate::icm::test_fixtures::require_srgb();
+        let png = png_bytes(Some(crate::icm::test_fixtures::adobe_like_icc()));
+        let frame = first_frame_pixels(&png, true);
+        assert_eq!(frame.content_space, ContentSpace::F16Srgb);
+        assert_eq!(frame.pixels.len(), 4 * 4 * 8, "four halves per pixel");
+        let (r, g, b) = first_rgb(&frame);
+        assert!(
+            (r as i32 - 239).abs() <= 2 && (g as i32 - 57).abs() <= 2 && b <= 2,
+            "got ({r},{g},{b}), expected the characterized mscms (239,57,0) ±2"
+        );
+    }
+
+    #[test]
+    fn the_injected_16bit_failure_lands_the_honest_8bit_fallback() {
+        // The D5 fallback at the assembler: the transform forced to
+        // refuse its 16-bit pass hands the frame to the 8-bit chain —
+        // BGRA bytes (4 per pixel), marked by the QUANTIZED depth (8), so
+        // the content space reads Srgb even though a transform is live.
+        // The same input without the injection (the contrast below)
+        // takes the f16 chain, pinning the fork to the 16-bit pass
+        // alone. Colors are the 8-bit era's characterized output,
+        // tolerance unchanged.
+        crate::icm::test_fixtures::require_srgb();
+        let t = crate::icm::prepare(true, Some(crate::icm::test_fixtures::adobe_like_icc()), "t")
+            .expect("an AdobeRGB-like profile transforms");
+        let env = env_icm(true);
+        let rgba = [200u8, 60, 10, 255].repeat(4 * 4);
+        let f16_frame = assemble_frame(4, 4, rgba.clone(), &env, Some(&t), 8);
+        assert_eq!(f16_frame.content_space, ContentSpace::F16Srgb);
+        assert_eq!(
+            f16_frame.pixels.len(),
+            4 * 4 * 8,
+            "the success arm's halves"
+        );
+        t.force16_fail.set(true);
+        let frame = assemble_frame(4, 4, rgba, &env, Some(&t), 8);
+        t.force16_fail.set(false);
+        assert_eq!(
+            frame.content_space,
+            ContentSpace::Srgb,
+            "the fallback's honest mark: the bytes ARE 8-bit"
+        );
+        assert_eq!(frame.pixels.len(), 4 * 4 * 4, "BGRA bytes, not halves");
+        let (r, g, b) = first_rgb(&frame);
+        assert!(
+            (r as i32 - 239).abs() <= 2 && (g as i32 - 57).abs() <= 2 && b <= 2,
+            "got ({r},{g},{b}), expected the 8-bit chain's (239,57,0) ±2"
         );
     }
 
@@ -2261,9 +2465,10 @@ mod apng_tests {
         DecodeEnv { icm, ..env() }
     }
 
-    /// The pixel at (x, y) of a PixelFrame as (R, G, B).
+    /// The pixel at (x, y) of a PixelFrame as (R, G, B), through the
+    /// direct-read dispatch (#142, as in the stdin module's `first_rgb`).
     fn rgb_at(frame: &PixelFrame, x: i32, y: i32) -> (u8, u8, u8) {
-        crate::pixels::sample_bgra(&frame.pixels, frame.width as i32, x, y)
+        crate::pixels::sample_master_rgb(frame, x, y)
             .unwrap_or_else(|| panic!("sample ({x},{y}) out of bounds"))
     }
 
@@ -2727,14 +2932,12 @@ mod apng_tests {
 
     #[test]
     fn deep_static_png_earns_the_f16_master_mark() {
-        // #140 (ADR 0003 D1/D6): the 16-bit static PNG is the direct
-        // path — no truncation through `into_rgba8()` anymore, the
-        // samples convert through the f16 master encoding, and the
-        // frame carries the F16Srgb mark (the gate's verdict; #141
-        // wires the mark into the cache keys). The fixture triple reads
-        // back 198/60/10 — the same codes the old quantization produced
-        // (the interim 8-bit landing is byte-stable where f16 costs
-        // nothing).
+        // #140/#142 (ADR 0003 D1/D6): the 16-bit static PNG is the direct
+        // path — no truncation through `into_rgba8()`, the samples land
+        // straight in the f16 master's halves (GENUINE 8-bytes-per-pixel
+        // storage since #142), and the frame carries the F16Srgb mark.
+        // The fixture triple reads back 198/60/10 — the same codes the
+        // old quantization produced (byte-stable where f16 costs nothing).
         let samples = [0xC700u16, 0x3C00, 0x0A00, 0xFFFF];
         let mut raw = Vec::with_capacity(samples.len() * 2);
         for s in samples {
@@ -2743,7 +2946,68 @@ mod apng_tests {
         let png16 = png_static_raw(png::ColorType::Rgba, png::BitDepth::Sixteen, &raw);
         let frame = static_first_frame(&png16);
         assert_eq!(frame.content_space, ContentSpace::F16Srgb);
+        assert_eq!(
+            frame.pixels.len(),
+            8,
+            "four halves per pixel of the 1x1 frame"
+        );
         assert_eq!(rgb_at(&frame, 0, 0), (198, 60, 10));
+    }
+
+    #[test]
+    fn a_tagged_deep_png16_keeps_sub_8bit_information() {
+        // The 16-bit chain's whole point (ADR 0003 D6): a deep source
+        // with a live transform flows 16-bit src AND dst through the CMM
+        // — the master's halves must carry sub-8-bit information, i.e.
+        // at least one stored RGB half is NOT the f16 of the 8-bit grid
+        // point its own read-back sits on (exactly the information the
+        // old `into_rgba8()` truncation destroyed).
+        crate::icm::test_fixtures::require_srgb();
+        let mut info = png::Info::with_size(4, 1);
+        info.color_type = png::ColorType::Rgb;
+        info.bit_depth = png::BitDepth::Sixteen;
+        info.icc_profile = Some(std::borrow::Cow::Owned(
+            crate::icm::test_fixtures::adobe_like_icc(),
+        ));
+        let mut out = Vec::new();
+        let enc = png::Encoder::with_info(&mut out, info).expect("with_info");
+        let mut writer = enc.write_header().expect("write_header");
+        // A varied 16-bit ramp: four pixels of distinct deep tones, so
+        // the CMM's output spreads across the f16 mantissa.
+        let rows: [u16; 12] = [
+            0xC700, 0x3C00, 0x0A00, //
+            0x8000, 0xFFFF, 0x4000, //
+            0x1234, 0xABCD, 0x5678, //
+            0xE001, 0x0F0F, 0x7007,
+        ];
+        let mut raw = Vec::with_capacity(rows.len() * 2);
+        for s in rows {
+            raw.extend_from_slice(&s.to_be_bytes());
+        }
+        writer.write_image_data(&raw).expect("image data");
+        writer.finish().expect("finish");
+        let replies = decode_all(&out, env_icm(true));
+        let Some(LoadReply::FirstFrame { frame, .. }) = replies.into_iter().next() else {
+            panic!("expected a first frame");
+        };
+        assert_eq!(frame.content_space, ContentSpace::F16Srgb);
+        assert_eq!(frame.pixels.len(), 32, "4x1 pixels, four halves each");
+        // The sub-8-bit scan: a half that is not the f16 of its own
+        // read-back code's k/255 grid point carries >8-bit information.
+        let mut off_grid = 0usize;
+        for px in frame.pixels.as_chunks::<8>().0 {
+            for c in [0usize, 2, 4] {
+                let half = u16::from_le_bytes([px[c], px[c + 1]]);
+                let code = crate::pixels::f16_bits_to_u8_code(half);
+                if half != crate::pixels::f32_to_f16_bits(f32::from(code) / 255.0) {
+                    off_grid += 1;
+                }
+            }
+        }
+        assert!(
+            off_grid > 0,
+            "every RGB half landed on an 8-bit grid point — no deep information survived the chain"
+        );
     }
 
     #[test]

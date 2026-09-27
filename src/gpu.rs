@@ -170,8 +170,11 @@ pub(crate) fn d2d_interp_mode(
 /// and hands them in per paint (so a device rebuild re-uploads without a
 /// re-decode, and a new image drops the levels with its frame).
 pub(crate) trait LevelSource {
-    /// The (width, height, BGRA bytes) of `level`, building it on demand
-    /// (and caching it). `None` = refused (over the CPU budget).
+    /// The (width, height, pixel bytes) of `level`, building it on demand
+    /// (and caching it). The byte width is the master's content space's
+    /// own (#142: 4 bytes per pixel Srgb, 8 for the f16 halves) — the
+    /// consumers branch on the same space the keys carry. `None` =
+    /// refused (over the CPU budget).
     fn level(&mut self, level: u32) -> Option<(u32, u32, &[u8])>;
 
     /// The CPU bytes this source is holding right now — the ledger's
@@ -865,6 +868,15 @@ impl GpuStack {
     /// design §5). The pitch is the tightly-packed invariant `width * 4`
     /// (pixels.rs). Level 0 is the master; level ≥ 1 is a giant's
     /// prefiltered overview.
+    ///
+    /// The upload format follows the key's content space (#142): an Srgb
+    /// level uploads its own BGRA bytes; an F16Srgb level is quantized
+    /// into a staging buffer first — the INTERIM upload seam (until #143
+    /// lands the `R16G16B16A16_FLOAT` bitmap arm, the device bitmap stays
+    /// `B8G8R8A8`). The quantize's rendered bytes are the 8-bit era's
+    /// byte-for-byte: the single quantize-read exit
+    /// (`pixels::f16_bits_to_u8_code`) is the same one every direct-read
+    /// seam uses.
     fn ensure_base(&mut self, key: UploadKey, pixels: &[u8]) -> Result<(), String> {
         if self.uploaded == Some(key) {
             return Ok(());
@@ -878,23 +890,50 @@ impl GpuStack {
         let pitch = wide
             .checked_mul(4)
             .ok_or_else(|| format!("frame {wide}x{high} pitch overflows"))?;
-        debug_assert_eq!(pixels.len(), wide as usize * high as usize * 4);
-        // SAFETY: `pixels` holds exactly wide*high*4 readable bytes (the
-        // master/level invariant, tightly packed top-down) and outlives
-        // this synchronous copy; the properties struct is a valid stack
-        // temporary.
-        let bitmap = unsafe {
+        // The F16Srgb staging (a Vec so the borrow below stays local);
+        // the Srgb arm uploads the source bytes directly.
+        let mut staging;
+        let upload: &[u8] = match key.content_space {
+            ContentSpace::Srgb => {
+                debug_assert_eq!(pixels.len(), wide as usize * high as usize * 4);
+                pixels
+            }
+            ContentSpace::F16Srgb => {
+                debug_assert_eq!(pixels.len(), wide as usize * high as usize * 8);
+                staging = vec![0u8; wide as usize * high as usize * 4];
+                crate::pixels::f16_halves_to_bgra8_bulk(pixels, &mut staging);
+                // The staging is the in-flight byte class exactly like a
+                // tile's (#82's ledger, Codex P2 on PR #147: an uncounted
+                // F16 upload underreports the true peak) — counted at its
+                // peak while the synchronous creation copies it, released
+                // on both exits below.
+                self.ledger.note_inflight(staging.len() as u64);
+                &staging
+            }
+        };
+        // SAFETY: `upload` holds exactly wide*high*4 readable bytes (the
+        // Srgb master/level invariant, tightly packed top-down — or the
+        // F16Srgb arm's freshly quantized staging of that exact size)
+        // and outlives this synchronous copy; the properties struct is a
+        // valid stack temporary.
+        let bitmap = match unsafe {
             self.context.CreateBitmap(
                 D2D_SIZE_U {
                     width: wide,
                     height: high,
                 },
-                Some(pixels.as_ptr().cast()),
+                Some(upload.as_ptr().cast()),
                 pitch,
                 &bitmap_properties(D2D1_BITMAP_OPTIONS_NONE),
             )
-        }
-        .map_err(|e| format!("D2D CreateBitmap({wide}x{high}) failed: {e}"))?;
+        } {
+            Ok(bitmap) => bitmap,
+            Err(e) => {
+                self.ledger.note_inflight(0);
+                return Err(format!("D2D CreateBitmap({wide}x{high}) failed: {e}"));
+            }
+        };
+        self.ledger.note_inflight(0);
         // DrawBitmap takes the parent ID2D1Bitmap (no auto upcast in 0.62)
         // — one QI per upload, none per frame.
         let bitmap_base: ID2D1Bitmap = bitmap
@@ -909,7 +948,12 @@ impl GpuStack {
     /// Copy one tile's haloed source rectangle out of the level's tightly
     /// packed CPU pixels into a tight staging buffer and upload it. The
     /// staging copy is the `in-flight` byte class; it is released before
-    /// this returns (its peak is what the ledger keeps).
+    /// this returns (its peak is what the ledger keeps). The source row
+    /// width follows the tile key's content space (#142): an F16Srgb
+    /// level's rows hold 8-byte half pixels and are quantized into the
+    /// 4-byte staging rows on the copy (the same interim upload seam
+    /// [`GpuStack::ensure_base`] documents — the staging shape, and so
+    /// the in-flight byte count, is the 8-bit era's either way).
     fn upload_tile(
         &mut self,
         quad: &crate::tile::TileRequest,
@@ -922,8 +966,13 @@ impl GpuStack {
         if wide == 0 || high == 0 {
             return Err("a zero-area tile has no bitmap".into());
         }
+        let src_bpp = match quad.key.content_space {
+            ContentSpace::Srgb => 4usize,
+            ContentSpace::F16Srgb => 8,
+        };
         let row_bytes = wide as usize * 4;
-        let pitch = level_w as usize * 4;
+        let src_row_bytes = wide as usize * src_bpp;
+        let pitch = level_w as usize * src_bpp;
         if quad.src.right() as u32 > level_w || quad.src.bottom() as u32 > level_h {
             return Err(format!(
                 "tile source {:?} escapes the {level_w}x{level_h} level",
@@ -932,12 +981,20 @@ impl GpuStack {
         }
         let mut staging = vec![0u8; row_bytes * high as usize];
         for row in 0..high as usize {
-            let src_off = (quad.src.y as usize + row) * pitch + quad.src.x as usize * 4;
+            let src_off = (quad.src.y as usize + row) * pitch + quad.src.x as usize * src_bpp;
             let dst_off = row * row_bytes;
-            let Some(src_row) = level_pixels.get(src_off..src_off + row_bytes) else {
+            let Some(src_row) = level_pixels.get(src_off..src_off + src_row_bytes) else {
                 return Err(format!("tile source row {row} is outside the level buffer"));
             };
-            staging[dst_off..dst_off + row_bytes].copy_from_slice(src_row);
+            match quad.key.content_space {
+                ContentSpace::Srgb => {
+                    staging[dst_off..dst_off + row_bytes].copy_from_slice(src_row);
+                }
+                ContentSpace::F16Srgb => {
+                    let dst_row = &mut staging[dst_off..dst_off + row_bytes];
+                    crate::pixels::f16_halves_to_bgra8_bulk(src_row, dst_row);
+                }
+            }
         }
         self.ledger.note_inflight(staging.len() as u64);
         // SAFETY: `staging` holds exactly wide*high*4 readable bytes (filled

@@ -137,8 +137,9 @@ pub(crate) fn copy_current(hwnd: HWND, cut: bool) {
                 state.image.as_ref().map(|i| {
                     let master = i.surface().master();
                     // The direct-read dispatch (#141): the master's 8-bit
-                    // BGRA reading — GDI has no f16 (ADR 0003 后果节); on
-                    // the interim master both dispatch arms coincide.
+                    // BGRA reading — GDI has no f16 (ADR 0003 后果节), so
+                    // an F16Srgb master quantizes its stored halves
+                    // through the one shared read point (#142).
                     (
                         master_gdi_bgra(master),
                         master.width as i32,
