@@ -165,10 +165,20 @@ impl Rect {
     }
 }
 
-/// The bytes one BGRA bitmap of `pixels` pixels costs — the accounting
-/// unit of the whole budget story (the ticket's 字节预算).
-pub(crate) fn bgra_bytes(pixels: i64) -> u64 {
-    (pixels.max(0) as u64) * 4
+/// The bytes one RESIDENT bitmap of `pixels` pixels costs under `space` —
+/// the accounting unit of the whole budget story (the ticket's
+/// 字节预算) and the dispatch table behind every byte estimate (#143): an
+/// `Srgb` bitmap is BGRA8, 4 bytes per pixel; an F16Srgb bitmap is
+/// `R16G16B16A16_FLOAT`, 8 bytes per pixel — the level cache's own #142
+/// pricing, so the plan can never offer a level the cache would refuse.
+/// Saturating: the doubled charge must not wrap (#142 Codex R3's lesson
+/// from the same defect shape).
+pub(crate) fn resident_bytes(space: ContentSpace, pixels: i64) -> u64 {
+    let per_pixel = match space {
+        ContentSpace::Srgb => 4u64,
+        ContentSpace::F16Srgb => 8,
+    };
+    (pixels.max(0) as u64).saturating_mul(per_pixel)
 }
 
 /// Truncating (C-style, toward zero) integer division — the arithmetic
@@ -377,9 +387,12 @@ pub(crate) struct TileRequest {
 }
 
 impl TileRequest {
-    /// Bytes the uploaded bitmap costs.
+    /// Bytes the uploaded bitmap costs — by its key's content space
+    /// (#143): an Srgb tile is a 4-byte-per-pixel BGRA bitmap, an F16Srgb
+    /// tile an 8-byte-per-pixel f16 one (both the same-format tight
+    /// staging the upload copies).
     pub(crate) fn bytes(&self) -> u64 {
-        bgra_bytes(self.src.area())
+        resident_bytes(self.key.content_space, self.src.area())
     }
 }
 
@@ -487,9 +500,16 @@ pub(crate) fn plan_frame(
         // business rejecting it (external review AI1 P1-1: gating level 0
         // pushed every > 128 MiB device-fitting master — 8000x5000, a
         // common large photo — onto a box mip, magnifying it at 1:1 and
-        // breaking the #81 full-resolution contract).
-        let cpu_fits =
-            level == 0 || bgra_bytes(i64::from(level_w) * i64::from(level_h)) <= level_budget_bytes;
+        // breaking the #81 full-resolution contract). The estimate
+        // follows the content space (#143): since #142 the cache charges
+        // an F16Srgb level 8 bytes per pixel (4 for Srgb), so the old
+        // flat 4-byte estimate would plan a level the cache then refuses
+        // — prepare fails and the frame blanks. This aligns the estimate
+        // with the cache's own price; the cap's VALUE stays untouched
+        // (#144 owns budget numbers).
+        let cpu_fits = level == 0
+            || resident_bytes(content_space, i64::from(level_w) * i64::from(level_h))
+                <= level_budget_bytes;
         if device_fits && cpu_fits && forced.is_none() {
             return FramePlan::Base { level };
         }
@@ -907,7 +927,7 @@ mod tests {
         assert!(level >= 1);
         let (w, h) = mip::mip_size(16777217, 1, level);
         assert!(w <= 1024 && h == 1, "the bitmap is {w}x{h}");
-        assert!(bgra_bytes(i64::from(w) * i64::from(h)) <= 4096);
+        assert!(resident_bytes(ContentSpace::Srgb, i64::from(w) * i64::from(h)) <= 4096);
     }
 
     #[test]
@@ -1848,7 +1868,7 @@ mod tests {
         };
         let (w, h) = mip::mip_size(16389, 8189, level);
         assert!(
-            bgra_bytes(i64::from(w) * i64::from(h)) <= budget,
+            resident_bytes(ContentSpace::Srgb, i64::from(w) * i64::from(h)) <= budget,
             "level {level} = {w}x{h} still exceeds the CPU budget"
         );
         assert!(level >= 1, "level 0 does not fit the device either");
@@ -1948,5 +1968,187 @@ mod tests {
             );
             assert_ne!(a, b, "same cell, different spaces — never one key");
         }
+    }
+
+    // ---- content-space byte accounting (#143, ADR 0003 D6) ----
+
+    #[test]
+    fn resident_bytes_charges_four_bytes_per_pixel_for_srgb() {
+        // The Srgb arm stays the 8-bit era's BGRA8 charge — the pre-#143
+        // flat 4-byte estimate is exactly this arm, so every number the
+        // 8-bit era asserted stays true.
+        assert_eq!(resident_bytes(ContentSpace::Srgb, 0), 0);
+        assert_eq!(resident_bytes(ContentSpace::Srgb, 1), 4);
+        assert_eq!(resident_bytes(ContentSpace::Srgb, 1000 * 1000), 4_000_000);
+    }
+
+    #[test]
+    fn resident_bytes_charges_eight_bytes_per_pixel_for_an_f16_bitmap() {
+        // The #143 arm: an F16Srgb bitmap is R16G16B16A16_FLOAT — the
+        // RGBA half quadruple is 8 bytes per pixel, matching the CPU
+        // master's own storage and the level cache's #142 pricing.
+        assert_eq!(resident_bytes(ContentSpace::F16Srgb, 0), 0);
+        assert_eq!(resident_bytes(ContentSpace::F16Srgb, 1), 8);
+        assert_eq!(
+            resident_bytes(ContentSpace::F16Srgb, 1000 * 1000),
+            8_000_000
+        );
+        assert_eq!(
+            resident_bytes(ContentSpace::F16Srgb, 7),
+            resident_bytes(ContentSpace::Srgb, 7) * 2,
+            "the f16 charge is exactly the doubled BGRA charge"
+        );
+    }
+
+    #[test]
+    fn resident_bytes_of_negative_pixels_is_zero() {
+        // An empty rect's area is 0 and a degenerate caller can hand a
+        // negative count; either way nothing is resident to charge.
+        assert_eq!(resident_bytes(ContentSpace::Srgb, -1), 0);
+        assert_eq!(resident_bytes(ContentSpace::F16Srgb, i64::MIN), 0);
+    }
+
+    #[test]
+    fn resident_bytes_saturates_instead_of_wrapping_at_the_i64_top() {
+        // The #142 Codex R3 lesson, pinned for the doubled charge too:
+        // i64::MAX pixels × 8 overflows u64 — the answer saturates to
+        // u64::MAX rather than wrapping to a "fits the cap" absurdity.
+        assert_eq!(resident_bytes(ContentSpace::F16Srgb, i64::MAX), u64::MAX);
+        assert_eq!(resident_bytes(ContentSpace::Srgb, i64::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn a_tiles_byte_cost_doubles_with_an_f16_key() {
+        // TileRequest::bytes dispatches on the key's content space: the
+        // same haloed rect costs 8 bytes per pixel when it was cut from
+        // an f16 master — the LRU's charge and the plan's frame-bytes sum
+        // price the tiles the way the uploads actually allocate them.
+        let tile = |space| TileRequest {
+            key: TileKey {
+                frame_gen: 1,
+                content_space: space,
+                level: 2,
+                tx: 3,
+                ty: 4,
+            },
+            src: Rect::new(0, 0, 1088, 1088),
+            dest: DestRect {
+                x: 0.0,
+                y: 0.0,
+                w: 1088.0,
+                h: 1088.0,
+            },
+            clip: Rect::new(0, 0, 1024, 1024),
+        };
+        assert_eq!(tile(ContentSpace::Srgb).bytes(), 1088 * 1088 * 4);
+        assert_eq!(tile(ContentSpace::F16Srgb).bytes(), 1088 * 1088 * 8);
+    }
+
+    #[test]
+    fn the_frame_budget_follows_the_content_space_so_an_f16_frame_deepens() {
+        // Same geometry, different masters: the Srgb frame's level-1 tile
+        // set fits the cap, the F16 frame's doubled charge does not — the
+        // ladder deepens instead of planning a frame it cannot hold
+        // (#143). The cap sits between the Srgb charge and its double; the
+        // cap's VALUE is this test's, not the product's (#144).
+        let dest = Rect::new(0, 0, 4000, 4000);
+        let viewport = Rect::new(0, 0, 4000, 4000);
+        // 8192² master on a 1024 device at a 4000² render: level 1
+        // (4096²) is past the device max, so the frame tiles there.
+        let probe = plan_frame(
+            1,
+            ContentSpace::Srgb,
+            geom((8192, 8192), (4000, 4000), dest, viewport),
+            1024,
+            u64::MAX,
+            u64::MAX,
+            None,
+        );
+        let FramePlan::Tiles { tiles: level1, .. } = probe else {
+            panic!("level 1 is past the device max: expected tiles, got {probe:?}");
+        };
+        assert!(
+            level1.iter().all(|t| t.key.level == 1),
+            "the probe tiled level 1"
+        );
+        let srgb_working_set: u64 = level1.iter().map(|t| t.bytes()).sum();
+        let cap = srgb_working_set * 3 / 2; // strictly between Srgb and its F16 double
+        let srgb = plan_frame(
+            1,
+            ContentSpace::Srgb,
+            geom((8192, 8192), (4000, 4000), dest, viewport),
+            1024,
+            cap,
+            u64::MAX,
+            None,
+        );
+        let f16 = plan_frame(
+            1,
+            ContentSpace::F16Srgb,
+            geom((8192, 8192), (4000, 4000), dest, viewport),
+            1024,
+            cap,
+            u64::MAX,
+            None,
+        );
+        let FramePlan::Tiles {
+            level: srgb_level, ..
+        } = srgb
+        else {
+            panic!("the Srgb charge fits the cap: {srgb:?}");
+        };
+        let FramePlan::Tiles {
+            level: f16_level, ..
+        } = f16
+        else {
+            panic!("the F16 frame must stay tiled (deeper): {f16:?}");
+        };
+        assert_eq!(srgb_level, 1, "the Srgb tile set is within the cap");
+        assert!(
+            f16_level > srgb_level,
+            "the doubled F16 charge deepens the plan (got level {f16_level})"
+        );
+    }
+
+    #[test]
+    fn the_cpu_level_budget_follows_the_content_space_so_an_f16_level_deepens() {
+        // The plan's CPU estimate must match what the level cache would
+        // actually charge (#142 priced the cache by space; #143 aligns the
+        // plan): a 512² level costs 1 MiB Srgb but 2 MiB F16, so a budget
+        // between the two admits the Srgb level and refuses the F16 one —
+        // the F16 ladder deepens to the level the cache would accept,
+        // instead of planning an upload that blanks the frame.
+        let budget = 1_572_864; // 1.5 MiB: between 512²×4 and 512²×8
+        let args = (8192i32, 8192i32, 2048u32, 512i32);
+        let dest = Rect::new(0, 0, args.3, args.3);
+        let viewport = Rect::new(0, 0, args.3, args.3);
+        let srgb = plan_frame(
+            1,
+            ContentSpace::Srgb,
+            geom((args.0, args.1), (args.3, args.3), dest, viewport),
+            args.2,
+            u64::MAX,
+            budget,
+            None,
+        );
+        assert_eq!(
+            srgb,
+            FramePlan::Base { level: 4 },
+            "512² fits the 1.5 MiB budget at 4 B/px"
+        );
+        let f16 = plan_frame(
+            1,
+            ContentSpace::F16Srgb,
+            geom((args.0, args.1), (args.3, args.3), dest, viewport),
+            args.2,
+            u64::MAX,
+            budget,
+            None,
+        );
+        assert_eq!(
+            f16,
+            FramePlan::Base { level: 5 },
+            "512² is over the budget at 8 B/px — deepen to 256² (0.5 MiB), not an upload the cache refuses"
+        );
     }
 }

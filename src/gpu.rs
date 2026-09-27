@@ -48,7 +48,8 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION, D3D11CreateDevice, ID3D11Device,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_ALPHA_MODE_IGNORE, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC,
+    DXGI_ALPHA_MODE_IGNORE, DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM,
+    DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
     DXGI_ERROR_DEVICE_REMOVED, DXGI_ERROR_DEVICE_RESET, DXGI_ERROR_DRIVER_INTERNAL_ERROR,
@@ -413,6 +414,37 @@ pub(crate) fn is_device_loss(hr: windows::core::HRESULT) -> bool {
         || hr == D2DERR_RECREATE_TARGET
 }
 
+/// The one output-surface format (five-piece #3, ADR 0003 D3): the
+/// swapchain and everything drawn INTO it stays `B8G8R8A8_UNORM`, never
+/// `_SRGB` — the f16 master's quantize to 8-bit is done by the composite
+/// itself, the output face gains no format row.
+const SWAPCHAIN_FORMAT: DXGI_FORMAT = DXGI_FORMAT_B8G8R8A8_UNORM;
+
+/// The upload/composite-input format for a master's content space — the
+/// pure dispatch table behind the f16 upload arm (#143, ADR 0003 D6
+/// entry 4): `Srgb` keeps the 8-bit era's `B8G8R8A8_UNORM` arm
+/// byte-for-byte, while `F16Srgb`'s halves memory layout (RGBA half LE,
+/// tightly packed, top-down) is byte-identical to what
+/// `R16G16B16A16_FLOAT` describes — the upload is a zero-conversion
+/// memcpy, no quantize (the output surface stays frozen, see
+/// [`SWAPCHAIN_FORMAT`]; the #137 probe proved CreateBitmap + DrawBitmap
+/// on this format into a BGRA8 target).
+fn upload_format(space: ContentSpace) -> DXGI_FORMAT {
+    match space {
+        ContentSpace::Srgb => DXGI_FORMAT_B8G8R8A8_UNORM,
+        ContentSpace::F16Srgb => DXGI_FORMAT_R16G16B16A16_FLOAT,
+    }
+}
+
+/// The bytes per pixel of [`upload_format`]'s layout — the pitch math's
+/// input (4 for BGRA8, 8 for the half quadruple).
+fn upload_bpp(space: ContentSpace) -> u32 {
+    match space {
+        ContentSpace::Srgb => 4,
+        ContentSpace::F16Srgb => 8,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The stack
 // ---------------------------------------------------------------------------
@@ -463,13 +495,20 @@ const D2D1_COLORMANAGEMENT_QUALITY_BEST: u32 = 2;
 struct EffectGraph {
     /// The composite surface, TARGET-only (sized to the viewport; the
     /// resize path drops the whole graph and the next paint rebuilds).
+    /// Its format follows the master's content space it was built for —
+    /// an F16Srgb master's composite input is an f16 bitmap (the
+    /// ColorManagement effect internally works at high precision, so the
+    /// sRGB→display transform consumes full f16 input instead of
+    /// 8-bit-quantized colors — ADR 0003 D4's precision half, landed by
+    /// #143), an Srgb master's stays BGRA8 (the 8-bit effect path is
+    /// byte-identical).
     intermediate: ID2D1Image,
     /// The effect, already holding `intermediate` as input 0.
     effect_image: ID2D1Image,
     _effect: ID2D1Effect,
     _src_ctx: ID2D1ColorContext,
     _dst_ctx: ID2D1ColorContext,
-    built_for: (u32, u32),
+    built_for: (u32, u32, ContentSpace),
 }
 
 /// The display segment's per-frame application state — what the window
@@ -492,10 +531,12 @@ struct DisplaySegment {
 /// layer): the frame generation, the master content space its bytes
 /// belong to, the level, and the level's dimensions. Any term changing
 /// re-uploads from the CPU level source. The content-space term keeps a
-/// same-session 8-bit/FP16 pair's bitmaps apart — the keys never compare
-/// equal across spaces, which is what makes the two regimes safe to
-/// alternate before (and after) #143 gives their uploads different
-/// formats.
+/// same-session 8-bit/FP16 pair's bitmaps apart — and since #143 the two
+/// spaces genuinely own different upload formats (`B8G8R8A8_UNORM` vs
+/// `R16G16B16A16_FLOAT`, [`upload_format`]), so one space's resident
+/// bitmap could never be mistaken for the other's anyway; the keys never
+/// compare equal across spaces, which is what keeps the alternation
+/// safe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct UploadKey {
     pub(crate) frame_gen: u64,
@@ -600,6 +641,14 @@ pub(crate) struct GpuStack {
     /// ladder rebuilds, so it sits on the window state (the same split
     /// as the device-loss timestamps).
     display: DisplaySegment,
+    /// The content space of the master the last `prepare` served (#143):
+    /// the effect graph's intermediate format dispatches on it (an F16Srgb
+    /// master's composite input is an f16 bitmap, an Srgb master's stays
+    /// BGRA8), so `draw_pass` hands it to the lazy builder. A space change
+    /// mismatches `built_for` and rebuilds the graph lazily — the same
+    /// mechanism a viewport resize uses. Plain Copy data, safe between
+    /// the COM fields.
+    frame_space: ContentSpace,
     /// The byte ledger (ticket's 分类记账) — observable at close.
     pub(crate) ledger: crate::tile::MemLedger,
     // NOTE: the device-loss timestamps do NOT live on the stack — the
@@ -641,15 +690,33 @@ fn video_memory_budget(dxgi_device: &IDXGIDevice) -> Option<u64> {
     Some(info.Budget)
 }
 
-/// The bitmap properties all three UNORM surfaces share (the 1:1
-/// five-piece #3): `B8G8R8A8_UNORM` + alpha IGNORE — an `_SRGB` variant
-/// would linearize the bytes and break the ±0 tolerance; DPI 96 keeps the
-/// metadata honest (unit mode PIXELS ignores it for math). `options`
+/// The bitmap properties the UNORM surfaces share (the 1:1 five-piece
+/// #3): the swapchain target, the readback staging, and the Srgb arm's
+/// upload/intermediate bitmaps are all `B8G8R8A8_UNORM` — an `_SRGB`
+/// variant would linearize the bytes and break the ±0 tolerance. The
+/// upload bitmaps and the f16 effect intermediate dispatch their format
+/// on the content space instead (#143) — [`bitmap_properties_for`] is
+/// the one builder; this wrapper pins the UNORM call sites. DPI 96 keeps
+/// the metadata honest (unit mode PIXELS ignores it for math); `options`
 /// varies per call site.
 fn bitmap_properties(options: D2D1_BITMAP_OPTIONS) -> D2D1_BITMAP_PROPERTIES1 {
+    bitmap_properties_for(DXGI_FORMAT_B8G8R8A8_UNORM, options)
+}
+
+/// The one bitmap-properties builder behind every surface this stack
+/// creates: `format` follows the surface's role (the swapchain target and
+/// its UNORM siblings via [`bitmap_properties`], the f16 upload/intermediate
+/// arm via [`upload_format`]), alpha is always IGNORE — the #137 probe
+/// proved `R16G16B16A16_FLOAT` + IGNORE CreateBitmaps and draws — and
+/// alpha 1 everywhere in the composite makes the IGNORE semantics
+/// byte-exact on the UNORM side either way.
+fn bitmap_properties_for(
+    format: DXGI_FORMAT,
+    options: D2D1_BITMAP_OPTIONS,
+) -> D2D1_BITMAP_PROPERTIES1 {
     D2D1_BITMAP_PROPERTIES1 {
         pixelFormat: D2D1_PIXEL_FORMAT {
-            format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            format,
             alphaMode: D2D1_ALPHA_MODE_IGNORE,
         },
         dpiX: 96.0,
@@ -722,7 +789,7 @@ pub(crate) fn create(
     let desc = DXGI_SWAP_CHAIN_DESC1 {
         Width: 0,
         Height: 0,
-        Format: DXGI_FORMAT_B8G8R8A8_UNORM, // five-piece #3: never _SRGB
+        Format: SWAPCHAIN_FORMAT, // five-piece #3: never _SRGB (ADR 0003 D3)
         Stereo: false.into(),
         SampleDesc: DXGI_SAMPLE_DESC {
             Count: 1,
@@ -821,6 +888,9 @@ pub(crate) fn create(
         // The judge's verdict arrives with the first paint's intent sync
         // (#130), not here: the window state owns the decision point.
         display: DisplaySegment::default(),
+        // The first paint's prepare stamps the master's own space in
+        // before any draw reads it (#143).
+        frame_space: ContentSpace::Srgb,
         ledger: crate::tile::MemLedger {
             cap: cap_bytes,
             ..crate::tile::MemLedger::default()
@@ -865,18 +935,19 @@ impl GpuStack {
     /// (Re)create the base bitmap when the displayed [`UploadKey`] differs
     /// from the resident one — the CPU level's bytes upload in the same
     /// step (one CreateBitmap with source data, no intermediate surface,
-    /// design §5). The pitch is the tightly-packed invariant `width * 4`
-    /// (pixels.rs). Level 0 is the master; level ≥ 1 is a giant's
-    /// prefiltered overview.
+    /// design §5). The pitch is the tightly-packed
+    /// `width * upload_bpp(key.content_space)` (pixels.rs). Level 0 is
+    /// the master; level ≥ 1 is a giant's prefiltered overview.
     ///
-    /// The upload format follows the key's content space (#142): an Srgb
-    /// level uploads its own BGRA bytes; an F16Srgb level is quantized
-    /// into a staging buffer first — the INTERIM upload seam (until #143
-    /// lands the `R16G16B16A16_FLOAT` bitmap arm, the device bitmap stays
-    /// `B8G8R8A8`). The quantize's rendered bytes are the 8-bit era's
-    /// byte-for-byte: the single quantize-read exit
-    /// (`pixels::f16_bits_to_u8_code`) is the same one every direct-read
-    /// seam uses.
+    /// The upload format follows the key's content space (#143, ADR 0003
+    /// D6 entry 4): an Srgb level uploads its own BGRA bytes into a
+    /// `B8G8R8A8_UNORM` bitmap; an F16Srgb level's halves upload into an
+    /// `R16G16B16A16_FLOAT` bitmap DIRECTLY — the stored layout (RGBA
+    /// half LE, tightly packed, top-down) is byte-identical to the DXGI
+    /// format's, so there is no staging buffer and no quantize; the
+    /// conversion to 8-bit happens inside the composite (the output
+    /// surface stays frozen, ADR 0003 D3). The bytes are the `cpu_source`
+    /// class only — nothing here is in-flight anymore.
     fn ensure_base(&mut self, key: UploadKey, pixels: &[u8]) -> Result<(), String> {
         if self.uploaded == Some(key) {
             return Ok(());
@@ -887,53 +958,32 @@ impl GpuStack {
         self.uploaded = None;
         let wide = key.wide;
         let high = key.high;
+        let bpp = upload_bpp(key.content_space) as usize;
         let pitch = wide
-            .checked_mul(4)
+            .checked_mul(bpp as u32)
             .ok_or_else(|| format!("frame {wide}x{high} pitch overflows"))?;
-        // The F16Srgb staging (a Vec so the borrow below stays local);
-        // the Srgb arm uploads the source bytes directly.
-        let mut staging;
-        let upload: &[u8] = match key.content_space {
-            ContentSpace::Srgb => {
-                debug_assert_eq!(pixels.len(), wide as usize * high as usize * 4);
-                pixels
-            }
-            ContentSpace::F16Srgb => {
-                debug_assert_eq!(pixels.len(), wide as usize * high as usize * 8);
-                staging = vec![0u8; wide as usize * high as usize * 4];
-                crate::pixels::f16_halves_to_bgra8_bulk(pixels, &mut staging);
-                // The staging is the in-flight byte class exactly like a
-                // tile's (#82's ledger, Codex P2 on PR #147: an uncounted
-                // F16 upload underreports the true peak) — counted at its
-                // peak while the synchronous creation copies it, released
-                // on both exits below.
-                self.ledger.note_inflight(staging.len() as u64);
-                &staging
-            }
-        };
-        // SAFETY: `upload` holds exactly wide*high*4 readable bytes (the
-        // Srgb master/level invariant, tightly packed top-down — or the
-        // F16Srgb arm's freshly quantized staging of that exact size)
-        // and outlives this synchronous copy; the properties struct is a
-        // valid stack temporary.
-        let bitmap = match unsafe {
+        debug_assert_eq!(
+            pixels.len(),
+            wide as usize * high as usize * bpp,
+            "the level's bytes match its dimensions at the space's own width"
+        );
+        // SAFETY: `pixels` holds exactly wide*high*bpp readable bytes (the
+        // master/level invariant: tightly packed top-down, in the layout
+        // `upload_format(key.content_space)` describes) and outlives this
+        // synchronous copy; the properties struct is a valid stack
+        // temporary.
+        let bitmap = unsafe {
             self.context.CreateBitmap(
                 D2D_SIZE_U {
                     width: wide,
                     height: high,
                 },
-                Some(upload.as_ptr().cast()),
+                Some(pixels.as_ptr().cast()),
                 pitch,
-                &bitmap_properties(D2D1_BITMAP_OPTIONS_NONE),
+                &bitmap_properties_for(upload_format(key.content_space), D2D1_BITMAP_OPTIONS_NONE),
             )
-        } {
-            Ok(bitmap) => bitmap,
-            Err(e) => {
-                self.ledger.note_inflight(0);
-                return Err(format!("D2D CreateBitmap({wide}x{high}) failed: {e}"));
-            }
-        };
-        self.ledger.note_inflight(0);
+        }
+        .map_err(|e| format!("D2D CreateBitmap({wide}x{high}) failed: {e}"))?;
         // DrawBitmap takes the parent ID2D1Bitmap (no auto upcast in 0.62)
         // — one QI per upload, none per frame.
         let bitmap_base: ID2D1Bitmap = bitmap
@@ -948,12 +998,12 @@ impl GpuStack {
     /// Copy one tile's haloed source rectangle out of the level's tightly
     /// packed CPU pixels into a tight staging buffer and upload it. The
     /// staging copy is the `in-flight` byte class; it is released before
-    /// this returns (its peak is what the ledger keeps). The source row
-    /// width follows the tile key's content space (#142): an F16Srgb
-    /// level's rows hold 8-byte half pixels and are quantized into the
-    /// 4-byte staging rows on the copy (the same interim upload seam
-    /// [`GpuStack::ensure_base`] documents — the staging shape, and so
-    /// the in-flight byte count, is the 8-bit era's either way).
+    /// this returns (its peak is what the ledger keeps). The source rows
+    /// follow the tile key's content space (#142: 4 bytes per pixel Srgb,
+    /// 8 for the f16 halves) and the staging rows are the SAME layout
+    /// (#143): the copy is a same-format memcpy either way — an F16Srgb
+    /// tile's half rows upload into an `R16G16B16A16_FLOAT` bitmap
+    /// byte-for-byte, no quantize (the composite converts, ADR 0003 D3).
     fn upload_tile(
         &mut self,
         quad: &crate::tile::TileRequest,
@@ -966,13 +1016,9 @@ impl GpuStack {
         if wide == 0 || high == 0 {
             return Err("a zero-area tile has no bitmap".into());
         }
-        let src_bpp = match quad.key.content_space {
-            ContentSpace::Srgb => 4usize,
-            ContentSpace::F16Srgb => 8,
-        };
-        let row_bytes = wide as usize * 4;
-        let src_row_bytes = wide as usize * src_bpp;
-        let pitch = level_w as usize * src_bpp;
+        let bpp = upload_bpp(quad.key.content_space) as usize;
+        let row_bytes = wide as usize * bpp;
+        let pitch = level_w as usize * bpp;
         if quad.src.right() as u32 > level_w || quad.src.bottom() as u32 > level_h {
             return Err(format!(
                 "tile source {:?} escapes the {level_w}x{level_h} level",
@@ -981,23 +1027,15 @@ impl GpuStack {
         }
         let mut staging = vec![0u8; row_bytes * high as usize];
         for row in 0..high as usize {
-            let src_off = (quad.src.y as usize + row) * pitch + quad.src.x as usize * src_bpp;
+            let src_off = (quad.src.y as usize + row) * pitch + quad.src.x as usize * bpp;
             let dst_off = row * row_bytes;
-            let Some(src_row) = level_pixels.get(src_off..src_off + src_row_bytes) else {
+            let Some(src_row) = level_pixels.get(src_off..src_off + row_bytes) else {
                 return Err(format!("tile source row {row} is outside the level buffer"));
             };
-            match quad.key.content_space {
-                ContentSpace::Srgb => {
-                    staging[dst_off..dst_off + row_bytes].copy_from_slice(src_row);
-                }
-                ContentSpace::F16Srgb => {
-                    let dst_row = &mut staging[dst_off..dst_off + row_bytes];
-                    crate::pixels::f16_halves_to_bgra8_bulk(src_row, dst_row);
-                }
-            }
+            staging[dst_off..dst_off + row_bytes].copy_from_slice(src_row);
         }
         self.ledger.note_inflight(staging.len() as u64);
-        // SAFETY: `staging` holds exactly wide*high*4 readable bytes (filled
+        // SAFETY: `staging` holds exactly wide*high*bpp readable bytes (filled
         // row by row above) and outlives this synchronous copy; the
         // properties struct is a valid stack temporary.
         let bitmap = match unsafe {
@@ -1008,7 +1046,10 @@ impl GpuStack {
                 },
                 Some(staging.as_ptr().cast()),
                 row_bytes as u32,
-                &bitmap_properties(D2D1_BITMAP_OPTIONS_NONE),
+                &bitmap_properties_for(
+                    upload_format(quad.key.content_space),
+                    D2D1_BITMAP_OPTIONS_NONE,
+                ),
             )
         } {
             Ok(bitmap) => bitmap,
@@ -1066,6 +1107,10 @@ impl GpuStack {
         // space change does the same (#141) — a different space's bytes
         // are a different master's.
         src.rebind(frame_gen, content_space);
+        // Stamp the master's space for the draw pass (#143): the effect
+        // graph's intermediate format follows it, so a space change (like
+        // a size change) rebuilds the graph lazily at the next draw.
+        self.frame_space = content_space;
         if self.tile_owner != Some((frame_gen, content_space)) {
             for key in self.tile_lru.clear() {
                 self.tiles.remove(&key);
@@ -1113,7 +1158,10 @@ impl GpuStack {
                 // cap + overview. Trim the LRU to the remaining headroom
                 // so `gpu <= cap` holds on this transition too (external
                 // review AI3 P2-2; the S5c sweep asserts the strict bound).
-                let base = crate::tile::bgra_bytes(i64::from(wide) * i64::from(high));
+                // The charge follows the content space (#143): an F16Srgb
+                // overview is an 8-byte-per-pixel f16 bitmap.
+                let base =
+                    crate::tile::resident_bytes(content_space, i64::from(wide) * i64::from(high));
                 if level > 0 {
                     for key in self.tile_lru.trim_to(self.cap_bytes.saturating_sub(base)) {
                         self.tiles.remove(&key);
@@ -1215,9 +1263,11 @@ impl GpuStack {
         // frame holds no base (the tiles ARE the source), while an overview
         // frame's cost is exactly that bitmap — reading `uploaded` instead
         // would report a stale level from an earlier frame of the session.
+        // The cost follows the plan's content space (#143): 4 bytes per
+        // pixel Srgb, 8 for the f16 arm.
         self.ledger.gpu_base = match &self.scene {
             Scene::Base { level, w, h } if *level > 0 => {
-                crate::tile::bgra_bytes(*w as i64 * *h as i64)
+                crate::tile::resident_bytes(content_space, i64::from(*w) * i64::from(*h))
             }
             _ => 0,
         };
@@ -1266,18 +1316,20 @@ impl GpuStack {
     /// the ratchet feed ONCE (get_or_insert — the direct pass may still
     /// fail on its own after this) and answers false: the frame draws
     /// direct (content visible untransformed beats blank; the ratchet
-    /// still counts it).
-    fn ensure_effect_graph(&mut self, w: u32, h: u32) -> bool {
+    /// still counts it). `space` is the prepared master's content space
+    /// ([`GpuStack::frame_space`], #143): the intermediate's format
+    /// follows it, so a space change rebuilds exactly like a resize.
+    fn ensure_effect_graph(&mut self, w: u32, h: u32, space: ContentSpace) -> bool {
         if w == 0 || h == 0 {
             return false;
         }
         if let Some(graph) = self.display.graph.as_ref()
-            && graph.built_for == (w, h)
+            && graph.built_for == (w, h, space)
         {
             return true;
         }
         self.display.graph = None;
-        match self.build_effect_graph(w, h) {
+        match self.build_effect_graph(w, h, space) {
             Ok(graph) => {
                 self.display.graph = Some(graph);
                 true
@@ -1292,13 +1344,24 @@ impl GpuStack {
     }
 
     /// The graph build (#130's applied-artifact list): the viewport-sized
-    /// intermediate, the ColorManagement effect wired sRGB source →
-    /// display-profile destination with BOTH intents forced to relative
-    /// colorimetric (D8-1) and quality BEST, and the intermediate as the
-    /// effect's input 0. Everything here is device-object creation —
-    /// device losses do not happen at construction; every error is a
-    /// profile/driver refusal the ratchet is for.
-    fn build_effect_graph(&self, w: u32, h: u32) -> Result<EffectGraph, String> {
+    /// intermediate (its format follows the master's content space —
+    /// #143, ADR 0003 D4's precision half: an F16Srgb master composites
+    /// through an `R16G16B16A16_FLOAT` input surface so the effect's
+    /// internally high-precision sRGB→display transform never sees the
+    /// 8-bit quantization the 8-bit era fed it; an Srgb master keeps the
+    /// byte-identical BGRA8 surface), the ColorManagement effect wired
+    /// sRGB source → display-profile destination with BOTH intents forced
+    /// to relative colorimetric (D8-1) and quality BEST, and the
+    /// intermediate as the effect's input 0. Everything here is
+    /// device-object creation — device losses do not happen at
+    /// construction; every error is a profile/driver refusal the ratchet
+    /// is for.
+    fn build_effect_graph(
+        &self,
+        w: u32,
+        h: u32,
+        space: ContentSpace,
+    ) -> Result<EffectGraph, String> {
         let profile = self
             .display
             .profile
@@ -1315,7 +1378,7 @@ impl GpuStack {
                 },
                 None,
                 0,
-                &bitmap_properties(D2D1_BITMAP_OPTIONS_TARGET),
+                &bitmap_properties_for(upload_format(space), D2D1_BITMAP_OPTIONS_TARGET),
             )
         }
         .map_err(|e| format!("intermediate CreateBitmap failed: {e}"))?;
@@ -1408,7 +1471,7 @@ impl GpuStack {
             _effect: effect,
             _src_ctx: src_ctx,
             _dst_ctx: dst_ctx,
-            built_for: (w, h),
+            built_for: (w, h, space),
         })
     }
 
@@ -1528,7 +1591,13 @@ impl GpuStack {
         // target is the swapchain's bitmap on entry — set by
         // create/resize and restored by every effect-pass exit).
         let size = unsafe { self.context.GetPixelSize() };
-        if self.display.want_effect && self.ensure_effect_graph(size.width, size.height) {
+        // The prepared master's space (Copy — read before the &mut borrow
+        // the ensure call takes): the intermediate's format follows it
+        // (#143).
+        let frame_space = self.frame_space;
+        if self.display.want_effect
+            && self.ensure_effect_graph(size.width, size.height, frame_space)
+        {
             // SAFETY: the graph, context and (when the scene draws) the
             // uploaded bitmaps are all live (the stack holds them;
             // `prepare` only ever replaces a bitmap while no draw is
@@ -2159,6 +2228,7 @@ mod tests {
         D2D1_INTERPOLATION_MODE_ANISOTROPIC, D2D1_INTERPOLATION_MODE_CUBIC,
         D2D1_INTERPOLATION_MODE_MULTI_SAMPLE_LINEAR,
     };
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
 
     // ---- failure_window (design §7) ----
 
@@ -2418,6 +2488,57 @@ mod tests {
             UploadKey::new(7, ContentSpace::Srgb, 0, 960, 540),
             "new dimensions re-upload"
         );
+    }
+
+    // ---- the upload formats (#143, ADR 0003 D3/D6) ----
+
+    #[test]
+    fn the_swapchain_format_is_pinned_to_bgra8_unorm_never_srgb() {
+        // ADR 0003 D3's output-face freeze, pinned as values: the
+        // swapchain (and every surface drawn INTO it) stays
+        // B8G8R8A8_UNORM — the _SRGB variant would linearize the bytes,
+        // and the f16 master's quantize is the composite's job, not a
+        // format row on the output face.
+        assert_eq!(SWAPCHAIN_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM);
+        assert_ne!(
+            SWAPCHAIN_FORMAT.0, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB.0,
+            "UNORM (87) and _SRGB (91) are different formats — the freeze means the UNORM one"
+        );
+    }
+
+    #[test]
+    fn the_upload_format_dispatches_by_content_space() {
+        // The D3 shape in one table: the Srgb arm keeps the 8-bit era's
+        // BGRA8 bitmap byte-for-byte, the F16Srgb arm uploads the halves
+        // into an R16G16B16A16_FLOAT bitmap — an INPUT surface format, so
+        // it must differ from the frozen SWAPCHAIN_FORMAT.
+        assert_eq!(
+            upload_format(ContentSpace::Srgb),
+            DXGI_FORMAT_B8G8R8A8_UNORM
+        );
+        assert_eq!(
+            upload_format(ContentSpace::Srgb),
+            SWAPCHAIN_FORMAT,
+            "the 8-bit arm is bit-identical to the pre-#143 upload"
+        );
+        assert_eq!(
+            upload_format(ContentSpace::F16Srgb),
+            DXGI_FORMAT_R16G16B16A16_FLOAT
+        );
+        assert_ne!(
+            upload_format(ContentSpace::F16Srgb),
+            SWAPCHAIN_FORMAT,
+            "f16 lives in input surfaces; the output face stays BGRA8 UNORM"
+        );
+    }
+
+    #[test]
+    fn the_upload_bpp_matches_the_format_layout() {
+        // The pitch math's inputs: BGRA8 is 4 bytes per pixel, the RGBA
+        // half quadruple is 8 — the same numbers the CPU master's own
+        // storage (pixels.rs) and the level cache (#142) already use.
+        assert_eq!(upload_bpp(ContentSpace::Srgb), 4);
+        assert_eq!(upload_bpp(ContentSpace::F16Srgb), 8);
     }
 
     #[test]
