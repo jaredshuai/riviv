@@ -13,21 +13,34 @@
 //! when the OS is not already managing the display transform AND the
 //! WCS display profile is not sRGB-equivalent.
 //!
-//! The judge is the WCS profile query, never the ACM bit (D3): under
-//! auto color management the getter answers "no profile", while the
-//! legacy compatibility helper ("Use legacy display ICC color
-//! management", no programmatic enablement) answers with the composite
-//! profile — the getter disambiguates both states by itself. The ACM
-//! bit from `DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO` is a diagnostic
-//! label that rides along in the output identity, nothing more.
+//! The judge of the sRGB content rows is the WCS profile query, never
+//! the ACM bit (D3): under auto color management the getter answers
+//! "no profile", while the legacy compatibility helper ("Use legacy
+//! display ICC color management", no programmatic enablement) answers
+//! with the composite profile — the getter disambiguates both states
+//! by itself. On those rows the ACM bit from
+//! `DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO` stays a diagnostic label
+//! that rides along in the output identity, nothing more (#127 D3's
+//! original text, pinned by test). ADR 0004 D4 revises D3 for the
+//! WIDE content rows only: on an `F16P3` master the ACM bit (type 9
+//! bit 1) is the AC output arm's primary judge — "does riviv declare
+//! itself the interpreter of its own buffer" is exactly the signal
+//! bit 1 carries — and it outranks the WCS query there (the P-D probe
+//! caught ACM-state getters answering non-empty, so the query must
+//! never veto the arm).
 //!
 //! #130 wired the judge (`display_profile.rs`: the modern getter via
 //! dynamic mscms resolution, per output-decision point) and the static
 //! gpu_effect application; `fingerprint_for` consumes the REAL query,
 //! bytes, and latch. #132 added the event-driven hot reload, and #134
 //! swapped the last placeholder: the ACM diagnostic (type 9 bit 1) now
-//! rides the fingerprint's `ac` term, a label that never feeds a
-//! decision (D3, pinned by test below).
+//! rides the fingerprint's `ac` term. #154 added the table's third
+//! dimension (ADR 0004 D4): the question is no longer just "which
+//! stage" but "which face and which stage" — [`desired_output`] — the
+//! fingerprint gained a surface term, the identity carries the display
+//! content's real class, and the wide `GpuEffectP3To*` stages joined
+//! the vocabulary (their draw wiring is #156's; no face or effect is
+//! built by this module).
 //!
 //! WARP never runs the gpu_effect (hard exclusion, ticket) and never
 //! runs the CPU pass either (probe P3: a WCS viewport transform
@@ -117,6 +130,29 @@ pub(crate) enum TransformStage {
     /// The D2D ColorManagement effect in the draw pass (hardware
     /// only — the WARP exclusion is one of the table's hard rules).
     GpuEffect,
+    /// The wide master's constant pass-through (ADR 0004 D1, the F16P3
+    /// "sRGB screen" column): a ColorManagement effect mapping an
+    /// F16P3 master to plain sRGB. Same effect shape as
+    /// [`TransformStage::GpuEffect`], but the destination is CONSTANT
+    /// and does not depend on the display verdict at all — hence
+    /// "pass-through": on hardware the arm runs whatever the judge
+    /// answered. Legacy surface. Draw wiring = #156.
+    GpuEffectP3ToSrgb,
+    /// The domain half's first leg (ADR 0004 D1, the legacy
+    /// wide-gamut screen column): a ColorManagement effect mapping an
+    /// F16P3 master to the JUDGED display profile — the same pass #130
+    /// runs for sRGB content, now fed values Stage 1 kept inside the
+    /// P3 container, so the super-sRGB colors survive to the panel.
+    /// Legacy surface, hardware only (the WARP exclusion holds).
+    /// Draw wiring = #156.
+    GpuEffectP3ToDisplay,
+    /// The domain half's second leg (ADR 0004 D3, the AC surface's
+    /// draw chain): a ColorManagement effect mapping an F16P3 master
+    /// to LINEAR scRGB, drawn into the FP16 swapchain whose color
+    /// space the OS maps to the panel (the `SetColorSpace1`
+    /// declaration). AC surface only — this stage never pairs with
+    /// [`OutputSurface::Legacy`]. Draw wiring = #156.
+    GpuEffectP3ToScRgb,
     /// The OS owns the display transform (auto color management):
     /// riviv's sRGB output is already correct. Stage 1 is unaffected.
     DwmAcm,
@@ -151,6 +187,93 @@ pub(crate) fn desired_stage(backend: Backend, query: DisplayProfileQuery) -> Tra
     }
 }
 
+/// The output face a decision lands on (ADR 0004 D3). `Legacy` is
+/// today's one face — the BGRA8 UNORM swapchain gpu.rs freezes in
+/// `SWAPCHAIN_FORMAT`. `AcScRgb` is the AC declaration's face (FP16
+/// swapchain + `SetColorSpace1(scRGB)`); #154 carries only the
+/// VARIANT and the table/fingerprint bookkeeping — building the face
+/// (the swapchain's dual arms) is #156, so nothing constructs it yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum OutputSurface {
+    Legacy,
+    AcScRgb,
+}
+
+/// [`desired_output`]'s answer: which face to present on, and what the
+/// display segment runs (ADR 0004 D4's third dimension of the table).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct DesiredOutput {
+    pub(crate) surface: OutputSurface,
+    pub(crate) stage: TransformStage,
+}
+
+/// The third dimension of the decision table (ADR 0004 D4): the sRGB-era
+/// question "which stage?" becomes "which face, and which stage?" — one
+/// answer per (backend, judge, ac) cell per content class, exhaustively
+/// pinned by tests. The narrow classes (`Srgb`, `F16Srgb`) delegate to
+/// [`desired_stage`] verbatim: every narrow cell is bit-identical to the
+/// pre-#154 table (D1's hard constraint, pinned). The wide class
+/// (`F16P3`) adds the AC arm — the ACM bit outranks the judge there
+/// (D4; the P-D probe caught ACM-state getters answering non-empty, so
+/// the query never vetoes the arm), and wide content on hardware NEVER
+/// falls to identity or DwmAcm: P3 halves shown as sRGB code values is
+/// the fake-color outcome D6's philosophy forbids. The WARP wide cell
+/// is a total-function completion that must stay unreachable: Stage 1's
+/// destination selection (#155) never mints an F16P3 master in a WARP
+/// session, so reaching that cell means the #155 production gate is
+/// broken.
+pub(crate) fn desired_output(
+    backend: Backend,
+    query: DisplayProfileQuery,
+    ac: AcState,
+    content_class: ContentSpace,
+) -> DesiredOutput {
+    match content_class {
+        // The narrow rows: #127 D3's original table, word for word —
+        // the ac bit is a label here, never an input.
+        ContentSpace::Srgb | ContentSpace::F16Srgb => DesiredOutput {
+            surface: OutputSurface::Legacy,
+            stage: desired_stage(backend, query),
+        },
+        ContentSpace::F16P3 => match backend {
+            // D5/#155: unreachable completion (see the fn doc). A WARP
+            // session cannot hold an F16P3 master, so there is no arm
+            // to answer with.
+            Backend::Warp => DesiredOutput {
+                surface: OutputSurface::Legacy,
+                stage: TransformStage::None,
+            },
+            Backend::Hardware => match ac {
+                // The AC arm (D4): the bit outranks the judge — the
+                // scRGB declaration face, the domain half's second leg.
+                AcState::On => DesiredOutput {
+                    surface: OutputSurface::AcScRgb,
+                    stage: TransformStage::GpuEffectP3ToScRgb,
+                },
+                // No AC declaration: the legacy face carries the wide
+                // content through an effect — the judged display
+                // profile when the judge earns one (the domain half's
+                // first leg), the constant sRGB pass-through otherwise.
+                // Identity/DwmAcm are not on this menu (fake color).
+                AcState::Off | AcState::Unknown => match query {
+                    DisplayProfileQuery::Profile(DisplayProfileSpace::Custom) => DesiredOutput {
+                        surface: OutputSurface::Legacy,
+                        stage: TransformStage::GpuEffectP3ToDisplay,
+                    },
+                    DisplayProfileQuery::NoProfile
+                    | DisplayProfileQuery::Unknown
+                    | DisplayProfileQuery::Profile(DisplayProfileSpace::SrgbEquivalent) => {
+                        DesiredOutput {
+                            surface: OutputSurface::Legacy,
+                            stage: TransformStage::GpuEffectP3ToSrgb,
+                        }
+                    }
+                },
+            },
+        },
+    }
+}
+
 // ---------------------------------------------------------------------
 // desired vs effective: the session ratchet (D4).
 // ---------------------------------------------------------------------
@@ -178,6 +301,16 @@ pub(crate) fn stage_degrades(consecutive_failures: u32) -> bool {
 /// the same way — there is no lower transform to fall to. The latch
 /// itself is the wiring's session state; quality downgrades are
 /// breadcrumb-only, never fatal (ADR 0001).
+///
+/// The latch is the LEGACY sRGB segment's quality ratchet (#130's
+/// effect-failure path is its only setter), and the `matches!` arm
+/// below names exactly the stages it governs — the wide
+/// `GpuEffectP3To*` stages pass through unchanged. That is by design
+/// (#154): the wide stages' failure ladder is D6's own SURFACE
+/// ratchet (an AC-arm failure drops the face to legacy, total
+/// failure re-derives to F16Srgb), which is #156's separate latch —
+/// until that lands a wide stage can never SET the latch (it never
+/// runs), and an sRGB row's latch must not eat a wide stage either.
 pub(crate) fn effective_stage(desired: TransformStage, degraded: bool) -> TransformStage {
     if degraded && matches!(desired, TransformStage::GpuEffect | TransformStage::Cpu) {
         TransformStage::None
@@ -194,16 +327,35 @@ pub(crate) fn effective_stage(desired: TransformStage, degraded: bool) -> Transf
 /// segment — master, LevelCache, uploads, tiles. `Srgb` is the 8-bit
 /// era's single space (D10's known limitation: wide-gamut sources are
 /// clipped through it); `F16Srgb` is L1's FP16 master (ADR 0003: the
-/// sRGB EOTF encoding values held as f16, gamma domain). #140 added the
+/// sRGB EOTF encoding values held as f16, gamma domain); `F16P3` is
+/// L2's wide-gamut master (ADR 0004 D2): a Display-P3-D65 container
+/// whose halves carry P3-primary values in the destination profile's
+/// gamma domain (the P3 TRC is an sRGB-shaped curve) — 8 bytes per
+/// pixel exactly like `F16Srgb`, so every #144 byte budget and its
+/// derivations hold unchanged. #154 lands the VARIANT and its
+/// bookkeeping only (ADR 0004 impact item 1): the accounting arms and
+/// the decision table's third dimension. Stage 1's destination
+/// selection and the F16P3 production gate are #155's — until that
+/// ticket, `master_content_space` answers Srgb/F16Srgb only and no
+/// runtime path can mint an F16P3 master. #140 added the first
 /// variant and the gating; #141 landed the consumers — the LevelCache,
 /// upload and tile keys carry the mark (a master-side property, part of
 /// every key per ADR 0003 D1), and the direct-read seams dispatch on it.
 /// The ordering/hash derives ride the key structs (`TileKey` orders by
-/// field order, the tile HashMap hashes by it).
+/// field order, the tile HashMap hashes by it); the Ord order only has
+/// to be deterministic — `F16P3` sits after `F16Srgb`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) enum ContentSpace {
     Srgb,
     F16Srgb,
+    /// Dead in the non-test build on purpose (#154, ADR 0004 impact
+    /// item 1): this ticket lands the VARIANT and its bookkeeping —
+    /// the accounting arms and the decision table's third dimension —
+    /// while the only constructor is #155's Stage 1 destination
+    /// selection. The unreachable-from-production state is the
+    /// truthful record, exactly like [`TransformStage::Cpu`]'s.
+    #[allow(dead_code)]
+    F16P3,
 }
 
 /// The L1 master's per-input gate (ADR 0003 D1): an image earns the
@@ -252,8 +404,9 @@ pub(crate) struct OutputPolicy {
 }
 
 /// The ACM diagnostic from `DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO` —
-/// a label, never a judge (D3). Per wingdi.h 26100 (probe P1's SDK
-/// transcription; the docs page is gone): bit 0 =
+/// a label for the sRGB content rows, the AC arm's judge for the wide
+/// ones (#127 D3 as revised by ADR 0004 D4). Per wingdi.h 26100
+/// (probe P1's SDK transcription; the docs page is gone): bit 0 =
 /// advancedColorSupported, bit 1 = advancedColorEnabled, bit 2 =
 /// wideColorEnforced, bit 3 = advancedColorForceDisabled. `Unknown`
 /// covers every read failure — #134's P1 probe corrected the old
@@ -261,8 +414,12 @@ pub(crate) struct OutputPolicy {
 /// artifact: in-process the type 9 call answers reliably (rc = 0,
 /// byte-stable, flags 0x3 on the probe machine), and any nonzero rc
 /// still lands here honestly. #134's ACM read (`display_profile.rs`,
-/// the type 9 target read) is what produces Off/On; they ride
-/// `fingerprint_for` as the `ac` term and nothing else.
+/// the type 9 target read) is what produces Off/On. On the narrow
+/// rows it rides `fingerprint_for` as the `ac` term and nothing else;
+/// on an `F16P3` row bit 1 IS the arm decision ("does riviv declare
+/// itself the interpreter of its own buffer"), outranking the WCS
+/// query (P-D's finding: ACM-state getters can answer non-empty, so
+/// the query must not veto the arm).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum AcState {
     Off,
@@ -271,15 +428,17 @@ pub(crate) enum AcState {
 }
 
 /// The digest of everything that changes the output: which stage
-/// runs, which destination profile it targets (byte hash), the ACM
-/// diagnostic, the backend, and the render policy. Equal fingerprints
-/// mean interchangeable output resources.
+/// runs, which OUTPUT FACE the decision landed on (ADR 0004 D4's
+/// surface term, #154), which destination profile it targets (byte
+/// hash), the ACM diagnostic, the backend, and the render policy.
+/// Equal fingerprints mean interchangeable output resources.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct OutputFingerprint {
     pub(crate) stage: TransformStage,
     pub(crate) profile_hash: u64,
     pub(crate) ac: AcState,
     pub(crate) backend: Backend,
+    pub(crate) surface: OutputSurface,
     pub(crate) policy: OutputPolicy,
 }
 
@@ -310,31 +469,45 @@ pub(crate) fn profile_hash(bytes: &[u8]) -> u64 {
 }
 
 /// The wiring fingerprint (#126 established it, #130 swapped the first
-/// placeholders for real inputs, #134 swapped the last): what the output
-/// actually went through. The judge — the WCS display-profile query — is
-/// REAL here (the modern getter, resolved per output-decision point);
-/// the stage term is the EFFECTIVE stage (`desired_stage` clamped by the
-/// session latch — a latched degrade switches the segment off, and the
-/// flip is a fingerprint transition the tracker mints a new generation
-/// for); the profile bytes are the real destination profile's (`None` =
-/// the query carries none — Unknown, NoProfile, or an unreadable file —
-/// and the digest is the empty profile's, pinned so an absent term never
-/// drifts); and `ac` is the REAL ACM diagnostic off the judged monitor's
-/// target (type 9 bit 1 — a label for the dump reader, never a stage
-/// input; every read failure is `Unknown` per D3). Every term is a
-/// visible transition through the dump channel's `output_gen` line.
+/// placeholders for real inputs, #134 swapped the last, #154 widened
+/// the table): what the output actually went through. The judge — the
+/// WCS display-profile query — is REAL here (the modern getter,
+/// resolved per output-decision point); the stage term is the
+/// EFFECTIVE stage (`desired_output`'s stage clamped by the session
+/// latch — a latched degrade switches the narrow segment off, and the
+/// flip is a fingerprint transition the tracker mints a new
+/// generation for; the wide stages pass the latch, see
+/// [`effective_stage`]); the profile bytes are the real destination
+/// profile's (`None` = the query carries none — Unknown, NoProfile, or
+/// an unreadable file — and the digest is the empty profile's, pinned
+/// so an absent term never drifts); and `ac` is the REAL ACM
+/// diagnostic off the judged monitor's target (type 9 bit 1 — on the
+/// narrow rows a label for the dump reader, on the wide rows the AC
+/// arm's judge per ADR 0004 D4; every read failure is `Unknown`).
+/// The `content_class` input is the third dimension's axis: the two
+/// narrow classes fingerprint IDENTICALLY cell for cell (today's
+/// sessions mint zero new generations from this ticket), the wide
+/// class adds the surface/stage arms — and its latched cells are
+/// unreachable before #155 produces an F16P3 master at all. The
+/// surface term is `desired_output`'s face taken WITHOUT the latch:
+/// the wide stages' D6 face ratchet is #156's own latch, not this
+/// one. Every term is a visible transition through the dump channel's
+/// `output_gen` line.
 pub(crate) fn fingerprint_for(
     backend: Backend,
     query: DisplayProfileQuery,
     degraded_latched: bool,
     profile_bytes: Option<&[u8]>,
     ac: AcState,
+    content_class: ContentSpace,
 ) -> OutputFingerprint {
+    let desired = desired_output(backend, query, ac, content_class);
     OutputFingerprint {
-        stage: effective_stage(desired_stage(backend, query), degraded_latched),
+        stage: effective_stage(desired.stage, degraded_latched),
         profile_hash: profile_hash(profile_bytes.unwrap_or(&[])),
         ac,
         backend,
+        surface: desired.surface,
         policy: OutputPolicy {
             intent: RenderIntent::RelativeColorimetric,
             quality: RenderQuality::Best,
@@ -363,7 +536,19 @@ impl OutputTracker {
     /// `output_gen` starts at 1: zero stays free for the wiring's "no
     /// output identity yet" sentinel. Re-identifying the unchanged
     /// active fingerprint is idempotent — same gen, same identity.
-    pub(crate) fn identify(&mut self, fingerprint: OutputFingerprint) -> OutputIdentity {
+    ///
+    /// `content_class` is a RECORD field only (#154): the transition
+    /// semantics stay fingerprint-only — a content-space flip that
+    /// leaves the fingerprint unchanged re-identifies to the same gen
+    /// with the field updated, because the output resources are not
+    /// keyed on the class (the master/tile keys carry the real class
+    /// themselves — #134's anti-placeholder rule means the identity
+    /// still records what is actually on display, never a stand-in).
+    pub(crate) fn identify(
+        &mut self,
+        fingerprint: OutputFingerprint,
+        content_class: ContentSpace,
+    ) -> OutputIdentity {
         if self.active != Some(fingerprint) {
             self.next_gen += 1;
             self.active = Some(fingerprint);
@@ -371,7 +556,7 @@ impl OutputTracker {
         OutputIdentity {
             output_gen: self.next_gen,
             fingerprint,
-            content_space: ContentSpace::Srgb,
+            content_space: content_class,
         }
     }
 }
@@ -403,6 +588,7 @@ mod tests {
             profile_hash,
             ac: AcState::Unknown,
             backend: Backend::Hardware,
+            surface: OutputSurface::Legacy,
             policy: OutputPolicy {
                 intent: RenderIntent::RelativeColorimetric,
                 quality: RenderQuality::Best,
@@ -552,13 +738,13 @@ mod tests {
         let mut tracker = OutputTracker::default();
         let a = fingerprint(TransformStage::None, 0xaaa);
         let b = fingerprint(TransformStage::GpuEffect, 0xbbb);
-        let a1 = tracker.identify(a);
+        let a1 = tracker.identify(a, ContentSpace::Srgb);
         assert_eq!(
             a1.output_gen, 1,
             "the first identity is gen 1 (zero stays sentinel)"
         );
-        assert_eq!(tracker.identify(b).output_gen, 2);
-        let a2 = tracker.identify(a);
+        assert_eq!(tracker.identify(b, ContentSpace::Srgb).output_gen, 2);
+        let a2 = tracker.identify(a, ContentSpace::Srgb);
         assert_eq!(
             a2.output_gen, 3,
             "the B -> A change must mint a new gen, not restore gen 1"
@@ -568,13 +754,13 @@ mod tests {
             "the reuse key survives the round trip — A's cached output resources stay valid"
         );
         assert_eq!(
-            tracker.identify(a).output_gen,
+            tracker.identify(a, ContentSpace::Srgb).output_gen,
             3,
             "re-identifying the unchanged decision is idempotent"
         );
         let c = fingerprint(TransformStage::None, 0xccc);
         assert_eq!(
-            tracker.identify(c).output_gen,
+            tracker.identify(c, ContentSpace::Srgb).output_gen,
             3 + 1,
             "a new fingerprint keeps the counter monotonic"
         );
@@ -589,9 +775,9 @@ mod tests {
         let mut tracker = OutputTracker::default();
         let mut fp = fingerprint(TransformStage::DwmAcm, 0x1234);
         fp.ac = AcState::Off;
-        let first = tracker.identify(fp).output_gen;
+        let first = tracker.identify(fp, ContentSpace::Srgb).output_gen;
         fp.ac = AcState::On;
-        assert_ne!(tracker.identify(fp).output_gen, first);
+        assert_ne!(tracker.identify(fp, ContentSpace::Srgb).output_gen, first);
     }
 
     #[test]
@@ -638,10 +824,18 @@ mod tests {
             for query in all_queries() {
                 for latched in [false, true] {
                     for ac in [AcState::Off, AcState::On, AcState::Unknown] {
-                        let fp = fingerprint_for(backend, query, latched, Some(bytes), ac);
+                        let fp = fingerprint_for(
+                            backend,
+                            query,
+                            latched,
+                            Some(bytes),
+                            ac,
+                            ContentSpace::Srgb,
+                        );
                         let expected_stage =
                             effective_stage(desired_stage(backend, query), latched);
                         assert_eq!(fp.stage, expected_stage, "{backend:?}/{query:?}/{latched}");
+                        assert_eq!(fp.surface, OutputSurface::Legacy);
                         assert_eq!(fp.profile_hash, profile_hash(bytes));
                         assert_eq!(fp.ac, ac, "the ac diagnostic passes through verbatim");
                         assert_eq!(fp.backend, backend);
@@ -650,8 +844,14 @@ mod tests {
 
                         // No bytes to hash: the pinned empty digest — an
                         // absent term must never drift.
-                        let fp_empty =
-                            fingerprint_for(backend, query, latched, None, AcState::Unknown);
+                        let fp_empty = fingerprint_for(
+                            backend,
+                            query,
+                            latched,
+                            None,
+                            AcState::Unknown,
+                            ContentSpace::Srgb,
+                        );
                         assert_eq!(fp_empty.profile_hash, profile_hash(b""));
                     }
                 }
@@ -680,9 +880,13 @@ mod tests {
             false,
             Some(adobe),
             AcState::On,
+            ContentSpace::Srgb,
         );
         assert_eq!(hw_effect.stage, GpuEffect);
-        assert_eq!(tracker.identify(hw_effect).output_gen, 1);
+        assert_eq!(
+            tracker.identify(hw_effect, ContentSpace::Srgb).output_gen,
+            1
+        );
         // The session latch flips the effective stage: a transition.
         let hw_latched = fingerprint_for(
             Backend::Hardware,
@@ -690,9 +894,13 @@ mod tests {
             true,
             Some(adobe),
             AcState::On,
+            ContentSpace::Srgb,
         );
         assert_eq!(hw_latched.stage, NoStage);
-        assert_eq!(tracker.identify(hw_latched).output_gen, 2);
+        assert_eq!(
+            tracker.identify(hw_latched, ContentSpace::Srgb).output_gen,
+            2
+        );
         // A backend flip on top: another transition.
         let warp = fingerprint_for(
             Backend::Warp,
@@ -700,9 +908,10 @@ mod tests {
             false,
             Some(adobe),
             AcState::On,
+            ContentSpace::Srgb,
         );
         assert_eq!(warp.stage, NoStage, "the WARP hard exclusion");
-        assert_eq!(tracker.identify(warp).output_gen, 3);
+        assert_eq!(tracker.identify(warp, ContentSpace::Srgb).output_gen, 3);
         // New profile bytes under the same decision shape: the digest is
         // a fingerprint term, so a profile change mints a new gen too.
         let other = fingerprint_for(
@@ -711,11 +920,12 @@ mod tests {
             false,
             Some(b"a-different-display-profile".as_slice()),
             AcState::On,
+            ContentSpace::Srgb,
         );
-        assert_eq!(tracker.identify(other).output_gen, 4);
+        assert_eq!(tracker.identify(other, ContentSpace::Srgb).output_gen, 4);
         // An ordinary same-decision re-identify (a same-kind rebuild):
         // idempotent, same gen.
-        assert_eq!(tracker.identify(other).output_gen, 4);
+        assert_eq!(tracker.identify(other, ContentSpace::Srgb).output_gen, 4);
     }
 
     #[test]
@@ -729,10 +939,24 @@ mod tests {
         let bytes: &[u8] = &[0xde, 0xad, 0xbe, 0xef];
         let query = DisplayProfileQuery::Profile(DisplayProfileSpace::Custom);
         let mut tracker = OutputTracker::default();
-        let off = fingerprint_for(Backend::Hardware, query, false, Some(bytes), AcState::Off);
-        assert_eq!(tracker.identify(off).output_gen, 1);
-        let on = fingerprint_for(Backend::Hardware, query, false, Some(bytes), AcState::On);
-        let on_identity = tracker.identify(on);
+        let off = fingerprint_for(
+            Backend::Hardware,
+            query,
+            false,
+            Some(bytes),
+            AcState::Off,
+            ContentSpace::Srgb,
+        );
+        assert_eq!(tracker.identify(off, ContentSpace::Srgb).output_gen, 1);
+        let on = fingerprint_for(
+            Backend::Hardware,
+            query,
+            false,
+            Some(bytes),
+            AcState::On,
+            ContentSpace::Srgb,
+        );
+        let on_identity = tracker.identify(on, ContentSpace::Srgb);
         assert_ne!(
             on_identity.fingerprint, off,
             "the ac term is part of the fingerprint, so the flip moves it"
@@ -740,7 +964,7 @@ mod tests {
         assert_eq!(on_identity.output_gen, 2);
         // Back to Off: a new gen again (transition semantics, not memo).
         assert_eq!(
-            tracker.identify(off).output_gen,
+            tracker.identify(off, ContentSpace::Srgb).output_gen,
             3,
             "the Off→On→Off round trip walks gens 1, 2, 3"
         );
@@ -751,25 +975,39 @@ mod tests {
             false,
             Some(bytes),
             AcState::Unknown,
+            ContentSpace::Srgb,
         );
-        assert_eq!(tracker.identify(unknown).output_gen, 4);
+        assert_eq!(tracker.identify(unknown, ContentSpace::Srgb).output_gen, 4);
     }
 
     #[test]
-    fn the_ac_label_never_feeds_the_stage_decision_in_any_cell() {
-        // The "declaration = no declaration" behavior pin (D3): the ACM
+    fn the_ac_label_never_feeds_the_narrow_rows_stage_decision_in_any_cell() {
+        // The "declaration = no declaration" behavior pin (D3), SCOPED
+        // by ADR 0004 D4 (#154): on the sRGB content rows the ACM
         // diagnostic is a fingerprint LABEL, never an input of the
-        // decision — across the whole (backend, query, latch) space, all
-        // three ac states produce the IDENTICAL effective stage (and the
-        // identical non-ac fingerprint terms), so the picture a user sees
-        // never moves when the ACM bit alone moves.
+        // decision — across the whole (backend, query, latch) space,
+        // all three ac states produce the IDENTICAL effective stage
+        // (and the identical non-ac fingerprint terms), so the picture
+        // a user sees never moves when the ACM bit alone moves. The
+        // wide rows are the deliberate exception (the AC-arm contrast
+        // is pinned in its own test below).
         let bytes: &[u8] = &[0xab, 0xcd, 0xef];
         for backend in both_backends() {
             for query in all_queries() {
                 for latched in [false, true] {
                     let stages: Vec<_> = [AcState::Off, AcState::On, AcState::Unknown]
                         .iter()
-                        .map(|&ac| fingerprint_for(backend, query, latched, Some(bytes), ac).stage)
+                        .map(|&ac| {
+                            fingerprint_for(
+                                backend,
+                                query,
+                                latched,
+                                Some(bytes),
+                                ac,
+                                ContentSpace::Srgb,
+                            )
+                            .stage
+                        })
                         .collect();
                     assert!(
                         stages[0] == stages[1] && stages[1] == stages[2],
@@ -777,16 +1015,409 @@ mod tests {
                     );
                     // And the rest of the fingerprint agrees too: equal
                     // except for the ac term itself.
-                    let a = fingerprint_for(backend, query, latched, Some(bytes), AcState::Off);
-                    let b = fingerprint_for(backend, query, latched, Some(bytes), AcState::On);
+                    let a = fingerprint_for(
+                        backend,
+                        query,
+                        latched,
+                        Some(bytes),
+                        AcState::Off,
+                        ContentSpace::Srgb,
+                    );
+                    let b = fingerprint_for(
+                        backend,
+                        query,
+                        latched,
+                        Some(bytes),
+                        AcState::On,
+                        ContentSpace::Srgb,
+                    );
                     assert_eq!(a.stage, b.stage);
                     assert_eq!(a.profile_hash, b.profile_hash);
                     assert_eq!(a.backend, b.backend);
+                    assert_eq!(a.surface, b.surface);
                     assert_eq!(a.policy, b.policy);
                     assert_ne!(a, b, "only the ac term differs");
                 }
             }
         }
+    }
+
+    // ---- the third dimension (#154, ADR 0004 D4) ----
+
+    #[test]
+    fn narrow_content_reproduces_the_pre_154_table_in_every_cell() {
+        // D1's hard constraint: ordinary and F16Srgb content keep the
+        // EXACT pre-#154 table — every (backend, query, ac) cell of
+        // both narrow classes answers {Legacy, desired_stage(b, q)},
+        // the same value `desired_stage` itself gives (whose body this
+        // ticket did not touch).
+        for content_class in [ContentSpace::Srgb, ContentSpace::F16Srgb] {
+            for backend in both_backends() {
+                for query in all_queries() {
+                    for ac in [AcState::Off, AcState::On, AcState::Unknown] {
+                        let out = desired_output(backend, query, ac, content_class);
+                        assert_eq!(
+                            out,
+                            DesiredOutput {
+                                surface: OutputSurface::Legacy,
+                                stage: desired_stage(backend, query),
+                            },
+                            "{content_class:?}/{backend:?}/{query:?}/{ac:?} must be the today cell"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_ac_state_gates_the_wide_arm_but_stays_inert_for_narrow_content() {
+        // #134's zero-effect pin, continued and SCOPED by ADR 0004 D4:
+        // narrow content — all three ac states answer identically
+        // (surface and stage, every cell). Wide content on hardware is
+        // the contrast the revision creates: On flips the AC arm while
+        // Off and Unknown stay legacy — and a failed read (Unknown) is
+        // NOT an arm signal, so Off ≡ Unknown there.
+        for content_class in [ContentSpace::Srgb, ContentSpace::F16Srgb] {
+            for backend in both_backends() {
+                for query in all_queries() {
+                    let off = desired_output(backend, query, AcState::Off, content_class);
+                    let on = desired_output(backend, query, AcState::On, content_class);
+                    let unknown = desired_output(backend, query, AcState::Unknown, content_class);
+                    assert_eq!(off, on, "narrow rows ignore ac: {backend:?}/{query:?}");
+                    assert_eq!(on, unknown, "narrow rows ignore ac: {backend:?}/{query:?}");
+                }
+            }
+        }
+        for query in all_queries() {
+            let off = desired_output(Backend::Hardware, query, AcState::Off, ContentSpace::F16P3);
+            let on = desired_output(Backend::Hardware, query, AcState::On, ContentSpace::F16P3);
+            let unknown = desired_output(
+                Backend::Hardware,
+                query,
+                AcState::Unknown,
+                ContentSpace::F16P3,
+            );
+            assert_eq!(
+                on.surface,
+                OutputSurface::AcScRgb,
+                "the AC declaration arm fires on wide content"
+            );
+            assert_ne!(
+                off, on,
+                "the bit outranks the judge on wide content (D4): On vs Off differ"
+            );
+            assert_eq!(
+                off, unknown,
+                "Off ≡ Unknown: a failed ACM read is not an arm signal"
+            );
+        }
+    }
+
+    #[test]
+    fn wide_content_on_hardware_maps_by_the_ac_state_and_the_judge() {
+        // The F16P3 × hardware column of D1's matrix, cell by cell: AC
+        // on → the scRGB arm whatever the judge answered; AC off or
+        // unknown → the legacy face, with the judge deciding WHICH
+        // legacy effect (a custom display profile earns the P3→display
+        // leg — the domain half's first leg; every other judge answer
+        // the constant P3→sRGB pass-through).
+        for query in all_queries() {
+            let on = desired_output(Backend::Hardware, query, AcState::On, ContentSpace::F16P3);
+            assert_eq!(on.surface, OutputSurface::AcScRgb, "{query:?}");
+            assert_eq!(on.stage, TransformStage::GpuEffectP3ToScRgb, "{query:?}");
+        }
+        for ac in [AcState::Off, AcState::Unknown] {
+            let custom = desired_output(
+                Backend::Hardware,
+                DisplayProfileQuery::Profile(DisplayProfileSpace::Custom),
+                ac,
+                ContentSpace::F16P3,
+            );
+            assert_eq!(custom.surface, OutputSurface::Legacy);
+            assert_eq!(
+                custom.stage,
+                TransformStage::GpuEffectP3ToDisplay,
+                "ac={ac:?}: the judged display profile is the wide pass's destination"
+            );
+            for query in [
+                DisplayProfileQuery::NoProfile,
+                DisplayProfileQuery::Unknown,
+                DisplayProfileQuery::Profile(DisplayProfileSpace::SrgbEquivalent),
+            ] {
+                let out = desired_output(Backend::Hardware, query, ac, ContentSpace::F16P3);
+                assert_eq!(out.surface, OutputSurface::Legacy);
+                assert_eq!(
+                    out.stage,
+                    TransformStage::GpuEffectP3ToSrgb,
+                    "ac={ac:?}/{query:?}: no display verdict to target → the constant pass-through"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn wide_content_on_warp_is_the_unreachable_total_function_completion() {
+        // D5/#155: Stage 1's destination selection never mints an F16P3
+        // master in a WARP session (the halves would have to display
+        // through a pass WARP cannot run), so this cell must be
+        // UNREACHABLE — reaching it at runtime means the #155
+        // production gate is broken. The value itself is only the
+        // total-function completion of the table.
+        for query in all_queries() {
+            for ac in [AcState::Off, AcState::On, AcState::Unknown] {
+                let out = desired_output(Backend::Warp, query, ac, ContentSpace::F16P3);
+                assert_eq!(
+                    out,
+                    DesiredOutput {
+                        surface: OutputSurface::Legacy,
+                        stage: TransformStage::None,
+                    },
+                    "warp/{query:?}/{ac:?}: the D5 completion cell"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn wide_content_on_hardware_never_lands_on_identity_or_dwm_acm() {
+        // The fake-color ban (D6's philosophy applied to the table):
+        // P3 halves displayed as sRGB code values recolor every
+        // super-sRGB pixel — the ONE outcome the wide rows must never
+        // produce. No (query, ac) cell on hardware may answer None or
+        // DwmAcm; there is always an effect carrying the container's
+        // semantics.
+        for query in all_queries() {
+            for ac in [AcState::Off, AcState::On, AcState::Unknown] {
+                let stage = desired_output(Backend::Hardware, query, ac, ContentSpace::F16P3).stage;
+                assert_ne!(
+                    stage,
+                    TransformStage::None,
+                    "wide content must not display uncorrected: {query:?}/{ac:?}"
+                );
+                assert_ne!(
+                    stage,
+                    TransformStage::DwmAcm,
+                    "wide content must not lean on the OS's sRGB-era management: {query:?}/{ac:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn warp_never_selects_any_gpu_effect_variant_anywhere_in_the_widened_space() {
+        // Hard exclusion #1, widened to the third dimension (#154): the
+        // software path must not grow a GPU-only effect — neither the
+        // original GpuEffect nor any of the wide GpuEffectP3To* arms —
+        // over the FULL input space (every judge, every ac state, every
+        // content class).
+        for query in all_queries() {
+            for ac in [AcState::Off, AcState::On, AcState::Unknown] {
+                for content_class in [
+                    ContentSpace::Srgb,
+                    ContentSpace::F16Srgb,
+                    ContentSpace::F16P3,
+                ] {
+                    let stage = desired_output(Backend::Warp, query, ac, content_class).stage;
+                    assert!(
+                        !matches!(
+                            stage,
+                            TransformStage::GpuEffect
+                                | TransformStage::GpuEffectP3ToSrgb
+                                | TransformStage::GpuEffectP3ToDisplay
+                                | TransformStage::GpuEffectP3ToScRgb
+                        ),
+                        "warp must not run a gpu effect: {query:?}/{ac:?}/{content_class:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn wide_stages_pass_the_legacy_quality_latch_unchanged() {
+        // The latch (#130's quality ratchet) governs only the legacy
+        // sRGB segment's effect stages; the wide stages are NOT its
+        // jurisdiction — their failure ladder is D6's own SURFACE
+        // ratchet (#156's separate latch, not yet landed). An sRGB
+        // row's latch must not eat a wide stage, and a wide stage can
+        // never set the latch (it never runs before #155/#156).
+        for wide in [
+            TransformStage::GpuEffectP3ToSrgb,
+            TransformStage::GpuEffectP3ToDisplay,
+            TransformStage::GpuEffectP3ToScRgb,
+        ] {
+            assert_eq!(
+                effective_stage(wide, true),
+                wide,
+                "the legacy latch must not clamp {wide:?}"
+            );
+            assert_eq!(effective_stage(wide, false), wide);
+        }
+    }
+
+    #[test]
+    fn the_fingerprint_surface_is_legacy_in_every_narrow_cell_and_narrow_classes_hash_alike() {
+        // The surface term's zero-change pin for today (#154): across
+        // the whole (backend, query, latch, ac, bytes) grid, both
+        // narrow content classes answer surface = Legacy AND
+        // bit-identical fingerprints to each other — today's sessions
+        // mint zero new generations from the third dimension's arrival
+        // and the smoke132 identity counts stay exact.
+        let bytes: &[u8] = &[0xab, 0xcd, 0xef];
+        for backend in both_backends() {
+            for query in all_queries() {
+                for latched in [false, true] {
+                    for ac in [AcState::Off, AcState::On, AcState::Unknown] {
+                        for with_bytes in [Some(bytes), None] {
+                            let srgb = fingerprint_for(
+                                backend,
+                                query,
+                                latched,
+                                with_bytes,
+                                ac,
+                                ContentSpace::Srgb,
+                            );
+                            let f16 = fingerprint_for(
+                                backend,
+                                query,
+                                latched,
+                                with_bytes,
+                                ac,
+                                ContentSpace::F16Srgb,
+                            );
+                            assert_eq!(
+                                srgb, f16,
+                                "the narrow classes fingerprint alike: \
+                                 {backend:?}/{query:?}/{latched}/{ac:?}"
+                            );
+                            assert_eq!(srgb.surface, OutputSurface::Legacy);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_fingerprint_surface_follows_the_wide_matrix() {
+        // The wide cells of the same grid (ADR 0004 D4): the surface
+        // term answers the matrix — hardware + ac=On → AcScRgb, every
+        // other narrow-shaped cell Legacy — and the stage term is the
+        // effective wide stage (the legacy latch passes it through, per
+        // the wide-stages pin above; the surface term never sees the
+        // latch at all).
+        let bytes: &[u8] = &[0xab, 0xcd, 0xef];
+        for query in all_queries() {
+            for latched in [false, true] {
+                let on = fingerprint_for(
+                    Backend::Hardware,
+                    query,
+                    latched,
+                    Some(bytes),
+                    AcState::On,
+                    ContentSpace::F16P3,
+                );
+                assert_eq!(on.surface, OutputSurface::AcScRgb, "{query:?}/{latched}");
+                assert_eq!(
+                    on.stage,
+                    TransformStage::GpuEffectP3ToScRgb,
+                    "{query:?}/{latched}"
+                );
+                for ac in [AcState::Off, AcState::Unknown] {
+                    let fp = fingerprint_for(
+                        Backend::Hardware,
+                        query,
+                        latched,
+                        Some(bytes),
+                        ac,
+                        ContentSpace::F16P3,
+                    );
+                    assert_eq!(
+                        fp.surface,
+                        OutputSurface::Legacy,
+                        "{query:?}/{latched}/{ac:?}"
+                    );
+                    let expected = match query {
+                        DisplayProfileQuery::Profile(DisplayProfileSpace::Custom) => {
+                            TransformStage::GpuEffectP3ToDisplay
+                        }
+                        _ => TransformStage::GpuEffectP3ToSrgb,
+                    };
+                    assert_eq!(fp.stage, expected, "{query:?}/{latched}/{ac:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_ac_surface_flip_on_wide_content_mints_a_new_generation() {
+        // The accepted churn (ADR 0004 已裁项 4, the #132 precedent):
+        // switching the display content between the narrow and wide
+        // classes on an AC machine flips the fingerprint's surface
+        // term, and a fingerprint TRANSITION mints — A (F16Srgb) -> B
+        // (F16P3) -> A walks three gens, never memoizing an old one.
+        let bytes: &[u8] = &[0xde, 0xad];
+        let query = DisplayProfileQuery::Profile(DisplayProfileSpace::Custom);
+        let narrow = fingerprint_for(
+            Backend::Hardware,
+            query,
+            false,
+            Some(bytes),
+            AcState::On,
+            ContentSpace::F16Srgb,
+        );
+        let wide = fingerprint_for(
+            Backend::Hardware,
+            query,
+            false,
+            Some(bytes),
+            AcState::On,
+            ContentSpace::F16P3,
+        );
+        assert_eq!(narrow.surface, OutputSurface::Legacy);
+        assert_eq!(wide.surface, OutputSurface::AcScRgb);
+        let mut tracker = OutputTracker::default();
+        assert_eq!(
+            tracker.identify(narrow, ContentSpace::F16Srgb).output_gen,
+            1
+        );
+        assert_eq!(
+            tracker.identify(wide, ContentSpace::F16P3).output_gen,
+            2,
+            "the surface flip is a fingerprint transition"
+        );
+        assert_eq!(
+            tracker.identify(narrow, ContentSpace::F16Srgb).output_gen,
+            3,
+            "the A -> B -> A round trip walks 1, 2, 3 (transition semantics, not a memo)"
+        );
+    }
+
+    #[test]
+    fn the_identity_carries_the_real_content_space_and_a_class_flip_alone_keeps_the_gen() {
+        // #134's anti-placeholder rule, extended to the identity's
+        // class field (#154): identify records the display content's
+        // REAL class; the transition semantics stay fingerprint-only —
+        // a class flip that leaves the fingerprint unchanged (any
+        // narrow pair here) is the same gen with the field updated,
+        // because the output resources are not keyed on the class (the
+        // master/tile keys carry the real one themselves).
+        let mut tracker = OutputTracker::default();
+        let fp = fingerprint(TransformStage::None, 0x123);
+        let first = tracker.identify(fp, ContentSpace::F16Srgb);
+        assert_eq!(first.content_space, ContentSpace::F16Srgb);
+        assert_eq!(first.output_gen, 1);
+        let same_fp = tracker.identify(fp, ContentSpace::Srgb);
+        assert_eq!(
+            same_fp.output_gen, 1,
+            "fingerprint unchanged → the class record alone is not a transition"
+        );
+        assert_eq!(
+            same_fp.content_space,
+            ContentSpace::Srgb,
+            "the field updated"
+        );
     }
 
     // ---- R2 / D5 pins ----
@@ -801,7 +1432,7 @@ mod tests {
             for query in all_queries() {
                 let stage = desired_stage(backend, query);
                 let mut tracker = OutputTracker::default();
-                let identity = tracker.identify(fingerprint(stage, 0));
+                let identity = tracker.identify(fingerprint(stage, 0), ContentSpace::Srgb);
                 assert_eq!(
                     identity.content_space,
                     ContentSpace::Srgb,
@@ -827,8 +1458,11 @@ mod tests {
         // while the space field stays mandatory. Two different output
         // identities below, one untouched tile key.
         let mut tracker = OutputTracker::default();
-        let _out1 = tracker.identify(fingerprint(TransformStage::None, 1));
-        let _out2 = tracker.identify(fingerprint(TransformStage::GpuEffect, 2));
+        let _out1 = tracker.identify(fingerprint(TransformStage::None, 1), ContentSpace::Srgb);
+        let _out2 = tracker.identify(
+            fingerprint(TransformStage::GpuEffect, 2),
+            ContentSpace::Srgb,
+        );
         let key = TileKey {
             frame_gen: 7,
             content_space: ContentSpace::F16Srgb,

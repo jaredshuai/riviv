@@ -542,15 +542,17 @@ pub(crate) struct PixelFrame {
 
 impl PixelFrame {
     /// Row stride in bytes — the space's own invariant (`width * 4` for
-    /// [`ContentSpace::Srgb`], `width * 8` for [`ContentSpace::F16Srgb`]),
-    /// expressed as a method rather than a stored field so it can never
-    /// drift from `width`. Test-only: the production seams branch on the
-    /// content space, never on a stored stride.
+    /// [`ContentSpace::Srgb`], `width * 8` for [`ContentSpace::F16Srgb`]
+    /// and [`ContentSpace::F16P3`] — the wide container shares the f16
+    /// halves layout, ADR 0004 D2), expressed as a method rather than a
+    /// stored field so it can never drift from `width`. Test-only: the
+    /// production seams branch on the content space, never on a stored
+    /// stride.
     #[cfg(test)]
     pub(crate) fn stride(&self) -> usize {
         match self.content_space {
             ContentSpace::Srgb => self.width as usize * 4,
-            ContentSpace::F16Srgb => self.width as usize * 8,
+            ContentSpace::F16Srgb | ContentSpace::F16P3 => self.width as usize * 8,
         }
     }
 
@@ -739,7 +741,14 @@ pub(crate) fn sample_bgra(pixels: &[u8], width: i32, x: i32, y: i32) -> Option<(
 pub(crate) fn sample_master_rgb(frame: &PixelFrame, x: i32, y: i32) -> Option<(u8, u8, u8)> {
     let [b, g, r, _] = match frame.content_space {
         ContentSpace::Srgb => sample_bgra_pixel(&frame.pixels, frame.width as i32, x, y)?,
-        ContentSpace::F16Srgb => {
+        // #154 transitional arm: an F16P3 master's P3-encoded halves are
+        // read as if they were sRGB code values — chromatically
+        // dishonest. The honest P3→sRGB direct-read conversion is the
+        // L2 direct-read seam ticket (#156, ADR 0004 impact item 4).
+        // Unreachable at runtime before #155 produces an F16P3 master,
+        // so there is nothing to observe; no output-byte pin is written
+        // against this arm on purpose (never pin a lie).
+        ContentSpace::F16Srgb | ContentSpace::F16P3 => {
             f16_rgba_halves_to_bgra8(sample_f16_pixel(&frame.pixels, frame.width as i32, x, y)?)
         }
     };
@@ -756,7 +765,13 @@ pub(crate) fn sample_master_rgb(frame: &PixelFrame, x: i32, y: i32) -> Option<(u
 pub(crate) fn master_gdi_bgra(frame: &PixelFrame) -> Vec<u8> {
     match frame.content_space {
         ContentSpace::Srgb => frame.pixels.to_vec(),
-        ContentSpace::F16Srgb => {
+        // #154 transitional arm (same story as [`sample_master_rgb`]):
+        // an F16P3 master's P3-encoded halves quantize through the
+        // sRGB-shaped arm — chromatically dishonest until #156's honest
+        // P3→sRGB direct-read seam lands. Unreachable before #155
+        // produces an F16P3 master; no output-byte pin against this arm
+        // on purpose (never pin a lie).
+        ContentSpace::F16Srgb | ContentSpace::F16P3 => {
             let mut out = vec![0u8; frame.pixels.len() / 2];
             f16_halves_to_bgra8_bulk(&frame.pixels, &mut out);
             out
