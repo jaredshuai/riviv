@@ -495,18 +495,30 @@ fn decode_reader<R: BufRead + Seek>(
                 .checked_mul(h as usize)
                 .and_then(|px| px.checked_mul(4))
                 .ok_or_else(|| user("canvas exceeds the addressable budget".to_string()))?;
+            // #77's while-the-decoder-is-alive rule — and, since #142's
+            // f16 masters, BEFORE the animation-wire gate below: a
+            // transformed stream's frames are 8-byte masters, so the
+            // gate must price the CHARGED size (Codex P1 on PR #147: a
+            // canvas just under the 4-byte threshold would otherwise
+            // enter the animated path while the four decode canvases
+            // plus the first retained master already break the bound).
+            let transform = prepare_transform(&mut decoder, &env, shown);
             // A file the animation path cannot take still fits the static
             // single-canvas path — degrade there instead of failing the
             // load (external review R2/R5: pre-#98, upstream GDI+, and
             // every static PNG viewer show such a file's first frame;
             // failing it would be a reachable regression). Two
             // independent lines: a canvas four buffers cannot afford
-            // (size), and a color depth the animation side cannot decode
-            // at all (16-bit — `.apng()` itself is infallible, the
-            // rejection lands at the first frame pull, after two canvas
+            // (size — priced at the stream's own charge since #142), and
+            // a color depth the animation side cannot decode at all
+            // (16-bit — `.apng()` itself is infallible, the rejection
+            // lands at the first frame pull, after two canvas
             // allocations).
             if !apng_color_is_animatable(decoder.color_type())
-                || !apng_canvas_fits_animation_budget(per_frame_bytes)
+                || !apng_canvas_fits_animation_budget(charged_frame_bytes(
+                    per_frame_bytes,
+                    transform.as_ref(),
+                ))
             {
                 // Support symmetry with the icc breadcrumb in
                 // prepare_transform: the degradation is silent on screen
@@ -523,11 +535,11 @@ fn decode_reader<R: BufRead + Seek>(
                 }
                 return sink_static(decoder, shown, env, sink);
             }
-            // ApngDecoder implements only AnimationDecoder, so orientation
-            // and the ICC profile must be taken from the PngDecoder before
-            // `.apng()` consumes it (#77's while-the-decoder-is-alive rule).
+            // ApngDecoder implements only AnimationDecoder, so the
+            // orientation must be taken from the PngDecoder before
+            // `.apng()` consumes it (the ICC transform was prepared
+            // above, ahead of the wire gate).
             let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
-            let transform = prepare_transform(&mut decoder, &env, shown);
             let decoder = decoder.apng().map_err(|e| user(e.to_string()))?;
             // APNG delays are the fcTL fraction num × 1000 / (den || 100) ms,
             // already computed by the iterator; zero delays pass through like
@@ -581,10 +593,15 @@ fn apng_color_is_animatable(color: image::ColorType) -> bool {
 /// image crate's compositing needs FOUR canvases inside the same 512 MB
 /// budget the static path spends on one (two persistent buffers plus the
 /// raw output and the subframe-RGBA transients — measured, external
-/// review R1). Over the wire the load degrades to the static path, which
-/// affords one full-budget canvas (#98 R2: pre-#98 riviv, upstream GDI+,
-/// and any static viewer display such a file's first frame — failing it
-/// would be a reachable regression).
+/// review R1). `per_frame_bytes` is the stream's own CHARGE (since #142:
+/// the decode canvas for a plain stream, the doubled f16-master size for
+/// a transformed one — Codex P1 on PR #147 — so a transformed canvas
+/// under the 4-byte threshold cannot enter the animated path and break
+/// the bound with its decode canvases plus the first retained master).
+/// Over the wire the load degrades to the static path, which affords one
+/// full-budget canvas (#98 R2: pre-#98 riviv, upstream GDI+, and any
+/// static viewer display such a file's first frame — failing it would be
+/// a reachable regression).
 fn apng_canvas_fits_animation_budget(per_frame_bytes: usize) -> bool {
     per_frame_bytes.saturating_mul(4) <= MAX_TOTAL_FRAME_BYTES
 }
@@ -705,7 +722,12 @@ fn stream_animation(
             }
             Some(_) => {}
         }
-        total_frame_bytes += buffer.len();
+        // Charge the frame at the gate's own rate (Codex P1 on PR #147,
+        // round 2): the canvas check above pins every frame to the same
+        // dimensions, so the charged `per_frame_bytes` IS this frame's
+        // retained size — accumulating the decode buffer instead would
+        // count a transformed stream's 8-byte masters at half price.
+        total_frame_bytes += per_frame_bytes;
         // ICM -> composite -> PixelFrame (#77/ADR 0002 D2). The frame
         // itself is pure memory since #76 — through #89 its GDI
         // derivations (and their failure class) lived on the UI thread;
@@ -2146,6 +2168,26 @@ mod stdin_bytes_tests {
             .expect("an AdobeRGB-like profile transforms");
         assert_eq!(charged_frame_bytes(100, Some(&t)), 200);
         assert_eq!(charged_frame_bytes(100, None), 100);
+    }
+
+    #[test]
+    fn a_transformed_apng_canvas_is_admitted_at_the_charged_size() {
+        // Codex P1 on PR #147, round 2: the animation-wire gate prices
+        // the stream's own charge, so an ICC APNG's canvas crosses the
+        // wire at HALF the plain threshold (its frames are 8-byte f16
+        // masters) — over the wire the file degrades to a static decode
+        // instead of entering the animated path and breaking the bound.
+        crate::icm::test_fixtures::require_srgb();
+        let t = crate::icm::prepare(true, Some(crate::icm::test_fixtures::adobe_like_icc()), "t")
+            .expect("an AdobeRGB-like profile transforms");
+        let canvas = MAX_TOTAL_FRAME_BYTES / 5; // plain: *4 fits, *8 does not
+        assert!(apng_canvas_fits_animation_budget(charged_frame_bytes(
+            canvas, None
+        )));
+        assert!(!apng_canvas_fits_animation_budget(charged_frame_bytes(
+            canvas,
+            Some(&t)
+        )));
     }
 
     fn first_frame_pixels(bytes: &[u8], icm: bool) -> PixelFrame {
