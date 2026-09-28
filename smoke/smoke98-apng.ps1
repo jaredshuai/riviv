@@ -677,14 +677,16 @@ if ($parityReady) {
     # Pinned rect so both runs letterbox identically; identical ini text
     # re-staged before each launch (WM_CLOSE writes the ini back).
     $rectIni = "x=40`r`ny=40`r`nwide=800`r`nhigh=600`r`nauto_zoom=0`r`n"
-    # renderer=warp on BOTH arms, via the INI key: the master parity exe
-    # (60c9f0f) predates the -renderer CLI switch (an unknown switch pops
-    # the usage box there), while the renderer= ini key exists on both
-    # sides. #130 made the branch's hw dump run the whole viewport through
-    # the sRGB->display transform, so hw bytes could never match the
-    # master's; apng decode/composite parity is renderer-agnostic and warp
-    # restores byte determinism (pure sRGB on both sides). REQUIRED gate
-    # semantics unchanged.
+    # renderer=warp on BOTH arms, via the INI key: #130 made the branch's
+    # hw dump run the whole viewport through the sRGB->display transform,
+    # so hw bytes could never match the master's; apng decode/composite
+    # parity is renderer-agnostic and warp restores byte determinism
+    # (pure sRGB on both sides). Parity REF re-pinned 60c9f0f -> 61c2fd2
+    # (#155's arbitration, 2026-09-28): the L1 f16-master decode chain
+    # (#142) moved the warp+icm=1 arm by the accepted +/-1 LSB CMM-output
+    # quantization, so the 60c9f0f-era exe went stale for the s4b pair -
+    # measured pre-#155 HEAD (61c2fd2) and the #155 branch byte-identical,
+    # only the old parity exe differed. REQUIRED gate semantics unchanged.
     $iniPlain = "[riviv]`r`n" + $rectIni + "icm=0`r`nrenderer=warp`r`n"
     $iniIcm = "[riviv]`r`n" + $rectIni + "icm=1`r`nrenderer=warp`r`n"
 
@@ -729,7 +731,7 @@ if ($parityReady) {
     Kill-Riviv
 } else {
     $script:gateIncomplete = $true
-    Skip-Scenario 'S4 static A/B (all three pairs)' ('REQUIRED gate: master parity exe missing at ' + $ParitySrc + ' - build it (git worktree add <tmp> 60c9f0f; cargo build --release inside; copy the exe) and rerun; exiting 2')
+    Skip-Scenario 'S4 static A/B (all three pairs)' ('REQUIRED gate: master parity exe missing at ' + $ParitySrc + ' - build it (git worktree add <tmp> 61c2fd2; cargo build --release inside; copy the exe) and rerun; exiting 2')
 }
 
 # ---------------------------------------------------------------------------
