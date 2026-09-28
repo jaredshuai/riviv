@@ -332,12 +332,14 @@ pub(crate) fn effective_stage(desired: TransformStage, degraded: bool) -> Transf
 /// whose halves carry P3-primary values in the destination profile's
 /// gamma domain (the P3 TRC is an sRGB-shaped curve) — 8 bytes per
 /// pixel exactly like `F16Srgb`, so every #144 byte budget and its
-/// derivations hold unchanged. #154 lands the VARIANT and its
+/// derivations hold unchanged. #154 landed the VARIANT and its
 /// bookkeeping only (ADR 0004 impact item 1): the accounting arms and
-/// the decision table's third dimension. Stage 1's destination
-/// selection and the F16P3 production gate are #155's — until that
-/// ticket, `master_content_space` answers Srgb/F16Srgb only and no
-/// runtime path can mint an F16P3 master. #140 added the first
+/// the decision table's third dimension. #155 landed Stage 1's
+/// destination selection and the F16P3 production gate
+/// (pixels.rs's `from_f16_halves_wide`, reached from the loader's
+/// wide arm); `master_content_space` itself still answers Srgb/F16Srgb
+/// only — the wide mark travels with the transform's own halves, not
+/// through the depth gate. #140 added the first
 /// variant and the gating; #141 landed the consumers — the LevelCache,
 /// upload and tile keys carry the mark (a master-side property, part of
 /// every key per ADR 0003 D1), and the direct-read seams dispatch on it.
@@ -348,13 +350,13 @@ pub(crate) fn effective_stage(desired: TransformStage, degraded: bool) -> Transf
 pub(crate) enum ContentSpace {
     Srgb,
     F16Srgb,
-    /// Dead in the non-test build on purpose (#154, ADR 0004 impact
-    /// item 1): this ticket lands the VARIANT and its bookkeeping —
-    /// the accounting arms and the decision table's third dimension —
-    /// while the only constructor is #155's Stage 1 destination
-    /// selection. The unreachable-from-production state is the
-    /// truthful record, exactly like [`TransformStage::Cpu`]'s.
-    #[allow(dead_code)]
+    /// The wide-gamut master (#155, ADR 0004 D2): minted ONLY through
+    /// pixels.rs's `from_f16_halves_wide`, the single production gate —
+    /// reached from the loader's transform arm when Stage 1's ICC
+    /// transform runs against the P3 destination profile (a hardware
+    /// session's foreign tagged source). #154 landed the variant and
+    /// its bookkeeping; #155 wired the gate and Stage 1's destination
+    /// selection.
     F16P3,
 }
 

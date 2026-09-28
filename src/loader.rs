@@ -137,13 +137,16 @@ enum Stop {
 ///
 /// Request-time decode inputs threaded to the sinks: the compositing
 /// background (upstream stashes the viewport and the composite at request
-/// time, viv.c:1557-1558 + the decode-time composite; riviv's viewport
-/// snapshot died with the #81 mip retirement) and the `icm` flag's
+/// time, viv.c:1557-1558 + the decode-time composite) and the `icm` flag's
 /// request-time snapshot (#77 — a config flip mid-load must not change
-/// frames already in flight).
+/// frames already in flight). #155 adds the render backend to the same
+/// snapshot: ONE `DecodeEnv` = ONE backend, so a mid-load flip cannot
+/// change the destination a frame already in flight will map into (the
+/// Stage-1 wide-gamut decision is made at request time like `icm`).
 pub(crate) struct DecodeEnv {
     pub(crate) background: [u8; 3],
     pub(crate) icm: bool,
+    pub(crate) backend: crate::transform_stage::Backend,
 }
 
 pub(crate) fn decode_to_sink(
@@ -276,7 +279,7 @@ fn prepare_transform<D: ImageDecoder>(
             None
         }
     };
-    icm::prepare(true, icc, shown)
+    icm::prepare(true, icc, shown, env.backend)
 }
 
 /// The shared post-decode frame pipeline — ADR 0002 D2's order
@@ -286,25 +289,48 @@ fn prepare_transform<D: ImageDecoder>(
 /// decode buffer through `BM_16b_RGB` into the f16 master's halves (the
 /// decoder's alpha restored — the output format carries none — then the
 /// composite over the sRGB background) and `PixelFrame::from_f16_halves`
-/// boxes it, the frame genuinely 8 bytes per pixel. A refused 16-bit
-/// pass (and only then) falls back to the 8-bit era's chain — the
-/// transform's `apply` on the same rows, the BGRA composite,
-/// `from_bgra` — marked `master_content_space(bits, false)`: a transform
-/// whose 16-bit output failed has left nothing for an f16 master to
-/// keep, so the mark is the bytes' own honest Srgb (ADR 0003 D5). The
-/// `transform=None` path is byte-for-byte the pre-#77 one (composite
+/// boxes it, the frame genuinely 8 bytes per pixel. #155 (ADR 0004 D2)
+/// added the wide arm on top: when the transform's destination is the
+/// P3 container (a hardware session's foreign profile), the SAME chain
+/// boxes the halves through `from_f16_halves_wide` — an `F16P3` master
+/// whose super-sRGB colors stay inside the container instead of
+/// clipping at the sRGB gamut boundary. A refused wide 16-bit pass
+/// retargets the destination back to sRGB (one breadcrumb inside; D6's
+/// "correct color" floor) and falls into the narrow ladder. The narrow
+/// 8-bit fallback stays the refused-16-bit arm of THAT ladder (ADR 0003
+/// D5: a refused 16-bit pass downgrades that frame to the 8-bit chain,
+/// breadcrumb once, load unaffected); the equivalence probe still runs
+/// in the 8-bit domain on `translate`, its tolerance calibrated there.
+/// The `transform=None` path is byte-for-byte the pre-#77 one (composite
 /// RGBA, `from_rgba` swizzles); #140's gate survives here as that
 /// fallback/no-transform mark, since the primary transform arm's mark is
-/// now the f16 storage itself (`from_f16_halves` pins `F16Srgb`).
+/// now the f16 storage itself (`from_f16_halves` pins `F16Srgb`,
+/// `from_f16_halves_wide` pins `F16P3`).
 fn assemble_frame(
     width: u32,
     height: u32,
-    mut rgba: Vec<u8>,
+    rgba: Vec<u8>,
     env: &DecodeEnv,
-    transform: Option<&icm::Transform>,
+    transform: Option<&mut icm::Transform>,
     source_bits_per_sample: u16,
 ) -> PixelFrame {
     if let Some(transform) = transform {
+        if transform.destination_is_wide() {
+            if let Some(mut halves) =
+                transform.apply_f16(width, height, icm::FrameSrc::Rgba8(&rgba))
+            {
+                restore_alpha_f16_from_u8(&mut halves, &rgba8_alpha(&rgba));
+                composite_over_background_f16_in_place(&mut halves, env.background);
+                return PixelFrame::from_f16_halves_wide(width, height, halves);
+            }
+            // #155's wide-arm fallback (D6): the wide 16-bit pass was
+            // refused — retarget to sRGB and continue into the narrow
+            // ladder below. A failed retarget (its own breadcrumb)
+            // leaves only the untransformed tail.
+            if !transform.retarget_srgb() {
+                return untransformed_tail(width, height, rgba, env, source_bits_per_sample);
+            }
+        }
         if let Some(mut halves) = transform.apply_f16(width, height, icm::FrameSrc::Rgba8(&rgba)) {
             restore_alpha_f16_from_u8(&mut halves, &rgba8_alpha(&rgba));
             composite_over_background_f16_in_place(&mut halves, env.background);
@@ -322,6 +348,21 @@ fn assemble_frame(
             );
         }
     }
+    untransformed_tail(width, height, rgba, env, source_bits_per_sample)
+}
+
+/// The no-transform tail of the frame pipeline (the pre-#77 path,
+/// byte-for-byte): composite the raw RGBA rows over the background and
+/// box them with the honest `master_content_space` mark. #155: shared
+/// by the `transform=None` path AND the wide ladder's dead end (a wide
+/// pass refused AND the sRGB retarget failed), so the tail exists once.
+fn untransformed_tail(
+    width: u32,
+    height: u32,
+    mut rgba: Vec<u8>,
+    env: &DecodeEnv,
+    source_bits_per_sample: u16,
+) -> PixelFrame {
     composite_over_background_in_place(&mut rgba, env.background);
     PixelFrame::from_rgba(
         width,
@@ -334,16 +375,22 @@ fn assemble_frame(
 /// The deep (>8-bit) source's frame assembly (#142, ADR 0003 D6): the
 /// samples land in the f16 master's halves either directly (no
 /// transform) or through the CMM's 16-bit chain (`BM_16b_RGB` src AND
-/// dst — the interim seam's 8-bit-into-mscms detour is history). Alpha:
-/// the layouts that carry it are restored from the samples after the
-/// transform (the CMM's input shape has no alpha channel), the opaque
-/// layouts keep the format default. A refused 16-bit pass falls back to
-/// the 8-bit era: quantize through `deep_to_rgba8_via_f16` and run the
-/// shared `assemble_frame` on the quantized rows — passing the
-/// QUANTIZED depth (8) so the mark stays honest Srgb whatever the 8-bit
-/// chain makes of them (the fallback also gives the mixed
-/// 8-bit-src/16-bit-dst shape one retry through `assemble_frame`; when
-/// that lands, the quantized rows still earn a real f16 master).
+/// dst — the interim seam's 8-bit-into-mscms detour is history). #155
+/// (ADR 0004 D2): a WIDE destination boxes the chain's halves through
+/// `from_f16_halves_wide` (`F16P3`, the container keeps the gamut); a
+/// refused wide 16-bit pass retargets to sRGB and retries the same
+/// chain into `F16Srgb`, and a refused retarget falls to the None-arm
+/// shape (the untransformed deep path — D6's correct-color floor: raw
+/// code values beat clipped ones). Alpha: the layouts that carry it are
+/// restored from the samples after the transform (the CMM's input shape
+/// has no alpha channel), the opaque layouts keep the format default. A
+/// refused 16-bit pass on the narrow ladder falls back to the 8-bit
+/// era: quantize through `deep_to_rgba8_via_f16` and run the shared
+/// `assemble_frame` on the quantized rows — passing the QUANTIZED depth
+/// (8) so the mark stays honest Srgb whatever the 8-bit chain makes of
+/// them (the fallback also gives the mixed 8-bit-src/16-bit-dst shape
+/// one retry through `assemble_frame`; when that lands, the quantized
+/// rows still earn a real f16 master).
 ///
 /// Known limit, ruled at #144 (documented, not gated): the static arm's
 /// riviv-side allocations (`bgr` staging, the f16 `halves`) sit OUTSIDE
@@ -365,7 +412,7 @@ fn assemble_deep_frame(
     height: u32,
     samples: DeepSamples<'_>,
     env: &DecodeEnv,
-    transform: Option<&icm::Transform>,
+    transform: Option<&mut icm::Transform>,
 ) -> PixelFrame {
     match transform {
         None => {
@@ -375,6 +422,43 @@ fn assemble_deep_frame(
             PixelFrame::from_f16_halves(width, height, halves)
         }
         Some(transform) => {
+            if transform.destination_is_wide() {
+                let mut bgr = vec![0u16; width as usize * height as usize * 3];
+                deep_to_bgr_u16(samples, &mut bgr);
+                if let Some(mut halves) =
+                    transform.apply_f16(width, height, icm::FrameSrc::Bgr16(&bgr))
+                {
+                    if let Some(alpha) = deep_source_alpha(&samples) {
+                        restore_alpha_f16_from_u16(&mut halves, &alpha);
+                    }
+                    composite_over_background_f16_in_place(&mut halves, env.background);
+                    return PixelFrame::from_f16_halves_wide(width, height, halves);
+                }
+                // #155's wide-arm fallback: refused against the wide
+                // destination — back to sRGB and retry the same chain.
+                if transform.retarget_srgb() {
+                    if let Some(mut halves) =
+                        transform.apply_f16(width, height, icm::FrameSrc::Bgr16(&bgr))
+                    {
+                        if let Some(alpha) = deep_source_alpha(&samples) {
+                            restore_alpha_f16_from_u16(&mut halves, &alpha);
+                        }
+                        composite_over_background_f16_in_place(&mut halves, env.background);
+                        return PixelFrame::from_f16_halves(width, height, halves);
+                    }
+                    // The sRGB 16-bit chain refused too: the existing
+                    // 8-bit era fallback on the quantized rows.
+                    let mut converted = vec![0u8; width as usize * height as usize * 4];
+                    deep_to_rgba8_via_f16(samples, &mut converted);
+                    return assemble_frame(width, height, converted, env, Some(transform), 8);
+                }
+                // The retarget failed (its own breadcrumb): the
+                // untransformed deep path — raw code values, D6's floor.
+                let mut halves = vec![0u16; width as usize * height as usize * 4];
+                deep_to_f16_halves(samples, &mut halves);
+                composite_over_background_f16_in_place(&mut halves, env.background);
+                return PixelFrame::from_f16_halves(width, height, halves);
+            }
             let mut bgr = vec![0u16; width as usize * height as usize * 3];
             deep_to_bgr_u16(samples, &mut bgr);
             if let Some(mut halves) = transform.apply_f16(width, height, icm::FrameSrc::Bgr16(&bgr))
@@ -424,7 +508,7 @@ fn decode_reader<R: BufRead + Seek>(
             // One ICC->sRGB transform for the whole stream, applied to
             // each frame at decode (#77) — upstream's GdipLoadImageFrom-
             // StreamICM slot.
-            let transform = prepare_transform(&mut decoder, &env, shown);
+            let mut transform = prepare_transform(&mut decoder, &env, shown);
             // GIF frame delays arrive as centiseconds × 10 ms from the image crate;
             // the zero/absent fallback to 100 ms is upstream behavior (viv.c:
             // 10710-10714 for additional frames, 10740-10744 for the first).
@@ -438,7 +522,7 @@ fn decode_reader<R: BufRead + Seek>(
                 orientation,
                 per_frame_bytes,
                 env,
-                transform.as_ref(),
+                transform.as_mut(),
                 terminate,
                 first_frame_painted,
                 sink,
@@ -457,7 +541,7 @@ fn decode_reader<R: BufRead + Seek>(
                 return sink_static(decoder, shown, env, sink);
             }
             let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
-            let transform = prepare_transform(&mut decoder, &env, shown);
+            let mut transform = prepare_transform(&mut decoder, &env, shown);
             // WebP delays are the decoder's millisecond values, used as-is like
             // upstream's libwebp path (viv.c:10289 — no zero fallback; the scheduler
             // floors zero to 1 ms instead). Per-frame budget cost as for GIF above.
@@ -469,7 +553,7 @@ fn decode_reader<R: BufRead + Seek>(
                 orientation,
                 per_frame_bytes,
                 env,
-                transform.as_ref(),
+                transform.as_mut(),
                 terminate,
                 first_frame_painted,
                 sink,
@@ -532,7 +616,7 @@ fn decode_reader<R: BufRead + Seek>(
             // canvas just under the 4-byte threshold would otherwise
             // enter the animated path while the four decode canvases
             // plus the first retained master already break the bound).
-            let transform = prepare_transform(&mut decoder, &env, shown);
+            let mut transform = prepare_transform(&mut decoder, &env, shown);
             // A file the animation path cannot take still fits the static
             // single-canvas path — degrade there instead of failing the
             // load (external review R2/R5: pre-#98, upstream GDI+, and
@@ -582,7 +666,7 @@ fn decode_reader<R: BufRead + Seek>(
                 orientation,
                 per_frame_bytes,
                 env,
-                transform.as_ref(),
+                transform.as_mut(),
                 terminate,
                 first_frame_painted,
                 sink,
@@ -681,13 +765,13 @@ fn stream_animation(
     orientation: Orientation,
     per_frame_bytes: usize,
     env: DecodeEnv,
-    icm: Option<&icm::Transform>,
+    mut icm: Option<&mut icm::Transform>,
     terminate: &AtomicBool,
     first_frame_painted: Option<&crate::loadthread::FirstFramePainted>,
     sink: &mut dyn FnMut(LoadReply),
 ) -> Result<(), Stop> {
     let user = |msg: String| Stop::User(msg);
-    let per_frame_bytes = charged_frame_bytes(per_frame_bytes, icm);
+    let per_frame_bytes = charged_frame_bytes(per_frame_bytes, icm.as_deref());
     let mut emitted = 0usize;
     let mut canvas: Option<(u32, u32)> = None;
     let mut total_frame_bytes: usize = 0;
@@ -776,7 +860,7 @@ fn stream_animation(
         // since #90 there are none. (The decode-side mip pre-generation
         // decision upstream threads through the same slot,
         // viv.c:10302/10316, was retired with #81.)
-        let frame = assemble_frame(w, h, buffer.into_raw(), &env, icm, 8);
+        let frame = assemble_frame(w, h, buffer.into_raw(), &env, icm.as_deref_mut(), 8);
         if emitted == 0 {
             sink(LoadReply::FirstFrame { frame, delay_ms });
             // The first-frame paint handshake (#76): hold frame 1's decode
@@ -819,7 +903,7 @@ fn sink_static<D: ImageDecoder>(
     let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
     // Extract + prepare the ICC->sRGB transform while the decoder is still
     // alive — `from_decoder` consumes it (#77).
-    let transform = prepare_transform(&mut decoder, &env, shown);
+    let mut transform = prepare_transform(&mut decoder, &env, shown);
     let mut img = image::DynamicImage::from_decoder(decoder).map_err(|e| user(e.to_string()))?;
     img.apply_orientation(orientation);
     let (w, h) = img.dimensions();
@@ -843,10 +927,10 @@ fn sink_static<D: ImageDecoder>(
         _ => None,
     };
     let frame = match deep {
-        Some(samples) => assemble_deep_frame(w, h, samples, &env, transform.as_ref()),
+        Some(samples) => assemble_deep_frame(w, h, samples, &env, transform.as_mut()),
         None => {
             let rgba = img.into_rgba8().into_raw();
-            assemble_frame(w, h, rgba, &env, transform.as_ref(), 8)
+            assemble_frame(w, h, rgba, &env, transform.as_mut(), 8)
         }
     };
     // A static image is a one-frame stream: first frame, then Complete from
@@ -2107,6 +2191,9 @@ mod stdin_bytes_tests {
         DecodeEnv {
             background: [255, 255, 255],
             icm: false,
+            // WARP = the pre-#155 production behavior; the wide-master
+            // tests opt into Hardware explicitly.
+            backend: crate::transform_stage::Backend::Warp,
         }
     }
 
@@ -2206,8 +2293,13 @@ mod stdin_bytes_tests {
         // charge stays the decode canvas itself (the pin the 4096-frame
         // edge above relies on).
         crate::icm::test_fixtures::require_srgb();
-        let t = crate::icm::prepare(true, Some(crate::icm::test_fixtures::adobe_like_icc()), "t")
-            .expect("an AdobeRGB-like profile transforms");
+        let t = crate::icm::prepare(
+            true,
+            Some(crate::icm::test_fixtures::adobe_like_icc()),
+            "t",
+            crate::transform_stage::Backend::Warp,
+        )
+        .expect("an AdobeRGB-like profile transforms");
         assert_eq!(charged_frame_bytes(100, Some(&t)), 200);
         assert_eq!(charged_frame_bytes(100, None), 100);
         // The saturation pin (Codex P1 round 3): a canvas past
@@ -2233,8 +2325,13 @@ mod stdin_bytes_tests {
         // masters) — over the wire the file degrades to a static decode
         // instead of entering the animated path and breaking the bound.
         crate::icm::test_fixtures::require_srgb();
-        let t = crate::icm::prepare(true, Some(crate::icm::test_fixtures::adobe_like_icc()), "t")
-            .expect("an AdobeRGB-like profile transforms");
+        let t = crate::icm::prepare(
+            true,
+            Some(crate::icm::test_fixtures::adobe_like_icc()),
+            "t",
+            crate::transform_stage::Backend::Warp,
+        )
+        .expect("an AdobeRGB-like profile transforms");
         let canvas = MAX_TOTAL_FRAME_BYTES / 5; // plain: *4 fits, *8 does not
         assert!(apng_canvas_fits_animation_budget(charged_frame_bytes(
             canvas, None
@@ -2305,11 +2402,16 @@ mod stdin_bytes_tests {
         // alone. Colors are the 8-bit era's characterized output,
         // tolerance unchanged.
         crate::icm::test_fixtures::require_srgb();
-        let t = crate::icm::prepare(true, Some(crate::icm::test_fixtures::adobe_like_icc()), "t")
-            .expect("an AdobeRGB-like profile transforms");
+        let mut t = crate::icm::prepare(
+            true,
+            Some(crate::icm::test_fixtures::adobe_like_icc()),
+            "t",
+            crate::transform_stage::Backend::Warp,
+        )
+        .expect("an AdobeRGB-like profile transforms");
         let env = env_icm(true);
         let rgba = [200u8, 60, 10, 255].repeat(4 * 4);
-        let f16_frame = assemble_frame(4, 4, rgba.clone(), &env, Some(&t), 8);
+        let f16_frame = assemble_frame(4, 4, rgba.clone(), &env, Some(&mut t), 8);
         assert_eq!(f16_frame.content_space, ContentSpace::F16Srgb);
         assert_eq!(
             f16_frame.pixels.len(),
@@ -2317,7 +2419,7 @@ mod stdin_bytes_tests {
             "the success arm's halves"
         );
         t.force16_fail.set(true);
-        let frame = assemble_frame(4, 4, rgba, &env, Some(&t), 8);
+        let frame = assemble_frame(4, 4, rgba, &env, Some(&mut t), 8);
         t.force16_fail.set(false);
         assert_eq!(
             frame.content_space,
@@ -2478,6 +2580,84 @@ mod stdin_bytes_tests {
             }
         }
     }
+
+    // ---- the wide F16P3 master (#155, ADR 0004 D2/D5) ----
+
+    #[test]
+    fn a_wide_icc_image_earns_the_f16p3_master_on_hardware() {
+        // The end-to-end D2 decision: a genuinely-foreign profile (the
+        // Adobe fixture) on a HARDWARE request-time snapshot retargets
+        // Stage 1's destination to the P3 container, and the decoded
+        // frame lands as an F16P3 master — super-sRGB colors kept
+        // inside the container instead of clipped.
+        crate::icm::test_fixtures::require_srgb();
+        let png = png_bytes(Some(crate::icm::test_fixtures::adobe_like_icc()));
+        let env = DecodeEnv {
+            backend: crate::transform_stage::Backend::Hardware,
+            ..env_icm(true)
+        };
+        let terminate = AtomicBool::new(false);
+        let mut replies = Vec::new();
+        decode_bytes_to_sink(&png, env, &terminate, None, &mut |r| replies.push(r));
+        let Some(LoadReply::FirstFrame { frame, .. }) = replies.into_iter().next() else {
+            panic!("expected a first frame");
+        };
+        assert_eq!(frame.content_space, ContentSpace::F16P3);
+        assert_eq!(
+            frame.pixels.len(),
+            4 * 4 * 8,
+            "8 bytes per pixel, the f16 layout"
+        );
+    }
+
+    #[test]
+    fn the_same_wide_icc_image_stays_f16srgb_on_warp() {
+        // The D5 WARP exclusion end to end: the IDENTICAL file decoded
+        // against a WARP request-time snapshot keeps today's sRGB
+        // destination — F16Srgb, byte-for-byte the pre-#155 behavior.
+        crate::icm::test_fixtures::require_srgb();
+        let png = png_bytes(Some(crate::icm::test_fixtures::adobe_like_icc()));
+        let env = DecodeEnv {
+            backend: crate::transform_stage::Backend::Warp,
+            ..env_icm(true)
+        };
+        let terminate = AtomicBool::new(false);
+        let mut replies = Vec::new();
+        decode_bytes_to_sink(&png, env, &terminate, None, &mut |r| replies.push(r));
+        let Some(LoadReply::FirstFrame { frame, .. }) = replies.into_iter().next() else {
+            panic!("expected a first frame");
+        };
+        assert_eq!(frame.content_space, ContentSpace::F16Srgb);
+    }
+
+    #[test]
+    fn mixed_8bit_source_into_the_wide_destination_sentinel() {
+        // The #142 mixed shape (8-bit BM_xBGRQUADS rows into the
+        // BM_16b_RGB destination) against the WIDE destination: mscms
+        // must take the mixed pass there too, and the sentinel —
+        // Adobe-source pure GREEN — must come back BELOW the f16 of
+        // full scale (in-container headroom the sRGB destination clips
+        // to its primary; measured 65375/65535. Pure red sits outside
+        // even the P3 container in this fixture pairing and clips in
+        // both — see icm.rs's container test for the measured pins).
+        crate::icm::test_fixtures::require_srgb();
+        let t = crate::icm::prepare(
+            true,
+            Some(crate::icm::test_fixtures::adobe_like_icc()),
+            "t",
+            crate::transform_stage::Backend::Hardware,
+        )
+        .expect("an AdobeRGB-like profile transforms");
+        assert!(t.destination_is_wide(), "hardware prepares the wide arm");
+        let halves = t
+            .apply_f16(1, 1, crate::icm::FrameSrc::Rgba8(&[0u8, 255, 0, 255]))
+            .expect("mscms takes the mixed 8-bit-src pass against the wide destination");
+        assert_ne!(
+            halves[1],
+            crate::pixels::F16_OPAQUE,
+            "in-container green keeps headroom — not the clipped full scale"
+        );
+    }
 }
 
 /// #98's APNG acceptance: the fcTL/acTL wiring end to end through
@@ -2496,6 +2676,9 @@ mod apng_tests {
         DecodeEnv {
             background: [255, 255, 255],
             icm: false,
+            // WARP = the pre-#155 production behavior; the wide-master
+            // tests opt into Hardware explicitly.
+            backend: crate::transform_stage::Backend::Warp,
         }
     }
 
@@ -3049,6 +3232,49 @@ mod apng_tests {
     }
 
     #[test]
+    fn a_tagged_deep_png16_earns_the_f16p3_master_on_hardware() {
+        // The deep arm of the wide chain (#155, ADR 0004 D2): a 16-bit
+        // source with a genuinely-foreign profile on a HARDWARE env
+        // flows the CMM's 16-bit chain into the P3 container — the
+        // frame lands F16P3 (8 bytes per pixel, same as the narrow
+        // deep master).
+        crate::icm::test_fixtures::require_srgb();
+        let mut info = png::Info::with_size(4, 1);
+        info.color_type = png::ColorType::Rgb;
+        info.bit_depth = png::BitDepth::Sixteen;
+        info.icc_profile = Some(std::borrow::Cow::Owned(
+            crate::icm::test_fixtures::adobe_like_icc(),
+        ));
+        let mut out = Vec::new();
+        let enc = png::Encoder::with_info(&mut out, info).expect("with_info");
+        let mut writer = enc.write_header().expect("write_header");
+        let rows: [u16; 12] = [
+            0xC700, 0x3C00, 0x0A00, //
+            0x8000, 0xFFFF, 0x4000, //
+            0x1234, 0xABCD, 0x5678, //
+            0xE001, 0x0F0F, 0x7007,
+        ];
+        let mut raw = Vec::with_capacity(rows.len() * 2);
+        for s in rows {
+            raw.extend_from_slice(&s.to_be_bytes());
+        }
+        writer.write_image_data(&raw).expect("image data");
+        writer.finish().expect("finish");
+        let replies = decode_all(
+            &out,
+            DecodeEnv {
+                backend: crate::transform_stage::Backend::Hardware,
+                ..env_icm(true)
+            },
+        );
+        let Some(LoadReply::FirstFrame { frame, .. }) = replies.into_iter().next() else {
+            panic!("expected a first frame");
+        };
+        assert_eq!(frame.content_space, ContentSpace::F16P3);
+        assert_eq!(frame.pixels.len(), 32, "4x1 pixels, four halves each");
+    }
+
+    #[test]
     fn plain_8bit_png_stays_in_the_srgb_master() {
         // The gate's zero-change arm, end to end: the untagged 8-bit
         // majority keeps the Srgb master byte-identically (it has
@@ -3394,8 +3620,13 @@ mod apng_tests {
         // "half the plain" claim. (The plain-only edges live in
         // `animation_wire_boundary_is_exactly_a_quarter_of_the_budget`.)
         crate::icm::test_fixtures::require_srgb();
-        let t = crate::icm::prepare(true, Some(crate::icm::test_fixtures::adobe_like_icc()), "t")
-            .expect("an AdobeRGB-like profile transforms");
+        let t = crate::icm::prepare(
+            true,
+            Some(crate::icm::test_fixtures::adobe_like_icc()),
+            "t",
+            crate::transform_stage::Backend::Warp,
+        )
+        .expect("an AdobeRGB-like profile transforms");
         assert!(apng_canvas_fits_animation_budget(charged_frame_bytes(
             16_777_216 * 4,
             Some(&t)

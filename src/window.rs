@@ -1296,6 +1296,10 @@ fn stack_rebuild_allowed(gpu_present: bool, terminal: bool) -> bool {
 /// init-failure latch: a rebuild that cannot create the stack defers the
 /// fatal like every other unrecoverable verdict.
 fn gpu_rebuild_if_due(view: HWND, owner: HWND) {
+    // #155: whether this rebuild flipped the session onto WARP — the
+    // wide-gamut invalidation reads it after the borrow ends (the
+    // re-derivation must not run across the state borrow below).
+    let mut flipped_to_warp = false;
     // SAFETY: the borrow spans the gate check and the (non-pumping) COM
     // creation; nothing here dispatches messages, so no second state_of
     // borrow can alias this one.
@@ -1306,9 +1310,13 @@ fn gpu_rebuild_if_due(view: HWND, owner: HWND) {
         let kind = rebuild_kind(renderer_request(state), state.gpu_kind);
         match crate::gpu::create(view, crate::gpu::owner_of(view), kind) {
             Ok((stack, effective)) => {
+                let old_kind = state.gpu_kind;
                 state.gpu = Some(stack);
                 state.gpu_kind = effective;
                 establish_output_identity(state);
+                // #155 (D5): a flip onto WARP invalidates every
+                // F16P3 master — P3 halves have no mapping there.
+                flipped_to_warp = backend_flipped_to_warp(old_kind, effective);
             }
             Err(e) => {
                 // The environment lost its device stack since startup, and
@@ -1327,6 +1335,22 @@ fn gpu_rebuild_if_due(view: HWND, owner: HWND) {
             }
         }
     }
+    // #155: the flip's invalidation runs OUTSIDE the borrow — it may
+    // clear displays, drop sessions and issue fresh open requests.
+    if flipped_to_warp {
+        rederive_wide_masters(owner);
+    }
+}
+
+/// Whether a backend transition flipped the session ONTO WARP (#155,
+/// pure like the other transition predicates): only a kind CHANGE to
+/// Warp counts — a same-kind WARP rebuild is no flip (a WARP session
+/// never held a wide master in the first place), and nothing ever flips
+/// back to hardware (rebuild_kind pins WARP after an escalation; the
+/// predicate simply answers "flipped to WARP" for whatever pair it is
+/// given).
+fn backend_flipped_to_warp(old: RendererKind, new: RendererKind) -> bool {
+    old != new && new == RendererKind::Warp
 }
 
 /// The renderer REQUEST a rebuild re-issues (#126): the startup-forced
@@ -1719,6 +1743,9 @@ fn gpu_runtime_failure(owner: HWND) {
     let mut rebuilt_view: Option<HWND> = None;
     let mut degraded_view: Option<HWND> = None;
     let mut fatal_view: Option<HWND> = None;
+    // #155: whether the ladder ESCALATED the session onto WARP — the
+    // wide-gamut invalidation reads it after the borrow ends.
+    let mut flipped_to_warp = false;
     // SAFETY: the borrow spans the ladder decision and the (non-pumping)
     // COM rebuild; nothing dispatches messages.
     if let Some(state) = unsafe { state_of(owner) } {
@@ -1763,6 +1790,7 @@ fn gpu_runtime_failure(owner: HWND) {
             // here).
             state.gpu = None;
             let view = state.viewport;
+            let old_kind = state.gpu_kind;
             match crate::gpu::create(view, crate::gpu::owner_of(view), kind) {
                 Ok((stack, effective)) => {
                     state.gpu_kind = if escalated {
@@ -1772,6 +1800,11 @@ fn gpu_runtime_failure(owner: HWND) {
                     };
                     establish_output_identity(state);
                     state.gpu = Some(stack);
+                    // #155 (D5): an escalation flip onto WARP invalidates
+                    // every F16P3 master — same re-derivation the rebuild
+                    // gate runs (the Fatal arm below is terminal, nothing
+                    // to protect there).
+                    flipped_to_warp = backend_flipped_to_warp(old_kind, state.gpu_kind);
                     // The failing paint already validated its region without
                     // drawing — a static image has no timer or hover to
                     // repaint it, so the recovered frame would hang blank
@@ -1807,6 +1840,11 @@ fn gpu_runtime_failure(owner: HWND) {
         if let Some(view) = fatal_view.or(rebuilt_view).or(degraded_view) {
             let _ = InvalidateRect(Some(view), None, false);
         }
+    }
+    // #155: the escalation flip's invalidation runs OUTSIDE the borrow —
+    // it may clear displays, drop sessions and issue fresh open requests.
+    if flipped_to_warp {
+        rederive_wide_masters(owner);
     }
 }
 
@@ -2865,47 +2903,18 @@ fn toggle_fit_input(hwnd: HWND, input: FitInput) {
 /// re-read from disk. No current file: a no-op (upstream's `_viv_open`
 /// with an empty fd does nothing).
 fn refresh_current(hwnd: HWND) {
-    // SAFETY: the borrow spans the entry clone, the cache drops and the
-    // display clear — nothing pumps.
+    // SAFETY: the borrow spans the entry clone and the display clear —
+    // nothing pumps.
     let entry = (unsafe { state_of(hwnd) }).and_then(|state| {
         let entry = state.nav_current.clone()?;
-        state.last_cache = None;
-        state.preload = None;
-        // The `_viv_clear` body: the frames die, the fd/title stay. The
-        // animation marks and the view reset ride along (viv.c:1278-1288).
-        state.image = None;
-        // #80 §5: the display pixels cleared — a D2D stack must not keep
-        // showing the old frame's upload.
-        state.frame_gen += 1;
-        state.displayed_from = None;
-        state.displayed_entry = None;
-        state.displayed_file_bytes = None;
-        state.pending_file_bytes = None;
-        state.session = None;
-        // The `_viv_clear` view edge (#68): with keep_zoom the state stands
-        // here — the re-open's adoption edge re-derives it moments later
-        // (same file, so the carry migrates by a ratio of one).
-        view_edge(hwnd, state, DisplayEdge::Cleared);
-        state.animation_looped = false;
-        state.animation_playing = true;
-        state.slideshow_timeup = false;
-        let stop_timer = state.animation_timer_running;
-        state.animation_timer_running = false;
+        let stop_timer = clear_display_state(hwnd, state);
         Some((entry, stop_timer))
     });
     let Some((entry, stop_timer)) = entry else {
         return;
     };
     if stop_timer {
-        // SAFETY: hwnd is live; a failed kill leaves a stale timer that
-        // the WM_TIMER guard no-ops on.
-        let _ = unsafe { KillTimer(Some(hwnd), ANIMATION_TIMER_ID) };
-        // The animation timer stopping is a prevent-sleep transition
-        // point (upstream `_viv_timer_stop`, viv.c:9633).
-        update_prevent_sleep(hwnd);
-        // And an on-top while-playing decision point (riviv superset:
-        // upstream re-evaluates only on slideshow events and menu opens).
-        update_ontop(hwnd);
+        stop_animation_timer(hwnd);
     }
     refresh_status(hwnd);
     // A blanked display can never hide the cursor — reconcile it
@@ -2917,6 +2926,181 @@ fn refresh_current(hwnd: HWND) {
     // frame (upstream `_viv_open(&fd, 0)` re-opens the CURRENT fd, id and
     // all: a navigation onto itself, not a fresh direct entry).
     request_open(hwnd, entry.path.as_os_str(), OpenOrigin::Nav(&entry));
+}
+
+/// The shared `_viv_clear` display-death body (upstream viv.c:1268-1293;
+/// #155 lifted it verbatim from `refresh_current` so the backend-migration
+/// invalidation can blank the display through the SAME sequence): the
+/// caches and the display die, the fd/title stay, the per-image marks and
+/// the view edge ride along (viv.c:1278-1288). Returns whether the
+/// animation timer was running and must now be killed — the Win32 half
+/// ([`stop_animation_timer`]) lives outside the caller's state borrow.
+/// `refresh_current` (F5) is the behavioral reference: the sequence is a
+/// pure extraction, byte-for-byte the body it came from.
+fn clear_display_state(hwnd: HWND, state: &mut WindowState) -> bool {
+    state.last_cache = None;
+    state.preload = None;
+    // The `_viv_clear` body: the frames die, the fd/title stay. The
+    // animation marks and the view reset ride along (viv.c:1278-1288).
+    state.image = None;
+    // #80 §5: the display pixels cleared — a D2D stack must not keep
+    // showing the old frame's upload.
+    state.frame_gen += 1;
+    state.displayed_from = None;
+    state.displayed_entry = None;
+    state.displayed_file_bytes = None;
+    state.pending_file_bytes = None;
+    state.session = None;
+    // The `_viv_clear` view edge (#68): with keep_zoom the state stands
+    // here — the re-open's adoption edge re-derives it moments later
+    // (same file, so the carry migrates by a ratio of one).
+    view_edge(hwnd, state, DisplayEdge::Cleared);
+    state.animation_looped = false;
+    state.animation_playing = true;
+    state.slideshow_timeup = false;
+    let stop_timer = state.animation_timer_running;
+    state.animation_timer_running = false;
+    stop_timer
+}
+
+/// The timer-kill half of a cleared display (shared by F5 and #155's
+/// migration invalidation): kill the animation timer, reconcile the
+/// prevent-sleep state (upstream `_viv_timer_stop`, viv.c:9633) and the
+/// on-top-while-playing decision.
+fn stop_animation_timer(hwnd: HWND) {
+    // SAFETY: hwnd is live; a failed kill leaves a stale timer that
+    // the WM_TIMER guard no-ops on.
+    let _ = unsafe { KillTimer(Some(hwnd), ANIMATION_TIMER_ID) };
+    update_prevent_sleep(hwnd);
+    // And an on-top while-playing decision point (riviv superset:
+    // upstream re-evaluates only on slideshow events and menu opens).
+    update_ontop(hwnd);
+}
+
+/// The backend-migration invalidation (#155, ADR 0004 D5): the session
+/// just flipped ONTO WARP, and P3-encoded halves have no mapping there —
+/// an F16P3 master displayed on WARP would be FAKE COLOR (the D6
+/// philosophy's forbidden outcome), so no wide master may survive the
+/// flip. Three strata, each handled by what CAN be re-derived:
+/// - the last-image cache and the parked preload hold re-derivable
+///   files — dropped wholesale (a later navigation simply re-decodes
+///   through the now-WARP env into narrow masters);
+/// - a WIDE image ON DISPLAY with a backing file re-derives through the
+///   existing reload channel (F5 semantics: clear + re-open — the new
+///   request's env snapshot is WARP, so the decode lands narrow);
+/// - a WIDE virtual display (stdin:/clipboard:) has no backing file —
+///   the stream is consumed and cannot be re-decoded, so the display is
+///   cleared and the in-flight (pre-flip-env) session killed;
+/// - a NARROW display with a load in flight re-opens it: that load's env
+///   predates the flip and could still land wide masters (a virtual
+///   stream cannot be re-opened, so its load is superseded instead).
+fn rederive_wide_masters(owner: HWND) {
+    enum Rederive {
+        Refresh,
+        Reopen(crate::playlist::PlaylistEntry),
+        /// The virtual display's dead end: cleared inside the borrow,
+        /// its Win32 tail (timer kill, status/cursor/repaint) runs
+        /// outside it.
+        Clear {
+            stop_timer: bool,
+        },
+        /// An in-flight VIRTUAL load killed inside the borrow (the
+        /// narrow display stands; only the supersede breadcrumb runs
+        /// outside it).
+        SupersedeVirtual,
+    }
+    let mut action: Option<Rederive> = None;
+    // SAFETY: the borrow spans the cache drops and the display clear —
+    // nothing here dispatches messages or re-enters state_of (the
+    // UI-facing tails run after the borrow ends).
+    if let Some(state) = unsafe { state_of(owner) } {
+        // The parked strata: a wide master anywhere in them dies (the
+        // entries stay in the playlist — navigation re-decodes).
+        let last_cache_wide = state.last_cache.as_ref().is_some_and(|cache| {
+            cache.image.surface().master().content_space
+                == crate::transform_stage::ContentSpace::F16P3
+        });
+        if last_cache_wide {
+            state.last_cache = None;
+        }
+        let preload_wide = state.preload.as_ref().is_some_and(|slot| {
+            slot.image.as_ref().is_some_and(|image| {
+                image.surface().content_space == crate::transform_stage::ContentSpace::F16P3
+            })
+        });
+        if preload_wide {
+            state.preload = None;
+        }
+        let wide_on_display =
+            current_content_class(state) == crate::transform_stage::ContentSpace::F16P3;
+        let loading = state.session.is_some();
+        if wide_on_display {
+            if state.nav_current.is_some() {
+                // A real file is behind the display: the F5 channel
+                // re-derives it (and any in-flight load with it — the
+                // refresh's re-request snapshots the NEW backend).
+                action = Some(Rederive::Refresh);
+            } else {
+                // Virtual display (stdin:/clipboard:): the stream is
+                // consumed — nothing to re-decode from. Kill the
+                // in-flight load (its env predates the flip) and blank
+                // through the shared `_viv_clear` body.
+                state.session = None;
+                let stop_timer = clear_display_state(owner, state);
+                action = Some(Rederive::Clear { stop_timer });
+            }
+        } else if loading {
+            // The display itself is narrow (stays valid), but the
+            // in-flight load's env is the PRE-flip snapshot — it could
+            // still land wide masters. With a nav entry the file
+            // re-requests under the NEW backend; a virtual stream
+            // (stdin:/clipboard:) cannot be re-requested (the pipe is
+            // consumed once), and letting a wide stdin: decode FINISH
+            // would put F16P3 masters on a session with no wide draw
+            // arm — fake color, D6's one forbidden outcome — so the
+            // load dies instead (its Drop sets the terminate flag; the
+            // late replies land inert). clipboard: payloads are always
+            // narrow, so only a wide stdin: load is ever collateral,
+            // on a once-per-session catastrophic path.
+            match state.nav_current.clone() {
+                Some(entry) => {
+                    state.session = None;
+                    action = Some(Rederive::Reopen(entry));
+                }
+                None => {
+                    state.session = None;
+                    action = Some(Rederive::SupersedeVirtual);
+                }
+            }
+        }
+    }
+    match action {
+        Some(Rederive::Refresh) => refresh_current(owner),
+        Some(Rederive::Reopen(entry)) => {
+            // The navigation flow's own re-open shape (a navigation onto
+            // the entry, not a fresh direct entry).
+            request_open(owner, &entry.path, OpenOrigin::Nav(&entry));
+        }
+        Some(Rederive::Clear { stop_timer }) => {
+            eprintln!(
+                "riviv: backend migrated to WARP — wide-gamut master invalidated; no backing file to re-derive, display cleared"
+            );
+            if stop_timer {
+                stop_animation_timer(owner);
+            }
+            refresh_status(owner);
+            // A blanked display can never hide the cursor — same
+            // reconciliation refresh_current runs after its clear.
+            update_cursor(owner);
+            repaint(owner);
+        }
+        Some(Rederive::SupersedeVirtual) => {
+            eprintln!(
+                "riviv: backend migrated to WARP — in-flight virtual load superseded (its color decisions predate the flip)"
+            );
+        }
+        None => {}
+    }
 }
 
 /// Ctrl+Alt+0 — toggle the temporary 1:1 pixel-exact mode (upstream
@@ -3833,14 +4017,18 @@ pub(crate) fn request_open(hwnd: HWND, path: &OsStr, origin: OpenOrigin<'_>) {
 }
 
 /// The request-time decode-input snapshot shared by every load request
-/// — the compositing background and the `icm` flag (#77), snapshot
-/// together so a color/icm change mid-load cannot flip frames already in
-/// flight. (The render viewport the mip pre-generation used to ride
-/// along with died with the #81 mip retirement.)
+/// — the compositing background, the `icm` flag (#77) and the render
+/// backend (#155), snapshot together so a color/icm/backend change
+/// mid-load cannot flip frames already in flight (ONE `DecodeEnv` = ONE
+/// backend: Stage 1's wide-gamut destination decision is a request-time
+/// fact, and a mid-flight flip cannot re-decide frames already decoded
+/// against the old one). (The render viewport the mip pre-generation
+/// used to ride along with died with the #81 mip retirement.)
 fn decode_env(state: &WindowState) -> DecodeEnv {
     DecodeEnv {
         background: state.config.windowed_bg(),
         icm: state.config.icm != 0,
+        backend: crate::transform_stage::Backend::from_effective(state.gpu_kind),
     }
 }
 
@@ -9300,6 +9488,38 @@ mod tests {
         assert_eq!(
             rebuild_kind(RendererKind::Warp, RendererKind::Warp),
             RendererKind::Warp
+        );
+    }
+
+    #[test]
+    fn only_a_kind_change_onto_warp_counts_as_the_wide_master_flip() {
+        // #155's invalidation trigger (pure): a flip ONTO WARP invalidates
+        // every F16P3 master (P3 halves have no mapping there); a
+        // same-kind WARP rebuild is no flip — a WARP session never held a
+        // wide master to protect. Nothing ever flips back to hardware
+        // (rebuild_kind pins WARP after an escalation), so the predicate
+        // only ever answers the "flipped to WARP" direction in practice;
+        // `Auto` cannot survive a live stack either, but the total
+        // function still maps an Auto→Warp transition to a flip.
+        assert!(
+            !backend_flipped_to_warp(RendererKind::Warp, RendererKind::Warp),
+            "a same-kind WARP rebuild protects nothing because there is nothing wide"
+        );
+        assert!(
+            backend_flipped_to_warp(RendererKind::D2d, RendererKind::Warp),
+            "a hardware session escalating to WARP invalidates the wide masters"
+        );
+        assert!(
+            backend_flipped_to_warp(RendererKind::Auto, RendererKind::Warp),
+            "an auto session resolving to WARP invalidates the wide masters"
+        );
+        assert!(
+            !backend_flipped_to_warp(RendererKind::D2d, RendererKind::D2d),
+            "a same-kind hardware rebuild is no flip"
+        );
+        assert!(
+            !backend_flipped_to_warp(RendererKind::Warp, RendererKind::D2d),
+            "nothing re-derives on the impossible return to hardware"
         );
     }
 

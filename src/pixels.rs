@@ -599,17 +599,47 @@ impl PixelFrame {
         }
     }
 
-    /// The f16 master's native entry (#142): `halves` holds exactly
+    /// The f16 master's narrow entry (#142): `halves` holds exactly
     /// `width * height * 4` u16 values (four per pixel, RGBA order),
     /// packed little-endian into the byte buffer. Infallible like the
     /// byte constructors (an allocation failure is a process-level
     /// abort); the space is always [`ContentSpace::F16Srgb`] — these
-    /// ARE the f16 master's own bytes.
+    /// ARE the f16 master's own bytes. Wide-gamut halves (a Stage-1 P3
+    /// destination, #155) enter through [`PixelFrame::from_f16_halves_wide`]
+    /// instead.
     pub(crate) fn from_f16_halves(width: u32, height: u32, halves: Vec<u16>) -> Self {
+        Self::from_f16_halves_in_space(width, height, halves, ContentSpace::F16Srgb)
+    }
+
+    /// The f16 master's WIDE entry (#155, ADR 0004 D2) — the ONLY
+    /// production gate that mints an `F16P3` master: the loader's
+    /// transform arm calls it when the ICC transform's destination is
+    /// the P3 container, and the stored halves then carry P3-primary
+    /// values in the destination gamma domain (8 bytes per pixel
+    /// exactly like the narrow f16 master). Every other constructor is
+    /// narrow by construction.
+    pub(crate) fn from_f16_halves_wide(width: u32, height: u32, halves: Vec<u16>) -> Self {
+        Self::from_f16_halves_in_space(width, height, halves, ContentSpace::F16P3)
+    }
+
+    /// The shared packing of both f16 entries — one copy of the
+    /// little-endian half packing, the content space the only argument
+    /// that differs.
+    fn from_f16_halves_in_space(
+        width: u32,
+        height: u32,
+        halves: Vec<u16>,
+        content_space: ContentSpace,
+    ) -> Self {
         debug_assert_eq!(
             halves.len(),
             width as usize * height as usize * 4,
             "four halves per pixel"
+        );
+        debug_assert_ne!(
+            content_space,
+            ContentSpace::Srgb,
+            "the f16 constructors never mint the 8-bit era's BGRA layout"
         );
         let mut pixels = Vec::with_capacity(halves.len() * 2);
         for h in halves {
@@ -619,7 +649,7 @@ impl PixelFrame {
             pixels: pixels.into_boxed_slice(),
             width,
             height,
-            content_space: ContentSpace::F16Srgb,
+            content_space,
         }
     }
 
@@ -1163,6 +1193,60 @@ mod tests {
         assert_eq!(sample_master_rgb(&frame, 2, 0), None);
         assert_eq!(sample_master_rgb(&frame, -1, 0), None);
         assert_eq!(sample_master_rgb(&frame, 0, 1), None);
+    }
+
+    #[test]
+    fn an_f16p3_master_samples_the_seams_like_the_f16srgb_one() {
+        // #155's structural pin (NOT a color pin — the chromatic
+        // honesty of the read is #156's debt, the transitional arms'
+        // comments say so): the wide master shares the f16 storage
+        // layout, so its direct-read seams run the same 8-byte stride
+        // and the same None-for-out-of-bounds shape.
+        let frame = PixelFrame::from_f16_halves_wide(
+            2,
+            1,
+            vec![
+                0x3C00, 0x3C00, 0x3C00, F16_OPAQUE, 0x3800, 0x3800, 0x3800, F16_OPAQUE,
+            ],
+        );
+        assert_eq!(frame.content_space, ContentSpace::F16P3);
+        assert_eq!(
+            frame.stride(),
+            2 * 8,
+            "8 bytes per pixel, same as the narrow f16"
+        );
+        assert_eq!(sample_master_rgb(&frame, 0, 0), Some((255, 255, 255)));
+        assert_eq!(sample_master_rgb(&frame, 1, 0), Some((128, 128, 128)));
+        assert_eq!(sample_master_rgb(&frame, 2, 0), None);
+        assert_eq!(sample_master_rgb(&frame, -1, 0), None);
+        assert_eq!(sample_master_rgb(&frame, 0, 1), None);
+    }
+
+    #[test]
+    fn the_two_f16_spaces_read_identically_at_the_seams_for_the_same_halves() {
+        // The routing pin: the same batch of halves boxed as F16Srgb and
+        // as F16P3 must produce BIT-IDENTICAL readings at both
+        // direct-read seams — the wide arm routes through the ONE
+        // quantize function (f16_rgba_halves_to_bgra8), never a second
+        // quantizer. Deliberately NOT a color-correctness pin: both
+        // readings are the transitional sRGB-shaped read (#156's debt).
+        let halves = vec![
+            0x3C00, 0x3C00, 0x3C00, F16_OPAQUE, 0x3800, 0x3800, 0x3800, F16_OPAQUE,
+        ];
+        let narrow = PixelFrame::from_f16_halves(2, 1, halves.clone());
+        let wide = PixelFrame::from_f16_halves_wide(2, 1, halves);
+        for (x, y) in [(0i32, 0i32), (1, 0)] {
+            assert_eq!(
+                sample_master_rgb(&narrow, x, y),
+                sample_master_rgb(&wide, x, y),
+                "the status read at ({x},{y}) is the shared quantize arm"
+            );
+        }
+        assert_eq!(
+            master_gdi_bgra(&narrow),
+            master_gdi_bgra(&wide),
+            "the clipboard read is the shared bulk quantize"
+        );
     }
 
     #[test]
