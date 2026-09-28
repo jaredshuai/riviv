@@ -360,8 +360,12 @@ const P3_D50_COLORANTS: [[f64; 3]; 3] = [
 /// panel instead of clipping at the sRGB gamut boundary. Built once per
 /// process from fixed literals (a v2 matrix-shaper, same shape the
 /// equivalence probe trusts in sources) — a pure function of constants,
-/// hence the byte-stable hash the test pins.
-fn p3_destination_profile() -> &'static [u8] {
+/// hence the byte-stable hash the test pins. `pub(crate)` since #156:
+/// the D2D effect graph's SOURCE context reads the same blob
+/// (gpu.rs's `CreateColorContext(CUSTOM, Some(bytes))` — the P-B-probed
+/// form), so the Stage-1 container and the display segment's source
+/// context can never drift apart.
+pub(crate) fn p3_destination_profile() -> &'static [u8] {
     static P3: OnceLock<Vec<u8>> = OnceLock::new();
     P3.get_or_init(|| {
         synthetic_icc(
@@ -786,11 +790,20 @@ fn dst_failure_consequence(wide: bool) -> &'static str {
 /// `Warp` keeps the sRGB destination (today's production behavior,
 /// byte-for-byte). The equivalence-probe path (display_profile.rs)
 /// builds sRGB destinations only and never retargets.
+///
+/// `wide_allowed` is the request-time snapshot of #156's wide-effect
+/// session latch (D6): once the display segment has latched the wide
+/// effects off for the session, new decodes must stop minting F16P3
+/// masters — a wide master on a session whose wide draw arm is latched
+/// would show `WideBlank` forever (the D6 latch's own re-derivation
+/// feeds this, and a NEW load arriving mid-session needs the same
+/// gate). The retarget condition is `Hardware && wide_allowed`.
 pub(crate) fn prepare(
     enabled: bool,
     icc: Option<Vec<u8>>,
     shown: &str,
     backend: crate::transform_stage::Backend,
+    wide_allowed: bool,
 ) -> Option<Transform> {
     if !enabled {
         return None;
@@ -801,10 +814,12 @@ pub(crate) fn prepare(
         // verdicts both mean "no transform" for Stage 1.
         None | Some(EquivalenceProbe::Equivalent) => None,
         Some(EquivalenceProbe::Different(mut transform)) => {
-            // D2's destination selection: wide only on hardware. A
-            // failed retarget keeps the sRGB transform (breadcrumb
-            // already emitted) — identical to the WARP shape below.
-            if backend == crate::transform_stage::Backend::Hardware {
+            // D2's destination selection: wide only on hardware AND only
+            // while the session still runs the wide draw arm (#156's
+            // latch). A failed retarget keeps the sRGB transform
+            // (breadcrumb already emitted) — identical to the WARP shape
+            // below.
+            if backend == crate::transform_stage::Backend::Hardware && wide_allowed {
                 transform.retarget_wide();
             }
             Some(transform)
@@ -1021,7 +1036,7 @@ mod tests {
     fn a_blob_byte_identical_to_srgb_is_skipped_without_a_transform() {
         // L1: the common tagged case — same bytes as the system profile.
         let srgb = require_srgb().to_vec();
-        assert!(prepare(true, Some(srgb), "t", Backend::Warp).is_none());
+        assert!(prepare(true, Some(srgb), "t", Backend::Warp, true).is_none());
     }
 
     #[test]
@@ -1030,13 +1045,13 @@ mod tests {
         // plus the sRGB tone curve — must not round-trip the pixels
         // (the CMM's own pass drifts a few LSBs; tolerance swallows it).
         let _ = require_srgb();
-        assert!(prepare(true, Some(srgb_like_icc()), "t", Backend::Warp).is_none());
+        assert!(prepare(true, Some(srgb_like_icc()), "t", Backend::Warp, true).is_none());
     }
 
     #[test]
     fn a_foreign_profile_transforms_pixels_and_keeps_alpha() {
         let _ = require_srgb();
-        let t = prepare(true, Some(adobe_like_icc()), "t", Backend::Warp)
+        let t = prepare(true, Some(adobe_like_icc()), "t", Backend::Warp, true)
             .expect("an AdobeRGB-like profile transforms");
         // Pure red, an asymmetric color, a midtone gray and a
         // semi-transparent pixel, RGBA in / BGRA out. The first two pin
@@ -1076,7 +1091,7 @@ mod tests {
         let _ = require_srgb();
         for blob in [p3_like_icc(), lin_like_icc()] {
             assert!(
-                prepare(true, Some(blob), "t", Backend::Warp).is_some(),
+                prepare(true, Some(blob), "t", Backend::Warp, true).is_some(),
                 "a genuinely foreign profile must transform"
             );
         }
@@ -1089,8 +1104,8 @@ mod tests {
         // land far from where it started (identity would leave it at
         // 128; the sRGB encode of linear 0.5 sits near 188).
         let _ = require_srgb();
-        let t =
-            prepare(true, Some(lin_like_icc()), "t", Backend::Warp).expect("linLike transforms");
+        let t = prepare(true, Some(lin_like_icc()), "t", Backend::Warp, true)
+            .expect("linLike transforms");
         let src = [128u8, 128, 128, 255];
         let mut dst = [0u8; 4];
         assert!(t.apply(1, 1, &src, &mut dst));
@@ -1101,19 +1116,28 @@ mod tests {
     #[test]
     fn disabled_icm_and_untagged_images_never_build_anything() {
         assert!(
-            prepare(false, Some(adobe_like_icc()), "t", Backend::Warp).is_none(),
+            prepare(false, Some(adobe_like_icc()), "t", Backend::Warp, true).is_none(),
             "icm=0 bypasses"
         );
         assert!(
-            prepare(true, None, "t", Backend::Warp).is_none(),
+            prepare(true, None, "t", Backend::Warp, true).is_none(),
             "no profile, no cost"
         );
     }
 
     #[test]
     fn non_rgb_and_malformed_blobs_are_downgraded() {
-        assert!(prepare(true, Some(header(b"CMYK", 2, b"acsp")), "t", Backend::Warp).is_none());
-        assert!(prepare(true, Some(vec![0u8; 16]), "t", Backend::Warp).is_none());
+        assert!(
+            prepare(
+                true,
+                Some(header(b"CMYK", 2, b"acsp")),
+                "t",
+                Backend::Warp,
+                true
+            )
+            .is_none()
+        );
+        assert!(prepare(true, Some(vec![0u8; 16]), "t", Backend::Warp, true).is_none());
     }
 
     // ---- the 16-bit output chain (#142, ADR 0003 D6) ----
@@ -1128,7 +1152,7 @@ mod tests {
         // R with B/G near zero (the 8-bit arm's asymmetric-color pin,
         // through the master's own quantizer).
         let _ = require_srgb();
-        let t = prepare(true, Some(adobe_like_icc()), "t", Backend::Warp)
+        let t = prepare(true, Some(adobe_like_icc()), "t", Backend::Warp, true)
             .expect("an AdobeRGB-like profile transforms");
         let src = [255u8, 0, 0, 255, 128, 128, 128, 255];
         let Some(halves) = t.apply_f16(2, 1, FrameSrc::Rgba8(&src)) else {
@@ -1155,7 +1179,7 @@ mod tests {
         // format that failed to honor the BGR order would put the value
         // in the wrong channel.
         let _ = require_srgb();
-        let t = prepare(true, Some(adobe_like_icc()), "t", Backend::Warp)
+        let t = prepare(true, Some(adobe_like_icc()), "t", Backend::Warp, true)
             .expect("an AdobeRGB-like profile transforms");
         let src = [0u16, 0, 0xFFFF, 0x8000, 0x8000, 0x8000];
         let halves = t
@@ -1176,8 +1200,8 @@ mod tests {
         // a linear-gamma profile's [128,128,128] must land far from
         // where it started.
         let _ = require_srgb();
-        let t =
-            prepare(true, Some(lin_like_icc()), "t", Backend::Warp).expect("linLike transforms");
+        let t = prepare(true, Some(lin_like_icc()), "t", Backend::Warp, true)
+            .expect("linLike transforms");
         let src = [128u8, 128, 128, 255];
         let halves = t
             .apply_f16(1, 1, FrameSrc::Rgba8(&src))
@@ -1196,7 +1220,7 @@ mod tests {
         // source's own alpha is the loader's job after the pass (the
         // same division the 8-bit arm's x-byte restore follows).
         let _ = require_srgb();
-        let t = prepare(true, Some(adobe_like_icc()), "t", Backend::Warp)
+        let t = prepare(true, Some(adobe_like_icc()), "t", Backend::Warp, true)
             .expect("an AdobeRGB-like profile transforms");
         let src = [200u8, 60, 10, 128];
         let halves = t
@@ -1214,7 +1238,7 @@ mod tests {
         // apply_failed latch means the fallback adds no second failure
         // breadcrumb of its own kind.
         let _ = require_srgb();
-        let t = prepare(true, Some(adobe_like_icc()), "t", Backend::Warp)
+        let t = prepare(true, Some(adobe_like_icc()), "t", Backend::Warp, true)
             .expect("an AdobeRGB-like profile transforms");
         t.force16_fail.set(true);
         assert!(
@@ -1326,7 +1350,7 @@ mod tests {
         // stays full but carries a G component the sRGB destination
         // erases.
         let _ = require_srgb();
-        let wide = prepare(true, Some(adobe_like_icc()), "t", Backend::Hardware)
+        let wide = prepare(true, Some(adobe_like_icc()), "t", Backend::Hardware, true)
             .expect("an AdobeRGB-like profile transforms");
         assert!(wide.destination_is_wide(), "hardware prepares the wide arm");
         let read16 = |halves: &[u16], px: usize, ch: usize| {
@@ -1349,7 +1373,7 @@ mod tests {
             g > 1000,
             "out-of-container red gamut-maps (keeps its hue), got G16={g} (measured 15704)"
         );
-        let srgb = prepare(true, Some(adobe_like_icc()), "t", Backend::Warp)
+        let srgb = prepare(true, Some(adobe_like_icc()), "t", Backend::Warp, true)
             .expect("the control transform prepares");
         let greens = srgb
             .apply_f16(1, 1, FrameSrc::Rgba8(&[0u8, 255, 0, 255]))
@@ -1388,6 +1412,7 @@ mod tests {
             Some(p3_destination_profile().to_vec()),
             "t",
             Backend::Hardware,
+            true,
         )
         .expect("a P3 source transforms");
         // BGR16 source rows: full-scale primaries and white, then
@@ -1441,7 +1466,7 @@ mod tests {
         // D2's destination selection: a genuinely-foreign profile on a
         // HARDWARE session earns the wide container.
         let _ = require_srgb();
-        let t = prepare(true, Some(p3_like_icc()), "t", Backend::Hardware)
+        let t = prepare(true, Some(p3_like_icc()), "t", Backend::Hardware, true)
             .expect("a P3 source transforms");
         assert!(t.destination_is_wide());
     }
@@ -1452,8 +1477,8 @@ mod tests {
         // today's sRGB destination — no F16P3 master can exist where no
         // wide draw arm runs.
         let _ = require_srgb();
-        let t =
-            prepare(true, Some(p3_like_icc()), "t", Backend::Warp).expect("a P3 source transforms");
+        let t = prepare(true, Some(p3_like_icc()), "t", Backend::Warp, true)
+            .expect("a P3 source transforms");
         assert!(!t.destination_is_wide());
     }
 
@@ -1464,7 +1489,7 @@ mod tests {
         // to sRGB and its 16-bit chain works again — destination no
         // longer wide.
         let _ = require_srgb();
-        let mut t = prepare(true, Some(adobe_like_icc()), "t", Backend::Hardware)
+        let mut t = prepare(true, Some(adobe_like_icc()), "t", Backend::Hardware, true)
             .expect("an AdobeRGB-like profile transforms");
         assert!(t.destination_is_wide());
         t.force16_fail.set(true);

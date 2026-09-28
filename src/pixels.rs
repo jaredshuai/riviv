@@ -717,6 +717,209 @@ pub(crate) fn f16_halves_to_bgra8_bulk(pixels: &[u8], dst: &mut [u8]) {
     }
 }
 
+// ---------------------------------------------------------------------
+// The P3→sRGB direct read (#156, ADR 0004 D7/impact item 4): the
+// honest chromatic arm of the direct-read seams. An `F16P3` master's
+// halves carry P3-primary values in the destination profile's gamma
+// domain (the sRGB-shaped TRC); showing them as sRGB code values
+// (what a gamma-only read does) recolors every super-sRGB pixel. This
+// section carries the one pure conversion the status readout and the
+// clipboard copy share: sRGB curve decode → P3-linear → 709-linear
+// (the P-B probe's reference matrix, constants verbatim) → clamp (the
+// seam's 8-bit reading语义: relative colorimetric clip, NOT a pipeline
+// clamp — the effect chain keeps super-gamut values unclipped) → sRGB
+// encode → quantize.
+// ---------------------------------------------------------------------
+
+/// sRGB curve decode (encoded → linear, the continuous piecewise form).
+/// #156's direct-read consumers: the P3 arm's first step (the P3
+/// container's TRC is this curve) and the AC face's letterbox color
+/// (gpu.rs writes LINEAR values into an scRGB-declared target — P-C's
+/// "D2D 对 FP16 target 直写线性值" contract). Monotone over the whole
+/// code range, pinned by test.
+pub(crate) fn srgb_decode(v: f32) -> f32 {
+    if v <= 0.04045 {
+        v / 12.92
+    } else {
+        ((v + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+/// sRGB curve encode (linear → encoded), the P3→sRGB read's last step.
+/// Private: only this module's conversion runs it.
+fn srgb_encode(l: f64) -> f64 {
+    if l <= 0.003_130_8 {
+        l * 12.92
+    } else {
+        1.055 * l.powf(1.0 / 2.4) - 0.055
+    }
+}
+
+/// The seam quantize (the sRGB code value a display would show): the
+/// SAME round-half-up shape [`f16_bits_to_u8_code`] uses, at f64
+/// precision — deliberately NOT routed through that function, whose
+/// f32 multiply could round a boundary value differently. The P3 arm's
+/// input is a matrix result, not a stored half.
+fn u8_code_round_half_up(scaled: f64) -> u8 {
+    if scaled <= 0.0 {
+        0
+    } else if scaled >= 255.0 {
+        255
+    } else {
+        (scaled + 0.5) as u8
+    }
+}
+
+/// The xy→XYZ step of the probe matrix (P-B's reference model, verbatim).
+fn p3read_xy_to_xyz(x: f64, y: f64) -> [f64; 3] {
+    [x / y, 1.0, (1.0 - x - y) / y]
+}
+
+/// 3×3 inverse (P-B's reference model, verbatim) — the matrix build runs
+/// once per process on literals, so the closure-free form is fine.
+fn p3read_inv3(m: &[[f64; 3]; 3]) -> [[f64; 3]; 3] {
+    let d = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+        - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+        + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+    [
+        [
+            (m[1][1] * m[2][2] - m[1][2] * m[2][1]) / d,
+            (m[0][2] * m[2][1] - m[0][1] * m[2][2]) / d,
+            (m[0][1] * m[1][2] - m[0][2] * m[1][1]) / d,
+        ],
+        [
+            (m[1][2] * m[2][0] - m[1][0] * m[2][2]) / d,
+            (m[0][0] * m[2][2] - m[0][2] * m[2][0]) / d,
+            (m[0][2] * m[1][0] - m[0][0] * m[1][2]) / d,
+        ],
+        [
+            (m[1][0] * m[2][1] - m[1][1] * m[2][0]) / d,
+            (m[0][1] * m[2][0] - m[0][0] * m[2][1]) / d,
+            (m[0][0] * m[1][1] - m[0][1] * m[1][0]) / d,
+        ],
+    ]
+}
+
+/// Linear RGB → XYZ from spectral primaries and a white (P-B's reference
+/// model, verbatim): the columns are the primary colorants scaled so
+/// (1,1,1) maps exactly onto the white.
+fn p3read_primaries_to_matrix(
+    rxy: [f64; 2],
+    gxy: [f64; 2],
+    bxy: [f64; 2],
+    white: [f64; 3],
+) -> [[f64; 3]; 3] {
+    let r = p3read_xy_to_xyz(rxy[0], rxy[1]);
+    let g = p3read_xy_to_xyz(gxy[0], gxy[1]);
+    let b = p3read_xy_to_xyz(bxy[0], bxy[1]);
+    let raw = [[r[0], g[0], b[0]], [r[1], g[1], b[1]], [r[2], g[2], b[2]]];
+    let inv = p3read_inv3(&raw);
+    let s = [
+        inv[0][0] * white[0] + inv[0][1] * white[1] + inv[0][2] * white[2],
+        inv[1][0] * white[0] + inv[1][1] * white[1] + inv[1][2] * white[2],
+        inv[2][0] * white[0] + inv[2][1] * white[1] + inv[2][2] * white[2],
+    ];
+    [
+        [r[0] * s[0], g[0] * s[1], b[0] * s[2]],
+        [r[1] * s[0], g[1] * s[1], b[1] * s[2]],
+        [r[2] * s[0], g[2] * s[1], b[2] * s[2]],
+    ]
+}
+
+/// P3 primaries' xy chromaticities (P-B probe constants, verbatim).
+const P3READ_P3_RXY: [f64; 2] = [0.680, 0.320];
+const P3READ_P3_GXY: [f64; 2] = [0.265, 0.690];
+const P3READ_P3_BXY: [f64; 2] = [0.150, 0.060];
+/// sRGB (= BT.709) primaries' xy chromaticities (P-B probe constants,
+/// verbatim — 709 and sRGB share the primaries; the curves differ, and
+/// the curves live in [`srgb_decode`]/[`srgb_encode`], not here).
+const P3READ_SRGB_RXY: [f64; 2] = [0.640, 0.330];
+const P3READ_SRGB_GXY: [f64; 2] = [0.300, 0.600];
+const P3READ_SRGB_BXY: [f64; 2] = [0.150, 0.060];
+
+/// The P3-linear → 709-linear matrix, built once per process: M =
+/// m709⁻¹ · p3_d65 from the probe constants (f64 throughout — the seam
+/// is a per-pixel read, not a pipeline hot path). Row sums are 1.0 to
+/// f64 rounding, so the neutral axis passes through untouched — pinned
+/// over all 256 code values.
+fn p3_to_709_matrix() -> &'static [[f64; 3]; 3] {
+    static M: std::sync::OnceLock<[[f64; 3]; 3]> = std::sync::OnceLock::new();
+    M.get_or_init(|| {
+        let d65 = p3read_xy_to_xyz(0.3127, 0.3290);
+        let p3_d65 = p3read_primaries_to_matrix(P3READ_P3_RXY, P3READ_P3_GXY, P3READ_P3_BXY, d65);
+        let m709 =
+            p3read_primaries_to_matrix(P3READ_SRGB_RXY, P3READ_SRGB_GXY, P3READ_SRGB_BXY, d65);
+        let m709_inv = p3read_inv3(&m709);
+        let mut out = [[0.0f64; 3]; 3];
+        for (row, m_row) in out.iter_mut().enumerate() {
+            for (cell, m_cell) in m_row.iter_mut().enumerate() {
+                *m_cell = m709_inv[row][0] * p3_d65[0][cell]
+                    + m709_inv[row][1] * p3_d65[1][cell]
+                    + m709_inv[row][2] * p3_d65[2][cell];
+            }
+        }
+        out
+    })
+}
+
+/// One `F16P3` master pixel as the 8-bit BGRA its sRGB-facing consumers
+/// show: f16 → f32 → sRGB decode (P3-encoded → P3-linear) → the P3→709
+/// matrix → clamp (relative colorimetric clip: the seam shows what an
+/// sRGB display shows of the color; recorded semantics of an 8-bit
+/// reading, not a pipeline clamp — the effect chain keeps super-gamut
+/// values unclipped end to end) → sRGB encode → the round-half-up
+/// quantize. BGRA order like its F16Srgb sibling
+/// [`f16_rgba_halves_to_bgra8`], alpha forced opaque.
+pub(crate) fn p3_halves_to_srgb8(px: [u16; 4]) -> [u8; 4] {
+    let m = p3_to_709_matrix();
+    let lin_p3 = [
+        f64::from(srgb_decode(f16_bits_to_f32(px[0]))),
+        f64::from(srgb_decode(f16_bits_to_f32(px[1]))),
+        f64::from(srgb_decode(f16_bits_to_f32(px[2]))),
+    ];
+    let lin_709 = [
+        m[0][0] * lin_p3[0] + m[0][1] * lin_p3[1] + m[0][2] * lin_p3[2],
+        m[1][0] * lin_p3[0] + m[1][1] * lin_p3[1] + m[1][2] * lin_p3[2],
+        m[2][0] * lin_p3[0] + m[2][1] * lin_p3[1] + m[2][2] * lin_p3[2],
+    ];
+    [
+        u8_code_round_half_up(255.0 * srgb_encode(lin_709[2].clamp(0.0, 1.0))), // B
+        u8_code_round_half_up(255.0 * srgb_encode(lin_709[1].clamp(0.0, 1.0))), // G
+        u8_code_round_half_up(255.0 * srgb_encode(lin_709[0].clamp(0.0, 1.0))), // R
+        255,
+    ]
+}
+
+/// The whole-frame bulk of [`p3_halves_to_srgb8`] (the clipboard seam's
+/// honest wide arm): `pixels` holds the master's 8-byte-per-pixel halves,
+/// `dst` the 4-byte-per-pixel BGRA reading — the same shape contract as
+/// [`f16_halves_to_bgra8_bulk`], the P3 matrix instead of the
+/// pass-through quantize.
+pub(crate) fn p3_halves_to_bgra8_bulk(pixels: &[u8], dst: &mut [u8]) {
+    let (src, src_tail) = pixels.as_chunks::<8>();
+    debug_assert!(
+        src_tail.is_empty(),
+        "the f16 master holds exactly 8 bytes per pixel"
+    );
+    let (out, dst_tail) = dst.as_chunks_mut::<4>();
+    debug_assert!(
+        dst_tail.is_empty(),
+        "dst must hold exactly 4 bytes per pixel"
+    );
+    debug_assert_eq!(src.len(), out.len(), "one half quadruple per BGRA quad");
+    let halves = |b: &[u8; 8]| {
+        [
+            u16::from_le_bytes([b[0], b[1]]),
+            u16::from_le_bytes([b[2], b[3]]),
+            u16::from_le_bytes([b[4], b[5]]),
+            u16::from_le_bytes([b[6], b[7]]),
+        ]
+    };
+    for (d, s) in out.iter_mut().zip(src) {
+        *d = p3_halves_to_srgb8(halves(s));
+    }
+}
+
 /// One pixel of a top-down tightly-packed BGRA buffer as its raw
 /// [B, G, R, A] quadruple — the shared shape of [`sample_bgra`] and the
 /// Srgb arm of [`sample_master_rgb`]. `None` for any out-of-bounds
@@ -771,15 +974,16 @@ pub(crate) fn sample_bgra(pixels: &[u8], width: i32, x: i32, y: i32) -> Option<(
 pub(crate) fn sample_master_rgb(frame: &PixelFrame, x: i32, y: i32) -> Option<(u8, u8, u8)> {
     let [b, g, r, _] = match frame.content_space {
         ContentSpace::Srgb => sample_bgra_pixel(&frame.pixels, frame.width as i32, x, y)?,
-        // #154 transitional arm: an F16P3 master's P3-encoded halves are
-        // read as if they were sRGB code values — chromatically
-        // dishonest. The honest P3→sRGB direct-read conversion is the
-        // L2 direct-read seam ticket (#156, ADR 0004 impact item 4).
-        // Unreachable at runtime before #155 produces an F16P3 master,
-        // so there is nothing to observe; no output-byte pin is written
-        // against this arm on purpose (never pin a lie).
-        ContentSpace::F16Srgb | ContentSpace::F16P3 => {
+        // The two f16 spaces diverge chromatically (#156): an F16Srgb
+        // master's halves ARE sRGB code values (the one quantize read),
+        // an F16P3 master's are P3 values in the container's gamma
+        // domain — the honest read maps them into sRGB
+        // ([`p3_halves_to_srgb8`]) instead of recoloring them.
+        ContentSpace::F16Srgb => {
             f16_rgba_halves_to_bgra8(sample_f16_pixel(&frame.pixels, frame.width as i32, x, y)?)
+        }
+        ContentSpace::F16P3 => {
+            p3_halves_to_srgb8(sample_f16_pixel(&frame.pixels, frame.width as i32, x, y)?)
         }
     };
     Some((r, g, b))
@@ -795,15 +999,18 @@ pub(crate) fn sample_master_rgb(frame: &PixelFrame, x: i32, y: i32) -> Option<(u
 pub(crate) fn master_gdi_bgra(frame: &PixelFrame) -> Vec<u8> {
     match frame.content_space {
         ContentSpace::Srgb => frame.pixels.to_vec(),
-        // #154 transitional arm (same story as [`sample_master_rgb`]):
-        // an F16P3 master's P3-encoded halves quantize through the
-        // sRGB-shaped arm — chromatically dishonest until #156's honest
-        // P3→sRGB direct-read seam lands. Unreachable before #155
-        // produces an F16P3 master; no output-byte pin against this arm
-        // on purpose (never pin a lie).
-        ContentSpace::F16Srgb | ContentSpace::F16P3 => {
+        // The F16Srgb arm quantizes through the one read point; the F16P3
+        // arm runs the honest P3→sRGB conversion (#156) — GDI's 8-bit face
+        // shows what an sRGB display shows of the wide color, not a
+        // recolored misreading of the container's bytes.
+        ContentSpace::F16Srgb => {
             let mut out = vec![0u8; frame.pixels.len() / 2];
             f16_halves_to_bgra8_bulk(&frame.pixels, &mut out);
+            out
+        }
+        ContentSpace::F16P3 => {
+            let mut out = vec![0u8; frame.pixels.len() / 2];
+            p3_halves_to_bgra8_bulk(&frame.pixels, &mut out);
             out
         }
     }
@@ -1196,57 +1403,226 @@ mod tests {
     }
 
     #[test]
-    fn an_f16p3_master_samples_the_seams_like_the_f16srgb_one() {
-        // #155's structural pin (NOT a color pin — the chromatic
-        // honesty of the read is #156's debt, the transitional arms'
-        // comments say so): the wide master shares the f16 storage
-        // layout, so its direct-read seams run the same 8-byte stride
-        // and the same None-for-out-of-bounds shape.
+    fn an_f16p3_master_reads_the_honest_srgb_values_at_the_seams() {
+        // #156's honest wide arm: an F16P3 master's P3 halves map into
+        // sRGB through the reference matrix before the seam shows them —
+        // neutral values pass through untouched (the matrix keeps the
+        // gray axis: white stays 255, the 0.5 half stays 128, the same
+        // numbers the F16Srgb arm would read), while a wide primary
+        // clips to the sRGB gamut boundary the way an sRGB display would
+        // show it — P3 red (1,0,0) reads as pure red, never as the raw
+        // halves' sRGB misreading.
         let frame = PixelFrame::from_f16_halves_wide(
-            2,
+            3,
             1,
             vec![
-                0x3C00, 0x3C00, 0x3C00, F16_OPAQUE, 0x3800, 0x3800, 0x3800, F16_OPAQUE,
+                0x3C00, 0x3C00, 0x3C00, F16_OPAQUE, 0x3800, 0x3800, 0x3800, F16_OPAQUE, 0x3C00,
+                0x0000, 0x0000, F16_OPAQUE,
             ],
         );
         assert_eq!(frame.content_space, ContentSpace::F16P3);
         assert_eq!(
             frame.stride(),
-            2 * 8,
+            3 * 8,
             "8 bytes per pixel, same as the narrow f16"
         );
         assert_eq!(sample_master_rgb(&frame, 0, 0), Some((255, 255, 255)));
         assert_eq!(sample_master_rgb(&frame, 1, 0), Some((128, 128, 128)));
-        assert_eq!(sample_master_rgb(&frame, 2, 0), None);
+        assert_eq!(
+            sample_master_rgb(&frame, 2, 0),
+            Some((255, 0, 0)),
+            "P3 red is outside sRGB: relative colorimetric clips to the gamut boundary"
+        );
+        // The None-for-out-of-bounds contract holds on the wide arm too.
+        assert_eq!(sample_master_rgb(&frame, 3, 0), None);
         assert_eq!(sample_master_rgb(&frame, -1, 0), None);
         assert_eq!(sample_master_rgb(&frame, 0, 1), None);
     }
 
     #[test]
-    fn the_two_f16_spaces_read_identically_at_the_seams_for_the_same_halves() {
-        // The routing pin: the same batch of halves boxed as F16Srgb and
-        // as F16P3 must produce BIT-IDENTICAL readings at both
-        // direct-read seams — the wide arm routes through the ONE
-        // quantize function (f16_rgba_halves_to_bgra8), never a second
-        // quantizer. Deliberately NOT a color-correctness pin: both
-        // readings are the transitional sRGB-shaped read (#156's debt).
-        let halves = vec![
+    fn gray_halves_read_identically_across_both_f16_spaces_chromatic_halves_diverge() {
+        // The two spaces' seam dispatch, after #156: the neutral axis is
+        // preserved by the P3→sRGB matrix (row sums 1.0), so GRAY halves
+        // read bit-identically through either arm — but a chromatic half
+        // must now diverge: the wide arm maps P3 primaries into sRGB
+        // (clipping), the narrow arm passes its sRGB halves through, and
+        // identical bits mean different colors in the two containers.
+        let neutral = vec![
             0x3C00, 0x3C00, 0x3C00, F16_OPAQUE, 0x3800, 0x3800, 0x3800, F16_OPAQUE,
         ];
-        let narrow = PixelFrame::from_f16_halves(2, 1, halves.clone());
-        let wide = PixelFrame::from_f16_halves_wide(2, 1, halves);
+        let narrow = PixelFrame::from_f16_halves(2, 1, neutral.clone());
+        let wide = PixelFrame::from_f16_halves_wide(2, 1, neutral);
         for (x, y) in [(0i32, 0i32), (1, 0)] {
             assert_eq!(
                 sample_master_rgb(&narrow, x, y),
                 sample_master_rgb(&wide, x, y),
-                "the status read at ({x},{y}) is the shared quantize arm"
+                "the neutral axis is matrix-transparent: ({x},{y}) reads the same"
             );
         }
+        assert_eq!(master_gdi_bgra(&narrow), master_gdi_bgra(&wide));
+        // The chromatic contrast: P3 red halves. The narrow container has
+        // no P3 semantics — but the wide arm's clip and the pass-through
+        // quantize DISAGREE on what (1,0,0) shows, and the wide arm's
+        // answer is the honest one (255,0,0 either way HERE, so pin the
+        // bulk + the warm mid-gamut sample where the values truly move).
+        let red = vec![0x3C00, 0x0000, 0x0000, F16_OPAQUE];
+        let red_wide = PixelFrame::from_f16_halves_wide(1, 1, red);
         assert_eq!(
-            master_gdi_bgra(&narrow),
-            master_gdi_bgra(&wide),
-            "the clipboard read is the shared bulk quantize"
+            sample_master_rgb(&red_wide, 0, 0),
+            Some((255, 0, 0)),
+            "P3 red clips to the sRGB red boundary"
         );
+    }
+
+    #[test]
+    fn the_p3_to_srgb_matrix_maps_the_reference_battery_to_pinned_codes() {
+        // The seam conversion against the independently-computed
+        // reference battery (the P-B probe's reference model run through
+        // the same decode→matrix→clamp→encode→quantize chain): the wide
+        // primaries clip to their sRGB boundaries, the gray axis is
+        // EXACT for all 256 code values, and a mid-gamut chromatic
+        // sample pins the matrix off the primaries.
+        let m = p3_to_709_matrix();
+        let conv = |enc: [f32; 3]| -> [u8; 3] {
+            let [b, g, r, _] = p3_halves_to_srgb8([
+                crate::pixels::f32_to_f16_bits(enc[0]),
+                crate::pixels::f32_to_f16_bits(enc[1]),
+                crate::pixels::f32_to_f16_bits(enc[2]),
+                F16_OPAQUE,
+            ]);
+            [r, g, b]
+        };
+        assert_eq!(conv([1.0, 0.0, 0.0]), [255, 0, 0], "P3 red clips");
+        assert_eq!(conv([0.0, 1.0, 0.0]), [0, 255, 0], "P3 green clips");
+        assert_eq!(conv([0.0, 0.0, 1.0]), [0, 0, 255], "P3 blue clips");
+        assert_eq!(conv([1.0, 1.0, 1.0]), [255, 255, 255]);
+        assert_eq!(
+            conv([0.86, 0.65, 0.52]),
+            [229, 163, 127],
+            "the warm mid-gamut sample pins the matrix itself"
+        );
+        assert_eq!(
+            conv([224.0 / 255.0, 172.0 / 255.0, 105.0 / 255.0]),
+            [234, 169, 92],
+            "the skin sample pins the matrix's low end"
+        );
+        // The neutral axis: every gray code maps to itself, exactly.
+        for code in 0..=255u32 {
+            let e = code as f32 / 255.0;
+            assert_eq!(
+                conv([e, e, e]),
+                [code as u8; 3],
+                "gray {code} must pass through untouched (row sums 1.0)"
+            );
+        }
+        // And the matrix is what the pinned construction says (the
+        // probe's m709⁻¹·p3_d65), row sums at f64 unity.
+        for row in m {
+            assert!((row.iter().sum::<f64>() - 1.0).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn an_srgb_red_stored_in_the_p3_container_carries_the_234_51_35_halves_and_reads_back_red() {
+        // The container's own quantize signature, pinned for the record:
+        // sRGB red ENCODED into the P3 container (the same color the
+        // narrow master stores as 255/0/0) lands on P3 halves whose naive
+        // u8 view is (234, 51, 35) — the exact numbers the transitional
+        // arm used to show. The honest seam reads those halves BACK to
+        // (255, 0, 0): the round trip closes and the misreading is gone.
+        let p3_enc = {
+            // sRGB red linear → P3 linear → P3-encoded, via the pinned
+            // matrix inverse (independent of the seam's own path).
+            let m = *p3_to_709_matrix();
+            let lin709 = [1.0f64, 0.0, 0.0];
+            // invert M by adjugate on the fly (test-only 3×3 inverse)
+            let det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+                - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+                + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+            let inv = [
+                [
+                    (m[1][1] * m[2][2] - m[1][2] * m[2][1]) / det,
+                    (m[0][2] * m[2][1] - m[0][1] * m[2][2]) / det,
+                    (m[0][1] * m[1][2] - m[0][2] * m[1][1]) / det,
+                ],
+                [
+                    (m[1][2] * m[2][0] - m[1][0] * m[2][2]) / det,
+                    (m[0][0] * m[2][2] - m[0][2] * m[2][0]) / det,
+                    (m[0][2] * m[1][0] - m[0][0] * m[1][2]) / det,
+                ],
+                [
+                    (m[1][0] * m[2][1] - m[1][1] * m[2][0]) / det,
+                    (m[0][1] * m[2][0] - m[0][0] * m[2][1]) / det,
+                    (m[0][0] * m[1][1] - m[0][1] * m[1][0]) / det,
+                ],
+            ];
+            let lin_p3 = [
+                inv[0][0] * lin709[0] + inv[0][1] * lin709[1] + inv[0][2] * lin709[2],
+                inv[1][0] * lin709[0] + inv[1][1] * lin709[1] + inv[1][2] * lin709[2],
+                inv[2][0] * lin709[0] + inv[2][1] * lin709[1] + inv[2][2] * lin709[2],
+            ];
+            lin_p3.map(srgb_encode)
+        };
+        let halves: Vec<u16> = p3_enc
+            .into_iter()
+            .map(|v| f32_to_f16_bits(v as f32))
+            .chain([F16_OPAQUE])
+            .collect();
+        // The halves' naive sRGB view is the pinned (234, 51, 35) triple.
+        let naive: Vec<u8> = halves[..3]
+            .iter()
+            .map(|&h| f16_bits_to_u8_code(h))
+            .collect();
+        assert_eq!(naive, vec![234, 51, 35]);
+        // The honest read of the same halves: sRGB red, exactly.
+        let frame = PixelFrame::from_f16_halves_wide(1, 1, halves);
+        assert_eq!(sample_master_rgb(&frame, 0, 0), Some((255, 0, 0)));
+    }
+
+    #[test]
+    fn srgb_decode_is_monotone_and_inverts_the_encode_curve_over_the_code_range() {
+        // The AC-face letterbox and the P3 seam share this curve: over
+        // all 256 sRGB code values it must be monotone, and the encode
+        // side (the seam's last step) must invert it to f32 precision.
+        let mut prev = -1.0f32;
+        for code in 0..=255u32 {
+            let e = code as f32 / 255.0;
+            let l = srgb_decode(e);
+            assert!(l > prev || code == 0, "decode must be monotone at {code}");
+            prev = l;
+            let back = srgb_encode(f64::from(l));
+            assert!(
+                (back - f64::from(e)).abs() < 1e-5,
+                "encode(decode({code}/255)) must round-trip, got {back}"
+            );
+        }
+        // The curve's own reference points.
+        assert_eq!(srgb_decode(0.0), 0.0);
+        assert_eq!(srgb_decode(1.0), 1.0);
+        assert!((srgb_decode(0.04045) - 0.04045 / 12.92).abs() < 1e-9);
+    }
+
+    #[test]
+    fn the_p3_bulk_clipboard_conversion_matches_the_per_pixel_seam() {
+        // The clipboard seam's wide arm: the whole-frame bulk equals the
+        // per-pixel seam read at every pixel — one conversion, two
+        // granularities (the same shape contract the narrow bulk pins).
+        let frame = PixelFrame::from_f16_halves_wide(
+            2,
+            1,
+            vec![
+                0x3C00, 0x3C00, 0x3C00, F16_OPAQUE, 0x3C00, 0x0000, 0x0000, F16_OPAQUE,
+            ],
+        );
+        let bulk = master_gdi_bgra(&frame);
+        assert_eq!(bulk.len(), frame.pixels.len() / 2, "4 bytes per pixel");
+        for (x, px) in bulk.as_chunks::<4>().0.iter().enumerate() {
+            let expected = p3_halves_to_srgb8(
+                sample_f16_pixel(&frame.pixels, frame.width as i32, x as i32, 0)
+                    .expect("in-bounds pixel"),
+            );
+            assert_eq!(*px, expected, "pixel {x}");
+        }
     }
 
     #[test]
@@ -1573,5 +1949,218 @@ mod tests {
         let mut back = vec![0u8; src.len()];
         rotate_f16_270_cw(&cw, 3, 2, &mut back);
         assert_eq!(back, src, "90 + 270 restores every half bit for bit");
+    }
+
+    // ---- smoke #156 (env-gated, run only by smoke/smoke156-acarm.ps1) ----
+
+    /// The smoke's ICC emitter: writes riviv's own P3 destination profile
+    /// (the byte-stable 6680-byte blob the digest test pins) to the path
+    /// named by RIVIV_S156_ICC so the PowerShell fixture writer can embed
+    /// it as the wide PNG's iCCP — the same bytes the AC face's source
+    /// color context carries, so the fixture and the display segment can
+    /// never drift apart. Ignored: touches the filesystem and is
+    /// meaningless outside the smoke.
+    #[test]
+    #[ignore = "smoke #156 fixture emitter: needs RIVIV_S156_ICC (env-gated)"]
+    fn smoke156_write_p3_profile() {
+        let path = std::env::var("RIVIV_S156_ICC")
+            .expect("RIVIV_S156_ICC must name the output path for the P3 destination profile");
+        let blob = crate::icm::p3_destination_profile();
+        assert_eq!(
+            blob.len(),
+            6680,
+            "the pinned P3 destination profile byte count"
+        );
+        std::fs::write(&path, blob).expect("write the P3 destination profile bytes");
+    }
+
+    /// f16 ULP at v's magnitude: the distance between the two f16
+    /// representations adjacent to |v|'s rounded half (the oracle's
+    /// scale-relative error bound; self-implemented per the P-B
+    /// calibration — no crate half-ULP helper exists in this build).
+    fn smoke156_f16_ulp(v: f32) -> f32 {
+        let a = v.abs();
+        let h = f32_to_f16_bits(a);
+        let center = f16_bits_to_f32(h);
+        let up = if h >= 0x7BFF {
+            center
+        } else {
+            f16_bits_to_f32(h + 1)
+        };
+        let down = if h == 0 { 0.0 } else { f16_bits_to_f32(h - 1) };
+        (up - center).max(center - down)
+    }
+
+    /// The half-exact oracle (smoke #156): the AC-face dump's scRGB halves
+    /// against the production mscms chain's own output. Reference = decode
+    /// the fixture PNG with the image crate (the production decoder
+    /// dependency), take its iCCP bytes through the same
+    /// `icc_profile()` seam loader.rs reads, and run the SAME
+    /// `prepare`/`apply_f16` production call the loader makes on a
+    /// hardware session with a genuinely-foreign profile — a deterministic
+    /// mscms transform, so run-to-run equality holds. Expected scRGB = the
+    /// pure Rust model over the reference halves: sRGB curve decode (the
+    /// P3 container's own TRC — [`srgb_decode`]) -> the P3-linear ->
+    /// 709-linear matrix -> 709 LINEAR, NO clamp (the reference is the
+    /// unclamped linear value the AC effect chain converts; the seam's
+    /// clamp is an 8-bit reading semantics, not a pipeline clamp). The
+    /// matrix is `p3_to_709_matrix()` — a private parent-module fn visible
+    /// here, and the SAME P-B probe constants it builds from are pinned
+    /// against the independent reference battery by
+    /// `the_p3_to_srgb_matrix_maps_the_reference_battery_to_pinned_codes`,
+    /// so the model cannot drift with the seam. Comparison — BOTH forms of
+    /// the ADR 0004 D7 threshold menu (P-B's calibration), a channel
+    /// passes if EITHER holds: the BANDED form (|expected| >= 0.02 ->
+    /// error <= 4 f16 ULP at that magnitude; |expected| < 0.02 -> <= 5e-4
+    /// absolute) or the SINGLE-VALUE form (<= 2e-3 f32-linear). The full
+    /// viewport sweep (unlike P-B's 48-channel battery) exposed the
+    /// banded form's banding-edge artifact P-B itself documented: on
+    /// out-of-gamut cancellation pixels (small negative R where
+    /// |M01·l1| >> |result|) the xy-derived-vs-profile-colorant matrix
+    /// provenance difference lands at ~4.1 ULP (absolute ~6e-5, far under
+    /// the 5e-4 the near-zero band grants for SMALLER magnitudes), so the
+    /// banded bound alone has no headroom there while the single-value
+    /// form passes with ~1.4x headroom (sweep max 1.399e-3). Banded-only
+    /// excesses are counted and printed as diagnostics, not failures.
+    /// Failures print the first violating pixels'
+    /// (x, y, ch, got, exp, err). Ignored: needs RIVIV_S156_DUMP (the AC
+    /// dump's .f16 file) + RIVIV_S156_PNG (the wide-ICC fixture).
+    #[test]
+    #[ignore = "smoke #156 oracle: needs RIVIV_S156_DUMP + RIVIV_S156_PNG (env-gated)"]
+    fn smoke156_half_oracle() {
+        use image::ImageDecoder as _;
+        let dump_path = std::env::var("RIVIV_S156_DUMP")
+            .expect("RIVIV_S156_DUMP must name the AC-face dump's .f16 file");
+        let png_path = std::env::var("RIVIV_S156_PNG")
+            .expect("RIVIV_S156_PNG must name the wide-ICC fixture PNG");
+        // The fixture decode, loader.rs's own shape (open -> guess format
+        // -> decoder while the metadata is still readable).
+        let reader = image::ImageReader::open(&png_path)
+            .expect("open the fixture PNG")
+            .with_guessed_format()
+            .expect("sniff the fixture PNG format");
+        let mut decoder = reader.into_decoder().expect("build the fixture decoder");
+        let (w, h) = decoder.dimensions();
+        assert!(w > 0 && h > 0, "the fixture must have a real size");
+        let icc = decoder
+            .icc_profile()
+            .expect("icc_profile() on the fixture PNG")
+            .expect("the fixture PNG must carry an iCCP profile");
+        let mut rgba = vec![0u8; usize::try_from(decoder.total_bytes()).expect("total bytes")];
+        decoder
+            .read_image(&mut rgba)
+            .expect("decode the fixture PNG to RGBA8");
+        assert_eq!(
+            rgba.len(),
+            w as usize * h as usize * 4,
+            "the fixture must decode as RGBA8 (four bytes per pixel)"
+        );
+        // The production reference: the same mscms wide-destination call
+        // the loader runs on a hardware session (prepare's D2 gate).
+        let transform = crate::icm::prepare(
+            true,
+            Some(icc),
+            "s156-oracle",
+            crate::transform_stage::Backend::Hardware,
+            true,
+        )
+        .expect("the fixture's foreign profile must prepare a transform");
+        assert!(
+            transform.destination_is_wide(),
+            "the reference must carry the wide P3 destination"
+        );
+        let reference = transform
+            .apply_f16(w, h, crate::icm::FrameSrc::Rgba8(&rgba))
+            .expect("the reference wide 16-bit pass must succeed");
+        assert_eq!(
+            reference.len(),
+            w as usize * h as usize * 4,
+            "four halves per reference pixel"
+        );
+        // The dump: raw little-endian u16 RGBA quadruples, w*h*4 of them.
+        let dump_bytes = std::fs::read(&dump_path).expect("read the AC dump .f16");
+        assert_eq!(
+            dump_bytes.len(),
+            w as usize * h as usize * 8,
+            "the dump holds {w}x{h} pixels at 8 bytes each"
+        );
+        let matrix = *p3_to_709_matrix();
+        let half_at = |px: usize, ch: usize| -> u16 {
+            let o = (px * 4 + ch) * 2;
+            u16::from_le_bytes([dump_bytes[o], dump_bytes[o + 1]])
+        };
+        let w_us = w as usize;
+        let mut alpha_bad: Vec<String> = Vec::new();
+        let mut violations: Vec<String> = Vec::new();
+        let mut viol_count = 0usize;
+        let mut banded_excess = 0usize;
+        let mut max_err = 0.0f64;
+        for px in 0..(w_us * h as usize) {
+            if half_at(px, 3) != F16_OPAQUE && alpha_bad.len() < 8 {
+                alpha_bad.push(format!(
+                    "px {px} (x={}, y={}) alpha=0x{:04X}",
+                    px % w_us,
+                    px / w_us,
+                    half_at(px, 3)
+                ));
+            }
+            let lin_p3 = [
+                f64::from(srgb_decode(f16_bits_to_f32(reference[px * 4]))),
+                f64::from(srgb_decode(f16_bits_to_f32(reference[px * 4 + 1]))),
+                f64::from(srgb_decode(f16_bits_to_f32(reference[px * 4 + 2]))),
+            ];
+            for (ch, m_row) in matrix.iter().enumerate() {
+                let exp = m_row[0] * lin_p3[0] + m_row[1] * lin_p3[1] + m_row[2] * lin_p3[2];
+                let got = f64::from(f16_bits_to_f32(half_at(px, ch)));
+                let err = (got - exp).abs();
+                max_err = max_err.max(err);
+                let banded = if exp.abs() >= 0.02 {
+                    4.0 * f64::from(smoke156_f16_ulp(exp as f32))
+                } else {
+                    5.0e-4
+                };
+                // Both forms of the ADR D7 menu: the banded bound OR the
+                // single-value 2e-3 linear cap. A banded-only excess (the
+                // banding-edge artifact on out-of-gamut cancellation
+                // pixels) is a counted diagnostic, not a failure.
+                if err > 2.0e-3 {
+                    viol_count += 1;
+                    if violations.len() < 16 {
+                        violations.push(format!(
+                            "px {px} (x={}, y={}) ch={ch}: got={got:.6} exp={exp:.6} err={err:.3e} banded={banded:.3e}",
+                            px % w_us,
+                            px / w_us
+                        ));
+                    }
+                } else if err > banded {
+                    banded_excess += 1;
+                }
+            }
+        }
+        assert!(
+            alpha_bad.is_empty(),
+            "every dump alpha half must be 0x3C00 (f16 1.0); first offenders: {:?}",
+            alpha_bad
+        );
+        assert!(
+            max_err <= 2.0e-3,
+            "the global max linear error {max_err:.3e} exceeds the ADR single-value bound 2e-3"
+        );
+        assert!(
+            viol_count == 0,
+            "{viol_count} pixel-channel violations beyond the ADR D7 threshold menu \
+             (banded 4-ULP/5e-4 OR single-value 2e-3); max linear error {max_err:.3e}; \
+             first offenders: {}",
+            violations.join(" | ")
+        );
+        // The banded-only excess is EXPECTED on a full-viewport sweep (the
+        // out-of-gamut cancellation regime P-B's battery never sampled) —
+        // reported so a future regression in the effect's own precision
+        // trend is visible in the smoke log.
+        eprintln!(
+            "s156-oracle: {}/{} channels beyond the banded bound, all within the single-value 2e-3; max linear error {max_err:.3e}",
+            banded_excess,
+            w_us * h as usize * 3
+        );
     }
 }
