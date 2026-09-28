@@ -18,6 +18,11 @@ image = { version = "0.25", default-features = false, features = [
     "gif",
     "webp",
 ] }
+# SVG 解码臂(#152):resvg full 档 = 依赖原则③ size-exception 破例,用户已
+# 拍板接受 +3.92 MiB(s-svg.md F4 实测 / ADR 0005 录案);默认 feature 面与
+# spike 实测档位逐一相同(svgz 嗅探侧不放行,见 src/svg.rs)。usvg/tiny-skia
+# 经 resvg 重导出取用,不另列直接依赖(防 feature 面漂移)。
+resvg = "0.48.1"
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Globalization",

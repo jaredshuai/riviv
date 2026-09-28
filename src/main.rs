@@ -126,6 +126,7 @@ mod shell;
 mod slideshow;
 mod status;
 mod surface;
+mod svg;
 mod text;
 mod tile;
 mod toolbar;
