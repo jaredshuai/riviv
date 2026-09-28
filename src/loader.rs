@@ -26,7 +26,8 @@
 //! as a stuck load instead, which is visible.
 
 use std::ffi::OsStr;
-use std::io::{BufRead, Cursor, Seek};
+use std::fs::File;
+use std::io::{BufRead, BufReader, Cursor, Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -147,12 +148,19 @@ enum Stop {
 /// = `!wide_effect_latched`): a session that latched the wide draw arm
 /// off must stop minting F16P3 masters for NEW decodes too, or every
 /// fresh load would re-widen and re-blank (the D6 latch's re-derivation
-/// channel and this term together close the loop).
+/// channel and this term together close the loop). #152 adds the SVG
+/// raster target's own request-time input (`viewport` = the view child's
+/// client area when the snapshot is taken; `(0, 0)` = unknown, the SVG
+/// arm falls back to its default face): the raster target is decided
+/// against it (natural at fit, viewport-fit with the intermediate floor
+/// below), so a window resized mid-load must not change the target of
+/// the decode already in flight — same snapshot discipline as `icm`.
 pub(crate) struct DecodeEnv {
     pub(crate) background: [u8; 3],
     pub(crate) icm: bool,
     pub(crate) backend: crate::transform_stage::Backend,
     pub(crate) wide_allowed: bool,
+    pub(crate) viewport: (u32, u32),
 }
 
 pub(crate) fn decode_to_sink(
@@ -186,7 +194,14 @@ pub(crate) fn decode_bytes_to_sink(
     // Sniff the format from the stream contents exactly like the file
     // path does (renamed/extensionless pipes still decode); the shown
     // name prefix flows from here into every user-level failure below.
+    // The SVG gate runs BEFORE the image crate — `with_guessed_format`
+    // knows no SVG (#152; same contents-over-extension semantics, the
+    // sniff itself is svg::sniff's shape gate).
     let outcome = (|| -> Result<(), Stop> {
+        let head = &bytes[..bytes.len().min(crate::svg::SNIFF_WINDOW)];
+        if crate::svg::sniff(head) {
+            return svg_decode_to_sink(bytes, STDIN_SHOWN_NAME, env, sink);
+        }
         let reader = ImageReader::new(Cursor::new(bytes))
             .with_guessed_format()
             .map_err(|e| Stop::User(format!("{STDIN_SHOWN_NAME}: {e}")))?;
@@ -251,15 +266,104 @@ fn produce(
     sink: &mut dyn FnMut(LoadReply),
 ) -> Result<(), Stop> {
     let shown = path.to_string_lossy();
+    // SVG gate BEFORE the image crate's own sniff (#152): `with_guessed_format`
+    // knows no SVG, so the shape gate (svg::sniff) runs on the file's leading
+    // bytes — same contents-over-extension semantics as the format guess
+    // below (a renamed/extensionless .svg still decodes). The file stays open
+    // through the gate: an SVG hands the handle to the SVG arm, anything else
+    // rewinds to byte 0 for the image crate.
+    let mut file = File::open(Path::new(path)).map_err(|e| Stop::User(format!("{shown}: {e}")))?;
+    let mut prefix = [0u8; crate::svg::SNIFF_WINDOW];
+    let mut sniffed = 0;
+    while sniffed < prefix.len() {
+        let n = file
+            .read(&mut prefix[sniffed..])
+            .map_err(|e| Stop::User(format!("{shown}: {e}")))?;
+        if n == 0 {
+            break;
+        }
+        sniffed += n;
+    }
+    if crate::svg::sniff(&prefix[..sniffed]) {
+        return svg_arm_from_file(file, &shown, env, sink);
+    }
     // Sniff the format from file contents (upstream GDI+ behavior): renamed or
     // extensionless files still decode. `with_guessed_format` rewinds the
-    // stream, so the concrete decoders below start at byte 0.
-    let reader =
-        ImageReader::open(Path::new(path)).map_err(|e| Stop::User(format!("{shown}: {e}")))?;
-    let reader = reader
+    // stream, so the concrete decoders below start at byte 0 — the manual
+    // rewind below restores the same start after the prefix read.
+    file.seek(SeekFrom::Start(0))
+        .map_err(|e| Stop::User(format!("{shown}: {e}")))?;
+    let reader = ImageReader::new(BufReader::new(file))
         .with_guessed_format()
         .map_err(|e| Stop::User(format!("{shown}: {e}")))?;
     decode_reader(&shown, reader, env, terminate, first_frame_painted, sink)
+}
+
+/// The file arm of the SVG decode (#152): the sniff admitted the stream,
+/// so the whole file is read (bounded by the SVG input budget — usvg
+/// bounds element counts, not input volume) and handed to the shared
+/// bytes arm.
+fn svg_arm_from_file(
+    mut file: File,
+    shown: &str,
+    env: DecodeEnv,
+    sink: &mut dyn FnMut(LoadReply),
+) -> Result<(), Stop> {
+    let user = |msg: String| Stop::User(format!("{shown}: {msg}"));
+    // Rewind first: the sniff consumed the leading bytes (the whole file
+    // when it is shorter than the sniff window) — the parse needs byte 0.
+    file.seek(SeekFrom::Start(0))
+        .map_err(|e| user(format!("seek failed ({e})")))?;
+    // Metadata/read failures ride the same user-level class as the open
+    // itself (a vanished/locked file keeps the old display — the pipeline's
+    // established posture for file-access trouble).
+    let len = file
+        .metadata()
+        .map_err(|e| user(format!("metadata read failed ({e})")))?
+        .len();
+    if len > crate::svg::MAX_INPUT_BYTES {
+        return Err(user(format!(
+            "SVG input {} MiB exceeds the {} MiB budget",
+            len / (1024 * 1024),
+            crate::svg::MAX_INPUT_BYTES / (1024 * 1024)
+        )));
+    }
+    let mut bytes = Vec::with_capacity(len.min(usize::MAX as u64) as usize);
+    file.read_to_end(&mut bytes)
+        .map_err(|e| user(format!("read failed ({e})")))?;
+    svg_decode_to_sink(&bytes, shown, env, sink)
+}
+
+/// The SVG decode's shared sink wiring (file arm + `stdin:` arm): parse,
+/// rasterize at the request-time viewport decision, and deliver ONE frame
+/// through the same tail every still decode uses — composite over the
+/// background, Srgb master. A one-frame stream exactly like the clipboard
+/// DIB arm: first frame, then Complete; no interruption points (the parse
+/// and the single raster are each one pass, `terminate` polls between
+/// frames and there is only one). SVG carries no ICC profile (resvg
+/// renders sRGB), so the icm chain is structurally absent — the same
+/// untagged class as BMP/ICO/DIB.
+fn svg_decode_to_sink(
+    bytes: &[u8],
+    shown: &str,
+    env: DecodeEnv,
+    sink: &mut dyn FnMut(LoadReply),
+) -> Result<(), Stop> {
+    let user = |msg: String| Stop::User(format!("{shown}: {msg}"));
+    if bytes.len() as u64 > crate::svg::MAX_INPUT_BYTES {
+        // The stdin arm's bytes are already in memory (the pipe read is the
+        // caller's); the cap still spares the doomed multi-second parse.
+        return Err(user(format!(
+            "SVG input {} MiB exceeds the {} MiB budget",
+            bytes.len() / (1024 * 1024),
+            crate::svg::MAX_INPUT_BYTES / (1024 * 1024)
+        )));
+    }
+    let (w, h, rgba) =
+        crate::svg::decode(bytes, env.viewport, MAX_TOTAL_FRAME_BYTES).map_err(user)?;
+    let frame = assemble_frame(w, h, rgba, &env, None, 8);
+    sink(LoadReply::FirstFrame { frame, delay_ms: 0 });
+    Ok(())
 }
 
 /// Extract and prepare the ICC->sRGB transform while the decoder is
@@ -2202,6 +2306,9 @@ mod stdin_bytes_tests {
             backend: crate::transform_stage::Backend::Warp,
             // The #156 latch default for decode tests: wide allowed.
             wide_allowed: true,
+            // #152: decode tests exercise raster formats — the viewport
+            // term is SVG-only, (0, 0) = unknown/default face.
+            viewport: (0, 0),
         }
     }
 
@@ -2693,6 +2800,9 @@ mod apng_tests {
             backend: crate::transform_stage::Backend::Warp,
             // The #156 latch default for decode tests: wide allowed.
             wide_allowed: true,
+            // #152: decode tests exercise raster formats — the viewport
+            // term is SVG-only, (0, 0) = unknown/default face.
+            viewport: (0, 0),
         }
     }
 
@@ -4046,6 +4156,62 @@ mod apng_tests {
             // the same wrapper).
             assert!(matches!(a[1], LoadReply::Complete));
             assert_eq!(b.len(), 1, "sink_static is one reply by itself");
+        }
+    }
+}
+
+#[cfg(test)]
+mod svg_tests {
+    use super::*;
+
+    fn svg_env() -> DecodeEnv {
+        DecodeEnv {
+            background: [255, 255, 255],
+            icm: false,
+            backend: crate::transform_stage::Backend::Warp,
+            wide_allowed: true,
+            viewport: (64, 64),
+        }
+    }
+
+    /// The SVG source of an 8x8 solid #00AA00 square — the pixel oracle
+    /// both arms below decode.
+    const GREEN_SQUARE: &[u8] = br##"<?xml version="1.0"?><svg xmlns="http://www.w3.org/2000/svg" width="8" height="8"><rect width="8" height="8" fill="#00AA00"/></svg>"##;
+
+    #[test]
+    fn svg_stdin_bytes_decode_to_one_green_frame() {
+        let terminate = AtomicBool::new(false);
+        let mut replies = Vec::new();
+        decode_bytes_to_sink(GREEN_SQUARE, svg_env(), &terminate, None, &mut |r| {
+            replies.push(r)
+        });
+        assert_green_first_frame(&replies);
+    }
+
+    #[test]
+    fn svg_file_path_decodes_from_byte_zero() {
+        // The file arm's regression net: the sniff consumes the leading
+        // bytes (the WHOLE file when shorter than the sniff window), so
+        // the parse must see a rewound stream — an un-rewound arm parses
+        // empty/truncated bytes and fails the load user-level.
+        let path = std::env::temp_dir().join("riviv-svg-loader-test.svg");
+        std::fs::write(&path, GREEN_SQUARE).expect("write temp svg");
+        let terminate = AtomicBool::new(false);
+        let mut replies = Vec::new();
+        decode_to_sink(path.as_os_str(), svg_env(), &terminate, None, &mut |r| {
+            replies.push(r)
+        });
+        let _ = std::fs::remove_file(&path);
+        assert_green_first_frame(&replies);
+    }
+
+    fn assert_green_first_frame(replies: &[LoadReply]) {
+        match replies {
+            [LoadReply::FirstFrame { frame, .. }, LoadReply::Complete] => {
+                let (r, g, b) = crate::pixels::sample_master_rgb(frame, 0, 0).expect("pixel (0,0)");
+                assert_eq!((r, g, b), (0, 170, 0));
+            }
+            other => panic!("expected [FirstFrame, Complete], got {other:?}"),
         }
     }
 }

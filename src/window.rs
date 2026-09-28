@@ -4323,13 +4323,16 @@ pub(crate) fn request_open(hwnd: HWND, path: &OsStr, origin: OpenOrigin<'_>) {
 }
 
 /// The request-time decode-input snapshot shared by every load request
-/// — the compositing background, the `icm` flag (#77) and the render
-/// backend (#155), snapshot together so a color/icm/backend change
-/// mid-load cannot flip frames already in flight (ONE `DecodeEnv` = ONE
-/// backend: Stage 1's wide-gamut destination decision is a request-time
-/// fact, and a mid-flight flip cannot re-decide frames already decoded
-/// against the old one). (The render viewport the mip pre-generation
-/// used to ride along with died with the #81 mip retirement.)
+/// — the compositing background, the `icm` flag (#77), the render
+/// backend (#155) and the SVG raster target's viewport (#152), snapshot
+/// together so a color/icm/backend/geometry change mid-load cannot flip
+/// frames already in flight (ONE `DecodeEnv` = ONE backend: Stage 1's
+/// wide-gamut destination decision is a request-time fact, and a
+/// mid-flight flip cannot re-decide frames already decoded against the
+/// old one). (The render viewport the mip pre-generation used to ride
+/// along with died with the #81 mip retirement; #152 brings a viewport
+/// term back for the SVG arm alone — the raster serves the fit display,
+/// so it snapshots at request time like every other term here.)
 fn decode_env(state: &WindowState) -> DecodeEnv {
     DecodeEnv {
         background: state.config.windowed_bg(),
@@ -4341,7 +4344,29 @@ fn decode_env(state: &WindowState) -> DecodeEnv {
         // a fresh wide load would otherwise re-widen and re-blank in a
         // loop. One DecodeEnv = one decision, like `backend` above.
         wide_allowed: !state.wide_effect_latched,
+        // #152: the SVG raster target's display face — the `riviv_view`
+        // child's client rect at request time (the same read
+        // `viewport_and_src` does; a blank/missing child yields (0, 0),
+        // which the SVG arm maps to its default face).
+        viewport: decode_viewport(state),
     }
+}
+
+/// The SVG snapshot's viewport read: the view child's client area, or
+/// `(0, 0)` when the child does not exist yet (pre-creation requests —
+/// the SVG arm treats 0 as unknown and falls back to its default face).
+fn decode_viewport(state: &WindowState) -> (u32, u32) {
+    if state.viewport.is_invalid() {
+        return (0, 0);
+    }
+    let mut view = RECT::default();
+    // SAFETY: read-only query on our own live child; a failed read leaves
+    // the zeroed rect and the SVG arm takes its unknown-viewport default.
+    let _ = unsafe { GetClientRect(state.viewport, &mut view) };
+    (
+        (view.right - view.left).max(0) as u32,
+        (view.bottom - view.top).max(0) as u32,
+    )
 }
 
 /// The `stdin:` virtual open (#65; upstream wishlist viv.c:81 — "open a

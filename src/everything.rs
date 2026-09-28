@@ -925,10 +925,10 @@ mod tests {
     #[test]
     fn wrap_search_is_ext_filter_then_quoted_term() {
         // The prefix follows the PLAYLIST navigation filter (#114): the
-        // search asks for exactly what the playlist can take — ten
-        // extensions, apng included — NOT the association table's
-        // wire-format nine (upstream's literal viv.c:13421 was its own
-        // association list).
+        // search asks for exactly what the playlist can take — eleven
+        // extensions, apng and svg included — NOT the association
+        // table's wire-format nine (upstream's literal viv.c:13421 was
+        // its own association list).
         let list = crate::playlist::EXTENSIONS.join(";");
         let text = unwide(&wrap_search(&wide("cat")));
         assert_eq!(text, format!("ext:{list} <cat>"));

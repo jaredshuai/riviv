@@ -75,9 +75,11 @@ pub(crate) fn to_wide_os(path: &std::ffi::OsStr) -> Vec<u16> {
 /// File-dialog filter as a double-null-terminated wide string, upstream's
 /// exact shape (viv.c:2363): `<label> (<patterns>)\0<patterns>\0<all>
 /// (*.*)\0*.*\0` with both labels from the loc tables. Patterns are
-/// upstream's nine (viv.c:2367, alphabetical) plus appended `*.apng` (#108).
+/// upstream's nine (viv.c:2367, alphabetical) plus appended `*.apng`
+/// (#108) and `*.svg` (#152 — both beyond-original decodes, appended
+/// after upstream's set like #108's precedent).
 pub(crate) fn dialog_filter() -> Vec<u16> {
-    const PATTERNS: &str = "*.bmp;*.gif;*.ico;*.jpeg;*.jpg;*.png;*.tif;*.tiff;*.webp;*.apng";
+    const PATTERNS: &str = "*.bmp;*.gif;*.ico;*.jpeg;*.jpg;*.png;*.tif;*.tiff;*.webp;*.apng;*.svg";
     let images = loc::get(Id::OpenAllImageFiles);
     let all = loc::get(Id::OpenAllFiles);
     format!(
@@ -456,8 +458,8 @@ mod tests {
         let s = String::from_utf16_lossy(&filter[..filter.len() - 1]);
         assert_eq!(
             s,
-            "All Image Files (*.bmp;*.gif;*.ico;*.jpeg;*.jpg;*.png;*.tif;*.tiff;*.webp;*.apng)\0\
-             *.bmp;*.gif;*.ico;*.jpeg;*.jpg;*.png;*.tif;*.tiff;*.webp;*.apng\0\
+            "All Image Files (*.bmp;*.gif;*.ico;*.jpeg;*.jpg;*.png;*.tif;*.tiff;*.webp;*.apng;*.svg)\0\
+             *.bmp;*.gif;*.ico;*.jpeg;*.jpg;*.png;*.tif;*.tiff;*.webp;*.apng;*.svg\0\
              All Files (*.*)\0*.*\0"
         );
         assert_eq!(*filter.last().unwrap(), 0, "double-null terminated");
