@@ -39,8 +39,13 @@
 //! stage" but "which face and which stage" — [`desired_output`] — the
 //! fingerprint gained a surface term, the identity carries the display
 //! content's real class, and the wide `GpuEffectP3To*` stages joined
-//! the vocabulary (their draw wiring is #156's; no face or effect is
-//! built by this module).
+//! the vocabulary. #156 wired the draw consumption: [`display_arm`] is
+//! the per-frame answer the paint actually executes (the desired cell
+//! run through the three session ratchets and the LIVE output face's
+//! clamp), [`clamped_surface`] is the face the output resources must
+//! physically sit on (the fingerprint's surface term AND the window
+//! wiring's face-reconciliation target), and a latched AC arm folds the
+//! wide AC cells back onto the legacy face's wide stage in both.
 //!
 //! WARP never runs the gpu_effect (hard exclusion, ticket) and never
 //! runs the CPU pass either (probe P3: a WCS viewport transform
@@ -275,6 +280,151 @@ pub(crate) fn desired_output(
 }
 
 // ---------------------------------------------------------------------
+// The draw-consumption arm (#156): what this frame's paint executes.
+// ---------------------------------------------------------------------
+
+/// The display arm ONE FRAME executes (ADR 0004 D3/D6, the draw-side
+/// projection of the table): the desired cell ([`desired_output`]) run
+/// through the three session ratchets and the LIVE output face's clamp.
+/// `Direct` is the untransformed pass (narrow rows' None/DwmAcm answer),
+/// `SrgbToDisplay` the narrow effect, the three `P3To*` arms the wide
+/// stages, and `WideBlank` the wide row with NO legal draw — the frame
+/// blanks and waits for a re-derivation (latched wide effect) or is an
+/// unreachable-cell defense (WARP). A wide row NEVER answers `Direct`:
+/// P3 halves shown untransformed is the fake-color outcome D6 forbids.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum DisplayArm {
+    Direct,
+    SrgbToDisplay,
+    P3ToSrgb,
+    P3ToDisplay,
+    P3ToScRgb,
+    WideBlank,
+}
+
+/// The output face a frame's decision lands on AFTER the AC surface
+/// ratchet's clamp (D6): [`desired_output`]'s face, folded back to
+/// Legacy once the session latched the AC arm off. One function, three
+/// consumers that must never drift apart: the fingerprint's surface
+/// term, [`display_arm`]'s pre-clamp face answer, and the window
+/// wiring's face-reconciliation target (gpu.rs's `GpuStack::face` chases
+/// THIS between paints).
+pub(crate) fn clamped_surface(
+    backend: Backend,
+    query: DisplayProfileQuery,
+    ac: AcState,
+    content_class: ContentSpace,
+    ac_surface_latched: bool,
+) -> OutputSurface {
+    let desired = desired_output(backend, query, ac, content_class);
+    match desired.surface {
+        OutputSurface::AcScRgb if ac_surface_latched => OutputSurface::Legacy,
+        other => other,
+    }
+}
+
+/// The legacy face's wide stage for the JUDGE's answer (the fold-back
+/// target of a latched AC arm and the pre-reconciliation legacy-face
+/// arm): a custom display profile earns the P3→display leg, every other
+/// judge answer the constant P3→sRGB pass-through. Never None/DwmAcm —
+/// the fake-color ban holds on the legacy face too.
+fn wide_legacy_stage(query: DisplayProfileQuery) -> TransformStage {
+    match query {
+        DisplayProfileQuery::Profile(DisplayProfileSpace::Custom) => {
+            TransformStage::GpuEffectP3ToDisplay
+        }
+        _ => TransformStage::GpuEffectP3ToSrgb,
+    }
+}
+
+/// This frame's executed display arm — the answer the paint draws with
+/// (D6's philosophy made executable). Layered on [`desired_output`]:
+///
+/// - The narrow classes (`Srgb`, `F16Srgb`) answer bit-identically to
+///   the pre-#156 draw shape: `SrgbToDisplay` exactly where the old
+///   `stage == GpuEffect` synced the two-phase pass, `Direct` otherwise
+///   (None/Cpu/DwmAcm) — the narrow latch (`narrow_latched`) clamps
+///   through [`effective_stage`] as before.
+/// - A wide row never goes direct. On hardware the desired cell answers;
+///   a latched AC arm (`ac_surface_latched`) folds an `AcScRgb` cell back
+///   onto the legacy face's wide stage ([`wide_legacy_stage`]); an
+///   UNRECONCILED face (the stack still on Legacy while the desired face
+///   is `AcScRgb` — the one frame before the face catches up, or
+///   defense) draws the legacy wide stage instead of the scRGB arm, and
+///   the reverse mismatch draws blank below. A latched wide effect
+///   (`wide_effect_latched`) answers `WideBlank`: the frame is blank
+///   while the re-derivation to sRGB masters runs — never a direct draw
+///   (D6: correct-and-blank beats fake color).
+/// - WARP + wide is the table's unreachable completion; the defense
+///   answer here is `WideBlank` too (the #155 production gate should
+///   never mint an F16P3 master in a WARP session — if one appears
+///   anyway, blank is the honest floor).
+// The spec's own signature — the three session latches and the live face
+// are four separate inputs by design; collapsing them into a struct would
+// hide which terms the ratchets own. The exhaustive pins read every cell
+// through exactly this shape.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn display_arm(
+    backend: Backend,
+    query: DisplayProfileQuery,
+    ac: AcState,
+    content_class: ContentSpace,
+    narrow_latched: bool,
+    ac_surface_latched: bool,
+    wide_effect_latched: bool,
+    stack_face: OutputSurface,
+) -> DisplayArm {
+    match content_class {
+        ContentSpace::Srgb | ContentSpace::F16Srgb => {
+            // The pre-#156 shape verbatim: the two-phase pass iff the
+            // effective stage is the narrow effect.
+            match effective_stage(desired_stage(backend, query), narrow_latched) {
+                TransformStage::GpuEffect => DisplayArm::SrgbToDisplay,
+                _ => DisplayArm::Direct,
+            }
+        }
+        ContentSpace::F16P3 => match backend {
+            Backend::Warp => DisplayArm::WideBlank,
+            Backend::Hardware => {
+                if wide_effect_latched {
+                    return DisplayArm::WideBlank;
+                }
+                let desired = desired_output(backend, query, ac, content_class);
+                match desired.surface {
+                    // The AC arm: only legal on the face that declares it.
+                    OutputSurface::AcScRgb => {
+                        if ac_surface_latched {
+                            // D6's surface ratchet fired: the session left
+                            // the AC arm — the legacy wide stage keeps the
+                            // colors correct on the legacy face.
+                            return match wide_legacy_stage(query) {
+                                TransformStage::GpuEffectP3ToDisplay => DisplayArm::P3ToDisplay,
+                                _ => DisplayArm::P3ToSrgb,
+                            };
+                        }
+                        match stack_face {
+                            OutputSurface::AcScRgb => DisplayArm::P3ToScRgb,
+                            // The face has not caught up (one reconciliation
+                            // frame / defense): the legacy wide stage keeps the
+                            // colors CORRECT (clipped, not fake).
+                            OutputSurface::Legacy => match wide_legacy_stage(query) {
+                                TransformStage::GpuEffectP3ToDisplay => DisplayArm::P3ToDisplay,
+                                _ => DisplayArm::P3ToSrgb,
+                            },
+                        }
+                    }
+                    // The legacy face's wide stages (ac off/unknown).
+                    OutputSurface::Legacy => match wide_legacy_stage(query) {
+                        TransformStage::GpuEffectP3ToDisplay => DisplayArm::P3ToDisplay,
+                        _ => DisplayArm::P3ToSrgb,
+                    },
+                }
+            }
+        },
+    }
+}
+
+// ---------------------------------------------------------------------
 // desired vs effective: the session ratchet (D4).
 // ---------------------------------------------------------------------
 
@@ -472,29 +622,31 @@ pub(crate) fn profile_hash(bytes: &[u8]) -> u64 {
 
 /// The wiring fingerprint (#126 established it, #130 swapped the first
 /// placeholders for real inputs, #134 swapped the last, #154 widened
-/// the table): what the output actually went through. The judge — the
-/// WCS display-profile query — is REAL here (the modern getter,
-/// resolved per output-decision point); the stage term is the
-/// EFFECTIVE stage (`desired_output`'s stage clamped by the session
-/// latch — a latched degrade switches the narrow segment off, and the
-/// flip is a fingerprint transition the tracker mints a new
-/// generation for; the wide stages pass the latch, see
+/// the table, #156 made the surface term latch-aware): what the output
+/// actually went through. The judge — the WCS display-profile query — is
+/// REAL here (the modern getter, resolved per output-decision point);
+/// the stage term is the EFFECTIVE stage (`desired_output`'s stage
+/// clamped by the session latch — a latched degrade switches the narrow
+/// segment off, and the flip is a fingerprint transition the tracker
+/// mints a new generation for; the wide stages pass the latch, see
 /// [`effective_stage`]); the profile bytes are the real destination
 /// profile's (`None` = the query carries none — Unknown, NoProfile, or
 /// an unreadable file — and the digest is the empty profile's, pinned
-/// so an absent term never drifts); and `ac` is the REAL ACM
-/// diagnostic off the judged monitor's target (type 9 bit 1 — on the
-/// narrow rows a label for the dump reader, on the wide rows the AC
-/// arm's judge per ADR 0004 D4; every read failure is `Unknown`).
-/// The `content_class` input is the third dimension's axis: the two
-/// narrow classes fingerprint IDENTICALLY cell for cell (today's
-/// sessions mint zero new generations from this ticket), the wide
-/// class adds the surface/stage arms — and its latched cells are
-/// unreachable before #155 produces an F16P3 master at all. The
-/// surface term is `desired_output`'s face taken WITHOUT the latch:
-/// the wide stages' D6 face ratchet is #156's own latch, not this
-/// one. Every term is a visible transition through the dump channel's
-/// `output_gen` line.
+/// so an absent term never drifts); and `ac` is the REAL ACM diagnostic
+/// off the judged monitor's target (type 9 bit 1 — on the narrow rows a
+/// label for the dump reader, on the wide rows the AC arm's judge per
+/// ADR 0004 D4; every read failure is `Unknown`). The `content_class`
+/// input is the third dimension's axis: the two narrow classes
+/// fingerprint IDENTICALLY cell for cell, the wide class adds the
+/// surface/stage arms. The surface term is [`clamped_surface`]'s answer
+/// — the desired face WITH the AC surface ratchet's clamp (#156): a
+/// latched AC arm folds the wide AC cells back to Legacy + the legacy
+/// wide stage word, so the fingerprint tracks the resources the session
+/// actually keeps. `ac_surface_latched` is that latch; the WIDE EFFECT
+/// latch deliberately does NOT enter — it is a transient on the way to a
+/// re-derivation, after which the content class turns narrow and the
+/// stage words change on their own (a fingerprint term would mint a gen
+/// for a state that exists for one paint).
 pub(crate) fn fingerprint_for(
     backend: Backend,
     query: DisplayProfileQuery,
@@ -502,14 +654,24 @@ pub(crate) fn fingerprint_for(
     profile_bytes: Option<&[u8]>,
     ac: AcState,
     content_class: ContentSpace,
+    ac_surface_latched: bool,
 ) -> OutputFingerprint {
     let desired = desired_output(backend, query, ac, content_class);
+    let surface = clamped_surface(backend, query, ac, content_class, ac_surface_latched);
+    // The stage term: the AC fold-back also rewrites the wide stage word
+    // (the scRGB arm cannot run on the legacy face it folded to); the
+    // narrow latch clamps the rest through effective_stage as before.
+    let stage = if desired.surface == OutputSurface::AcScRgb && surface == OutputSurface::Legacy {
+        wide_legacy_stage(query)
+    } else {
+        effective_stage(desired.stage, degraded_latched)
+    };
     OutputFingerprint {
-        stage: effective_stage(desired.stage, degraded_latched),
+        stage,
         profile_hash: profile_hash(profile_bytes.unwrap_or(&[])),
         ac,
         backend,
-        surface: desired.surface,
+        surface,
         policy: OutputPolicy {
             intent: RenderIntent::RelativeColorimetric,
             quality: RenderQuality::Best,
@@ -833,6 +995,7 @@ mod tests {
                             Some(bytes),
                             ac,
                             ContentSpace::Srgb,
+                            false,
                         );
                         let expected_stage =
                             effective_stage(desired_stage(backend, query), latched);
@@ -853,6 +1016,7 @@ mod tests {
                             None,
                             AcState::Unknown,
                             ContentSpace::Srgb,
+                            false,
                         );
                         assert_eq!(fp_empty.profile_hash, profile_hash(b""));
                     }
@@ -883,6 +1047,7 @@ mod tests {
             Some(adobe),
             AcState::On,
             ContentSpace::Srgb,
+            false,
         );
         assert_eq!(hw_effect.stage, GpuEffect);
         assert_eq!(
@@ -897,6 +1062,7 @@ mod tests {
             Some(adobe),
             AcState::On,
             ContentSpace::Srgb,
+            false,
         );
         assert_eq!(hw_latched.stage, NoStage);
         assert_eq!(
@@ -911,6 +1077,7 @@ mod tests {
             Some(adobe),
             AcState::On,
             ContentSpace::Srgb,
+            false,
         );
         assert_eq!(warp.stage, NoStage, "the WARP hard exclusion");
         assert_eq!(tracker.identify(warp, ContentSpace::Srgb).output_gen, 3);
@@ -923,6 +1090,7 @@ mod tests {
             Some(b"a-different-display-profile".as_slice()),
             AcState::On,
             ContentSpace::Srgb,
+            false,
         );
         assert_eq!(tracker.identify(other, ContentSpace::Srgb).output_gen, 4);
         // An ordinary same-decision re-identify (a same-kind rebuild):
@@ -948,6 +1116,7 @@ mod tests {
             Some(bytes),
             AcState::Off,
             ContentSpace::Srgb,
+            false,
         );
         assert_eq!(tracker.identify(off, ContentSpace::Srgb).output_gen, 1);
         let on = fingerprint_for(
@@ -957,6 +1126,7 @@ mod tests {
             Some(bytes),
             AcState::On,
             ContentSpace::Srgb,
+            false,
         );
         let on_identity = tracker.identify(on, ContentSpace::Srgb);
         assert_ne!(
@@ -978,6 +1148,7 @@ mod tests {
             Some(bytes),
             AcState::Unknown,
             ContentSpace::Srgb,
+            false,
         );
         assert_eq!(tracker.identify(unknown, ContentSpace::Srgb).output_gen, 4);
     }
@@ -1007,6 +1178,7 @@ mod tests {
                                 Some(bytes),
                                 ac,
                                 ContentSpace::Srgb,
+                                false,
                             )
                             .stage
                         })
@@ -1024,6 +1196,7 @@ mod tests {
                         Some(bytes),
                         AcState::Off,
                         ContentSpace::Srgb,
+                        false,
                     );
                     let b = fingerprint_for(
                         backend,
@@ -1032,6 +1205,7 @@ mod tests {
                         Some(bytes),
                         AcState::On,
                         ContentSpace::Srgb,
+                        false,
                     );
                     assert_eq!(a.stage, b.stage);
                     assert_eq!(a.profile_hash, b.profile_hash);
@@ -1279,6 +1453,7 @@ mod tests {
                                 with_bytes,
                                 ac,
                                 ContentSpace::Srgb,
+                                false,
                             );
                             let f16 = fingerprint_for(
                                 backend,
@@ -1287,6 +1462,7 @@ mod tests {
                                 with_bytes,
                                 ac,
                                 ContentSpace::F16Srgb,
+                                false,
                             );
                             assert_eq!(
                                 srgb, f16,
@@ -1319,6 +1495,7 @@ mod tests {
                     Some(bytes),
                     AcState::On,
                     ContentSpace::F16P3,
+                    false,
                 );
                 assert_eq!(on.surface, OutputSurface::AcScRgb, "{query:?}/{latched}");
                 assert_eq!(
@@ -1334,6 +1511,7 @@ mod tests {
                         Some(bytes),
                         ac,
                         ContentSpace::F16P3,
+                        false,
                     );
                     assert_eq!(
                         fp.surface,
@@ -1368,6 +1546,7 @@ mod tests {
             Some(bytes),
             AcState::On,
             ContentSpace::F16Srgb,
+            false,
         );
         let wide = fingerprint_for(
             Backend::Hardware,
@@ -1376,6 +1555,7 @@ mod tests {
             Some(bytes),
             AcState::On,
             ContentSpace::F16P3,
+            false,
         );
         assert_eq!(narrow.surface, OutputSurface::Legacy);
         assert_eq!(wide.surface, OutputSurface::AcScRgb);
@@ -1503,5 +1683,393 @@ mod tests {
         assert_eq!(master_content_space(16, false), ContentSpace::F16Srgb);
         assert_eq!(master_content_space(8, true), ContentSpace::F16Srgb);
         assert_eq!(master_content_space(16, true), ContentSpace::F16Srgb);
+    }
+
+    // ---- the executed arm (#156, ADR 0004 D3/D6) ----
+
+    /// The FULL wide-arm cell space: every (judge, ac, latch triple,
+    /// stack face) combination the draw wiring can present.
+    fn wide_arm_cells() -> impl Iterator<
+        Item = (
+            DisplayProfileQuery,
+            AcState,
+            bool,
+            bool,
+            bool,
+            OutputSurface,
+        ),
+    > {
+        all_queries()
+            .into_iter()
+            .flat_map(|query| {
+                [AcState::Off, AcState::On, AcState::Unknown]
+                    .into_iter()
+                    .map(move |ac| {
+                        (
+                            query,
+                            ac,
+                            [false, true],
+                            [false, true],
+                            [false, true],
+                            [OutputSurface::Legacy, OutputSurface::AcScRgb],
+                        )
+                    })
+            })
+            .flat_map(|(query, ac, nl, al, wl, faces)| {
+                nl.into_iter().flat_map(move |narrow_latched| {
+                    al.into_iter().flat_map(move |ac_surface_latched| {
+                        wl.into_iter().flat_map(move |wide_effect_latched| {
+                            faces.into_iter().map(move |stack_face| {
+                                (
+                                    query,
+                                    ac,
+                                    narrow_latched,
+                                    ac_surface_latched,
+                                    wide_effect_latched,
+                                    stack_face,
+                                )
+                            })
+                        })
+                    })
+                })
+            })
+    }
+
+    #[test]
+    fn narrow_rows_answer_the_pre_156_draw_shape_in_every_cell() {
+        // The narrow classes' zero-change pin, on the DRAW arm: across
+        // the whole (backend, query, ac, narrow-latch, ac-latch,
+        // wide-latch, face) grid, `SrgbToDisplay` fires exactly where
+        // the pre-#156 wiring synced the two-phase pass
+        // (effective_stage(desired_stage(b, q), latched) == GpuEffect),
+        // `Direct` everywhere else — and NOTHING else is ever answered.
+        for content_class in [ContentSpace::Srgb, ContentSpace::F16Srgb] {
+            for backend in both_backends() {
+                for query in all_queries() {
+                    for ac in [AcState::Off, AcState::On, AcState::Unknown] {
+                        for narrow_latched in [false, true] {
+                            for ac_surface_latched in [false, true] {
+                                for wide_effect_latched in [false, true] {
+                                    for stack_face in
+                                        [OutputSurface::Legacy, OutputSurface::AcScRgb]
+                                    {
+                                        let arm = display_arm(
+                                            backend,
+                                            query,
+                                            ac,
+                                            content_class,
+                                            narrow_latched,
+                                            ac_surface_latched,
+                                            wide_effect_latched,
+                                            stack_face,
+                                        );
+                                        let expected = match effective_stage(
+                                            desired_stage(backend, query),
+                                            narrow_latched,
+                                        ) {
+                                            TransformStage::GpuEffect => DisplayArm::SrgbToDisplay,
+                                            _ => DisplayArm::Direct,
+                                        };
+                                        assert_eq!(
+                                            arm, expected,
+                                            "{content_class:?}/{backend:?}/{query:?}/{ac:?}/\
+                                             {narrow_latched}/{ac_surface_latched}/\
+                                             {wide_effect_latched}/{stack_face:?}"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn wide_rows_on_warp_always_answer_wide_blank() {
+        // The D5 completion cell's draw defense: WARP cannot run a wide
+        // effect, so every wide WARP cell (whole latch grid, both faces)
+        // blanks — never a direct draw of P3 halves.
+        for (query, ac, narrow_latched, ac_surface_latched, wide_effect_latched, stack_face) in
+            wide_arm_cells()
+        {
+            let arm = display_arm(
+                Backend::Warp,
+                query,
+                ac,
+                ContentSpace::F16P3,
+                narrow_latched,
+                ac_surface_latched,
+                wide_effect_latched,
+                stack_face,
+            );
+            assert_eq!(
+                arm,
+                DisplayArm::WideBlank,
+                "warp/{query:?}/{ac:?}/{narrow_latched}/{ac_surface_latched}/\
+                 {wide_effect_latched}/{stack_face:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn wide_rows_on_hardware_map_by_the_latches_and_the_live_face() {
+        // The wide hardware grid, cell by cell, against the D6 layering:
+        // (1) a latched WIDE EFFECT blanks the frame (the re-derivation
+        // is coming; nothing may draw); (2) the latched AC surface folds
+        // the AC cell onto the legacy wide stage; (3) an unlatched AC
+        // cell runs the scRGB arm only on the AC face — on a stale Legacy
+        // face the legacy wide stage keeps the colors CORRECT; (4) the
+        // judge-off cells run the legacy wide stages regardless of face.
+        for (query, ac, narrow_latched, ac_surface_latched, wide_effect_latched, stack_face) in
+            wide_arm_cells()
+        {
+            let arm = display_arm(
+                Backend::Hardware,
+                query,
+                ac,
+                ContentSpace::F16P3,
+                narrow_latched,
+                ac_surface_latched,
+                wide_effect_latched,
+                stack_face,
+            );
+            let label = format!(
+                "hw/{query:?}/{ac:?}/{narrow_latched}/{ac_surface_latched}/\
+                 {wide_effect_latched}/{stack_face:?}"
+            );
+            if wide_effect_latched {
+                assert_eq!(arm, DisplayArm::WideBlank, "{label}");
+                continue;
+            }
+            let legacy_wide = match query {
+                DisplayProfileQuery::Profile(DisplayProfileSpace::Custom) => {
+                    DisplayArm::P3ToDisplay
+                }
+                _ => DisplayArm::P3ToSrgb,
+            };
+            if ac == AcState::On {
+                if ac_surface_latched {
+                    assert_eq!(arm, legacy_wide, "{label}");
+                } else {
+                    match stack_face {
+                        OutputSurface::AcScRgb => {
+                            assert_eq!(arm, DisplayArm::P3ToScRgb, "{label}")
+                        }
+                        OutputSurface::Legacy => assert_eq!(arm, legacy_wide, "{label}"),
+                    }
+                }
+            } else {
+                // Off ≡ Unknown: the legacy face's wide stages, whatever
+                // face the stack physically shows (the face reconciliation
+                // owns the mismatch, the colors must not).
+                assert_eq!(arm, legacy_wide, "{label}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_wide_row_never_answers_a_direct_or_narrow_arm() {
+        // The fake-color ban, on the executed arm: over the ENTIRE wide
+        // input space (both backends, every judge, every ac, every latch
+        // triple, both faces) the answer is never Direct and never
+        // SrgbToDisplay — P3 halves only ever travel through a P3-mapping
+        // effect or a blank.
+        for backend in both_backends() {
+            for (query, ac, narrow_latched, ac_surface_latched, wide_effect_latched, stack_face) in
+                wide_arm_cells()
+            {
+                let arm = display_arm(
+                    backend,
+                    query,
+                    ac,
+                    ContentSpace::F16P3,
+                    narrow_latched,
+                    ac_surface_latched,
+                    wide_effect_latched,
+                    stack_face,
+                );
+                assert_ne!(arm, DisplayArm::Direct, "{backend:?}/{query:?}/{ac:?}");
+                assert_ne!(
+                    arm,
+                    DisplayArm::SrgbToDisplay,
+                    "{backend:?}/{query:?}/{ac:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn wide_blank_is_reachable_only_through_the_latched_wide_effect_or_warp() {
+        // The blank's reachability pin: on hardware a wide cell answers
+        // WideBlank exactly when the wide-effect latch is set — with the
+        // latch off, every hardware cell runs an effect (the screen shows
+        // something, never a blank from the decision layer).
+        for (query, ac, narrow_latched, ac_surface_latched, wide_effect_latched, stack_face) in
+            wide_arm_cells()
+        {
+            let arm = display_arm(
+                Backend::Hardware,
+                query,
+                ac,
+                ContentSpace::F16P3,
+                narrow_latched,
+                ac_surface_latched,
+                wide_effect_latched,
+                stack_face,
+            );
+            assert_eq!(
+                arm == DisplayArm::WideBlank,
+                wide_effect_latched,
+                "hw/{query:?}/{ac:?}/{narrow_latched}/{ac_surface_latched}/\
+                 {wide_effect_latched}/{stack_face:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_clamped_surface_folds_the_ac_face_back_only_when_latched() {
+        // The one helper three consumers share (fingerprint surface term,
+        // display_arm's face answer, the window wiring's reconciliation
+        // target): the desired face stands until the AC latch fires, then
+        // the AC cells fold to Legacy — and ONLY the AC cells (the
+        // already-legacy cells cannot move, in any cell of the grid).
+        for content_class in [
+            ContentSpace::Srgb,
+            ContentSpace::F16Srgb,
+            ContentSpace::F16P3,
+        ] {
+            for backend in both_backends() {
+                for query in all_queries() {
+                    for ac in [AcState::Off, AcState::On, AcState::Unknown] {
+                        let desired = desired_output(backend, query, ac, content_class).surface;
+                        let clamped = clamped_surface(backend, query, ac, content_class, true);
+                        if desired == OutputSurface::AcScRgb {
+                            assert_eq!(clamped, OutputSurface::Legacy);
+                        } else {
+                            assert_eq!(clamped, desired, "a legacy cell must not move");
+                        }
+                        // Unlatched: the raw desired face.
+                        assert_eq!(
+                            clamped_surface(backend, query, ac, content_class, false),
+                            desired
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_ac_surface_latch_folds_the_wide_fingerprint_back_to_the_legacy_wide_stage() {
+        // The #156 fingerprint pin: on the wide AC cell, latching the AC
+        // surface is a fingerprint TRANSITION — surface AcScRgb→Legacy AND
+        // stage p3_to_scrgb→the judge's legacy wide stage word — so the
+        // dump channel's gen moves exactly when the session's output
+        // resources change shape. The narrow latch alone must NOT touch
+        // the wide cell (the wide stages pass it), and unlatched cells
+        // reproduce the #154 matrix exactly.
+        let bytes: &[u8] = &[0xab, 0xcd, 0xef];
+        let query = DisplayProfileQuery::Profile(DisplayProfileSpace::Custom);
+        let open = fingerprint_for(
+            Backend::Hardware,
+            query,
+            false,
+            Some(bytes),
+            AcState::On,
+            ContentSpace::F16P3,
+            false,
+        );
+        assert_eq!(open.surface, OutputSurface::AcScRgb);
+        assert_eq!(open.stage, TransformStage::GpuEffectP3ToScRgb);
+        let folded = fingerprint_for(
+            Backend::Hardware,
+            query,
+            false,
+            Some(bytes),
+            AcState::On,
+            ContentSpace::F16P3,
+            true,
+        );
+        assert_eq!(folded.surface, OutputSurface::Legacy);
+        assert_eq!(
+            folded.stage,
+            TransformStage::GpuEffectP3ToDisplay,
+            "the custom judge keeps its legacy wide stage word through the fold"
+        );
+        // The pass-through judge folds to the constant wide pass-through.
+        for q in [
+            DisplayProfileQuery::NoProfile,
+            DisplayProfileQuery::Unknown,
+            DisplayProfileQuery::Profile(DisplayProfileSpace::SrgbEquivalent),
+        ] {
+            let folded = fingerprint_for(
+                Backend::Hardware,
+                q,
+                false,
+                Some(bytes),
+                AcState::On,
+                ContentSpace::F16P3,
+                true,
+            );
+            assert_eq!(folded.surface, OutputSurface::Legacy, "{q:?}");
+            assert_eq!(folded.stage, TransformStage::GpuEffectP3ToSrgb, "{q:?}");
+        }
+        // The narrow latch does not clamp a wide stage (unlatched AC arm).
+        let latched_narrow = fingerprint_for(
+            Backend::Hardware,
+            query,
+            true,
+            Some(bytes),
+            AcState::On,
+            ContentSpace::F16P3,
+            false,
+        );
+        assert_eq!(latched_narrow.stage, TransformStage::GpuEffectP3ToScRgb);
+        assert_eq!(latched_narrow.surface, OutputSurface::AcScRgb);
+    }
+
+    #[test]
+    fn the_ac_surface_latch_never_moves_a_narrow_fingerprint() {
+        // The narrow rows' zero-disturbance pin for the new term: across
+        // the whole narrow grid, both ac_surface_latched values produce
+        // IDENTICAL fingerprints — the AC face ratchet is a wide-row
+        // concept, and today's sessions mint nothing from its arrival.
+        let bytes: &[u8] = &[0xab, 0xcd, 0xef];
+        for backend in both_backends() {
+            for query in all_queries() {
+                for latched in [false, true] {
+                    for ac in [AcState::Off, AcState::On, AcState::Unknown] {
+                        for with_bytes in [Some(bytes), None] {
+                            for content_class in [ContentSpace::Srgb, ContentSpace::F16Srgb] {
+                                let off = fingerprint_for(
+                                    backend,
+                                    query,
+                                    latched,
+                                    with_bytes,
+                                    ac,
+                                    content_class,
+                                    false,
+                                );
+                                let on = fingerprint_for(
+                                    backend,
+                                    query,
+                                    latched,
+                                    with_bytes,
+                                    ac,
+                                    content_class,
+                                    true,
+                                );
+                                assert_eq!(
+                                    off, on,
+                                    "{backend:?}/{query:?}/{latched}/{ac:?}/{content_class:?}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }

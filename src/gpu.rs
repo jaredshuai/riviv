@@ -35,8 +35,9 @@ use windows::Win32::Graphics::Direct2D::Common::{
 use windows::Win32::Graphics::Direct2D::{
     CLSID_D2D1ColorManagement, D2D1_ANTIALIAS_MODE_ALIASED, D2D1_BITMAP_OPTIONS,
     D2D1_BITMAP_OPTIONS_CANNOT_DRAW, D2D1_BITMAP_OPTIONS_CPU_READ, D2D1_BITMAP_OPTIONS_NONE,
-    D2D1_BITMAP_OPTIONS_TARGET, D2D1_BITMAP_PROPERTIES1, D2D1_COLOR_SPACE_SRGB,
-    D2D1_DEVICE_CONTEXT_OPTIONS_NONE, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_INTERPOLATION_MODE,
+    D2D1_BITMAP_OPTIONS_TARGET, D2D1_BITMAP_PROPERTIES1, D2D1_COLOR_SPACE_CUSTOM,
+    D2D1_COLOR_SPACE_SCRGB, D2D1_COLOR_SPACE_SRGB, D2D1_DEVICE_CONTEXT_OPTIONS_NONE,
+    D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_INTERPOLATION_MODE,
     D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, D2D1_INTERPOLATION_MODE_LINEAR,
     D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, D2D1_MAP_OPTIONS_READ, D2D1_PRIMITIVE_BLEND_COPY,
     D2D1_PROPERTY_TYPE_COLOR_CONTEXT, D2D1_PROPERTY_TYPE_ENUM, D2D1_UNIT_MODE_PIXELS,
@@ -48,15 +49,16 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION, D3D11CreateDevice, ID3D11Device,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_ALPHA_MODE_IGNORE, DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM,
-    DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC,
+    DXGI_ALPHA_MODE_IGNORE, DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709, DXGI_FORMAT,
+    DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_UNKNOWN,
+    DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
     DXGI_ERROR_DEVICE_REMOVED, DXGI_ERROR_DEVICE_RESET, DXGI_ERROR_DRIVER_INTERNAL_ERROR,
     DXGI_MEMORY_SEGMENT_GROUP_LOCAL, DXGI_MWA_NO_ALT_ENTER, DXGI_PRESENT,
     DXGI_QUERY_VIDEO_MEMORY_INFO, DXGI_SCALING_NONE, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG,
     DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIAdapter3, IDXGIDevice,
-    IDXGIFactory2, IDXGISurface, IDXGISwapChain1,
+    IDXGIFactory2, IDXGISurface, IDXGISwapChain1, IDXGISwapChain3,
 };
 use windows::Win32::Graphics::Gdi::ValidateRect;
 use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, PAINTSTRUCT};
@@ -65,7 +67,7 @@ use windows::core::Interface;
 
 use crate::config::RendererKind;
 use crate::paint::scene_rect;
-use crate::transform_stage::ContentSpace;
+use crate::transform_stage::{ContentSpace, DisplayArm, OutputSurface};
 use crate::window::{fatal, state_of};
 
 // ---------------------------------------------------------------------------
@@ -248,6 +250,28 @@ pub(crate) fn bg_color_f(bg: [u8; 3]) -> D2D1_COLOR_F {
     }
 }
 
+/// The letterbox background as a D2D color, per FACE (P-C probe: D2D
+/// writes LINEAR values into an FP16 scRGB-declared target, and the DWM
+/// maps them with the exact sRGB OETF — so writing sRGB code values
+/// directly would show a washed-out, too-bright letterbox). The legacy
+/// arm is [`bg_color_f`] verbatim (code values, as always); the AC arm
+/// runs each channel through `srgb_decode` (the same curve the P3 seam
+/// uses), alpha 1.0. Only ever consumed by the direct passes' Clear —
+/// the effect phase-1 intermediate clear stays CODE VALUES (the
+/// intermediate is an ordinary f16 bitmap the effect re-interprets
+/// through its color contexts).
+pub(crate) fn bg_color_f_for_face(bg: [u8; 3], face: OutputSurface) -> D2D1_COLOR_F {
+    match face {
+        OutputSurface::Legacy => bg_color_f(bg),
+        OutputSurface::AcScRgb => D2D1_COLOR_F {
+            r: crate::pixels::srgb_decode(f32::from(bg[0]) / 255.0),
+            g: crate::pixels::srgb_decode(f32::from(bg[1]) / 255.0),
+            b: crate::pixels::srgb_decode(f32::from(bg[2]) / 255.0),
+            a: 1.0,
+        },
+    }
+}
+
 /// The backend label (About line / status-bar suffix / stderr breadcrumbs):
 /// the ticket evidence that says WHICH renderer actually drew.
 pub(crate) fn backend_label(hardware: bool) -> &'static str {
@@ -274,6 +298,16 @@ pub(crate) struct DumpRequest {
     pub(crate) bg: [u8; 3],
     pub(crate) frame: Option<(u64, u32, u32, ContentSpace)>,
     pub(crate) plan: Option<DrawPlan>,
+}
+
+/// The dump channel's readback (#156's dual arms): the legacy face reads
+/// back as the 8-bit RGBA the PNG writer takes (the pre-#156 bytes,
+/// verbatim); the AC face reads back as the FP16 target's raw LE halves
+/// (RGBA order, 8 bytes per pixel — the P-B-probed `CopyFromRenderTarget`
+/// on a `R16G16B16A16_FLOAT` staging), the half-exact oracle's input.
+pub(crate) enum DumpPixels {
+    Rgba8 { w: u32, h: u32, rgba: Vec<u8> },
+    ScRgbHalves { w: u32, h: u32, halves: Vec<u16> },
 }
 
 /// Everything one D2D frame draws with, gathered from the window state by
@@ -366,16 +400,20 @@ pub(crate) enum PaintOutcome {
     Unrecoverable { hr: i32 },
 }
 
-/// A draw-pass failure, split by WHO owns the recovery (#130): a
-/// `Renderer` error takes the existing two-way classification (device
-/// loss → the ladder; anything else → the deferred fatal), while an
-/// `Effect` error came from inside the two-phase effect path — a
-/// non-loss refusal of the graph itself, which the session's quality
-/// ratchet (three consecutive → segment off) owns, never the ladder.
+/// A draw-pass failure, split by WHO owns the recovery (#130, widened by
+/// #156's D6 ladders): a `Renderer` error takes the existing two-way
+/// classification (device loss → the ladder; anything else → the
+/// deferred fatal), an `Effect` error came from inside the two-phase
+/// effect path — a non-loss refusal of the graph itself, which the
+/// session's per-class ratchets own, never the ladder — and
+/// `EffectNotBuilt` marks the WIDE arms' graph-construction failure: no
+/// draw happened at all (no present, never a direct passthrough), the
+/// failure detail is already recorded with its class.
 #[derive(Debug)]
 enum DrawFailure {
     Renderer(windows::core::Error),
     Effect(windows::core::Error),
+    EffectNotBuilt,
 }
 
 impl DrawFailure {
@@ -396,6 +434,7 @@ impl std::fmt::Display for DrawFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             DrawFailure::Renderer(e) | DrawFailure::Effect(e) => write!(f, "{e}"),
+            DrawFailure::EffectNotBuilt => write!(f, "the effect graph did not build"),
         }
     }
 }
@@ -414,11 +453,28 @@ pub(crate) fn is_device_loss(hr: windows::core::HRESULT) -> bool {
         || hr == D2DERR_RECREATE_TARGET
 }
 
-/// The one output-surface format (five-piece #3, ADR 0003 D3): the
-/// swapchain and everything drawn INTO it stays `B8G8R8A8_UNORM`, never
-/// `_SRGB` — the f16 master's quantize to 8-bit is done by the composite
-/// itself, the output face gains no format row.
+/// The one output-surface format per face (five-piece #3, ADR 0003 D3
+/// plus ADR 0004 D3's dual arms): the LEGACY face keeps the frozen
+/// `B8G8R8A8_UNORM` — never `_SRGB` — while the AC face's swapchain and
+/// everything drawn INTO it is `R16G16B16A16_FLOAT`, the FP16 scRGB
+/// declaration (P-C probe: FP16 swapchain + `SetColorSpace1(scRGB)`
+/// first-try, SDR white drift-free). The f16 master's quantize to 8-bit
+/// stays the composite's job on the legacy face; the AC face needs no
+/// quantize at all (halves in, halves out).
 const SWAPCHAIN_FORMAT: DXGI_FORMAT = DXGI_FORMAT_B8G8R8A8_UNORM;
+/// The AC face's own format (ADR 0004 D3): linear scRGB FP16, the
+/// `DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709` declaration's container.
+const AC_SWAPCHAIN_FORMAT: DXGI_FORMAT = DXGI_FORMAT_R16G16B16A16_FLOAT;
+
+/// The swapchain format of an output face — the pure dispatch behind
+/// `create`/`resize`'s dual arms. The legacy arm is the frozen pre-#156
+/// constant, byte-for-byte; the AC arm is the FP16 declaration.
+pub(crate) fn face_format(face: OutputSurface) -> DXGI_FORMAT {
+    match face {
+        OutputSurface::Legacy => SWAPCHAIN_FORMAT,
+        OutputSurface::AcScRgb => AC_SWAPCHAIN_FORMAT,
+    }
+}
 
 /// The upload/composite-input format for a master's content space — the
 /// pure dispatch table behind the f16 upload arm (#143, ADR 0003 D6
@@ -506,30 +562,47 @@ struct EffectGraph {
     /// sRGB→display transform consumes full f16 input instead of
     /// 8-bit-quantized colors — ADR 0003 D4's precision half, landed by
     /// #143), an Srgb master's stays BGRA8 (the 8-bit effect path is
-    /// byte-identical).
+    /// byte-identical). `F16P3` shares the f16 layout (ADR 0004 D2).
     intermediate: ID2D1Image,
     /// The effect, already holding `intermediate` as input 0.
     effect_image: ID2D1Image,
     _effect: ID2D1Effect,
     _src_ctx: ID2D1ColorContext,
     _dst_ctx: ID2D1ColorContext,
-    built_for: (u32, u32, ContentSpace),
+    built_for: (u32, u32, ContentSpace, DisplayArm),
 }
 
-/// The display segment's per-frame application state — what the window
-/// side wants RIGHT NOW (the effective stage from the table + the latch,
-/// plus the profile the judge returned). The graph is rebuilt whenever
-/// the intent or the target size changes, so a rebuild or a resize never
-/// reuses a stale graph.
+/// WHO owns a display-segment failure's recovery (#130's narrow ratchet,
+/// widened by #156's D6 ladders): `Narrow` feeds the pre-existing sRGB
+/// segment ratchet (`stage_latched`), `WideLegacy` the legacy-wide
+/// arms' own counter (`wide_effect_failures`, re-deriving to sRGB at
+/// the threshold), and `AcFace` the AC surface ratchet (one failure
+/// latches the whole AC arm off for the session — the verdict is about
+/// the machine, not the frame).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DisplayFailureClass {
+    Narrow,
+    WideLegacy,
+    AcFace,
+}
+
+/// The display segment's per-frame application state — the arm the
+/// window side wants RIGHT NOW ([`DisplayArm`] plus the profile the
+/// effect's destination context loads, `None` where the arm needs no
+/// file) and the lazily built graph for it. `None` intent = "not synced
+/// yet" — the direct pass, the pre-#156 default. The graph is rebuilt
+/// whenever the intent or the target size/space changes, so a rebuild,
+/// a resize, or a face/arm flip never reuses a stale graph. The frame's
+/// failure rides here as a (class, detail) pair for the DRAIN to feed
+/// the right ratchet.
 #[derive(Default)]
 struct DisplaySegment {
-    want_effect: bool,
-    profile: Option<std::path::PathBuf>,
+    intent: Option<(DisplayArm, Option<std::path::PathBuf>)>,
     graph: Option<EffectGraph>,
-    /// This frame's effect failure (construction or two-phase draw),
-    /// drained by the paint caller to feed the session ratchet. None on
+    /// This frame's effect failure (construction or effect draw),
+    /// drained by the paint caller to feed the session ratchets. None on
     /// every clean frame.
-    failure: Option<String>,
+    failure: Option<(DisplayFailureClass, String)>,
 }
 
 /// The base bitmap's residency key (#141, ADR 0003 D1's upload-key
@@ -654,6 +727,14 @@ pub(crate) struct GpuStack {
     /// mechanism a viewport resize uses. Plain Copy data, safe between
     /// the COM fields.
     frame_space: ContentSpace,
+    /// The OUTPUT FACE this stack was built for (#156, ADR 0004 D3): the
+    /// swapchain format and color-space declaration follow it
+    /// ([`face_format`]). The window wiring reconciles it against
+    /// `transform_stage::clamped_surface` between paints — a wide↔narrow
+    /// content flip on an AC machine swaps the whole stack (the P-C-proven
+    /// `create` path; ResizeBuffers format changes were never probed and
+    /// stay unexplored). Plain Copy data, safe between the COM fields.
+    pub(crate) face: OutputSurface,
     /// The byte ledger (ticket's 分类记账) — observable at close.
     pub(crate) ledger: crate::tile::MemLedger,
     // NOTE: the device-loss timestamps do NOT live on the stack — the
@@ -695,26 +776,14 @@ fn video_memory_budget(dxgi_device: &IDXGIDevice) -> Option<u64> {
     Some(info.Budget)
 }
 
-/// The bitmap properties the UNORM surfaces share (the 1:1 five-piece
-/// #3): the swapchain target, the readback staging, and the Srgb arm's
-/// upload/intermediate bitmaps are all `B8G8R8A8_UNORM` — an `_SRGB`
-/// variant would linearize the bytes and break the ±0 tolerance. The
-/// upload bitmaps and the f16 effect intermediate dispatch their format
-/// on the content space instead (#143) — [`bitmap_properties_for`] is
-/// the one builder; this wrapper pins the UNORM call sites. DPI 96 keeps
-/// the metadata honest (unit mode PIXELS ignores it for math); `options`
-/// varies per call site.
-fn bitmap_properties(options: D2D1_BITMAP_OPTIONS) -> D2D1_BITMAP_PROPERTIES1 {
-    bitmap_properties_for(DXGI_FORMAT_B8G8R8A8_UNORM, options)
-}
-
-/// The one bitmap-properties builder behind every surface this stack
-/// creates: `format` follows the surface's role (the swapchain target and
-/// its UNORM siblings via [`bitmap_properties`], the f16 upload/intermediate
-/// arm via [`upload_format`]), alpha is always IGNORE — the #137 probe
-/// proved `R16G16B16A16_FLOAT` + IGNORE CreateBitmaps and draws — and
-/// alpha 1 everywhere in the composite makes the IGNORE semantics
-/// byte-exact on the UNORM side either way.
+/// The bitmap properties behind every surface this stack creates:
+/// `format` follows the surface's role (the swapchain target and its
+/// siblings via [`face_format`], the f16 upload/intermediate arm via
+/// [`upload_format`]), alpha is always IGNORE — the #137 probe proved
+/// `R16G16B16A16_FLOAT` + IGNORE CreateBitmaps and draws — and alpha 1
+/// everywhere in the composite makes the IGNORE semantics byte-exact on
+/// the UNORM side either way. DPI 96 keeps the metadata honest (unit
+/// mode PIXELS ignores it for math); `options` varies per call site.
 fn bitmap_properties_for(
     format: DXGI_FORMAT,
     options: D2D1_BITMAP_OPTIONS,
@@ -731,18 +800,25 @@ fn bitmap_properties_for(
     }
 }
 
-/// Build the whole stack (design §3's chain, in order). Returns the stack
-/// plus the EFFECTIVE renderer kind (auto resolves to hardware or WARP by
-/// what actually created) — the caller stores it for same-kind runtime
-/// rebuilds. Errors are environment diagnoses (strings): since #90 there
-/// is no renderer below this one — the startup caller fatals with the
-/// diagnosis (ADR 0001 system-level; `auto` has already tried hardware
-/// AND WARP by the time the error surfaces), and a mid-session rebuild
-/// failure lands in the same deferred fatal.
+/// Build the whole stack (design §3's chain, in order) on the FACE the
+/// caller decided (#156): `Legacy` is the pre-#156 stack byte-for-byte,
+/// `AcScRgb` the AC declaration's FP16 face (ADR 0004 D3 — `R16G16B16A16_FLOAT`
+/// swapchain, `SetColorSpace1(scRGB)` via a `SwapChain3` QI; both steps
+/// FAIL LOUD here so the caller's D6 ratchet latches the arm off before
+/// any draw — a half-declared AC face would be fake color territory).
+/// Returns the stack plus the EFFECTIVE renderer kind (auto resolves to
+/// hardware or WARP by what actually created) — the caller stores it for
+/// same-kind runtime rebuilds. Errors are environment diagnoses
+/// (strings): since #90 there is no renderer below this one — the
+/// startup caller fatals with the diagnosis (ADR 0001 system-level;
+/// `auto` has already tried hardware AND WARP by the time the error
+/// surfaces), and a mid-session rebuild failure lands in the same
+/// deferred fatal.
 pub(crate) fn create(
     view: HWND,
     top: HWND,
     request: RendererKind,
+    face: OutputSurface,
 ) -> Result<(GpuStack, RendererKind), String> {
     // 1. The D3D device. The request picks the driver ladder: `warp` and
     //    `d2d` are single-driver diagnostics (a failing `d2d` request fails
@@ -794,7 +870,7 @@ pub(crate) fn create(
     let desc = DXGI_SWAP_CHAIN_DESC1 {
         Width: 0,
         Height: 0,
-        Format: SWAPCHAIN_FORMAT, // five-piece #3: never _SRGB (ADR 0003 D3)
+        Format: face_format(face), // dual arms: BGRA8 legacy / FP16 scRGB (ADR 0004 D3)
         Stereo: false.into(),
         SampleDesc: DXGI_SAMPLE_DESC {
             Count: 1,
@@ -813,6 +889,26 @@ pub(crate) fn create(
     let swapchain =
         unsafe { dxgi_factory.CreateSwapChainForHwnd(&d3d_device, view, &desc, None, None) }
             .map_err(|e| format!("CreateSwapChainForHwnd failed: {e}"))?;
+    // The AC face's declaration (ADR 0004 D3, P-C-probed form): the
+    // scRGB color-space declaration goes through the SwapChain3 QI —
+    // BOTH steps fail loud (the D6 ratchet latches the arm off before
+    // any draw; a FP16 buffer the OS reads as sRGB gamma would be fake
+    // color). The stack keeps the plain IDXGISwapChain1; the QI'd
+    // interface drops after the call.
+    if face == OutputSurface::AcScRgb {
+        let sc3: IDXGISwapChain3 = swapchain
+            .cast()
+            .map_err(|e| format!("cast to IDXGISwapChain3 failed: {e}"))?;
+        // SAFETY: the QI'd swapchain is live; the color-space enum is a
+        // plain value.
+        unsafe { sc3.SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709) }
+            .map_err(|e| format!("SetColorSpace1(scRGB) failed: {e}"))?;
+        drop(sc3);
+        // The AC face's one breadcrumb — the smoke's `surface=ac-*`
+        // channel. The legacy face prints NOTHING here: narrow sessions'
+        // stderr must stay byte-identical.
+        eprintln!("riviv: output-surface=ac-scrgb");
+    }
     // 4. Alt+Enter would race the viewer's own fullscreen toggle (design
     //    §3-4) — and the association counts per TOP-LEVEL window, hence
     //    `top`, not the child.
@@ -823,7 +919,9 @@ pub(crate) fn create(
     //    then the context posture: unit mode PIXELS once (dest coordinates
     //    are physical pixels), ALIASED + COPY for the pixel-exact contract.
     //    SetTransform is NEVER called anywhere in this arm — the identity
-    //    audit is a grep, design §4-2.
+    //    audit is a grep, design §4-2. The bitmap format follows the face
+    //    (FP16 on the AC arm — the D2D target must match the FP16 buffers
+    //    or CreateBitmapFromDxgiSurface refuses).
     // SAFETY: read-only buffer query on the live swapchain.
     let surface: IDXGISurface = unsafe { swapchain.GetBuffer(0) }
         .map_err(|e| format!("swapchain GetBuffer(0) failed: {e}"))?;
@@ -832,7 +930,8 @@ pub(crate) fn create(
     let target_bitmap = unsafe {
         context.CreateBitmapFromDxgiSurface(
             &surface,
-            Some(&bitmap_properties(
+            Some(&bitmap_properties_for(
+                face_format(face),
                 D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
             )),
         )
@@ -896,6 +995,9 @@ pub(crate) fn create(
         // The first paint's prepare stamps the master's own space in
         // before any draw reads it (#143).
         frame_space: ContentSpace::Srgb,
+        // The face `create` was called with (#156): the swapchain and the
+        // target bitmap were literally built for it.
+        face,
         ledger: crate::tile::MemLedger {
             cap: cap_bytes,
             ..crate::tile::MemLedger::default()
@@ -1286,50 +1388,71 @@ impl GpuStack {
         Ok(())
     }
 
-    /// The display-segment intent sync (#130): what the EFFECTIVE stage
-    /// (the table's answer clamped by the session latch, computed on the
-    /// window state) and the judge's profile say RIGHT NOW. Called per
-    /// paint and before every dump — one channel for stack rebuilds,
-    /// latch flips, and (later) profile changes, each of which just
-    /// changes the intent and lets the lazy graph builder react.
+    /// The display-segment intent sync (#130, #156's shape): the arm the
+    /// window side computed ([`DisplayArm`] — the table's answer run
+    /// through the session ratchets and the live face's clamp) and the
+    /// profile the effect's destination context loads (`None` where the
+    /// arm needs no file). Called per paint and before every dump — one
+    /// channel for arm flips, latch flips, and profile changes, each of
+    /// which just changes the intent and lets the lazy graph builder
+    /// react.
     pub(crate) fn sync_display_intent(
         &mut self,
-        want_effect: bool,
+        arm: DisplayArm,
         profile: Option<&std::path::Path>,
     ) {
         let profile = profile.map(|p| p.to_path_buf());
-        if self.display.want_effect == want_effect && self.display.profile == profile {
+        if self
+            .display
+            .intent
+            .as_ref()
+            .is_some_and(|(a, p)| *a == arm && *p == profile)
+        {
             return; // unchanged intent: the graph (if any) stays valid
         }
-        self.display.want_effect = want_effect;
-        self.display.profile = profile;
+        self.display.intent = Some((arm, profile));
         // The graph is intent-shaped (its destination context and input
-        // wiring belong to one profile): drop it, rebuild lazily.
+        // wiring belong to one arm/profile): drop it, rebuild lazily.
         self.display.graph = None;
     }
 
-    /// Drains this frame's effect failure (the quality ratchet's feed —
-    /// construction or two-phase draw, whichever happened last; the
-    /// window state counts consecutive failures and latches the segment
-    /// off at `transform_stage::STAGE_DEGRADE_FAILURES`).
-    pub(crate) fn take_display_failure(&mut self) -> Option<String> {
+    /// Drains this frame's effect failure as its (class, detail) pair —
+    /// the D6 ratchets' feed (construction or effect draw, whichever
+    /// happened last; the window state counts consecutive failures per
+    /// class and latches at `transform_stage::STAGE_DEGRADE_FAILURES`,
+    /// the AC face immediately). None on every clean frame.
+    pub(crate) fn take_display_failure(&mut self) -> Option<(DisplayFailureClass, String)> {
         self.display.failure.take()
+    }
+
+    /// The failure class the CURRENT intent arm feeds (the drain routes
+    /// by it): the AC arm's failures latch the face, the legacy-wide
+    /// arms' re-derive, the narrow arm's degrade the sRGB segment.
+    fn failure_class(&self) -> DisplayFailureClass {
+        match self.display.intent.as_ref().map(|(arm, _)| *arm) {
+            Some(DisplayArm::P3ToScRgb) => DisplayFailureClass::AcFace,
+            Some(DisplayArm::P3ToSrgb | DisplayArm::P3ToDisplay) => DisplayFailureClass::WideLegacy,
+            _ => DisplayFailureClass::Narrow,
+        }
     }
 
     /// True when the effect graph is usable this frame, building it
     /// lazily when the intent wants one. A construction failure records
-    /// the ratchet feed ONCE (get_or_insert — the direct pass may still
-    /// fail on its own after this) and answers false: the frame draws
-    /// direct (content visible untransformed beats blank; the ratchet
-    /// still counts it). `space` is the prepared master's content space
-    /// ([`GpuStack::frame_space`], #143): the intermediate's format
+    /// the ratchet feed ONCE with the arm's own failure class
+    /// (get_or_insert) and answers false; the CALLER decides what a
+    /// false means — the narrow arm still draws direct (content visible
+    /// untransformed beats blank; the ratchet still counts it), the wide
+    /// arms never draw direct and report the no-present failure instead
+    /// (#156: a wide graph failure is blank or correct effect, never a
+    /// fake-color passthrough). `space` is the prepared master's content
+    /// space ([`GpuStack::frame_space`], #143): the intermediate's format
     /// follows it, so a space change rebuilds exactly like a resize.
     fn ensure_effect_graph(&mut self, w: u32, h: u32, space: ContentSpace) -> bool {
         if w == 0 || h == 0 {
             return false;
         }
         if let Some(graph) = self.display.graph.as_ref()
-            && graph.built_for == (w, h, space)
+            && graph.built_for == (w, h, space, self.current_arm())
         {
             return true;
         }
@@ -1340,38 +1463,74 @@ impl GpuStack {
                 true
             }
             Err(e) => {
+                let class = self.failure_class();
                 self.display
                     .failure
-                    .get_or_insert_with(|| format!("display effect build failed: {e}"));
+                    .get_or_insert_with(|| (class, format!("display effect build failed: {e}")));
                 false
             }
         }
     }
 
-    /// The graph build (#130's applied-artifact list): the viewport-sized
-    /// intermediate (its format follows the master's content space —
-    /// #143, ADR 0003 D4's precision half: an F16Srgb master composites
-    /// through an `R16G16B16A16_FLOAT` input surface so the effect's
-    /// internally high-precision sRGB→display transform never sees the
-    /// 8-bit quantization the 8-bit era fed it; an Srgb master keeps the
-    /// byte-identical BGRA8 surface), the ColorManagement effect wired
-    /// sRGB source → display-profile destination with BOTH intents forced
-    /// to relative colorimetric (D8-1) and quality BEST, and the
-    /// intermediate as the effect's input 0. Everything here is
-    /// device-object creation — device losses do not happen at
-    /// construction; every error is a profile/driver refusal the ratchet
-    /// is for.
+    /// The current intent's arm (`Direct` when the window side has not
+    /// synced yet — the pre-#156 default). Copy read, no borrow held.
+    fn current_arm(&self) -> DisplayArm {
+        self.display
+            .intent
+            .as_ref()
+            .map_or(DisplayArm::Direct, |(arm, _)| *arm)
+    }
+
+    /// The graph build (#130's applied-artifact list, #156's wide arms):
+    /// the viewport-sized intermediate (its format follows the master's
+    /// content space — #143, ADR 0003 D4's precision half; `F16P3` shares
+    /// the f16 layout, ADR 0004 D2), the ColorManagement effect, and the
+    /// intermediate as the effect's input 0. The COLOR CONTEXTS follow
+    /// the arm (`self.display.intent`, the same sync `ensure` read):
+    ///
+    /// - source: the narrow masters' simple sRGB context (the pre-#156
+    ///   form, byte-for-byte); an `F16P3` master's CUSTOM context loaded
+    ///   from the SAME bytes Stage 1 used as its destination (the P-B
+    ///   probe's `CreateColorContext(CUSTOM, mem)` form) — the container
+    ///   and the display segment's source can never drift apart.
+    /// - destination: the judged display profile FILE for the display
+    ///   legs, the simple sRGB context for the pass-through, the simple
+    ///   scRGB context for the AC arm (P-B-probed).
+    ///
+    /// A (space, arm) mismatch is a WIRING BUG: rejected in debug via
+    /// the assert and in release via an explicit Err (never a silently
+    /// mis-colored graph). Property writes as before (pointer values /
+    /// enum values; both intents RELATIVE_COLORIMETRIC; PREMULTIPLIED;
+    /// BEST). Everything here is device-object creation — device losses
+    /// do not happen at construction; every error is a context/profile
+    /// refusal the ratchets are for.
     fn build_effect_graph(
         &self,
         w: u32,
         h: u32,
         space: ContentSpace,
     ) -> Result<EffectGraph, String> {
-        let profile = self
-            .display
-            .profile
-            .as_deref()
-            .ok_or("effect wanted but the judge carried no profile")?;
+        let (arm, profile) = match self.display.intent.as_ref() {
+            Some((arm, path)) => (*arm, path.as_deref()),
+            None => (DisplayArm::Direct, None),
+        };
+        match (space, arm) {
+            (
+                ContentSpace::F16P3,
+                DisplayArm::P3ToSrgb | DisplayArm::P3ToDisplay | DisplayArm::P3ToScRgb,
+            ) => {}
+            (ContentSpace::Srgb | ContentSpace::F16Srgb, DisplayArm::SrgbToDisplay) => {}
+            _ => {
+                debug_assert!(
+                    false,
+                    "effect graph arm {arm:?} does not match the master space {space:?}"
+                );
+                return Err(format!(
+                    "effect graph arm {arm:?} does not match the master space {space:?} — \
+                     display intent wiring bug"
+                ));
+            }
+        }
         // SAFETY: the context is live; no source data (a bare TARGET
         // bitmap); the properties struct is a stack temporary outliving
         // the call.
@@ -1396,21 +1555,64 @@ impl GpuStack {
         // SAFETY: the context is live; the CLSID is a static constant.
         let effect = unsafe { self.context.CreateEffect(&CLSID_D2D1ColorManagement) }
             .map_err(|e| format!("CreateEffect(ColorManagement) failed: {e}"))?;
-        // The simple sRGB source context (the master's space) and the
-        // destination context loaded from the judge's ICC file.
-        // SAFETY: the context is live; the enum is a plain value; no
-        // custom profile bytes for the simple-space form.
-        let src_ctx = unsafe { self.context.CreateColorContext(D2D1_COLOR_SPACE_SRGB, None) }
-            .map_err(|e| format!("CreateColorContext(sRGB) failed: {e}"))?;
-        let profile_name = windows::core::HSTRING::from(profile.as_os_str());
-        // SAFETY: the context is live; the path string outlives the call.
-        let dst_ctx = unsafe { self.context.CreateColorContextFromFilename(&profile_name) }
-            .map_err(|e| {
-                format!(
-                    "CreateColorContextFromFilename({}) failed: {e}",
-                    profile.display()
-                )
-            })?;
+        // The SOURCE context: the master's space decides (simple sRGB for
+        // the narrow masters, CUSTOM + the container bytes for F16P3).
+        let src_ctx = match space {
+            ContentSpace::Srgb | ContentSpace::F16Srgb => {
+                // SAFETY: the context is live; the enum is a plain value;
+                // no custom profile bytes for the simple-space form.
+                unsafe { self.context.CreateColorContext(D2D1_COLOR_SPACE_SRGB, None) }
+                    .map_err(|e| format!("CreateColorContext(sRGB) failed: {e}"))?
+            }
+            ContentSpace::F16P3 => {
+                // SAFETY: the context is live; the profile bytes are the
+                // process-wide P3 container (static, outlives the call).
+                unsafe {
+                    self.context.CreateColorContext(
+                        D2D1_COLOR_SPACE_CUSTOM,
+                        Some(crate::icm::p3_destination_profile()),
+                    )
+                }
+                .map_err(|e| format!("CreateColorContext(P3 container) failed: {e}"))?
+            }
+        };
+        // The DESTINATION context: the arm decides.
+        let dst_ctx = match arm {
+            DisplayArm::SrgbToDisplay | DisplayArm::P3ToDisplay => {
+                let profile = profile.ok_or("effect wanted but the judge carried no profile")?;
+                let profile_name = windows::core::HSTRING::from(profile.as_os_str());
+                // SAFETY: the context is live; the path string outlives the call.
+                unsafe { self.context.CreateColorContextFromFilename(&profile_name) }.map_err(
+                    |e| {
+                        format!(
+                            "CreateColorContextFromFilename({}) failed: {e}",
+                            profile.display()
+                        )
+                    },
+                )?
+            }
+            DisplayArm::P3ToSrgb => {
+                // SAFETY: the context is live; the enum is a plain value.
+                unsafe { self.context.CreateColorContext(D2D1_COLOR_SPACE_SRGB, None) }
+                    .map_err(|e| format!("CreateColorContext(sRGB destination) failed: {e}"))?
+            }
+            DisplayArm::P3ToScRgb => {
+                // SAFETY: the context is live; the enum is a plain value
+                // (the P-B-probed scRGB destination form).
+                unsafe {
+                    self.context
+                        .CreateColorContext(D2D1_COLOR_SPACE_SCRGB, None)
+                }
+                .map_err(|e| format!("CreateColorContext(scRGB) failed: {e}"))?
+            }
+            // The (space, arm) gate above rejected every other pairing;
+            // this arm is total over the gate's accepted set only.
+            DisplayArm::Direct | DisplayArm::WideBlank => {
+                return Err(format!(
+                    "effect graph cannot serve the {arm:?} arm — display intent wiring bug"
+                ));
+            }
+        };
         // The property writes: COLOR_CONTEXT-typed properties (the SDK's
         // "Property Type: ID2D1ColorContext *" — registered as
         // D2D1_PROPERTY_TYPE_COLOR_CONTEXT, verified by the #130 probe:
@@ -1476,15 +1678,18 @@ impl GpuStack {
             _effect: effect,
             _src_ctx: src_ctx,
             _dst_ctx: dst_ctx,
-            built_for: (w, h, space),
+            built_for: (w, h, space, arm),
         })
     }
 
     /// The scene body both pass shapes share (design §4: the letterbox IS
-    /// the Clear; the tile loop's clip pairs stay balanced). No
-    /// Begin/EndDraw here — the caller owns the target switch and the
-    /// bracket; nothing here reports an error.
-    fn draw_scene(&self, bg: [u8; 3], plan: Option<&DrawPlan>) {
+    /// the Clear; the tile loop's clip pairs stay balanced). The CLEAR
+    /// COLOR arrives precomputed (the direct passes pass a FACE-corrected
+    /// color, the effect's phase-1 passes code values into the
+    /// intermediate — see [`bg_color_f_for_face`]); no Begin/EndDraw here
+    /// — the caller owns the target switch and the bracket; nothing here
+    /// reports an error.
+    fn draw_scene(&self, clear: D2D1_COLOR_F, plan: Option<&DrawPlan>) {
         // SAFETY: the context and (when the scene draws) the uploaded
         // bitmaps are live (the stack holds them; `prepare` only ever
         // replaces a bitmap while no draw is running); every
@@ -1492,8 +1697,7 @@ impl GpuStack {
         // clip pairs below stay balanced, so EndDraw never runs with a
         // clip still open (D2D rejects that).
         unsafe {
-            let color = bg_color_f(bg);
-            self.context.Clear(Some(&color));
+            self.context.Clear(Some(&clear));
             if let Some(plan) = plan
                 && plan.rw > 0
                 && plan.rh > 0
@@ -1585,12 +1789,15 @@ impl GpuStack {
     /// paths and the dump share (external review AI2: a duplicated
     /// sequence here would let paint-path drift go invisible to the L0
     /// channel). The EndDraw HRESULT is the sole error channel
-    /// (BeginDraw/DrawBitmap report nothing themselves). #130: the pass
-    /// SHAPE follows the display segment — the two-phase effect pass
-    /// when the effective stage says GpuEffect and the graph is usable,
-    /// the direct pass otherwise (stage None/DwmAcm, a latched session,
-    /// or a construction failure THIS frame — content visible
-    /// untransformed beats a blank frame, and the ratchet counts it).
+    /// (BeginDraw/DrawBitmap report nothing themselves). #156: the pass
+    /// SHAPE follows the synced arm — the two-phase effect pass for the
+    /// effect arms when the graph is usable, the direct pass otherwise
+    /// (Direct, an unsynced intent, or a NARROW construction failure —
+    /// content visible untransformed beats blank, #130's contract,
+    /// byte-for-byte). The WIDE arms never degrade to a direct content
+    /// draw (D6: P3 halves as raw output = fake color): a wide graph
+    /// failure reports the no-present failure instead, and the face-arm
+    /// gate below blanks anything that does not match the face.
     fn draw_pass(&mut self, bg: [u8; 3], plan: Option<&DrawPlan>) -> Result<(), DrawFailure> {
         // SAFETY: read-only target-size query on the live context (the
         // target is the swapchain's bitmap on entry — set by
@@ -1600,26 +1807,79 @@ impl GpuStack {
         // the ensure call takes): the intermediate's format follows it
         // (#143).
         let frame_space = self.frame_space;
-        if self.display.want_effect
-            && self.ensure_effect_graph(size.width, size.height, frame_space)
-        {
-            // SAFETY: the graph, context and (when the scene draws) the
-            // uploaded bitmaps are all live (the stack holds them;
-            // `prepare` only ever replaces a bitmap while no draw is
-            // running); every rectangle/parameter outlives the calls;
-            // nothing pumps. The clip pairs inside draw_scene stay
-            // balanced, so neither EndDraw runs with a clip open.
-            self.effect_pass(bg, plan)
-        } else {
-            // SAFETY: same liveness contract, direct into the swapchain
-            // target.
-            unsafe {
-                self.context.BeginDraw();
-                self.draw_scene(bg, plan);
-                self.context
-                    .EndDraw(None, None)
-                    .map_err(DrawFailure::Renderer)
+        let arm = self.current_arm();
+        // The face-arm gate FIRST: a (face, arm) mismatch (a dying
+        // session's windows, or WideBlank's own contract) draws the blank
+        // letterbox — no content, in any shape, ever reaches a face its
+        // declaration does not match.
+        if !self.face_allows_content(arm) {
+            return self.direct_pass(bg, None);
+        }
+        match arm {
+            DisplayArm::Direct => self.direct_pass(bg, plan),
+            DisplayArm::WideBlank => self.direct_pass(bg, None),
+            DisplayArm::SrgbToDisplay => {
+                if self.ensure_effect_graph(size.width, size.height, frame_space) {
+                    self.effect_pass(bg, plan)
+                } else {
+                    // #130's narrow contract, unchanged: draw direct, the
+                    // ratchet counts the failure (already recorded).
+                    self.direct_pass(bg, plan)
+                }
             }
+            DisplayArm::P3ToSrgb | DisplayArm::P3ToDisplay | DisplayArm::P3ToScRgb => {
+                if self.ensure_effect_graph(size.width, size.height, frame_space) {
+                    self.effect_pass(bg, plan)
+                } else {
+                    // A wide graph that will not build: NO present, NO
+                    // direct draw (fake color is the one forbidden
+                    // outcome) — the failure is recorded with the arm's
+                    // class; the ratchets take it from here.
+                    Err(DrawFailure::EffectNotBuilt)
+                }
+            }
+        }
+    }
+
+    /// The face-arm gate (D6's never-fake-color invariant, ONE copy):
+    /// content may reach the target only through an arm that matches the
+    /// face — the narrow direct/effect arms and the legacy-wide arms on
+    /// the legacy face, the scRGB arm on the AC face. Every mismatch
+    /// (reachable only in a dying session's windows, when a face rebuild
+    /// has failed and a fatal is pending) draws the blank letterbox
+    /// instead of mis-declared content; `WideBlank` is blank by
+    /// contract. The D6 invariant this enforces: the AC face never takes
+    /// non-scRGB content, EVER.
+    fn face_allows_content(&self, arm: DisplayArm) -> bool {
+        matches!(
+            (self.face, arm),
+            (
+                OutputSurface::Legacy,
+                DisplayArm::Direct
+                    | DisplayArm::SrgbToDisplay
+                    | DisplayArm::P3ToSrgb
+                    | DisplayArm::P3ToDisplay
+            ) | (OutputSurface::AcScRgb, DisplayArm::P3ToScRgb)
+        )
+    }
+
+    /// The direct pass: BeginDraw → face-corrected Clear → scene →
+    /// EndDraw. The Clear color follows the FACE (P-C: an FP16 scRGB
+    /// target receives LINEAR values — a code-value letterbox would glow;
+    /// the legacy face's bytes are the pre-#156 ones verbatim). The
+    /// face-arm gate lives in `draw_pass` — this pass receives an already
+    /// gated plan (a mismatch arrives as `None`, the blank letterbox).
+    fn direct_pass(&mut self, bg: [u8; 3], plan: Option<&DrawPlan>) -> Result<(), DrawFailure> {
+        let clear = bg_color_f_for_face(bg, self.face);
+        // SAFETY: same liveness contract as every pass — the context and
+        // (when the scene draws) the uploaded bitmaps are live; every
+        // rectangle/parameter outlives the calls; nothing pumps.
+        unsafe {
+            self.context.BeginDraw();
+            self.draw_scene(clear, plan);
+            self.context
+                .EndDraw(None, None)
+                .map_err(DrawFailure::Renderer)
         }
     }
 
@@ -1628,12 +1888,19 @@ impl GpuStack {
     /// into the swapchain target (the post-composition viewport pass,
     /// AI1's ruling). Every non-loss error inside this pass is the
     /// ratchet's feed, never the ladder's — a driver refusing the graph
-    /// must not fatal the renderer (#130). The target is restored on
-    /// every exit so a later direct pass never draws into the stale
-    /// intermediate.
+    /// must not fatal the renderer (#130). The intermediate's Clear uses
+    /// CODE VALUES ([`bg_color_f`]) — it is an ordinary f16/BGRA bitmap
+    /// the effect re-interprets through its color contexts; only the
+    /// direct passes' target-facing Clear is face-corrected. The AC arm's
+    /// phase 2 carries the P-E-probed Flush BEFORE EndDraw (this driver
+    /// answers D2DERR_WRONG_STATE for a post-EndDraw Flush); the legacy
+    /// pass shapes stay flush-free (#130's byte-identical form). The
+    /// target is restored on every exit so a later direct pass never
+    /// draws into the stale intermediate.
     fn effect_pass(&mut self, bg: [u8; 3], plan: Option<&DrawPlan>) -> Result<(), DrawFailure> {
         // The caller's ensure_effect_graph just proved the graph alive.
         let graph = self.display.graph.as_ref().expect("graph ensured");
+        let arm = self.current_arm();
         // SAFETY: the graph, context and (when the scene draws) the
         // uploaded bitmaps are live (the stack holds them; `prepare` only
         // ever replaces a bitmap while no draw is running); every
@@ -1645,12 +1912,13 @@ impl GpuStack {
         // intermediate is viewport-sized, so the effect's interpolation
         // never resamples; composite SOURCE_OVER over the cleared target
         // with an opaque source — alpha 1 everywhere, the composite's
-        // opaque background), and closes the bracket again.
+        // opaque background), flushes when the arm is the AC one (the
+        // P-E timing contract), and closes the bracket again.
         unsafe {
             // Phase 1: the composite, into the intermediate.
             self.context.SetTarget(Some(&graph.intermediate));
             self.context.BeginDraw();
-            self.draw_scene(bg, plan);
+            self.draw_scene(bg_color_f(bg), plan);
             if let Err(e) = self.context.EndDraw(None, None) {
                 let failure = DrawFailure::classify(e);
                 self.restore_target();
@@ -1669,6 +1937,17 @@ impl GpuStack {
                 D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR,
                 D2D1_COMPOSITE_MODE_SOURCE_OVER,
             );
+            if arm == DisplayArm::P3ToScRgb {
+                // The P-E probe's timing contract: BeginDraw→Draw→Flush→
+                // EndDraw. A Flush failure classifies exactly like an
+                // EndDraw one (loss → the ladder; anything else → the
+                // ratchets).
+                if let Err(e) = self.context.Flush(None, None) {
+                    let failure = DrawFailure::classify(e);
+                    self.restore_target();
+                    return Err(failure);
+                }
+            }
             if let Err(e) = self.context.EndDraw(None, None) {
                 let failure = DrawFailure::classify(e);
                 self.restore_target();
@@ -1745,18 +2024,33 @@ impl GpuStack {
         }
     }
 
-    /// The shared error arm of the present paths (#130): renderer errors
-    /// keep the existing two-way classification; an effect-path failure
-    /// records the ratchet feed and reports the no-present outcome (the
-    /// failed frame's back buffer content is undefined — the next paint
-    /// redraws, latched or not).
+    /// The shared error arm of the present paths (#130, #156's classes):
+    /// renderer errors keep the existing two-way classification; an
+    /// effect-path failure records the ratchet feed TAGGED WITH THE
+    /// ARM'S OWN CLASS (the drain routes Narrow/WideLegacy/AcFace) and
+    /// reports the no-present outcome (the failed frame's back buffer
+    /// content is undefined — the next paint redraws, latched or not).
+    /// `EffectNotBuilt` (the wide arms' graph refusal): the detail is
+    /// already recorded by `ensure_effect_graph`; this only enforces the
+    /// no-present.
     fn draw_failure_outcome(&mut self, failure: DrawFailure) -> PaintOutcome {
         match failure {
             DrawFailure::Renderer(e) => self.enddraw_outcome(e),
             DrawFailure::Effect(e) => {
+                let class = self.failure_class();
                 self.display
                     .failure
-                    .get_or_insert_with(|| format!("display effect draw failed: {e}"));
+                    .get_or_insert_with(|| (class, format!("display effect draw failed: {e}")));
+                PaintOutcome::DisplayEffectFailed
+            }
+            DrawFailure::EffectNotBuilt => {
+                let class = self.failure_class();
+                self.display.failure.get_or_insert_with(|| {
+                    (
+                        class,
+                        "display effect graph did not build — frame not drawn".to_string(),
+                    )
+                });
                 PaintOutcome::DisplayEffectFailed
             }
         }
@@ -1795,12 +2089,16 @@ impl GpuStack {
         // SAFETY: read-only buffer query on the live swapchain.
         let surface: IDXGISurface = unsafe { self.swapchain.GetBuffer(0) }
             .map_err(|e| format!("resize GetBuffer(0) failed: {e}"))?;
+        // The rebuilt target follows the stack's OWN face (#156): a
+        // ResizeBuffers with DXGI_FORMAT_UNKNOWN keeps the creation-time
+        // format, so the bitmap must match it (FP16 on the AC arm).
         // SAFETY: the surface is live and buffer-owned; the properties
         // struct is a stack temporary outliving the call.
         let target_bitmap = unsafe {
             self.context.CreateBitmapFromDxgiSurface(
                 &surface,
-                Some(&bitmap_properties(
+                Some(&bitmap_properties_for(
+                    face_format(self.face),
                     D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
                 )),
             )
@@ -1833,7 +2131,7 @@ impl GpuStack {
         req: DumpRequest,
         diag: Diagnostics,
         src: &mut dyn LevelSource,
-    ) -> Result<(u32, u32, Vec<u8>), String> {
+    ) -> Result<DumpPixels, String> {
         let DumpRequest {
             cw,
             ch,
@@ -1873,21 +2171,35 @@ impl GpuStack {
         // The SAME scene pass the present paths run (external review AI2:
         // a duplicated sequence here would let paint-path drift go
         // invisible to the L0 channel) — minus the Present, so a
-        // never-shown window dumps identically. #130: the pass shape
-        // follows the display segment here too — a transformed screen
-        // dumps transformed, or the dump channel would diverge from what
-        // the viewport shows.
-        self.draw_pass(bg, plan.as_ref()).map_err(|e| match e {
-            DrawFailure::Renderer(e) => format!("dump EndDraw failed: {e}"),
-            DrawFailure::Effect(e) => format!("dump effect pass failed: {e}"),
-        })?;
+        // never-shown window dumps identically. #156: the pass shape
+        // follows the display arm here too — a transformed screen dumps
+        // transformed, or the dump channel would diverge from what the
+        // viewport shows. On the AC face the pass runs TWICE: the first
+        // is the pipe-compile warm-up (its cost is the driver's, not the
+        // steady-state chain), the second is wall-clocked for the P-E
+        // throughput evidence line; both must succeed before the readback
+        // (a warm-up failure takes the ordinary failure path).
+        if self.face == OutputSurface::AcScRgb {
+            self.dump_draw_pass(bg, plan.as_ref())?;
+            let start = std::time::Instant::now();
+            self.dump_draw_pass(bg, plan.as_ref())?;
+            let ms = start.elapsed().as_secs_f64() * 1000.0;
+            eprintln!("riviv: dump-viewport face=ac-scrgb w={cw} h={ch} ac-draw={ms:.3}ms");
+        } else {
+            self.dump_draw_pass(bg, plan.as_ref())?;
+        }
         // The readback staging bitmap: CPU_READ | CANNOT_DRAW, viewport
-        // sized, the same UNORM format (design §9).
-        // The readback plus the two decoded copies below are this call's
-        // in-flight buffers: the ledger's inflight class covers them, and the
-        // peak is what survives the call.
-        self.ledger
-            .note_inflight((cw as u64 * ch as u64 * 4).saturating_mul(2));
+        // sized, the face's own format (design §9; the AC arm reads the
+        // FP16 halves). The readback plus the decoded copies below are
+        // this call's in-flight buffers: the ledger's inflight class
+        // covers them, and the peak is what survives the call.
+        let inflight = match self.face {
+            OutputSurface::Legacy => (cw as u64 * ch as u64 * 4).saturating_mul(2),
+            // The AC readback: the staging holds cw*ch*8 bytes of halves
+            // (the legacy 4-bytes-per-pixel caliber doubled).
+            OutputSurface::AcScRgb => cw as u64 * ch as u64 * 8,
+        };
+        self.ledger.note_inflight(inflight);
         // The readback tail runs as one unit so the in-flight accounting is
         // restored on EVERY exit: the six failure paths between here and
         // the old success-path reset used to strand the staging bytes in
@@ -1899,10 +2211,37 @@ impl GpuStack {
         read
     }
 
+    /// The dump's one draw pass with its error mapping (the DrawFailure
+    /// sum → the automation channel's diagnosis string).
+    fn dump_draw_pass(&mut self, bg: [u8; 3], plan: Option<&DrawPlan>) -> Result<(), String> {
+        self.draw_pass(bg, plan).map_err(|e| match e {
+            DrawFailure::Renderer(e) => format!("dump EndDraw failed: {e}"),
+            DrawFailure::Effect(e) => format!("dump effect pass failed: {e}"),
+            DrawFailure::EffectNotBuilt => {
+                format!(
+                    "dump effect build failed: {}",
+                    self.display
+                        .failure
+                        .clone()
+                        .map_or_else(|| "unrecorded".to_string(), |(_, d)| d)
+                )
+            }
+        })
+    }
+
     /// The dump's readback tail: staging bitmap, copy, map, rows, unmap,
-    /// the BGRA-to-RGBA decode. Every `?` here is a caller-side in-flight
-    /// reset away from leaking the accounting (see `dump`).
-    fn dump_readback(&mut self, cw: u32, ch: u32) -> Result<(u32, u32, Vec<u8>), String> {
+    /// the decode. The FACE decides the staging format and the decode:
+    /// the legacy arm is the BGRA8→RGBA8 swap (the pre-#156 bytes,
+    /// verbatim); the AC arm maps the FP16 staging and collects the raw
+    /// LE u16 RGBA quadruples row by row (P-B's draw_and_read form). Every
+    /// `?` here is a caller-side in-flight reset away from leaking the
+    /// accounting (see `dump`).
+    fn dump_readback(&mut self, cw: u32, ch: u32) -> Result<DumpPixels, String> {
+        let face = self.face;
+        let (format, row_u16) = match face {
+            OutputSurface::Legacy => (face_format(face), 0usize),
+            OutputSurface::AcScRgb => (face_format(face), cw as usize * 4),
+        };
         // SAFETY: the context is live; the properties struct outlives the
         // call; the bitmap is created bare (never set as the target).
         let readback = unsafe {
@@ -1913,7 +2252,10 @@ impl GpuStack {
                 },
                 None,
                 0,
-                &bitmap_properties(D2D1_BITMAP_OPTIONS_CPU_READ | D2D1_BITMAP_OPTIONS_CANNOT_DRAW),
+                &bitmap_properties_for(
+                    format,
+                    D2D1_BITMAP_OPTIONS_CPU_READ | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+                ),
             )
         }
         .map_err(|e| format!("dump readback CreateBitmap failed: {e}"))?;
@@ -1939,7 +2281,13 @@ impl GpuStack {
         let mapped = unsafe { readback.Map(D2D1_MAP_OPTIONS_READ) }
             .map_err(|e| format!("dump Map failed: {e}"))?;
         let pitch = mapped.pitch as usize;
-        let row_bytes = cw as usize * 4;
+        // The legacy arm reads 4-byte rows (BGRA8), the AC arm 8-byte rows
+        // (the half quadruple) — one shared guard over the row's byte width.
+        let row_bytes = if row_u16 > 0 {
+            row_u16 * 2
+        } else {
+            cw as usize * 4
+        };
         if mapped.bits.is_null() || pitch < row_bytes {
             let mapped_pitch = mapped.pitch;
             // Unmap before failing: the mapping must not outlive the call
@@ -1949,6 +2297,30 @@ impl GpuStack {
             return Err(format!(
                 "dump Map gave pitch {mapped_pitch} for a {row_bytes}-byte row"
             ));
+        }
+        if face == OutputSurface::AcScRgb {
+            // The AC arm: collect the raw halves row by row (RGBA LE u16
+            // quads — the P-B draw_and_read shape), then unmap.
+            let mut halves = Vec::with_capacity(row_u16 * ch as usize);
+            for row in 0..ch as usize {
+                // SAFETY: the guards above pinned pitch ≥ row_bytes and a
+                // non-null base; the mapped region holds pitch*ch readable
+                // bytes for the lifetime of the map, and the u16 rows stay
+                // inside it (row_bytes = row_u16 * 2).
+                let slice = unsafe {
+                    let row_ptr = mapped.bits.add(row * pitch) as *const u16;
+                    std::slice::from_raw_parts(row_ptr, row_u16)
+                };
+                halves.extend_from_slice(slice);
+            }
+            // SAFETY: paired with Map above; nothing reads the mapped bits
+            // after this point.
+            unsafe { readback.Unmap() }.map_err(|e| format!("dump Unmap failed: {e}"))?;
+            return Ok(DumpPixels::ScRgbHalves {
+                w: cw,
+                h: ch,
+                halves,
+            });
         }
         let mut bgra = vec![0u8; row_bytes * ch as usize];
         for (row, dst_row) in bgra.chunks_mut(row_bytes).enumerate() {
@@ -1968,7 +2340,7 @@ impl GpuStack {
         unsafe { readback.Unmap() }.map_err(|e| format!("dump Unmap failed: {e}"))?;
         let mut rgba = vec![0u8; bgra.len()];
         crate::pixels::bgra_to_rgba(&bgra, &mut rgba);
-        Ok((cw, ch, rgba))
+        Ok(DumpPixels::Rgba8 { w: cw, h: ch, rgba })
     }
 }
 
@@ -2118,8 +2490,10 @@ pub(crate) fn paint_d2d(view: HWND, owner: HWND) -> PaintOutcome {
             )
         });
         // #130: the display segment's intent, synced before the mutable
-        // gpu borrow (the same computation the dump path runs).
-        let (want_effect, display_profile) = crate::window::display_intent(state);
+        // gpu borrow (the same computation the dump path runs). #156: the
+        // intent is the EXECUTED ARM (the table run through the ratchets
+        // and the live face's clamp) plus the profile file, not a bool.
+        let (display_arm, display_profile) = crate::window::display_intent(state);
         let Some(gpu) = state.gpu.as_mut() else {
             // No stack: reachable on the same WM_PAINT whose
             // gpu_rebuild_if_due just deferred a fatal (the router calls
@@ -2140,7 +2514,7 @@ pub(crate) fn paint_d2d(view: HWND, owner: HWND) -> PaintOutcome {
         // #130: one channel, both draw paths — the intent sync happens
         // before EVERY draw this paint (draw_frame and present_clear
         // alike), so even the blank-letterbox arm stays in the segment.
-        gpu.sync_display_intent(want_effect, display_profile.as_deref());
+        gpu.sync_display_intent(display_arm, display_profile.as_deref());
         let outcome = match (&plan, state.image.as_ref()) {
             (Some((plan, mw, mh, space)), Some(image)) => {
                 // The CPU level source (master + mip cache) — a disjoint
@@ -2454,6 +2828,45 @@ mod tests {
         assert_eq!(bg_color_f([0, 0, 0]).a, 1.0);
     }
 
+    #[test]
+    fn the_ac_face_letterbox_is_the_srgb_decoded_linear_value_per_channel() {
+        // P-C's two-sided contract, as a 256-value pin: the AC face's
+        // direct Clear must write the sRGB-DECODED (linear) value — the
+        // DWM re-encodes with the exact OETF, so only the decoded value
+        // lands back on the same byte; the legacy arm stays the code
+        // value (bg_color_f itself, unchanged).
+        for v in 0u32..=255 {
+            let byte = v as u8;
+            let ac = bg_color_f_for_face([byte, 0, 0], OutputSurface::AcScRgb);
+            assert_eq!(
+                ac.r,
+                crate::pixels::srgb_decode(f32::from(byte) / 255.0),
+                "ac r channel {v}"
+            );
+            let ac_g = bg_color_f_for_face([0, byte, 0], OutputSurface::AcScRgb);
+            assert_eq!(
+                ac_g.g,
+                crate::pixels::srgb_decode(f32::from(byte) / 255.0),
+                "ac g channel {v}"
+            );
+            let ac_b = bg_color_f_for_face([0, 0, byte], OutputSurface::AcScRgb);
+            assert_eq!(
+                ac_b.b,
+                crate::pixels::srgb_decode(f32::from(byte) / 255.0),
+                "ac b channel {v}"
+            );
+            // The legacy arm IS the pre-#156 value, byte for byte.
+            let legacy = bg_color_f_for_face([byte, 0, 0], OutputSurface::Legacy);
+            assert_eq!(legacy, bg_color_f([byte, 0, 0]), "legacy arm {v}");
+            assert_eq!(legacy.r, f32::from(byte) / 255.0);
+        }
+        // Alpha is forced opaque on both faces.
+        assert_eq!(
+            bg_color_f_for_face([0, 0, 0], OutputSurface::AcScRgb).a,
+            1.0
+        );
+    }
+
     // ---- backend labels (§8's evidence channel) ----
 
     #[test]
@@ -2498,16 +2911,26 @@ mod tests {
     // ---- the upload formats (#143, ADR 0003 D3/D6) ----
 
     #[test]
-    fn the_swapchain_format_is_pinned_to_bgra8_unorm_never_srgb() {
-        // ADR 0003 D3's output-face freeze, pinned as values: the
-        // swapchain (and every surface drawn INTO it) stays
-        // B8G8R8A8_UNORM — the _SRGB variant would linearize the bytes,
-        // and the f16 master's quantize is the composite's job, not a
-        // format row on the output face.
+    fn the_swapchain_formats_are_pinned_per_output_face() {
+        // ADR 0003 D3's legacy freeze + ADR 0004 D3's dual arms, pinned as
+        // values: the LEGACY face's swapchain (and every surface drawn
+        // INTO it) stays B8G8R8A8_UNORM — the _SRGB variant would
+        // linearize the bytes — and the AC face's is R16G16B16A16_FLOAT,
+        // the FP16 scRGB declaration container. Two faces, two formats,
+        // both never the _SRGB variant.
         assert_eq!(SWAPCHAIN_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM);
         assert_ne!(
             SWAPCHAIN_FORMAT.0, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB.0,
             "UNORM (87) and _SRGB (91) are different formats — the freeze means the UNORM one"
+        );
+        assert_eq!(AC_SWAPCHAIN_FORMAT, DXGI_FORMAT_R16G16B16A16_FLOAT);
+        // The dispatch: face_format is the one place both arms come from.
+        assert_eq!(face_format(OutputSurface::Legacy), SWAPCHAIN_FORMAT);
+        assert_eq!(face_format(OutputSurface::AcScRgb), AC_SWAPCHAIN_FORMAT);
+        assert_ne!(
+            face_format(OutputSurface::Legacy),
+            face_format(OutputSurface::AcScRgb),
+            "the arms are distinct formats — a same-format pair would hide a face mixup"
         );
     }
 

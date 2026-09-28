@@ -486,6 +486,31 @@ pub(crate) struct WindowState {
     /// ADR 0001; the flip is a fingerprint transition the tracker mints
     /// a new generation for).
     pub(crate) stage_latched: bool,
+    /// #156 (D6): the AC surface's session latch — once set, the session
+    /// never builds the `AcScRgb` output face again (an FP16-swapchain /
+    /// QI / `SetColorSpace1` / AC-effect failure is a verdict about the
+    /// MACHINE, not the frame). One-way for the session; the fingerprint's
+    /// surface term and [`display_arm`] fold the wide AC cells back onto
+    /// the legacy face's wide stages through it. Session-level on the
+    /// window state on purpose: it must survive ladder rebuilds (the
+    /// same split as `stage_latched` above).
+    pub(crate) ac_surface_latched: bool,
+    /// #156 (D6): the wide effect's consecutive-failure counter — the
+    /// legacy-wide arms (`P3ToSrgb`/`P3ToDisplay`) own quality ratchet.
+    /// Counted per frame failure, cleared on every clean frame (the
+    /// "consecutive" semantics), latching at
+    /// `transform_stage::STAGE_DEGRADE_FAILURES` — the same shape the
+    /// narrow `stage_failures` counter runs. Session-level for the same
+    /// reason.
+    pub(crate) wide_effect_failures: u32,
+    /// #156 (D6): the wide effect's session latch — once set, every wide
+    /// arm answers `WideBlank` (a blank frame, never fake color) until
+    /// the wide masters re-derive to sRGB through the D5 reload channel.
+    /// The latch itself does NOT enter the output fingerprint (it is a
+    /// transient on the way to the re-derivation, which changes the
+    /// content class and the stage words on its own). Session-level,
+    /// survives ladder rebuilds.
+    pub(crate) wide_effect_latched: bool,
 }
 
 /// Window state pointer stored in GWLP_USERDATA between WM_NCCREATE and
@@ -1189,6 +1214,15 @@ fn paint_view(view: HWND, owner: HWND) {
     // The decision rides the pure [`stack_rebuild_allowed`] predicate.
     // SAFETY: the read-only borrow ends inside its is_some_and.
     let terminal = (unsafe { state_of(owner) }).is_some_and(|s| s.gpu_terminal);
+    // #156: the face reconciliation runs OUTSIDE the no-stack rebuild
+    // gate — it is the LIVE stack's job (its own gate returns early
+    // without one; the rebuild below builds on the desired face through
+    // the same helper), and it swaps BEFORE the paint draws so the
+    // executed arm always matches the surface it draws into.
+    surface_rebuild_if_due(view, owner);
+    // Re-read AFTER the reconciliation: a failed face swap can leave the
+    // session stackless with the fatal latched, and the rebuild gate
+    // must see the real state, not the pre-swap one.
     // SAFETY: the read-only borrow ends inside its is_some_and.
     let has_gpu = (unsafe { state_of(owner) }).is_some_and(|s| s.gpu.is_some());
     if stack_rebuild_allowed(has_gpu, terminal) {
@@ -1245,14 +1279,22 @@ fn paint_view(view: HWND, owner: HWND) {
     // failure also drives its own retry (Codex P2, PR #131): a static
     // image would otherwise paint once and never reach the latch —
     // bounded at STAGE_DEGRADE_FAILURES repaints, after which the latch
-    // turns the segment off and the failures stop.
-    if drain_display_failure(owner) {
-        // SAFETY: invalidates our own child; no borrow is live (this
-        // runs after paint_d2d returned and after the drain's borrow
-        // ended).
-        unsafe {
-            let _ = InvalidateRect(Some(view), None, false);
+    // turns the segment off and the failures stop. #156: the drain
+    // answers an ACTION — a counted failure repaints, a latched wide
+    // effect re-derives its masters (OUTSIDE any borrow, the
+    // flipped_to_warp precedent), a latched AC face reconciles through
+    // its repaint.
+    match drain_display_failure(owner) {
+        DrainAction::None => {}
+        DrainAction::Repaint => {
+            // SAFETY: invalidates our own child; no borrow is live (this
+            // runs after paint_d2d returned and after the drain's borrow
+            // ended).
+            unsafe {
+                let _ = InvalidateRect(Some(view), None, false);
+            }
         }
+        DrainAction::RederiveWide => rederive_wide_masters(owner),
     }
     // The ladder's final tier defers its fatal to HERE: the paint's state
     // borrows are gone, so the modal may pump (design §7). The reason
@@ -1286,6 +1328,126 @@ fn stack_rebuild_allowed(gpu_present: bool, terminal: bool) -> bool {
     !gpu_present && !terminal
 }
 
+/// The OUTPUT FACE the session should be on right now (#156): the
+/// decision table's desired surface clamped by the AC surface latch —
+/// the same computation [`crate::transform_stage::clamped_surface`] runs
+/// for the fingerprint. The face reconciliation chases THIS between
+/// paints; the live stack face is deliberately NOT an input (the face
+/// follows the decision, never the reverse).
+fn desired_output_face(state: &WindowState) -> crate::transform_stage::OutputSurface {
+    crate::transform_stage::clamped_surface(
+        crate::transform_stage::Backend::from_effective(state.gpu_kind),
+        state.display_query.query,
+        state.display_query.ac,
+        current_content_class(state),
+        state.ac_surface_latched,
+    )
+}
+
+/// One `create` call with the D6 AC-face fallback (#156), shared by every
+/// create site: an AC-face creation failure (FP16 swapchain, `SwapChain3`
+/// QI, `SetColorSpace1` — the "before any draw" verdicts) latches the
+/// session's AC arm OFF (one breadcrumb, the fingerprint folds) and
+/// retries on the legacy face; a legacy-face failure has no lower face —
+/// the deferred fatal (the pre-#156 rebuild-failure shape, verbatim).
+/// A WARP session never carries the AC face (the D5 completion: no
+/// effect arm exists there), so the face is forced Legacy for a WARP
+/// request regardless of the caller's input. `None` = the fatal latched.
+fn create_stack_with_face(
+    view: HWND,
+    kind: RendererKind,
+    face: crate::transform_stage::OutputSurface,
+    state: &mut WindowState,
+) -> Option<(crate::gpu::GpuStack, RendererKind)> {
+    // WARP + AC is not a pairing any probe stood up — the legacy face is
+    // the only face a software session has.
+    let face = if kind == RendererKind::Warp {
+        crate::transform_stage::OutputSurface::Legacy
+    } else {
+        face
+    };
+    match crate::gpu::create(view, crate::gpu::owner_of(view), kind, face) {
+        Ok(pair) => Some(pair),
+        Err(e) if face == crate::transform_stage::OutputSurface::AcScRgb => {
+            // The D6 surface ratchet: draw-before-present failed at
+            // creation — latch the arm off for the session and fall to
+            // the legacy face (correct, clipped, never fake).
+            state.ac_surface_latched = true;
+            eprintln!("riviv: ac surface latched ({e}) - ac arm off for the session");
+            identify_output(state);
+            match crate::gpu::create(view, crate::gpu::owner_of(view), kind, {
+                crate::transform_stage::OutputSurface::Legacy
+            }) {
+                Ok(pair) => Some(pair),
+                Err(e2) => {
+                    latch_renderer_fatal(state, e2.to_string());
+                    None
+                }
+            }
+        }
+        Err(e) => {
+            latch_renderer_fatal(state, e.to_string());
+            None
+        }
+    }
+}
+
+/// The deferred-fatal latch (the rebuild paths' terminal verdict): set
+/// the sticky flags with the diagnosis and print the stderr line — both
+/// in the pre-#156 byte shape (the modal reason carries the em-dash, the
+/// stderr line the hyphen; do not normalize either, the smoke greps the
+/// stderr form). The fatal fires at paint_view's tail, outside every
+/// state borrow.
+fn latch_renderer_fatal(state: &mut WindowState, create_error: String) {
+    state.gpu_pending_fatal = true;
+    state.gpu_terminal = true;
+    state.gpu_fatal_reason = Some(format!(
+        "renderer rebuild failed ({create_error}) — no fallback renderer left"
+    ));
+    eprintln!("riviv: renderer rebuild failed ({create_error}) - no fallback renderer left");
+}
+
+/// The face reconciliation (#156, D6): bring the LIVE stack's face to
+/// the decision's face before the paint draws. Runs at every paint,
+/// BEFORE `gpu_rebuild_if_due` (a missing stack is that function's job —
+/// it builds on the desired face through the same helper). The swap is a
+/// FULL stack rebuild, not a ResizeBuffers format change: the
+/// ResizeBuffers path was never probed and stays unexplored, while
+/// `create` is the P-C-proven path end to end — and the cost is bounded
+/// by the decision itself (only a wide-content arrival or departure on
+/// an AC machine, once per transition). No `establish_output_identity`
+/// on success: the fingerprint's surface term never tracked the live
+/// face (it tracks the DESIRED one through the AC latch), so the
+/// identity is unchanged — the face merely caught up (the AC face's own
+/// `output-surface` breadcrumb comes from `create`).
+fn surface_rebuild_if_due(view: HWND, owner: HWND) {
+    // SAFETY: the borrow spans the gate checks and the (non-pumping) COM
+    // creation; nothing here dispatches messages, so no second state_of
+    // borrow can alias this one.
+    if let Some(state) = unsafe { state_of(owner) } {
+        if state.gpu_terminal {
+            return; // a dying session hosts no new stacks
+        }
+        let Some(current_face) = state.gpu.as_ref().map(|gpu| gpu.face) else {
+            return; // no stack: gpu_rebuild_if_due builds one, on the
+            // desired face, through the same helper
+        };
+        let desired_face = desired_output_face(state);
+        if current_face == desired_face {
+            return;
+        }
+        let kind = rebuild_kind(renderer_request(state), state.gpu_kind);
+        let old = state.gpu.take();
+        drop(old); // the replaced stack's teardown is deterministic (Drop)
+        // A None here means the fatal is already latched (the tail fires
+        // it); the session keeps no stack on this path either way.
+        if let Some((stack, effective)) = create_stack_with_face(view, kind, desired_face, state) {
+            state.gpu = Some(stack);
+            state.gpu_kind = effective;
+        }
+    }
+}
+
 /// Rebuild the D2D stack when a paint finds none (#80 design §5, widened
 /// by #82): the stack is gone only after a device loss that could not
 /// rebuild or an unrecoverable verdict (whose deferred fatal gates this
@@ -1294,7 +1456,8 @@ fn stack_rebuild_allowed(gpu_present: bool, terminal: bool) -> bool {
 /// inside the stack, so this is a plain "the stack is missing and we want
 /// one" rebuild. Since #90 there is no `gdi` config to gate on and no
 /// init-failure latch: a rebuild that cannot create the stack defers the
-/// fatal like every other unrecoverable verdict.
+/// fatal like every other unrecoverable verdict. #156: the build lands
+/// on the DESIRED face (through the shared AC-fallback helper).
 fn gpu_rebuild_if_due(view: HWND, owner: HWND) {
     // #155: whether this rebuild flipped the session onto WARP — the
     // wide-gamut invalidation reads it after the borrow ends (the
@@ -1308,31 +1471,17 @@ fn gpu_rebuild_if_due(view: HWND, owner: HWND) {
             return;
         }
         let kind = rebuild_kind(renderer_request(state), state.gpu_kind);
-        match crate::gpu::create(view, crate::gpu::owner_of(view), kind) {
-            Ok((stack, effective)) => {
-                let old_kind = state.gpu_kind;
-                state.gpu = Some(stack);
-                state.gpu_kind = effective;
-                establish_output_identity(state);
-                // #155 (D5): a flip onto WARP invalidates every
-                // F16P3 master — P3 halves have no mapping there.
-                flipped_to_warp = backend_flipped_to_warp(old_kind, effective);
-            }
-            Err(e) => {
-                // The environment lost its device stack since startup, and
-                // create has already tried hardware AND WARP by the time
-                // this runs when the request is auto (external review AI2
-                // P2-3's fix): nothing below exists to catch the session
-                // (#90) — defer the fatal to paint_view's tail (this runs
-                // before the paint, whose tail takes the flag on the very
-                // same WM_PAINT).
-                state.gpu_pending_fatal = true;
-                state.gpu_terminal = true;
-                state.gpu_fatal_reason = Some(format!(
-                    "renderer rebuild failed ({e}) — no fallback renderer left"
-                ));
-                eprintln!("riviv: renderer rebuild failed ({e}) - no fallback renderer left");
-            }
+        let face = desired_output_face(state);
+        // A None here means the deferred fatal is latched; the tail fires
+        // it before the next paint.
+        if let Some((stack, effective)) = create_stack_with_face(view, kind, face, state) {
+            let old_kind = state.gpu_kind;
+            state.gpu = Some(stack);
+            state.gpu_kind = effective;
+            establish_output_identity(state);
+            // #155 (D5): a flip onto WARP invalidates every
+            // F16P3 master — P3 halves have no mapping there.
+            flipped_to_warp = backend_flipped_to_warp(old_kind, effective);
         }
     }
     // #155: the flip's invalidation runs OUTSIDE the borrow — it may
@@ -1396,10 +1545,23 @@ fn identify_output(state: &mut WindowState) {
     let backend = crate::transform_stage::Backend::from_effective(state.gpu_kind);
     let query = state.display_query.query;
     let latched = state.stage_latched;
-    let stage = crate::transform_stage::effective_stage(
-        crate::transform_stage::desired_stage(backend, query),
-        latched,
-    );
+    // #156: the stage word is content-aware. The narrow rows keep the
+    // pre-#156 chain VERBATIM (their word set {none, cpu, gpu_effect,
+    // dwm_acm} is byte-pinned by test); the wide rows walk the same
+    // display_arm chain the draw consumes — the DESIRED face answer
+    // (establish time may precede the face reconciliation, so the live
+    // stack face is NOT the input here) with the wide latch's transient
+    // shown as its own word.
+    let stage_word = match current_content_class(state) {
+        crate::transform_stage::ContentSpace::Srgb
+        | crate::transform_stage::ContentSpace::F16Srgb => {
+            stage_label(crate::transform_stage::effective_stage(
+                crate::transform_stage::desired_stage(backend, query),
+                latched,
+            ))
+        }
+        crate::transform_stage::ContentSpace::F16P3 => wide_stage_word(state),
+    };
     let ac = state.display_query.ac;
     let profile = state
         .display_query
@@ -1410,11 +1572,56 @@ fn identify_output(state: &mut WindowState) {
         .unwrap_or_else(|| "none".to_string());
     eprintln!(
         "riviv: display-stage={} profile={} backend={} ac={}",
-        stage_label(stage),
+        stage_word,
         profile,
         backend_label(backend),
         ac_label(ac)
     );
+}
+
+/// The wide rows' identify-time stage word (#156): the SAME
+/// `display_arm` chain the paint executes, minus the stack-face clamp —
+/// the face answer comes from the AC-latch-clamped DESIRED surface
+/// ([`crate::transform_stage::clamped_surface`]), because establish runs
+/// at decision points where the face may not have caught up yet. The
+/// wide-effect latch's transient blank shows as its own word
+/// (`wide_blank`); the narrow rows' words are untouched (pinned
+/// separately).
+fn wide_stage_word(state: &WindowState) -> &'static str {
+    let backend = crate::transform_stage::Backend::from_effective(state.gpu_kind);
+    let desired_face = crate::transform_stage::clamped_surface(
+        backend,
+        state.display_query.query,
+        state.display_query.ac,
+        crate::transform_stage::ContentSpace::F16P3,
+        state.ac_surface_latched,
+    );
+    let arm = crate::transform_stage::display_arm(
+        backend,
+        state.display_query.query,
+        state.display_query.ac,
+        crate::transform_stage::ContentSpace::F16P3,
+        state.stage_latched,
+        state.ac_surface_latched,
+        state.wide_effect_latched,
+        desired_face,
+    );
+    arm_word(arm)
+}
+
+/// The breadcrumb's word for an executed arm (the dump-reader vocabulary;
+/// the Direct/SrgbToDisplay arms' words are the narrow rows' own, kept
+/// for totality — the wide rows' tests pin that only the `p3_*`/blank
+/// words are reachable there).
+fn arm_word(arm: crate::transform_stage::DisplayArm) -> &'static str {
+    match arm {
+        crate::transform_stage::DisplayArm::Direct => "none",
+        crate::transform_stage::DisplayArm::SrgbToDisplay => "gpu_effect",
+        crate::transform_stage::DisplayArm::P3ToSrgb => "p3_to_srgb",
+        crate::transform_stage::DisplayArm::P3ToDisplay => "p3_to_display",
+        crate::transform_stage::DisplayArm::P3ToScRgb => "p3_to_scrgb",
+        crate::transform_stage::DisplayArm::WideBlank => "wide_blank",
+    }
 }
 
 /// `identify_output`'s mint without the breadcrumb: recompute the
@@ -1456,6 +1663,7 @@ fn current_output_fingerprint(state: &WindowState) -> crate::transform_stage::Ou
         state.display_query.bytes.as_deref(),
         state.display_query.ac,
         current_content_class(state),
+        state.ac_surface_latched,
     )
 }
 
@@ -1502,27 +1710,47 @@ fn reidentify_output_on_transition(state: &mut WindowState) {
 }
 
 /// The display segment's application intent for the CURRENT state
-/// (#130): the EFFECTIVE stage (the table's answer clamped by the session
-/// latch) says whether the two-phase effect pass runs; the judge's
-/// profile is its destination. Computed before the mutable gpu borrow on
-/// both consumers — the paint (gpu.rs) and the dump (below). The sRGB
-/// rows' draw consumption is all this computes: the wide stages' draw
-/// wiring (what a GpuEffectP3To* pass feeds) is #156's scope.
-pub(crate) fn display_intent(state: &WindowState) -> (bool, Option<std::path::PathBuf>) {
+/// (#130, #156's shape): the EXECUTED arm — the decision table's answer
+/// run through the three session ratchets and the LIVE output face's
+/// clamp (`transform_stage::display_arm`) — plus the profile file the
+/// effect's destination context loads (only the two display legs need
+/// one; the constant pass-through and the scRGB arm carry their own
+/// simple contexts). Computed before the mutable gpu borrow on both
+/// consumers — the paint (gpu.rs) and the dump (below). The face input
+/// reads the LIVE stack (`gpu.face`), so the arm always names a pass
+/// the stack can physically run.
+pub(crate) fn display_intent(
+    state: &WindowState,
+) -> (
+    crate::transform_stage::DisplayArm,
+    Option<std::path::PathBuf>,
+) {
     let backend = crate::transform_stage::Backend::from_effective(state.gpu_kind);
-    let stage = crate::transform_stage::effective_stage(
-        crate::transform_stage::desired_stage(backend, state.display_query.query),
+    let face = state
+        .gpu
+        .as_ref()
+        .map(|gpu| gpu.face)
+        .unwrap_or(crate::transform_stage::OutputSurface::Legacy);
+    let arm = crate::transform_stage::display_arm(
+        backend,
+        state.display_query.query,
+        state.display_query.ac,
+        current_content_class(state),
         state.stage_latched,
+        state.ac_surface_latched,
+        state.wide_effect_latched,
+        face,
     );
-    let want = stage == crate::transform_stage::TransformStage::GpuEffect;
-    (
-        want,
-        if want {
-            state.display_query.path.clone()
-        } else {
-            None
-        },
-    )
+    let profile = if matches!(
+        arm,
+        crate::transform_stage::DisplayArm::SrgbToDisplay
+            | crate::transform_stage::DisplayArm::P3ToDisplay
+    ) {
+        state.display_query.path.clone()
+    } else {
+        None
+    };
+    (arm, profile)
 }
 
 /// The stderr breadcrumb's stage word (the ticket's vocabulary:
@@ -1665,47 +1893,99 @@ fn display_monitor_check(owner: HWND) {
     }
 }
 
-/// The display segment's post-paint bookkeeping (#130): drains this
-/// frame's effect failure (construction or two-phase draw — whichever
-/// happened last) into the quality ratchet. A clean frame resets the
-/// consecutive counter; the third consecutive failure latches the
-/// segment off for the session (breadcrumb-only, ADR 0001) and the
-/// latch flip re-identifies the output (a fingerprint transition — the
-/// dump channel's gen must move). Returns whether a failure was counted
-/// this frame — the caller turns that into a repaint so a static image
-/// still walks the ratchet to its latch (Codex P2, PR #131).
-fn drain_display_failure(owner: HWND) -> bool {
+/// The display segment's post-paint bookkeeping (#130, #156's classes):
+/// drains this frame's effect failure into the CLASS's own ratchet.
+/// A clean frame resets BOTH consecutive counters; each class latches on
+/// its own schedule (the shared threshold, the AC face immediately):
+/// - `Narrow` → the pre-#156 sRGB segment ratchet, byte-for-byte (the
+///   breadcrumbs included);
+/// - `AcFace` → one failure latches the AC surface off for the session
+///   (the verdict is about the machine): the fingerprint's surface term
+///   folds to Legacy, `identify_output` re-words the decision, and the
+///   returned repaint drives the face reconciliation;
+/// - `WideLegacy` → its own counter, and at the threshold the latch
+///   flips plus the wide masters RE-DERIVE to sRGB (the D6 ladder's
+///   terminal quality floor) — the re-derivation runs OUTSIDE the state
+///   borrow (the flipped_to_warp precedent), hence the action enum.
+enum DrainAction {
+    None,
+    Repaint,
+    RederiveWide,
+}
+
+fn drain_display_failure(owner: HWND) -> DrainAction {
     // SAFETY: the borrow spans the take and the counter updates; nothing
     // here pumps (D2D objects are already idle — the paint returned).
     let Some(state) = (unsafe { state_of(owner) }) else {
-        return false;
+        return DrainAction::None;
     };
     let Some(gpu) = state.gpu.as_mut() else {
-        return false;
+        return DrainAction::None;
     };
-    let Some(detail) = gpu.take_display_failure() else {
-        // A clean application (or no segment at all): the ratchet's
-        // counter restarts — only CONSECUTIVE failures count.
+    let Some((class, detail)) = gpu.take_display_failure() else {
+        // A clean application (or no segment at all): both ratchets'
+        // counters restart — only CONSECUTIVE failures count.
         state.stage_failures = 0;
-        return false;
+        state.wide_effect_failures = 0;
+        return DrainAction::None;
     };
-    state.stage_failures += 1;
-    eprintln!(
-        "riviv: display effect failure #{}: {}",
-        state.stage_failures, detail
-    );
-    if crate::transform_stage::stage_degrades(state.stage_failures) && !state.stage_latched {
-        state.stage_latched = true;
-        eprintln!(
-            "riviv: display-stage degrade latched ({} consecutive effect failures) - display segment off for the session",
-            state.stage_failures
-        );
-        identify_output(state);
-        // The latch ended the failure sequence — no retry needed (the
-        // next paint draws direct and succeeds).
-        return false;
+    match class {
+        crate::gpu::DisplayFailureClass::Narrow => {
+            state.stage_failures += 1;
+            eprintln!(
+                "riviv: display effect failure #{}: {}",
+                state.stage_failures, detail
+            );
+            if crate::transform_stage::stage_degrades(state.stage_failures) && !state.stage_latched
+            {
+                state.stage_latched = true;
+                eprintln!(
+                    "riviv: display-stage degrade latched ({} consecutive effect failures) - display segment off for the session",
+                    state.stage_failures
+                );
+                identify_output(state);
+                // The latch ended the failure sequence — no retry needed (the
+                // next paint draws direct and succeeds).
+                return DrainAction::None;
+            }
+            DrainAction::Repaint
+        }
+        crate::gpu::DisplayFailureClass::AcFace => {
+            if !state.ac_surface_latched {
+                state.ac_surface_latched = true;
+                eprintln!("riviv: ac surface latched ({detail}) - ac arm off for the session");
+                identify_output(state);
+                // The repaint drives the face reconciliation: the next
+                // paint rebuilds the legacy stack (the arm folded there).
+                return DrainAction::Repaint;
+            }
+            // Already latched: silent (a second AC verdict would only
+            // repeat; the face reconciliation owns the recovery).
+            DrainAction::None
+        }
+        crate::gpu::DisplayFailureClass::WideLegacy => {
+            state.wide_effect_failures += 1;
+            eprintln!(
+                "riviv: display effect failure #{}: {}",
+                state.wide_effect_failures, detail
+            );
+            if crate::transform_stage::stage_degrades(state.wide_effect_failures)
+                && !state.wide_effect_latched
+            {
+                state.wide_effect_latched = true;
+                eprintln!(
+                    "riviv: wide effect latched ({} consecutive) - re-deriving wide masters to srgb",
+                    state.wide_effect_failures
+                );
+                identify_output(state);
+                // The re-derivation must run OUTSIDE the borrow (it may
+                // clear displays, drop sessions and issue fresh open
+                // requests) — the paint_view tail consumes the action.
+                return DrainAction::RederiveWide;
+            }
+            DrainAction::Repaint
+        }
     }
-    true
 }
 
 /// The rebuild request kind (external review AI2 P2-3): a session that
@@ -1787,12 +2067,16 @@ fn gpu_runtime_failure(owner: HWND) {
         if fatal_view.is_none() {
             // Drop the dead stack, rebuild, remember the effective kind
             // (the escalation pins WARP — the request mode is ignored from
-            // here).
+            // here). #156: the rebuild lands on the DESIRED face through
+            // the shared AC-fallback helper (a WARP request is forced to
+            // the legacy face inside the helper — the escalation's face
+            // follows the kind).
             state.gpu = None;
             let view = state.viewport;
             let old_kind = state.gpu_kind;
-            match crate::gpu::create(view, crate::gpu::owner_of(view), kind) {
-                Ok((stack, effective)) => {
+            let face = desired_output_face(state);
+            match create_stack_with_face(view, kind, face, state) {
+                Some((stack, effective)) => {
                     state.gpu_kind = if escalated {
                         RendererKind::Warp
                     } else {
@@ -1813,19 +2097,12 @@ fn gpu_runtime_failure(owner: HWND) {
                     // (no re-decode).
                     rebuilt_view = Some(view);
                 }
-                Err(e) => {
+                None => {
                     // Even the ladder's WARP tier could not build: nothing
-                    // below the stack exists (#90) — defer the fatal to
-                    // paint_view's tail (the auto request already exhausted
-                    // hardware+WARP inside create); the invalidate keeps
-                    // the viewport from silently freezing on the last flip
-                    // frame while the deferred modal is pending.
-                    state.gpu_pending_fatal = true;
-                    state.gpu_terminal = true;
-                    state.gpu_fatal_reason = Some(format!(
-                        "renderer rebuild failed ({e}) — no fallback renderer left"
-                    ));
-                    eprintln!("riviv: renderer rebuild failed ({e}) - no fallback renderer left");
+                    // below the stack exists (#90) — the helper latched the
+                    // deferred fatal for paint_view's tail; the invalidate
+                    // keeps the viewport from silently freezing on the last
+                    // flip frame while the deferred modal is pending.
                     degraded_view = Some(view);
                 }
             }
@@ -1950,16 +2227,43 @@ fn dump_viewport_now(hwnd: HWND, path: &OsStr) {
         .map(|state| state.viewport)
         .unwrap_or_default();
     let readback = dump_via_gpu(hwnd, view);
-    let (wide, high, rgba) = match readback {
-        Ok(result) => result,
+    // #156's dual-arm dump tail: the legacy face's RGBA bytes go through
+    // the PNG writer exactly as before; the AC face's FP16 halves go to
+    // the target path as RAW LITTLE-ENDIAN u16 (RGBA order, 8 bytes per
+    // pixel — the half-exact oracle's input; no PNG container). The
+    // AC-face evidence line (`dump-viewport face=ac-scrgb ... ac-draw=`)
+    // is gpu.dump's — nothing is added here. Failures stay stderr +
+    // exit(2) — the automation channel's contract.
+    match readback {
+        Ok(crate::gpu::DumpPixels::Rgba8 {
+            w: wide,
+            h: high,
+            rgba,
+        }) => {
+            if let Err(e) = crate::paint::save_rgba_png(Path::new(path), wide, high, rgba) {
+                eprintln!("riviv: dump-viewport write {} failed: {e}", path.display());
+                std::process::exit(2);
+            }
+        }
+        Ok(crate::gpu::DumpPixels::ScRgbHalves { w, h, halves }) => {
+            debug_assert_eq!(
+                halves.len(),
+                w as usize * h as usize * 4,
+                "the AC readback holds four LE u16 halves per pixel"
+            );
+            let mut bytes = Vec::with_capacity(halves.len() * 2);
+            for half in halves {
+                bytes.extend_from_slice(&half.to_le_bytes());
+            }
+            if let Err(e) = std::fs::write(Path::new(path), &bytes) {
+                eprintln!("riviv: dump-viewport write {} failed: {e}", path.display());
+                std::process::exit(2);
+            }
+        }
         Err(e) => {
             eprintln!("riviv: dump-viewport failed: {e}");
             std::process::exit(2);
         }
-    };
-    if let Err(e) = crate::paint::save_rgba_png(Path::new(path), wide, high, rgba) {
-        eprintln!("riviv: dump-viewport write {} failed: {e}", path.display());
-        std::process::exit(2);
     }
     // #126: the dumped frame's output identity — the change-signal channel
     // (#127 D5 + the erratum): `output_gen` is minted at every output
@@ -1978,11 +2282,12 @@ fn dump_viewport_now(hwnd: HWND, path: &OsStr) {
 
 /// The D2D dump arm: render once more into the target (no Present — a
 /// never-shown window dumps identically, the readback is independent of
-/// the display pipeline) and read back through a CPU-readable bitmap.
-/// ONE state borrow across the call: field-disjoint borrows feed the
-/// stack the plan and the CPU level source (gpu mutable, image shared,
-/// levels mutable).
-fn dump_via_gpu(hwnd: HWND, view: HWND) -> Result<(u32, u32, Vec<u8>), String> {
+/// the display pipeline) and read back through a CPU-readable bitmap —
+/// the FACE's format (#156: BGRA8 RGBA bytes on the legacy face, raw FP16
+/// halves on the AC face). ONE state borrow across the call:
+/// field-disjoint borrows feed the stack the plan and the CPU level
+/// source (gpu mutable, image shared, levels mutable).
+fn dump_via_gpu(hwnd: HWND, view: HWND) -> Result<crate::gpu::DumpPixels, String> {
     let mut client = RECT::default();
     // SAFETY: read-only rect query on our own child.
     let _ = unsafe { GetClientRect(view, &mut client) };
@@ -2024,13 +2329,14 @@ fn dump_via_gpu(hwnd: HWND, view: HWND) -> Result<(u32, u32, Vec<u8>), String> {
     // `prepared`): the CPU level cache the stack uploads from.
     // #130: the display intent syncs BEFORE the draw — the dump must
     // capture the same pass shape the screen shows, or the output
-    // identity would label pixels that never existed.
-    let (want_effect, display_profile) = display_intent(state);
+    // identity would label pixels that never existed. #156: the intent
+    // is the executed arm (face-clamped), not a bool.
+    let (display_arm, display_profile) = display_intent(state);
     let levels = &mut state.levels;
     let Some(gpu) = state.gpu.as_mut() else {
         return Err("no gpu stack".into());
     };
-    gpu.sync_display_intent(want_effect, display_profile.as_deref());
+    gpu.sync_display_intent(display_arm, display_profile.as_deref());
     match prepared {
         Some((plan, frame_gen, wide, high, space, master)) => {
             let mut src = crate::gpu::MasterLevels {
@@ -4029,6 +4335,12 @@ fn decode_env(state: &WindowState) -> DecodeEnv {
         background: state.config.windowed_bg(),
         icm: state.config.icm != 0,
         backend: crate::transform_stage::Backend::from_effective(state.gpu_kind),
+        // #156: the wide-effect session latch's request-time snapshot —
+        // once the display segment latched the wide effects off (D6),
+        // new decodes stop minting F16P3 masters; a latched session plus
+        // a fresh wide load would otherwise re-widen and re-blank in a
+        // loop. One DecodeEnv = one decision, like `backend` above.
+        wide_allowed: !state.wide_effect_latched,
     }
 }
 
@@ -9033,6 +9345,9 @@ pub(crate) fn run() -> Result<(), String> {
         display_monitor: None,
         stage_failures: 0,
         stage_latched: false,
+        ac_surface_latched: false,
+        wide_effect_failures: 0,
+        wide_effect_latched: false,
     };
 
     // SAFETY: returns the module handle of this exe; no side effects.
@@ -9254,18 +9569,30 @@ pub(crate) fn run() -> Result<(), String> {
     // create — a failure means the environment has no D2D renderer at all,
     // so we fatal with the diagnosis string.
     // SAFETY: the read-only borrow ends inside the map.
-    let (request, view_target) = (unsafe { state_of(hwnd) })
+    let (request, view_target, startup_face) = (unsafe { state_of(hwnd) })
         .map(|state| {
             (
                 state.renderer_forced.unwrap_or(state.config.renderer),
                 state.viewport,
+                // #156: the startup stack builds on the DESIRED face (a
+                // blank display's decision is the legacy face — and the
+                // AC latch cannot have fired yet).
+                desired_output_face(state),
             )
         })
         // The fallback mirrors the config default (auto); the path is
         // unreachable in practice (state missing = the window is going
         // away) and fatals below either way.
-        .unwrap_or((RendererKind::Auto, HWND::default()));
-    let (stack, effective) = match crate::gpu::create(view_target, hwnd, request) {
+        .unwrap_or((
+            RendererKind::Auto,
+            HWND::default(),
+            crate::transform_stage::OutputSurface::Legacy,
+        ));
+    // Startup AC-face creation failure fatals here on purpose (ADR 0001:
+    // the startup path has no ratchet behind it — the session has no
+    // display history to protect; a mid-session AC failure takes the
+    // D6 latch instead).
+    let (stack, effective) = match crate::gpu::create(view_target, hwnd, request, startup_face) {
         Ok(built) => built,
         Err(e) => {
             fatal(&format!(

@@ -143,10 +143,16 @@ enum Stop {
 /// snapshot: ONE `DecodeEnv` = ONE backend, so a mid-load flip cannot
 /// change the destination a frame already in flight will map into (the
 /// Stage-1 wide-gamut decision is made at request time like `icm`).
+/// #156 adds the wide-effect session latch's own snapshot (`wide_allowed`
+/// = `!wide_effect_latched`): a session that latched the wide draw arm
+/// off must stop minting F16P3 masters for NEW decodes too, or every
+/// fresh load would re-widen and re-blank (the D6 latch's re-derivation
+/// channel and this term together close the loop).
 pub(crate) struct DecodeEnv {
     pub(crate) background: [u8; 3],
     pub(crate) icm: bool,
     pub(crate) backend: crate::transform_stage::Backend,
+    pub(crate) wide_allowed: bool,
 }
 
 pub(crate) fn decode_to_sink(
@@ -279,7 +285,7 @@ fn prepare_transform<D: ImageDecoder>(
             None
         }
     };
-    icm::prepare(true, icc, shown, env.backend)
+    icm::prepare(true, icc, shown, env.backend, env.wide_allowed)
 }
 
 /// The shared post-decode frame pipeline — ADR 0002 D2's order
@@ -2194,6 +2200,8 @@ mod stdin_bytes_tests {
             // WARP = the pre-#155 production behavior; the wide-master
             // tests opt into Hardware explicitly.
             backend: crate::transform_stage::Backend::Warp,
+            // The #156 latch default for decode tests: wide allowed.
+            wide_allowed: true,
         }
     }
 
@@ -2298,6 +2306,7 @@ mod stdin_bytes_tests {
             Some(crate::icm::test_fixtures::adobe_like_icc()),
             "t",
             crate::transform_stage::Backend::Warp,
+            true,
         )
         .expect("an AdobeRGB-like profile transforms");
         assert_eq!(charged_frame_bytes(100, Some(&t)), 200);
@@ -2330,6 +2339,7 @@ mod stdin_bytes_tests {
             Some(crate::icm::test_fixtures::adobe_like_icc()),
             "t",
             crate::transform_stage::Backend::Warp,
+            true,
         )
         .expect("an AdobeRGB-like profile transforms");
         let canvas = MAX_TOTAL_FRAME_BYTES / 5; // plain: *4 fits, *8 does not
@@ -2407,6 +2417,7 @@ mod stdin_bytes_tests {
             Some(crate::icm::test_fixtures::adobe_like_icc()),
             "t",
             crate::transform_stage::Backend::Warp,
+            true,
         )
         .expect("an AdobeRGB-like profile transforms");
         let env = env_icm(true);
@@ -2646,6 +2657,7 @@ mod stdin_bytes_tests {
             Some(crate::icm::test_fixtures::adobe_like_icc()),
             "t",
             crate::transform_stage::Backend::Hardware,
+            true,
         )
         .expect("an AdobeRGB-like profile transforms");
         assert!(t.destination_is_wide(), "hardware prepares the wide arm");
@@ -2679,6 +2691,8 @@ mod apng_tests {
             // WARP = the pre-#155 production behavior; the wide-master
             // tests opt into Hardware explicitly.
             backend: crate::transform_stage::Backend::Warp,
+            // The #156 latch default for decode tests: wide allowed.
+            wide_allowed: true,
         }
     }
 
@@ -3625,6 +3639,7 @@ mod apng_tests {
             Some(crate::icm::test_fixtures::adobe_like_icc()),
             "t",
             crate::transform_stage::Backend::Warp,
+            true,
         )
         .expect("an AdobeRGB-like profile transforms");
         assert!(apng_canvas_fits_animation_budget(charged_frame_bytes(
