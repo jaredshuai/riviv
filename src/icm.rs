@@ -28,6 +28,23 @@
 //! equivalent sources drift within the noise floor, real profiles move
 //! midtones by tens.
 //!
+//! #155 (ADR 0004 D2/D5) added the DESTINATION axis: on a hardware
+//! session a genuinely-foreign profile's transform is RETARGETED from
+//! the system sRGB destination to riviv's own Display-P3-D65 v2
+//! matrix-shaper profile (built once, in-process, from fixed literals —
+//! [`p3_destination_profile`]), and the frames it touches land as
+//! `F16P3` masters whose halves keep the super-sRGB colors inside the
+//! P3 container instead of clipping them at the sRGB boundary. A WARP
+//! session keeps the sRGB destination (WARP never runs the wide draw
+//! arms, so a wide master there would be fake color) — the backend is
+//! the caller's one request-time snapshot (`DecodeEnv.backend`). The
+//! retarget can fail (profile open or transform build) and then simply
+//! keeps the sRGB transform: the ladder's "guarantee correct color"
+//! floor (D6), one breadcrumb, nothing else changes. The loader-side
+//! fallback ladder lives in loader.rs's `assemble_frame` /
+//! `assemble_deep_frame`: a refused wide 16-bit pass retargets back to
+//! sRGB and retries the narrow chain.
+//!
 //! Every failure downgrades to "decode untagged": breadcrumb on the
 //! debug channel, raw pixels, the load itself unaffected (the viewer's
 //! user-level failure contract — keep the old image, no dialog, no
@@ -172,6 +189,191 @@ fn load_system_srgb() -> Result<Vec<u8>, String> {
     std::fs::read(&path).map_err(|e| format!("{}: {e}", path.to_string_lossy()))
 }
 
+// ---- a minimal synthetic ICC v2 profile builder (production) ----
+// The CMM needs a real tag set to build a usable transform: a
+// bare-bones header-plus-colorants profile opens but produces
+// degenerate output. This set (matrix colorants + 1024-entry curv
+// TRCs + wtpt/bkpt/lumi/chad/desc/cprt) mirrors the system sRGB
+// profile's structure and transforms correctly — verified against
+// mscms directly. Lifted from the test fixtures when #155 needed a
+// REAL destination profile (the P3 constant below); the fixtures
+// delegate so every pre-existing test blob stays byte-identical.
+
+fn be16(v: u16) -> [u8; 2] {
+    v.to_be_bytes()
+}
+
+fn be32(v: u32) -> [u8; 4] {
+    v.to_be_bytes()
+}
+
+fn s15f16(v: f64) -> [u8; 4] {
+    be32((v * 65536.0).round() as i32 as u32)
+}
+
+fn tag_xyz(x: f64, y: f64, z: f64) -> Vec<u8> {
+    let mut t = b"XYZ ".to_vec();
+    t.extend_from_slice(&be32(0));
+    for v in [x, y, z] {
+        t.extend_from_slice(&s15f16(v));
+    }
+    t
+}
+
+/// 'curv' with a 1024-entry table (the shape the CMM's transform
+/// builder consumes reliably — single-gamma and parametric forms
+/// produced degenerate transforms in probing).
+fn tag_curv_table(f: impl Fn(f64) -> f64) -> Vec<u8> {
+    let mut t = b"curv".to_vec();
+    t.extend_from_slice(&be32(0));
+    t.extend_from_slice(&be32(1024));
+    for i in 0..1024u32 {
+        t.extend_from_slice(&be16((f(i as f64 / 1023.0) * 65535.0).round() as u16));
+    }
+    t
+}
+
+fn tag_desc(text: &str) -> Vec<u8> {
+    let mut t = b"desc".to_vec();
+    t.extend_from_slice(&be32(0));
+    let a = text.as_bytes();
+    t.extend_from_slice(&be32(a.len() as u32 + 1));
+    t.extend_from_slice(a);
+    t.push(0);
+    t
+}
+
+fn tag_text(text: &str) -> Vec<u8> {
+    let mut t = b"text".to_vec();
+    t.extend_from_slice(&be32(0));
+    t.extend_from_slice(text.as_bytes());
+    t.push(0);
+    t
+}
+
+fn tag_sf32_identity() -> Vec<u8> {
+    let mut t = b"sf32".to_vec();
+    t.extend_from_slice(&be32(0));
+    for v in [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0] {
+        t.extend_from_slice(&s15f16(v));
+    }
+    t
+}
+
+/// Assemble a v2 'mntr'/'RGB '/'XYZ ' matrix-shaper profile. Fully
+/// deterministic: every byte derives from the arguments (date included),
+/// so the same call always produces the same blob.
+fn synthetic_icc(
+    desc: &str,
+    cprt: &str,
+    date: [u16; 6],
+    primaries: [[f64; 3]; 3],
+    trc: Vec<u8>,
+) -> Vec<u8> {
+    let tags: Vec<([u8; 4], Vec<u8>)> = vec![
+        (*b"desc", tag_desc(desc)),
+        (*b"cprt", tag_text(cprt)),
+        (*b"wtpt", tag_xyz(0.9642, 1.0, 0.8249)),
+        (*b"bkpt", tag_xyz(0.0, 0.0, 0.0)),
+        (*b"lumi", tag_xyz(0.7645, 0.8, 0.9216)),
+        (*b"chad", tag_sf32_identity()),
+        (
+            *b"rXYZ",
+            tag_xyz(primaries[0][0], primaries[0][1], primaries[0][2]),
+        ),
+        (
+            *b"gXYZ",
+            tag_xyz(primaries[1][0], primaries[1][1], primaries[1][2]),
+        ),
+        (
+            *b"bXYZ",
+            tag_xyz(primaries[2][0], primaries[2][1], primaries[2][2]),
+        ),
+        (*b"rTRC", trc.clone()),
+        (*b"gTRC", trc.clone()),
+        (*b"bTRC", trc),
+    ];
+    let n = tags.len() as u32;
+    let mut table = be32(n).to_vec();
+    let mut data = Vec::new();
+    let base = 128 + 4 + n as usize * 12;
+    for (sig_bytes, bytes) in &tags {
+        table.extend_from_slice(sig_bytes);
+        table.extend_from_slice(&be32((base + data.len()) as u32));
+        table.extend_from_slice(&be32(bytes.len() as u32));
+        data.extend_from_slice(bytes);
+        while data.len() % 4 != 0 {
+            data.push(0);
+        }
+    }
+    let size = (128 + 4 + n as usize * 12 + data.len()) as u32;
+    let mut h = vec![0u8; 128];
+    h[0..4].copy_from_slice(&be32(size));
+    h[8] = 0x02;
+    h[9] = 0x10;
+    h[12..16].copy_from_slice(b"mntr");
+    h[16..20].copy_from_slice(b"RGB ");
+    h[20..24].copy_from_slice(b"XYZ ");
+    for (i, v) in date.iter().enumerate() {
+        h[24 + i * 2..26 + i * 2].copy_from_slice(&be16(*v));
+    }
+    h[36..40].copy_from_slice(b"acsp");
+    h[40..44].copy_from_slice(b"MSFT");
+    // PCS illuminant: D50 (ICC-mandated for v2 profile connection
+    // space) — probe P-A verified mscms refuses otherwise.
+    h[68..72].copy_from_slice(&s15f16(0.9642));
+    h[72..76].copy_from_slice(&s15f16(1.0));
+    h[76..80].copy_from_slice(&s15f16(0.8249));
+    let mut profile = h;
+    profile.extend_from_slice(&table);
+    profile.extend_from_slice(&data);
+    profile
+}
+
+/// The sRGB tone response as a 1024-entry curv table — the TRC both the
+/// test fixtures and the P3 destination profile share (the P3 TRC IS an
+/// sRGB-shaped curve; parametric forms were rejected by mscms, probe
+/// P-A GLE=2011).
+fn srgb_trc() -> Vec<u8> {
+    tag_curv_table(|x| {
+        if x <= 0.04045 {
+            x / 12.92
+        } else {
+            ((x + 0.055) / 1.055).powf(2.4)
+        }
+    })
+}
+
+/// Display P3 (D65) primaries stored as ICC PCS (XYZ) colorants: the
+/// Bradford-adapted D50 values, probe P-A's verified literals. Stored
+/// verbatim — never recomputed at runtime (the adaptation matrix math
+/// is a probe concern, not a build concern).
+const P3_D50_COLORANTS: [[f64; 3]; 3] = [
+    [0.51512, 0.24119, -0.00105],
+    [0.29198, 0.69224, 0.04188],
+    [0.15711, 0.06657, 0.78408],
+];
+
+/// riviv's own Display-P3-D65 destination profile (#155, ADR 0004 D2):
+/// the wide container Stage 1 maps genuinely-foreign tagged sources
+/// into on hardware sessions, so super-sRGB colors survive to the
+/// panel instead of clipping at the sRGB gamut boundary. Built once per
+/// process from fixed literals (a v2 matrix-shaper, same shape the
+/// equivalence probe trusts in sources) — a pure function of constants,
+/// hence the byte-stable hash the test pins.
+fn p3_destination_profile() -> &'static [u8] {
+    static P3: OnceLock<Vec<u8>> = OnceLock::new();
+    P3.get_or_init(|| {
+        synthetic_icc(
+            "riviv Display P3-D65",
+            "public domain",
+            [2026, 9, 27, 12, 0, 0],
+            P3_D50_COLORANTS,
+            srgb_trc(),
+        )
+    })
+}
+
 /// RAII for an HPROFILE opened from a memory buffer. The blob is owned
 /// alongside the handle: the API contract does not promise the profile
 /// copy is complete at open time, so the caller's buffer must outlive
@@ -253,6 +455,14 @@ pub(crate) enum FrameSrc<'a> {
 /// the same way — `GdipLoadImageFromStreamICM`). Created, used, and
 /// dropped on the decode worker; nothing crosses a thread boundary.
 ///
+/// #155 (ADR 0004 D2/D5): the DESTINATION starts as the system sRGB
+/// profile, but on a hardware session with a genuinely-foreign source
+/// profile `prepare` retargets it to riviv's own P3 profile
+/// ([`p3_destination_profile`]) — [`Transform::wide`] then says the
+/// frames this transform touches land in the P3 container. A failed
+/// retarget simply keeps sRGB (one breadcrumb; the D6 "correct color"
+/// floor).
+///
 /// `Transform`'s own `Drop` deletes the transform handle BEFORE the
 /// profile handles close — Rust guarantees the `Drop` impl runs ahead
 /// of field destruction, and the CMM may keep referencing its profiles
@@ -264,8 +474,14 @@ pub(crate) struct Transform {
     /// Held only so the profile outlives `xform` (RAII); the leading
     /// underscore marks the drop-only field.
     _src_profile: ProfileHandle,
-    /// Same hold for the destination (system sRGB) profile.
+    /// Same hold for the destination profile (system sRGB, or riviv's
+    /// P3 after a successful [`Transform::retarget_wide`]).
     _dst_profile: ProfileHandle,
+    /// Whether the destination is the wide P3 container (#155): the
+    /// loader's wide arm dispatches on this. Always mirrors the REAL
+    /// destination — `true` only after a successful `retarget_wide`,
+    /// flipped back by a successful `retarget_srgb`.
+    wide: bool,
     /// Test hook for the D5 fallback (#142): force every `translate16`
     /// call to fail so the fallback chains can be exercised without a
     /// CMM that actually refuses `BM_16b_RGB`.
@@ -457,14 +673,125 @@ impl Transform {
         crate::pixels::bgr_u16_to_f16_rgba(&bgr, &mut halves);
         Some(halves)
     }
+
+    /// Whether this transform's destination is the wide P3 container
+    /// (#155) — the loader's wide-arm dispatch bit. `true` only after a
+    /// successful [`Transform::retarget_wide`].
+    pub(crate) fn destination_is_wide(&self) -> bool {
+        self.wide
+    }
+
+    /// Swap the destination profile in place (#155): open `blob` as the
+    /// new destination, build a fresh transform from the SAME source
+    /// profile to it, and — only after that succeeded — delete the old
+    /// transform and replace both fields. `Err`/`false` leaves the
+    /// transform untouched (the caller keeps its sRGB behavior).
+    ///
+    /// No new unsafe: the swap composes the existing safe wrappers
+    /// ([`ProfileHandle::open_mem`], [`create_transform`]); the one raw
+    /// call is the same `DeleteColorTransform` the `Drop` impl makes.
+    /// Field-swap order is the liveness contract: the CMM may reference
+    /// its profiles while a transform lives, so the OLD destination
+    /// handle must outlive the OLD transform — the old xform is deleted
+    /// first, then the field replace drops the old `ProfileHandle`.
+    fn retarget(&mut self, dst: ProfileHandle, wide: bool, failure_word: &str) -> bool {
+        let xform = match create_transform(&self._src_profile, &dst) {
+            Ok(xform) => xform,
+            Err(gle) => {
+                eprintln!(
+                    "riviv: icm: {}: {failure_word} unavailable (GLE={gle}) — {}",
+                    self.shown,
+                    dst_failure_consequence(wide),
+                );
+                return false;
+            }
+        };
+        // SAFETY: `self.xform` is a transform this value owns and is
+        // about to stop owning; it is deleted exactly once here, before
+        // the old destination profile handle (field) drops. A delete
+        // failure is unrecoverable and unreportable from here.
+        let _ = unsafe { DeleteColorTransform(self.xform) };
+        self.xform = xform;
+        self._dst_profile = dst;
+        self.wide = wide;
+        true
+    }
+
+    /// Retarget the destination to riviv's P3 profile (#155): the
+    /// hardware session's wide container, so super-sRGB source colors
+    /// land INSIDE the container instead of clipping at sRGB. `false` =
+    /// the wide destination could not be built — the transform keeps
+    /// its sRGB destination (one breadcrumb; the ladder's floor).
+    fn retarget_wide(&mut self) -> bool {
+        let dst = match ProfileHandle::open_mem(p3_destination_profile().to_vec()) {
+            Ok(dst) => dst,
+            Err(gle) => {
+                eprintln!(
+                    "riviv: icm: {}: wide destination profile unavailable (GLE={gle}) — clipping to sRGB",
+                    self.shown
+                );
+                return false;
+            }
+        };
+        self.retarget(dst, true, "wide destination profile")
+    }
+
+    /// Retarget the destination back to the system sRGB profile (#155):
+    /// the wide arm's fallback when the CMM refuses the wide 16-bit
+    /// pass (loader ladder). `false` = sRGB could not be rebuilt either
+    /// — the caller falls to the untransformed tail; the transform
+    /// keeps its current destination.
+    pub(crate) fn retarget_srgb(&mut self) -> bool {
+        let Some(blob) = system_srgb() else {
+            eprintln!(
+                "riviv: icm: {}: sRGB destination unavailable — decoding untransformed",
+                self.shown
+            );
+            return false;
+        };
+        let dst = match ProfileHandle::open_mem(blob.to_vec()) {
+            Ok(dst) => dst,
+            Err(gle) => {
+                eprintln!(
+                    "riviv: icm: {}: sRGB destination unavailable (GLE={gle}) — decoding untransformed",
+                    self.shown
+                );
+                return false;
+            }
+        };
+        self.retarget(dst, false, "sRGB destination profile")
+    }
+}
+
+/// The retarget failure's consequence phrase — a wide failure keeps
+/// clipping to sRGB, an sRGB failure (the wide arm's own fallback) has
+/// nothing left but the raw decode.
+fn dst_failure_consequence(wide: bool) -> &'static str {
+    if wide {
+        "clipping to sRGB"
+    } else {
+        "decoding untransformed"
+    }
 }
 
 /// Stage-1 entry point: decide whether `icc` (the decoder's embedded
-/// profile bytes) needs an ICC->sRGB transform and build it. `None`
+/// profile bytes) needs an ICC transform and build it. `None`
 /// means "decode untagged" — `icm=0`, no profile, a profile already
 /// equivalent to sRGB, or any degrade along the chain (each leaves a
 /// breadcrumb; the load itself is never failed over color management).
-pub(crate) fn prepare(enabled: bool, icc: Option<Vec<u8>>, shown: &str) -> Option<Transform> {
+///
+/// `backend` is the caller's request-time snapshot of the render
+/// backend (#155, ADR 0004 D2): a `Hardware` session retargets a
+/// genuinely-foreign profile's transform to the wide P3 destination,
+/// `Warp` keeps the sRGB destination (today's production behavior,
+/// byte-for-byte). The equivalence-probe path (display_profile.rs)
+/// builds sRGB destinations only and never retargets.
+pub(crate) fn prepare(
+    enabled: bool,
+    icc: Option<Vec<u8>>,
+    shown: &str,
+    backend: crate::transform_stage::Backend,
+) -> Option<Transform> {
     if !enabled {
         return None;
     }
@@ -473,7 +800,15 @@ pub(crate) fn prepare(enabled: bool, icc: Option<Vec<u8>>, shown: &str) -> Optio
         // The ladder's own failures breadcrumb inside; the equivalent
         // verdicts both mean "no transform" for Stage 1.
         None | Some(EquivalenceProbe::Equivalent) => None,
-        Some(EquivalenceProbe::Different(transform)) => Some(transform),
+        Some(EquivalenceProbe::Different(mut transform)) => {
+            // D2's destination selection: wide only on hardware. A
+            // failed retarget keeps the sRGB transform (breadcrumb
+            // already emitted) — identical to the WARP shape below.
+            if backend == crate::transform_stage::Backend::Hardware {
+                transform.retarget_wide();
+            }
+            Some(transform)
+        }
     }
 }
 
@@ -542,6 +877,10 @@ pub(crate) fn probe_equivalence(
         apply_failed: Cell::new(false),
         _src_profile: src,
         _dst_profile: dst,
+        // The equivalence probe always builds an sRGB destination (the
+        // probe IS the sRGB comparison); any wide retarget is the
+        // caller's decision (#155, prepare's backend arm).
+        wide: false,
         #[cfg(test)]
         force16_fail: Cell::new(false),
     };
@@ -564,139 +903,42 @@ pub(crate) fn probe_equivalence(
 }
 
 // ---- a minimal synthetic ICC v2 profile builder (test fixtures) ----
-// The CMM needs a real tag set to build a usable transform: a
-// bare-bones header-plus-colorants profile opens but produces
-// degenerate output. This set (matrix colorants + 1024-entry curv
-// TRCs + wtpt/bkpt/lumi/chad/desc/cprt) mirrors the system sRGB
-// profile's structure and transforms correctly — verified against
-// mscms directly. `pub(crate)` so the loader's end-to-end decode tests
-// reuse the same profiles.
+// The assembly itself is PRODUCTION code now (#155 lifted it for the
+// P3 destination profile); this module only picks the fixture
+// parameters. The constants below reproduce the fixtures' original
+// byte streams exactly (same desc/cprt/date the lifted builder once
+// hardcoded), so every pre-existing test blob is unchanged.
 #[cfg(test)]
 pub(crate) mod test_fixtures {
-    fn be16(v: u16) -> [u8; 2] {
-        v.to_be_bytes()
-    }
-    fn be32(v: u32) -> [u8; 4] {
-        v.to_be_bytes()
-    }
-    fn s15f16(v: f64) -> [u8; 4] {
-        be32((v * 65536.0).round() as i32 as u32)
-    }
-    fn tag_xyz(x: f64, y: f64, z: f64) -> Vec<u8> {
-        let mut t = b"XYZ ".to_vec();
-        t.extend_from_slice(&be32(0));
-        for v in [x, y, z] {
-            t.extend_from_slice(&s15f16(v));
-        }
-        t
-    }
-    /// 'curv' with a 1024-entry table (the shape the CMM's transform
-    /// builder consumes reliably — single-gamma and parametric forms
-    /// produced degenerate transforms in probing).
-    fn tag_curv_table(f: impl Fn(f64) -> f64) -> Vec<u8> {
-        let mut t = b"curv".to_vec();
-        t.extend_from_slice(&be32(0));
-        t.extend_from_slice(&be32(1024));
-        for i in 0..1024u32 {
-            t.extend_from_slice(&be16((f(i as f64 / 1023.0) * 65535.0).round() as u16));
-        }
-        t
-    }
-    fn tag_desc(text: &str) -> Vec<u8> {
-        let mut t = b"desc".to_vec();
-        t.extend_from_slice(&be32(0));
-        let a = text.as_bytes();
-        t.extend_from_slice(&be32(a.len() as u32 + 1));
-        t.extend_from_slice(a);
-        t.push(0);
-        t
-    }
-    fn tag_text(text: &str) -> Vec<u8> {
-        let mut t = b"text".to_vec();
-        t.extend_from_slice(&be32(0));
-        t.extend_from_slice(text.as_bytes());
-        t.push(0);
-        t
-    }
-    fn tag_sf32_identity() -> Vec<u8> {
-        let mut t = b"sf32".to_vec();
-        t.extend_from_slice(&be32(0));
-        for v in [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0] {
-            t.extend_from_slice(&s15f16(v));
-        }
-        t
-    }
-
-    /// Assemble a v2 'mntr'/'RGB '/'XYZ ' matrix-shaper profile.
+    /// Assemble a v2 'mntr'/'RGB '/'XYZ ' matrix-shaper profile (the
+    /// fixtures' original shape: desc="synthetic", cprt="test",
+    /// date 2026-09-18 12:00:00).
     fn synthetic_icc(primaries: [[f64; 3]; 3], trc: Vec<u8>) -> Vec<u8> {
-        let tags: Vec<([u8; 4], Vec<u8>)> = vec![
-            (*b"desc", tag_desc("synthetic")),
-            (*b"cprt", tag_text("test")),
-            (*b"wtpt", tag_xyz(0.9642, 1.0, 0.8249)),
-            (*b"bkpt", tag_xyz(0.0, 0.0, 0.0)),
-            (*b"lumi", tag_xyz(0.7645, 0.8, 0.9216)),
-            (*b"chad", tag_sf32_identity()),
-            (
-                *b"rXYZ",
-                tag_xyz(primaries[0][0], primaries[0][1], primaries[0][2]),
-            ),
-            (
-                *b"gXYZ",
-                tag_xyz(primaries[1][0], primaries[1][1], primaries[1][2]),
-            ),
-            (
-                *b"bXYZ",
-                tag_xyz(primaries[2][0], primaries[2][1], primaries[2][2]),
-            ),
-            (*b"rTRC", trc.clone()),
-            (*b"gTRC", trc.clone()),
-            (*b"bTRC", trc),
-        ];
-        let n = tags.len() as u32;
-        let mut table = be32(n).to_vec();
-        let mut data = Vec::new();
-        let base = 128 + 4 + n as usize * 12;
-        for (sig_bytes, bytes) in &tags {
-            table.extend_from_slice(sig_bytes);
-            table.extend_from_slice(&be32((base + data.len()) as u32));
-            table.extend_from_slice(&be32(bytes.len() as u32));
-            data.extend_from_slice(bytes);
-            while data.len() % 4 != 0 {
-                data.push(0);
-            }
-        }
-        let size = (128 + 4 + n as usize * 12 + data.len()) as u32;
-        let mut h = vec![0u8; 128];
-        h[0..4].copy_from_slice(&be32(size));
-        h[8] = 0x02;
-        h[9] = 0x10;
-        h[12..16].copy_from_slice(b"mntr");
-        h[16..20].copy_from_slice(b"RGB ");
-        h[20..24].copy_from_slice(b"XYZ ");
-        // date-time: 2026-09-18 12:00:00
-        let dt = [2026u16, 9, 18, 12, 0, 0];
-        for (i, v) in dt.iter().enumerate() {
-            h[24 + i * 2..26 + i * 2].copy_from_slice(&be16(*v));
-        }
-        h[36..40].copy_from_slice(b"acsp");
-        h[40..44].copy_from_slice(b"MSFT");
-        h[68..72].copy_from_slice(&s15f16(0.9642));
-        h[72..76].copy_from_slice(&s15f16(1.0));
-        h[76..80].copy_from_slice(&s15f16(0.8249));
-        let mut profile = h;
-        profile.extend_from_slice(&table);
-        profile.extend_from_slice(&data);
-        profile
+        super::synthetic_icc("synthetic", "test", [2026, 9, 18, 12, 0, 0], primaries, trc)
     }
 
-    fn srgb_trc() -> Vec<u8> {
-        tag_curv_table(|x| {
-            if x <= 0.04045 {
-                x / 12.92
-            } else {
-                ((x + 0.055) / 1.055).powf(2.4)
-            }
-        })
+    /// sRGB primaries + sRGB tone curve: a DIFFERENT blob encoding the
+    /// same space (the L2 probe's job to detect).
+    pub(crate) fn srgb_like_icc() -> Vec<u8> {
+        synthetic_icc(SRGB_PRIMARIES, super::srgb_trc())
+    }
+
+    /// AdobeRGB primaries + gamma 2.2: a real foreign profile.
+    pub(crate) fn adobe_like_icc() -> Vec<u8> {
+        synthetic_icc(ADOBE_PRIMARIES, super::tag_curv_table(|x| x.powf(2.2)))
+    }
+
+    /// Display P3 (D65) primaries + the sRGB tone curve: the second
+    /// real foreign space the #77 acceptance names.
+    pub(crate) fn p3_like_icc() -> Vec<u8> {
+        synthetic_icc(P3_D65_PRIMARIES, super::srgb_trc())
+    }
+
+    /// sRGB primaries + a linear tone curve: same gamut, wildly
+    /// different transfer function — the midtone-mover of the suite
+    /// (design pin: `linLike` must prepare a transform).
+    pub(crate) fn lin_like_icc() -> Vec<u8> {
+        synthetic_icc(SRGB_PRIMARIES, super::tag_curv_table(|x| x))
     }
     const SRGB_PRIMARIES: [[f64; 3]; 3] = [
         [0.43607, 0.22249, 0.01392],
@@ -714,30 +956,6 @@ pub(crate) mod test_fixtures {
         [0.1982, 0.0792, 1.0439],
     ];
 
-    /// sRGB primaries + sRGB tone curve: a DIFFERENT blob encoding the
-    /// same space (the L2 probe's job to detect).
-    pub(crate) fn srgb_like_icc() -> Vec<u8> {
-        synthetic_icc(SRGB_PRIMARIES, srgb_trc())
-    }
-
-    /// AdobeRGB primaries + gamma 2.2: a real foreign profile.
-    pub(crate) fn adobe_like_icc() -> Vec<u8> {
-        synthetic_icc(ADOBE_PRIMARIES, tag_curv_table(|x| x.powf(2.2)))
-    }
-
-    /// Display P3 (D65) primaries + the sRGB tone curve: the second
-    /// real foreign space the #77 acceptance names.
-    pub(crate) fn p3_like_icc() -> Vec<u8> {
-        synthetic_icc(P3_D65_PRIMARIES, srgb_trc())
-    }
-
-    /// sRGB primaries + a linear tone curve: same gamut, wildly
-    /// different transfer function — the midtone-mover of the suite
-    /// (design pin: `linLike` must prepare a transform).
-    pub(crate) fn lin_like_icc() -> Vec<u8> {
-        synthetic_icc(SRGB_PRIMARIES, tag_curv_table(|x| x))
-    }
-
     /// Require a working system sRGB profile (the same dependency the
     /// runtime transform has — Windows always ships one).
     pub(crate) fn require_srgb() -> &'static [u8] {
@@ -749,6 +967,7 @@ pub(crate) mod test_fixtures {
 mod tests {
     use super::test_fixtures::*;
     use super::*;
+    use crate::transform_stage::Backend;
 
     // ---- pure header gate ----
 
@@ -802,7 +1021,7 @@ mod tests {
     fn a_blob_byte_identical_to_srgb_is_skipped_without_a_transform() {
         // L1: the common tagged case — same bytes as the system profile.
         let srgb = require_srgb().to_vec();
-        assert!(prepare(true, Some(srgb), "t").is_none());
+        assert!(prepare(true, Some(srgb), "t", Backend::Warp).is_none());
     }
 
     #[test]
@@ -811,13 +1030,13 @@ mod tests {
         // plus the sRGB tone curve — must not round-trip the pixels
         // (the CMM's own pass drifts a few LSBs; tolerance swallows it).
         let _ = require_srgb();
-        assert!(prepare(true, Some(srgb_like_icc()), "t").is_none());
+        assert!(prepare(true, Some(srgb_like_icc()), "t", Backend::Warp).is_none());
     }
 
     #[test]
     fn a_foreign_profile_transforms_pixels_and_keeps_alpha() {
         let _ = require_srgb();
-        let t = prepare(true, Some(adobe_like_icc()), "t")
+        let t = prepare(true, Some(adobe_like_icc()), "t", Backend::Warp)
             .expect("an AdobeRGB-like profile transforms");
         // Pure red, an asymmetric color, a midtone gray and a
         // semi-transparent pixel, RGBA in / BGRA out. The first two pin
@@ -857,7 +1076,7 @@ mod tests {
         let _ = require_srgb();
         for blob in [p3_like_icc(), lin_like_icc()] {
             assert!(
-                prepare(true, Some(blob), "t").is_some(),
+                prepare(true, Some(blob), "t", Backend::Warp).is_some(),
                 "a genuinely foreign profile must transform"
             );
         }
@@ -870,7 +1089,8 @@ mod tests {
         // land far from where it started (identity would leave it at
         // 128; the sRGB encode of linear 0.5 sits near 188).
         let _ = require_srgb();
-        let t = prepare(true, Some(lin_like_icc()), "t").expect("linLike transforms");
+        let t =
+            prepare(true, Some(lin_like_icc()), "t", Backend::Warp).expect("linLike transforms");
         let src = [128u8, 128, 128, 255];
         let mut dst = [0u8; 4];
         assert!(t.apply(1, 1, &src, &mut dst));
@@ -881,16 +1101,19 @@ mod tests {
     #[test]
     fn disabled_icm_and_untagged_images_never_build_anything() {
         assert!(
-            prepare(false, Some(adobe_like_icc()), "t").is_none(),
+            prepare(false, Some(adobe_like_icc()), "t", Backend::Warp).is_none(),
             "icm=0 bypasses"
         );
-        assert!(prepare(true, None, "t").is_none(), "no profile, no cost");
+        assert!(
+            prepare(true, None, "t", Backend::Warp).is_none(),
+            "no profile, no cost"
+        );
     }
 
     #[test]
     fn non_rgb_and_malformed_blobs_are_downgraded() {
-        assert!(prepare(true, Some(header(b"CMYK", 2, b"acsp")), "t").is_none());
-        assert!(prepare(true, Some(vec![0u8; 16]), "t").is_none());
+        assert!(prepare(true, Some(header(b"CMYK", 2, b"acsp")), "t", Backend::Warp).is_none());
+        assert!(prepare(true, Some(vec![0u8; 16]), "t", Backend::Warp).is_none());
     }
 
     // ---- the 16-bit output chain (#142, ADR 0003 D6) ----
@@ -905,7 +1128,7 @@ mod tests {
         // R with B/G near zero (the 8-bit arm's asymmetric-color pin,
         // through the master's own quantizer).
         let _ = require_srgb();
-        let t = prepare(true, Some(adobe_like_icc()), "t")
+        let t = prepare(true, Some(adobe_like_icc()), "t", Backend::Warp)
             .expect("an AdobeRGB-like profile transforms");
         let src = [255u8, 0, 0, 255, 128, 128, 128, 255];
         let Some(halves) = t.apply_f16(2, 1, FrameSrc::Rgba8(&src)) else {
@@ -932,7 +1155,7 @@ mod tests {
         // format that failed to honor the BGR order would put the value
         // in the wrong channel.
         let _ = require_srgb();
-        let t = prepare(true, Some(adobe_like_icc()), "t")
+        let t = prepare(true, Some(adobe_like_icc()), "t", Backend::Warp)
             .expect("an AdobeRGB-like profile transforms");
         let src = [0u16, 0, 0xFFFF, 0x8000, 0x8000, 0x8000];
         let halves = t
@@ -953,7 +1176,8 @@ mod tests {
         // a linear-gamma profile's [128,128,128] must land far from
         // where it started.
         let _ = require_srgb();
-        let t = prepare(true, Some(lin_like_icc()), "t").expect("linLike transforms");
+        let t =
+            prepare(true, Some(lin_like_icc()), "t", Backend::Warp).expect("linLike transforms");
         let src = [128u8, 128, 128, 255];
         let halves = t
             .apply_f16(1, 1, FrameSrc::Rgba8(&src))
@@ -972,7 +1196,7 @@ mod tests {
         // source's own alpha is the loader's job after the pass (the
         // same division the 8-bit arm's x-byte restore follows).
         let _ = require_srgb();
-        let t = prepare(true, Some(adobe_like_icc()), "t")
+        let t = prepare(true, Some(adobe_like_icc()), "t", Backend::Warp)
             .expect("an AdobeRGB-like profile transforms");
         let src = [200u8, 60, 10, 128];
         let halves = t
@@ -990,7 +1214,7 @@ mod tests {
         // apply_failed latch means the fallback adds no second failure
         // breadcrumb of its own kind.
         let _ = require_srgb();
-        let t = prepare(true, Some(adobe_like_icc()), "t")
+        let t = prepare(true, Some(adobe_like_icc()), "t", Backend::Warp)
             .expect("an AdobeRGB-like profile transforms");
         t.force16_fail.set(true);
         assert!(
@@ -1004,5 +1228,257 @@ mod tests {
             "the 8-bit chain still runs"
         );
         assert_eq!(dst[2], 255, "the 8-bit transform's own pin still holds");
+    }
+
+    // ---- the wide P3 destination (#155, ADR 0004 D2/D5) ----
+
+    /// The i-th tag entry's (signature, offset, size) from a synthetic
+    /// profile's tag table (the lifted builder's own layout: the table
+    /// starts at byte 128 with a 4-byte count).
+    fn tag_entry(profile: &[u8], index: usize) -> ([u8; 4], u32, u32) {
+        let at = 128 + 4 + index * 12;
+        let mut sig = [0u8; 4];
+        sig.copy_from_slice(&profile[at..at + 4]);
+        let offset = u32::from_be_bytes(profile[at + 4..at + 8].try_into().expect("offset"));
+        let size = u32::from_be_bytes(profile[at + 8..at + 12].try_into().expect("size"));
+        (sig, offset, size)
+    }
+
+    /// The s15Fixed16 triple of an 'XYZ ' tag's data.
+    fn tag_xyz_values(profile: &[u8], offset: u32) -> [f64; 3] {
+        let at = offset as usize + 8; // sig + reserved
+        [0, 1, 2]
+            .map(|i| {
+                let b: [u8; 4] = profile[at + i * 4..at + i * 4 + 4].try_into().expect("xyz");
+                i32::from_be_bytes(b) as f64 / 65536.0
+            })
+            .map(|v| (v * 65536.0).round() / 65536.0) // the s15f16 round trip
+    }
+
+    #[test]
+    fn the_p3_destination_profile_is_deterministic_and_hash_pinned() {
+        // The destination is minted once from fixed literals — a byte
+        // drift would silently re-key every F16P3 output identity (the
+        // fingerprint's profile term), so the exact digest is pinned.
+        let a = p3_destination_profile();
+        let b = p3_destination_profile();
+        assert_eq!(a, b, "the profile is a pure function of constants");
+        assert_eq!(
+            crate::transform_stage::profile_hash(a),
+            0x9eac_1480_b05c_ae00,
+            "pinned P3 destination digest — a change re-keys output identities"
+        );
+        assert_eq!(a.len(), 6680, "header + 12-entry tag table + tag data");
+    }
+
+    #[test]
+    fn the_p3_profile_carries_the_bradford_d50_colorants() {
+        // P-A's authoritative literals, read back through the tag table
+        // and compared in the s15f16 domain both sides are quantized to
+        // (the file format stores 16.16 fixed point; the check is that
+        // EXACTLY those literals were stored, not a re-adaptation).
+        let profile = p3_destination_profile();
+        for (sig, want) in [
+            (*b"rXYZ", P3_D50_COLORANTS[0]),
+            (*b"gXYZ", P3_D50_COLORANTS[1]),
+            (*b"bXYZ", P3_D50_COLORANTS[2]),
+        ] {
+            let want: [f64; 3] = want.map(|v| (v * 65536.0).round() / 65536.0); // the s15f16 round trip
+            let mut found = None;
+            for i in 0..12 {
+                let (s, offset, _) = tag_entry(profile, i);
+                if s == sig {
+                    found = Some(tag_xyz_values(profile, offset));
+                    break;
+                }
+            }
+            assert_eq!(
+                found.expect("the colorant tag exists"),
+                want,
+                "colorant {sig:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_p3_profile_passes_the_header_gate_and_opens() {
+        // The same two gates a SOURCE profile faces (the RGB v2/v4 gate
+        // and OpenColorProfileW) — the destination must clear them too,
+        // or mscms would refuse every wide transform this profile feeds.
+        let profile = p3_destination_profile();
+        assert!(icc_declares_rgb_v2v4(profile));
+        ProfileHandle::open_mem(profile.to_vec())
+            .expect("mscms opens riviv's P3 destination profile");
+    }
+
+    #[test]
+    fn the_p3_destination_keeps_super_srgb_colors_inside_the_container() {
+        // The container's reason to exist, end to end through mscms: an
+        // Adobe-fixture source's pure GREEN is outside sRGB (the sRGB
+        // destination clips it to exactly the sRGB green primary,
+        // 65535 — today's production clipping, the control) but INSIDE
+        // the P3 container, which stores it below full scale with real
+        // headroom. The pure RED corner is outside even the P3
+        // container (the Adobe fixture's red colorants sit beyond P3's
+        // in absolute XYZ — P-A's reference number 62456 was measured
+        // with matched-profile sources): there the wide destination
+        // GAMUT-MAPS instead of hard-clipping to the primary — the red
+        // stays full but carries a G component the sRGB destination
+        // erases.
+        let _ = require_srgb();
+        let wide = prepare(true, Some(adobe_like_icc()), "t", Backend::Hardware)
+            .expect("an AdobeRGB-like profile transforms");
+        assert!(wide.destination_is_wide(), "hardware prepares the wide arm");
+        let read16 = |halves: &[u16], px: usize, ch: usize| {
+            (crate::pixels::f16_bits_to_f32(halves[px * 4 + ch]) * 65535.0).round() as i32
+        };
+        let greens = wide
+            .apply_f16(1, 1, FrameSrc::Rgba8(&[0u8, 255, 0, 255]))
+            .expect("the wide 16-bit pass takes the mixed shape");
+        let g = read16(&greens, 0, 1);
+        assert!(
+            (65535 - 1000..65535).contains(&g),
+            "in-container green keeps headroom below full scale, got G16={g} (measured 65375)"
+        );
+        let reds = wide
+            .apply_f16(1, 1, FrameSrc::Rgba8(&[255u8, 0, 0, 255]))
+            .expect("the wide 16-bit pass takes the mixed shape");
+        let (r, g) = (read16(&reds, 0, 0), read16(&reds, 0, 1));
+        assert_eq!(r, 65535, "the out-of-container red pins at full");
+        assert!(
+            g > 1000,
+            "out-of-container red gamut-maps (keeps its hue), got G16={g} (measured 15704)"
+        );
+        let srgb = prepare(true, Some(adobe_like_icc()), "t", Backend::Warp)
+            .expect("the control transform prepares");
+        let greens = srgb
+            .apply_f16(1, 1, FrameSrc::Rgba8(&[0u8, 255, 0, 255]))
+            .expect("the control 16-bit pass takes the mixed shape");
+        assert_eq!(
+            read16(&greens, 0, 1),
+            65535,
+            "the sRGB destination clips the same green to the primary"
+        );
+        let reds = srgb
+            .apply_f16(1, 1, FrameSrc::Rgba8(&[255u8, 0, 0, 255]))
+            .expect("the control 16-bit pass takes the mixed shape");
+        assert_eq!(
+            (read16(&reds, 0, 0), read16(&reds, 0, 1)),
+            (65535, 0),
+            "the sRGB destination hard-clips red to the bare primary"
+        );
+    }
+
+    #[test]
+    fn p3_to_p3_identity_round_trip_stays_near_lossless() {
+        // The destination profile's own acceptance (probe P-A): a P3
+        // source through the P3 destination is (near-)identity —
+        // full-scale primaries survive essentially intact and in-gamut
+        // grays drift only single-digit LSBs of the 16-bit container.
+        // Measured on the raw BM_16b_RGB CMM output, before the f16
+        // transcode adds its own quantization. The source here is the
+        // destination profile ITSELF: identity requires the SAME
+        // encoding, and the test fixture's P3 primaries are a different
+        // P3 matrix shape (the Lindbloom-style colorants, not these
+        // Bradford-D50 literals — a genuinely foreign space to the
+        // container, not an identity).
+        let _ = require_srgb();
+        let t = prepare(
+            true,
+            Some(p3_destination_profile().to_vec()),
+            "t",
+            Backend::Hardware,
+        )
+        .expect("a P3 source transforms");
+        // BGR16 source rows: full-scale primaries and white, then
+        // in-gamut grays (never at the encoding's rails).
+        let mut src: Vec<u16> = Vec::new();
+        let mut want: Vec<[u16; 3]> = Vec::new();
+        for px in [
+            [0u16, 0, 0xFFFF],        // red
+            [0, 0xFFFF, 0],           // green
+            [0xFFFF, 0, 0],           // blue
+            [0xFFFF, 0xFFFF, 0xFFFF], // white
+        ] {
+            src.extend_from_slice(&px);
+            want.push(px);
+        }
+        for v in [
+            0x1999u16, 0x3333, 0x4CCC, 0x6666, 0x8000, 0x9999, 0xB333, 0xCCCC, 0xE666,
+        ] {
+            src.extend_from_slice(&[v, v, v]);
+            want.push([v, v, v]);
+        }
+        let mut dst = vec![0u16; src.len()];
+        t.translate16(want.len() as u32, 1, FrameSrc::Bgr16(&src), &mut dst)
+            .expect("the identity probe's 16->16 form");
+        let mut max_drift = 0u16;
+        for (i, want_px) in want.iter().enumerate() {
+            let got = [dst[i * 3], dst[i * 3 + 1], dst[i * 3 + 2]];
+            for (ch, (g, w)) in got.iter().zip(want_px).enumerate() {
+                let d = g.abs_diff(*w);
+                let full_scale_channel = *w == 0xFFFF;
+                if full_scale_channel {
+                    // The primary's own channel (P-A measured min 65523;
+                    // the threshold keeps headroom for CMM versions).
+                    assert!(
+                        *g >= 65500,
+                        "full scale must survive, got {g} on channel {ch} (P-A ref min 65523)"
+                    );
+                } else if *w != 0 {
+                    max_drift = max_drift.max(d);
+                }
+            }
+        }
+        assert!(
+            max_drift <= 32,
+            "in-gamut grays stay near-lossless, max drift {max_drift} (P-A ref 13, repo ramp max 26)"
+        );
+    }
+
+    #[test]
+    fn hardware_sessions_retarget_the_transform_to_the_wide_destination() {
+        // D2's destination selection: a genuinely-foreign profile on a
+        // HARDWARE session earns the wide container.
+        let _ = require_srgb();
+        let t = prepare(true, Some(p3_like_icc()), "t", Backend::Hardware)
+            .expect("a P3 source transforms");
+        assert!(t.destination_is_wide());
+    }
+
+    #[test]
+    fn warp_sessions_keep_the_srgb_destination() {
+        // D5's WARP exclusion: the same source on a WARP session keeps
+        // today's sRGB destination — no F16P3 master can exist where no
+        // wide draw arm runs.
+        let _ = require_srgb();
+        let t =
+            prepare(true, Some(p3_like_icc()), "t", Backend::Warp).expect("a P3 source transforms");
+        assert!(!t.destination_is_wide());
+    }
+
+    #[test]
+    fn a_refused_wide_pass_falls_back_to_the_srgb_destination() {
+        // The loader ladder's fallback, driven directly: the wide
+        // 16-bit pass refused (injected), the SAME transform retargets
+        // to sRGB and its 16-bit chain works again — destination no
+        // longer wide.
+        let _ = require_srgb();
+        let mut t = prepare(true, Some(adobe_like_icc()), "t", Backend::Hardware)
+            .expect("an AdobeRGB-like profile transforms");
+        assert!(t.destination_is_wide());
+        t.force16_fail.set(true);
+        assert!(
+            t.apply_f16(1, 1, FrameSrc::Rgba8(&[255u8, 0, 0, 255]))
+                .is_none()
+        );
+        t.force16_fail.set(false);
+        assert!(t.retarget_srgb(), "the sRGB destination rebuilds");
+        assert!(!t.destination_is_wide());
+        assert!(
+            t.apply_f16(1, 1, FrameSrc::Rgba8(&[255u8, 0, 0, 255]))
+                .is_some(),
+            "the 16-bit chain runs again against sRGB"
+        );
     }
 }
