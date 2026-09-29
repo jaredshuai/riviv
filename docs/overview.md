@@ -20,7 +20,7 @@ riviv 是 Windows 上的单 exe 看图程序，[voidImageViewer](https://github.
 
 **设计。** 视口像素在子窗口 `riviv_view` 上，用 DXGI flip；菜单、状态栏、工具条仍走 GDI。父窗口带 `WS_CLIPCHILDREN`，不再往视口区做 GDI 绘制（ADR 0002 D4）。DPI 决策是 PerMonitorV2，相对上游的 system DPI 是有意偏离（ADR 0002 D9）。系统级失败要带上下文直报；用户给的坏图片不能把程序带崩（ADR 0001）。
 
-**现状。** `window::run` 依赖加载器在用户代码之前套用的嵌入清单；进程若是 DPI-unaware，直接失败退出（`src/window.rs` 9253–9282）。主窗口自己的 `WM_PAINT` 只校验更新区（8529–8540）。像素在子窗口的 `WM_PAINT`（`view_proc` 1090–1097），交给 `paint_view`（1216）——#90 后只有 D2D 一条路径，不再有 GDI 臂可选。
+**现状。** `window::run` 依赖加载器在用户代码之前套用的嵌入清单；进程若是 DPI-unaware，直接失败退出（`src/window.rs` 9253–9282）。主窗口自己的 `WM_PAINT` 只校验更新区（8529–8538）。像素在子窗口的 `WM_PAINT`（`view_proc` 1090–1097），交给 `paint_view`（1216）——#90 后只有 D2D 一条路径，不再有 GDI 臂可选。
 
 ### 打开、解码、色彩
 
@@ -68,9 +68,9 @@ L2（ADR 0004）的 AC 会话画在 FP16 scRGB 输出面上：swapchain 与画�
 ### 当前代码怎么走
 
 1. **路径从三条入口进来。**
-   - 命令行：安装族开关若处理完就退出、不建窗口（`run` 9321–9332）。否则在单实例门之后建窗口，再 `process_parsed_cl`（9919）。一个文件词走 `open_from_filename`（5721–5723）。没有文件词则不发起加载，窗口是空的（README Usage）。第二个进程在默认单实例下把整行命令交给已在运行的窗口后自己退出（9334–9444）；接收端改到对方的工作目录，再调用同一个 `process_parsed_cl`（5897–5918）。
-   - Ctrl+O 或文件菜单的打开：`open_image_via_dialog`。取消则返回。打开（不是添加）先清空播放列表，再 `open_from_filename`（6700–6745）。
-   - 往窗口拖一个文件、且没有按 Shift：`WM_DROPFILES` → `on_drop_files` → `apply_drop_files` → `open_from_filename`（8834–8838、8175–8190、8243；子窗口也把 HDROP 转给 owner，1174–1177）。
+   - 命令行：安装族开关若处理完就退出、不建窗口（`run` 9321–9331）。否则在单实例门之后建窗口，再 `process_parsed_cl`（9919）。一个文件词走 `open_from_filename`（5721–5723）。没有文件词则不发起加载，窗口是空的（README Usage）。第二个进程在默认单实例下把整行命令交给已在运行的窗口后自己退出（9334–9444）；接收端改到对方的工作目录，再调用同一个 `process_parsed_cl`（5897–5918）。
+   - Ctrl+O 或文件菜单的打开：`open_image_via_dialog`。取消则返回。打开（不是添加）先清空播放列表，再 `open_from_filename`（6700–6734）。
+   - 往窗口拖一个文件、且没有按 Shift：`WM_DROPFILES` → `on_drop_files` → `apply_drop_files` → `open_from_filename`（8835–8839、8175–8190、8243；子窗口也把 HDROP 转给 owner，1174–1177）。
 2. **目录和普通文件在这里分开。** `open_from_filename` 见到目录就收进播放列表再 home；见到普通文件就 `request_open(..., OpenOrigin::Direct)`（4612–4645）。这一步不看扩展名。多个文件或按着 Shift 拖放会先经 `add_filename` 改播放列表，扩展名不在那十一个里的文件不会进列表。本轮没有逐行读 `home_open`，所以文件夹打开后第一张是哪一个文件，这里不写死。
 3. **排队解码，或直接换上已有的图。** `request_open`（4321–4489）若命中上一张缓存或预加载，换上现成的帧并返回（4324–4359）。若路径不存在，不进加载器，状态栏走 “File not found.”，旧画面留着（4361–4408）。否则记下当时的背景色和 `icm`（`decode_env`，4459；定义 4502），`LoadThread::request` 送出 `LoadSource::File`，并打开第一帧绘制握手（4466–4471）。标题在这一刻就改成所请求的文件（4474–4487），不等解码结束。
 4. **工作线程产出内存帧。** `decode_to_sink` 成功则以 `Complete` 收尾，用户级错误则 `FailedUser`（`src/loader.rs` 166–178）。帧在进回复之前做 ICC（若启用）和背景合成，见上一节的 `assemble_frame`。透明在这一步变成不透明（`composite_over_background_in_place`，`src/pixels.rs` 61–80；BGRA 路径在 89–91 转调它）。工作线程不创建 GDI 对象（`loadthread.rs` 22–24）。
