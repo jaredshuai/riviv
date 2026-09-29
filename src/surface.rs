@@ -163,7 +163,49 @@ impl Surface {
             // Rotation moves geometry, not encoding — the rotated frame
             // stays in its master's content space (#140).
             content_space: self.master.content_space,
+            // #163: the rotated raster is no longer the Tree's face — the
+            // vector source dies with the edit (a re-raster would
+            // un-rotate the display).
+            svg: None,
         };
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // #163: rotation rebuilds the frame — the vector handle dies with the
+    // edit (the rotated raster is no longer the Tree's face; a re-raster
+    // would un-rotate the display).
+    #[test]
+    fn rotation_drops_the_vector_source() {
+        let source = crate::svg::parse(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="4" height="2"><rect width="4" height="2" fill="red"/></svg>"#,
+        )
+        .unwrap();
+        let mut frame = crate::pixels::PixelFrame::from_rgba(
+            4,
+            2,
+            vec![0u8; 4 * 2 * 4],
+            crate::transform_stage::ContentSpace::Srgb,
+        );
+        frame.attach_svg(std::sync::Arc::new(source));
+        assert!(
+            frame.svg_source().is_some(),
+            "the decode arm's attach holds"
+        );
+        let mut surface = Surface::from_master(frame);
+        assert!(surface.rotate(true));
+        assert!(
+            surface.master().svg_source().is_none(),
+            "the handle died with the edit"
+        );
+        assert_eq!(
+            (surface.width(), surface.height()),
+            (2, 4),
+            "geometry rotated"
+        );
     }
 }

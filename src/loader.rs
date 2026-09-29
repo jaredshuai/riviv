@@ -342,7 +342,9 @@ fn svg_arm_from_file(
 /// and the single raster are each one pass, `terminate` polls between
 /// frames and there is only one). SVG carries no ICC profile (resvg
 /// renders sRGB), so the icm chain is structurally absent — the same
-/// untagged class as BMP/ICO/DIB.
+/// untagged class as BMP/ICO/DIB. #163: the parsed `Tree` rides the frame
+/// (`PixelFrame::svg`) so the interactive re-raster can rebuild from it
+/// without re-parsing.
 fn svg_decode_to_sink(
     bytes: &[u8],
     shown: &str,
@@ -359,11 +361,28 @@ fn svg_decode_to_sink(
             crate::svg::MAX_INPUT_BYTES / (1024 * 1024)
         )));
     }
-    let (w, h, rgba) =
-        crate::svg::decode(bytes, env.viewport, MAX_TOTAL_FRAME_BYTES).map_err(user)?;
-    let frame = assemble_frame(w, h, rgba, &env, None, 8);
+    let source = crate::svg::parse(bytes).map_err(user)?;
+    let target = crate::svg::raster_target(source.natural, env.viewport, MAX_TOTAL_FRAME_BYTES);
+    let (w, h, rgba) = crate::svg::rasterize(&source, target).map_err(user)?;
+    let mut frame = assemble_frame(w, h, rgba, &env, None, 8);
+    frame.attach_svg(std::sync::Arc::new(source));
     sink(LoadReply::FirstFrame { frame, delay_ms: 0 });
     Ok(())
+}
+
+/// The interactive re-raster's assembly tail (#163): the load worker's
+/// re-raster job builds its frame through the SAME still-decode tail the
+/// SVG arm uses (composite over the request-time background, untagged
+/// 8-bit — `svg_decode_to_sink` above). The vector handle is re-attached
+/// by the UI at the swap, not here (the reply replaces the displayed
+/// frame; the surviving handle stays the one already on screen).
+pub(crate) fn assemble_reraster_frame(
+    width: u32,
+    height: u32,
+    rgba: Vec<u8>,
+    env: &DecodeEnv,
+) -> PixelFrame {
+    assemble_frame(width, height, rgba, env, None, 8)
 }
 
 /// Extract and prepare the ICC->sRGB transform while the decoder is
@@ -4210,8 +4229,37 @@ mod svg_tests {
             [LoadReply::FirstFrame { frame, .. }, LoadReply::Complete] => {
                 let (r, g, b) = crate::pixels::sample_master_rgb(frame, 0, 0).expect("pixel (0,0)");
                 assert_eq!((r, g, b), (0, 170, 0));
+                // #163: the SVG arm's frame carries the parsed Tree (the
+                // interactive re-raster rebuilds from it); a natural
+                // size is recorded for the rasterize scale math.
+                let svg = frame.svg_source().expect("svg frame carries its source");
+                assert_eq!(svg.natural, (8.0, 8.0));
             }
             other => panic!("expected [FirstFrame, Complete], got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_bitmap_frame_never_carries_a_vector_source() {
+        // The handle is the SVG arm's alone — a PNG decode's frames stay
+        // bare (the re-raster channel keys on its presence).
+        let png: &[u8] = &[
+            0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0x0d, b'I', b'H', b'D', b'R',
+            0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0, 0x1f, 0x15, 0xc4, 0x89, 0, 0, 0, 0x0a, b'I',
+            b'D', b'A', b'T', 0x78, 0x9c, 0x63, 0, 1, 0, 0, 0x05, 0, 0x01, 0x0d, 0x0a, 0x2d, 0xb4,
+            0, 0, 0, 0, b'I', b'E', b'N', b'D', 0xae, 0x42, 0x60, 0x82,
+        ];
+        let terminate = AtomicBool::new(false);
+        let mut replies = Vec::new();
+        decode_bytes_to_sink(png, svg_env(), &terminate, None, &mut |r| replies.push(r));
+        match replies.as_slice() {
+            [LoadReply::FirstFrame { frame, .. }, ..] => {
+                assert!(
+                    frame.svg_source().is_none(),
+                    "bitmap frames carry no svg handle"
+                );
+            }
+            other => panic!("expected a FirstFrame, got {other:?}"),
         }
     }
 }

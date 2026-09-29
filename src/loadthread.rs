@@ -113,6 +113,35 @@ struct Job {
     first_frame_painted: Option<FirstFramePainted>,
 }
 
+/// One finished interactive re-raster (#163, ADR 0005 D6): the seq it was
+/// requested under (the UI drops the reply when the view epoch moved on)
+/// and the assembled frame. A re-raster failure produces NO reply at all
+/// — it is not a user-visible event (the display keeps the current
+/// raster; the stills' user-level failure class does not apply).
+pub(crate) struct RerasterReply {
+    pub(crate) seq: u64,
+    pub(crate) frame: PixelFrame,
+}
+
+/// The in-flight re-raster's reply parking (the same queue shape a load
+/// session uses, without the session machinery).
+pub(crate) type RerasterQueue = Arc<Mutex<VecDeque<RerasterReply>>>;
+
+/// One queued interactive re-raster (#163): rides the SAME worker as the
+/// decodes — the serialization is the point (#82's frame-budget
+/// discipline: a decode and a re-raster never hold their frame bytes
+/// concurrently). No terminate flag: a single raster pass is bounded
+/// (the same granularity a still's single decode has), and staleness is
+/// settled on the UI side by the seq check, not by cancellation.
+struct RerasterJob {
+    source: Arc<crate::svg::SvgSource>,
+    target: (u32, u32),
+    env: DecodeEnv,
+    hwnd: SendHwnd,
+    seq: u64,
+    queue: RerasterQueue,
+}
+
 /// The handshake signal: set by the UI thread's first paint after an
 /// animation first-frame adoption, awaited by the worker's decode loop.
 /// Plain data (Mutex/Condvar/Arc) — `Send` by construction.
@@ -160,11 +189,18 @@ const FIRST_FRAME_PAINT_CAP: std::time::Duration = std::time::Duration::from_sec
 /// The polling granularity while waiting (terminate responsiveness).
 const FIRST_FRAME_WAIT_TICK: std::time::Duration = std::time::Duration::from_millis(50);
 
+/// What the worker runs: a decode or an interactive re-raster (#163 —
+/// both serialize on the one worker; see [`RerasterJob`]).
+enum Task {
+    Decode(Job),
+    Reraster(RerasterJob),
+}
+
 /// The process-wide decode worker handle. Jobs are processed strictly in
 /// order (upstream chains the same way, viv.c:1520-1572), so at most one
 /// decode is active no matter how fast the user switches images.
 pub(crate) struct LoadThread {
-    sender: Option<Sender<Job>>,
+    sender: Option<Sender<Task>>,
     handle: Option<JoinHandle<()>>,
 }
 
@@ -222,7 +258,11 @@ impl LoadThread {
         // Unbounded channel: never blocks the UI thread. A send can only
         // fail if the worker already exited — impossible short of the
         // spawn failure ADR 0001 already failed loud on.
-        let _ = self.sender.as_ref().expect("sender dropped").send(job);
+        let _ = self
+            .sender
+            .as_ref()
+            .expect("sender dropped")
+            .send(Task::Decode(job));
         LoadSession {
             id,
             path,
@@ -230,6 +270,36 @@ impl LoadThread {
             queue,
             paint_signal: first_frame_painted,
         }
+    }
+
+    /// Queue an interactive re-raster (#163, ADR 0005 D6) and return its
+    /// reply queue. The UI drops the reply (by seq) when the view moved
+    /// on; a raster failure replies nothing — the display simply keeps
+    /// its current raster. `env` snapshots the request-time composite
+    /// background, exactly like a load.
+    pub(crate) fn request_reraster(
+        &self,
+        hwnd: HWND,
+        source: Arc<crate::svg::SvgSource>,
+        target: (u32, u32),
+        env: DecodeEnv,
+        seq: u64,
+    ) -> RerasterQueue {
+        let queue: RerasterQueue = Arc::new(Mutex::new(VecDeque::new()));
+        // Same send-can't-fail reasoning as `request`.
+        let _ = self
+            .sender
+            .as_ref()
+            .expect("sender dropped")
+            .send(Task::Reraster(RerasterJob {
+                source,
+                target,
+                env,
+                hwnd: SendHwnd(hwnd),
+                seq,
+                queue: Arc::clone(&queue),
+            }));
+        queue
     }
 
     /// Stop the worker and wait for it. Closing the channel ends the
@@ -249,97 +319,132 @@ impl LoadThread {
     }
 }
 
-fn worker(receiver: Receiver<Job>) {
-    while let Ok(job) = receiver.recv() {
-        let Job {
-            source,
-            env,
-            hwnd: SendHwnd(hwnd),
-            terminate,
-            queue,
-            first_frame_painted,
-        } = job;
-        // Superseded while still queued: nothing was decoded, nothing to
-        // reply — skip before touching the source.
-        if terminate.load(Ordering::Relaxed) {
-            continue;
+fn worker(receiver: Receiver<Task>) {
+    while let Ok(task) = receiver.recv() {
+        match task {
+            Task::Decode(job) => worker_decode(job),
+            Task::Reraster(job) => worker_reraster(job),
         }
-        // The sink gets its own handle for its retry loop; the original
-        // stays with the decode call's terminate parameter.
-        let sink_terminate = Arc::clone(&terminate);
-        let mut sink = move |reply: LoadReply<PixelFrame>| {
-            // unwrap: a poisoned lock means some thread panicked while
-            // holding the queue — an undefined state we fail loud on
-            // (ADR 0001) rather than limp past.
-            queue.lock().unwrap().push_back(reply);
-            // The kick must survive a full destination queue: the LAST
-            // reply of a stream has no successor push to heal a lost post,
-            // so retry until it lands or the job is terminated. Teardown
-            // sets the terminate flag before the window finishes dying
-            // (WM_NCDESTROY terminates the session, then quits the worker),
-            // which bounds the loop; a post to the dead window fails
-            // harmlessly until then.
-            loop {
-                // SAFETY: `hwnd` is a valid handle captured for this job;
-                // PostMessageW never dereferences it on this thread and
-                // validates it on the owning thread's queue (the queue —
-                // not the kick — owns the replies, so a lost post costs
-                // drain latency, never data).
-                if unsafe { PostMessageW(Some(hwnd), REPLY_KICK_MESSAGE, WPARAM(0), LPARAM(0)) }
-                    .is_ok()
-                {
-                    break;
-                }
-                if sink_terminate.load(Ordering::Relaxed) {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+/// The interactive re-raster pass (#163): one rasterize + the still-decode
+/// assembly tail. The kick is posted ONCE — unlike the decode sink's
+/// retry loop, a lost post here loses only a reply the seq check would
+/// likely drop anyway (a dying window has no view epoch left to match),
+/// and the queue dies with the window's state.
+fn worker_reraster(job: RerasterJob) {
+    let RerasterJob {
+        source,
+        target,
+        env,
+        hwnd: SendHwnd(hwnd),
+        seq,
+        queue,
+    } = job;
+    let Some((w, h, rgba)) = crate::svg::rasterize(&source, target).ok() else {
+        return; // not user-visible: the display keeps its current raster
+    };
+    let reply = RerasterReply {
+        seq,
+        frame: crate::loader::assemble_reraster_frame(w, h, rgba, &env),
+    };
+    // unwrap on poisoning, as in the decode sink.
+    queue.lock().unwrap().push_back(reply);
+    // SAFETY: the handle was captured for this job; PostMessageW never
+    // dereferences it on this thread — a dead window fails the post and
+    // the reply is dropped with the window (see the comment above).
+    let _ = unsafe { PostMessageW(Some(hwnd), REPLY_KICK_MESSAGE, WPARAM(0), LPARAM(0)) };
+}
+
+fn worker_decode(job: Job) {
+    let Job {
+        source,
+        env,
+        hwnd: SendHwnd(hwnd),
+        terminate,
+        queue,
+        first_frame_painted,
+    } = job;
+    // Superseded while still queued: nothing was decoded, nothing to
+    // reply — skip before touching the source.
+    if terminate.load(Ordering::Relaxed) {
+        return;
+    }
+    // The sink gets its own handle for its retry loop; the original
+    // stays with the decode call's terminate parameter.
+    let sink_terminate = Arc::clone(&terminate);
+    let mut sink = move |reply: LoadReply<PixelFrame>| {
+        // unwrap: a poisoned lock means some thread panicked while
+        // holding the queue — an undefined state we fail loud on
+        // (ADR 0001) rather than limp past.
+        queue.lock().unwrap().push_back(reply);
+        // The kick must survive a full destination queue: the LAST
+        // reply of a stream has no successor push to heal a lost post,
+        // so retry until it lands or the job is terminated. Teardown
+        // sets the terminate flag before the window finishes dying
+        // (WM_NCDESTROY terminates the session, then quits the worker),
+        // which bounds the loop; a post to the dead window fails
+        // harmlessly until then.
+        loop {
+            // SAFETY: `hwnd` is a valid handle captured for this job;
+            // PostMessageW never dereferences it on this thread and
+            // validates it on the owning thread's queue (the queue —
+            // not the kick — owns the replies, so a lost post costs
+            // drain latency, never data).
+            if unsafe { PostMessageW(Some(hwnd), REPLY_KICK_MESSAGE, WPARAM(0), LPARAM(0)) }.is_ok()
+            {
+                break;
             }
-        };
-        match source {
-            LoadSource::File(path) => {
-                decode_to_sink(
-                    &path,
+            if sink_terminate.load(Ordering::Relaxed) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    };
+    match source {
+        LoadSource::File(path) => {
+            decode_to_sink(
+                &path,
+                env,
+                &terminate,
+                first_frame_painted.as_ref(),
+                &mut sink,
+            );
+        }
+        LoadSource::Stdin => match read_stdin_terminated(&terminate) {
+            Some(StdinOutcome::Bytes(bytes)) => {
+                decode_bytes_to_sink(
+                    &bytes,
                     env,
                     &terminate,
                     first_frame_painted.as_ref(),
                     &mut sink,
                 );
             }
-            LoadSource::Stdin => match read_stdin_terminated(&terminate) {
-                Some(StdinOutcome::Bytes(bytes)) => {
-                    decode_bytes_to_sink(
-                        &bytes,
-                        env,
-                        &terminate,
-                        first_frame_painted.as_ref(),
-                        &mut sink,
-                    );
-                }
-                Some(StdinOutcome::Failed(msg)) => sink(LoadReply::FailedUser(msg)),
+            Some(StdinOutcome::Failed(msg)) => sink(LoadReply::FailedUser(msg)),
+            None => {} // terminated mid-read: exit silently
+        },
+        // The clipboard read is a short open-copy-close session on a
+        // DETACHED helper thread, terminate-aware (#66): a delayed-
+        // rendering clipboard owner can stall GetClipboardData
+        // forever, and the stall must not hang this worker (the
+        // window teardown joins it) — the stdin reader's contract
+        // (see read_stdin_terminated). Every read problem is
+        // user-level (keep old image, no dialog, no exit — ADR
+        // 0001), exactly like a foreign pipe's bytes.
+        LoadSource::Clipboard => {
+            match crate::clipboard::read_clipboard_dib_terminated(&terminate) {
+                Some(Ok(Some(payload))) => decode_dib_to_sink(&payload, env, &mut sink),
+                Some(Ok(None)) => sink(LoadReply::FailedUser(format!(
+                    "{} no image on the clipboard",
+                    crate::clipboard::CLIPBOARD_NAME
+                ))),
+                Some(Err(msg)) => sink(LoadReply::FailedUser(format!(
+                    "{} {msg}",
+                    crate::clipboard::CLIPBOARD_NAME
+                ))),
                 None => {} // terminated mid-read: exit silently
-            },
-            // The clipboard read is a short open-copy-close session on a
-            // DETACHED helper thread, terminate-aware (#66): a delayed-
-            // rendering clipboard owner can stall GetClipboardData
-            // forever, and the stall must not hang this worker (the
-            // window teardown joins it) — the stdin reader's contract
-            // (see read_stdin_terminated). Every read problem is
-            // user-level (keep old image, no dialog, no exit — ADR
-            // 0001), exactly like a foreign pipe's bytes.
-            LoadSource::Clipboard => {
-                match crate::clipboard::read_clipboard_dib_terminated(&terminate) {
-                    Some(Ok(Some(payload))) => decode_dib_to_sink(&payload, env, &mut sink),
-                    Some(Ok(None)) => sink(LoadReply::FailedUser(format!(
-                        "{} no image on the clipboard",
-                        crate::clipboard::CLIPBOARD_NAME
-                    ))),
-                    Some(Err(msg)) => sink(LoadReply::FailedUser(format!(
-                        "{} {msg}",
-                        crate::clipboard::CLIPBOARD_NAME
-                    ))),
-                    None => {} // terminated mid-read: exit silently
-                }
             }
         }
     }
