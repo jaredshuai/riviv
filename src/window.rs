@@ -3044,6 +3044,15 @@ fn consider_reraster(hwnd: HWND) {
         return;
     };
     state.reraster_seq += 1;
+    reraster_request_if_needed(hwnd, state);
+}
+
+/// The request half of the consideration — everything AFTER the epoch
+/// bump, split out so `view_edge` can run it on a `keep_zoom` carry
+/// (#164 Codex P1): a carried view can land a new image past 2× its
+/// load-time raster, and an adoption edge re-considers nowhere else
+/// (the display-face touchpoints all assume a user action).
+fn reraster_request_if_needed(hwnd: HWND, state: &mut WindowState) {
     if state.reraster_queue.is_some() {
         // One raster in flight; its drain re-considers when it lands.
         return;
@@ -3112,14 +3121,22 @@ fn drain_reraster_replies(hwnd: HWND) {
             state.reraster_queue = Some(queue);
             return;
         }
-        for mut reply in replies {
+        let mut failed = false;
+        for reply in replies {
             if reply.seq != state.reraster_seq {
                 continue; // the view moved on: drop, no swap
             }
+            // #164 Codex P2: the rasterization itself failed — retire the
+            // slot with no swap. The display keeps its current raster;
+            // the next user display-face change re-arms naturally.
+            let Some(mut frame) = reply.frame else {
+                failed = true;
+                continue;
+            };
             let (vp, _) = viewport_and_src(hwnd, state);
             let fit = fit_policy(state);
-            let new_w = reply.frame.width as i32;
-            let new_h = reply.frame.height as i32;
+            let new_w = frame.width as i32;
+            let new_h = frame.height as i32;
             let Some(image) = state.image.as_mut() else {
                 continue;
             };
@@ -3134,17 +3151,22 @@ fn drain_reraster_replies(hwnd: HWND) {
             // worker's raster never had one — the swap keeps the ability
             // for the NEXT zoom step).
             if let Some(handle) = image.surface().master().svg_source() {
-                reply.frame.attach_svg(std::sync::Arc::clone(handle));
+                frame.attach_svg(std::sync::Arc::clone(handle));
             }
-            image.frames_mut()[0] = Surface::from_master(reply.frame);
+            image.frames_mut()[0] = Surface::from_master(frame);
             // #80 §5: the displayed pixels changed — the D2D upload
             // refreshes at the next paint (the rotate pass's precedent).
             state.frame_gen += 1;
             swapped = true;
         }
         // Swapped or dropped, the slot is idle — re-consider (a no-op
-        // unless the current view still wants a bigger raster).
-        consider_reraster(hwnd);
+        // unless the current view still wants a bigger raster). A FAILED
+        // raster skips the re-consider on purpose: re-arming here would
+        // spin the worker on a persistently failing rasterize (the
+        // retry comes from the next user display-face change instead).
+        if !failed {
+            consider_reraster(hwnd);
+        }
     }
     if swapped {
         // The adoption tail: the status strip's WxH reads the new face,
@@ -4176,8 +4198,12 @@ enum DisplayEdge {
 fn view_edge(hwnd: HWND, state: &mut WindowState, edge: DisplayEdge) {
     // #163: a display-content edge invalidates any in-flight re-raster —
     // the new image (or blank) has its own raster story; the reply drops
-    // at its drain on this seq bump. No request here: a fresh image's
-    // load-time raster already matches its fit face by construction.
+    // at its drain on this seq bump. A reset view needs no request here
+    // (a fresh image's load-time raster matches its fit face by
+    // construction) — but a `keep_zoom` carry does not enjoy that
+    // invariant, so the tail runs the consideration (#164 Codex P1: a
+    // carried view can open a new SVG past 2× its load-time raster and
+    // would otherwise stay blurry until the next user zoom).
     state.reraster_seq += 1;
     if state.config.keep_zoom == 0 {
         state.view.reset();
@@ -4187,6 +4213,7 @@ fn view_edge(hwnd: HWND, state: &mut WindowState, edge: DisplayEdge) {
         state.view.carry(src.0, src.1, vp, fit);
     }
     reidentify_output_on_transition(state);
+    reraster_request_if_needed(hwnd, state);
 }
 
 /// See [`DisplayEdge`] — the shared marks tail of every `_viv_clear` edge:
