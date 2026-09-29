@@ -115,12 +115,13 @@ struct Job {
 
 /// One finished interactive re-raster (#163, ADR 0005 D6): the seq it was
 /// requested under (the UI drops the reply when the view epoch moved on)
-/// and the assembled frame. A re-raster failure produces NO reply at all
-/// — it is not a user-visible event (the display keeps the current
-/// raster; the stills' user-level failure class does not apply).
+/// and the assembled frame. A rasterization FAILURE also replies, with
+/// `frame: None` — the display keeps its current raster (still not a
+/// user-visible event), but the UI's in-flight slot retires instead of
+/// parking forever (#164 Codex P2).
 pub(crate) struct RerasterReply {
     pub(crate) seq: u64,
-    pub(crate) frame: PixelFrame,
+    pub(crate) frame: Option<PixelFrame>,
 }
 
 /// The in-flight re-raster's reply parking (the same queue shape a load
@@ -329,10 +330,17 @@ fn worker(receiver: Receiver<Task>) {
 }
 
 /// The interactive re-raster pass (#163): one rasterize + the still-decode
-/// assembly tail. The kick is posted ONCE — unlike the decode sink's
-/// retry loop, a lost post here loses only a reply the seq check would
-/// likely drop anyway (a dying window has no view epoch left to match),
-/// and the queue dies with the window's state.
+/// assembly tail. A failure replies with `frame: None` — never a silent
+/// return, which would park the UI's in-flight slot for the window's
+/// lifetime (#164 Codex P2: the drain retires the slot on the None reply
+/// and deliberately does NOT re-arm, so a persistent allocation failure
+/// cannot spin this worker). The kick retries a BOUNDED number of times:
+/// unlike the decode sink's unbounded loop (which leans on its terminate
+/// flag), a reraster job carries no such flag, and the window's teardown
+/// joins this worker — an unbounded loop on a full destination queue
+/// could hang that join. A give-up is not fatal either: the reply sits in
+/// the queue and the NEXT load's kick drains it (the kick is shared with
+/// `on_load_replies`).
 fn worker_reraster(job: RerasterJob) {
     let RerasterJob {
         source,
@@ -342,19 +350,32 @@ fn worker_reraster(job: RerasterJob) {
         seq,
         queue,
     } = job;
-    let Some((w, h, rgba)) = crate::svg::rasterize(&source, target).ok() else {
-        return; // not user-visible: the display keeps its current raster
-    };
     let reply = RerasterReply {
         seq,
-        frame: crate::loader::assemble_reraster_frame(w, h, rgba, &env),
+        frame: crate::svg::rasterize(&source, target)
+            .ok()
+            .map(|(w, h, rgba)| crate::loader::assemble_reraster_frame(w, h, rgba, &env)),
     };
     // unwrap on poisoning, as in the decode sink.
     queue.lock().unwrap().push_back(reply);
-    // SAFETY: the handle was captured for this job; PostMessageW never
-    // dereferences it on this thread — a dead window fails the post and
-    // the reply is dropped with the window (see the comment above).
-    let _ = unsafe { PostMessageW(Some(hwnd), REPLY_KICK_MESSAGE, WPARAM(0), LPARAM(0)) };
+    let mut posted = false;
+    for _ in 0..64 {
+        // SAFETY: the handle was captured for this job; PostMessageW
+        // never dereferences it on this thread — a dead window fails
+        // the post and the reply is dropped with the window (see the
+        // comment above).
+        if unsafe { PostMessageW(Some(hwnd), REPLY_KICK_MESSAGE, WPARAM(0), LPARAM(0)) }.is_ok() {
+            posted = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    if !posted {
+        // 64 consecutive post failures = a persistently full queue (or a
+        // dying window). The parked reply self-heals at the next load's
+        // kick; the breadcrumb keeps the stall observable.
+        eprintln!("riviv: reraster reply kick lost after retries; it drains at the next load kick");
+    }
 }
 
 fn worker_decode(job: Job) {

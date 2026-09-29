@@ -54,10 +54,19 @@
 #   S7  huge viewBox (100000) + 9 notches -> exit 0, red/blue halves
 #       present (clamps hold on the interactive path too; its swaps land
 #       at L5/L9 of the ~660 fit)
+#   S8  (#164 Codex P1) keep_zoom carry: 6 notches on a 48px striped
+#       PNG (bitmaps never re-raster - S3 - so the slot stays virgin)
+#       then NavNext onto a 2048px SVG whose load raster is the 1024
+#       intermediate: the carried level 6 displays it at ~2.5x its
+#       raster -> the view-edge tail re-rasters (AA gray band present,
+#       full-bleed dump). -OnlyS8 skips S1-S7 (the control-exe negative
+#       run: S8 must FAIL there - master never re-considers on an
+#       adoption edge).
 
 param(
     [string]$Exe = 'D:\codespace\riviv\target\release\riviv.exe',
-    [string]$MasterExe = "$env:TEMP\riviv-163-parity\riviv.exe"
+    [string]$MasterExe = "$env:TEMP\riviv-163-parity\riviv.exe",
+    [switch]$OnlyS8
 )
 
 $ErrorActionPreference = 'Stop'
@@ -243,7 +252,9 @@ if ($MasterExe -ne '' -and (Test-Path $MasterExe)) {
     $haveMaster = $true
 }
 Check 'S0a staged exe copied' (Test-Path $script:RunExe) 'Copy-Item failed'
-Check 'S0b master parity exe present' $haveMaster "MasterExe='$MasterExe' not found"
+if (-not $OnlyS8) {
+    Check 'S0b master parity exe present' $haveMaster "MasterExe='$MasterExe' not found"
+}
 
 $BaseIni = "[riviv]`r`nx=60`r`ny=60`r`nwide=1000`r`nhigh=700`r`nauto_zoom=0`r`nicm=0`r`nwindowed_background_color_r=8`r`nwindowed_background_color_g=8`r`nwindowed_background_color_b=8`r`n"
 
@@ -313,10 +324,115 @@ for ($y = 0; $y -lt 48; $y++) {
     }
 }
 [Px]::SaveRgba($F.pngTwin, $pt, 48, 48)
+# S8's second playlist entry: 2048px natural, WHITE-first 4-unit vertical
+# stripes. The load raster is the 1024 INTERMEDIATE (raster_target's
+# zoom-headroom arm: fit ~0.32 < intermediate 0.5), at exactly scale 0.5
+# - so the 4-unit stripes land on EXACT 2px boundaries: a crisp B/W
+# raster (no AA fringe -> the control's point-sampled upscale of it has
+# zero gray). The swapped face (~2482, scale ~1.21) re-rasterizes the
+# same stripes at fractional boundaries: a real gray band. White-first
+# keeps the outer edges outside the letterbox pin.
+$F.carry2 = Join-Path $Stage 'carry2.svg'
+$c2 = '<svg xmlns="http://www.w3.org/2000/svg" width="2048" height="2048">'
+for ($x = 0; $x -lt 2048; $x += 8) {
+    $c2 += '<rect x="' + $x + '" y="0" width="4" height="2048" fill="#FFFFFF"/>'
+    $c2 += '<rect x="' + ($x + 4) + '" y="0" width="4" height="2048" fill="#000000"/>'
+}
+$c2 += '</svg>'
+[IO.File]::WriteAllText($F.carry2, $c2)
 $svgHead = [Text.Encoding]::ASCII.GetString(([IO.File]::ReadAllBytes($F.stripes))[0..4])
 Check 'S0c stripes.svg is an svg root' ($svgHead -eq '<svg ') "head=[$svgHead]"
 $pngHead = [IO.File]::ReadAllBytes($F.pngTwin)
 Check 'S0d stripes.png is a PNG' ($pngHead[0] -eq 0x89 -and $pngHead[1] -eq 0x50) 'not png'
+
+# ---------------------------------------------------------------------------
+# S8 (#164 Codex P1): the keep_zoom CARRY re-raster. With keep_zoom=1 a
+# NavNext carries the zoom LEVEL onto the next image; a carried view can
+# land a new SVG past 2x its load-time raster. The fix runs the #163
+# consideration at the view-edge tail (window.rs reraster_request_if_needed),
+# so the adopted image immediately queues a background re-raster. The
+# pre-fix behavior (the control exe): the carry shows the load raster
+# upscaled (point-sampled hard stripes, zero gray) until the next USER
+# zoom - an adoption edge re-considers nowhere else.
+#
+# Why image 1 is a PNG (run-1/run-2 diag evidence, kept as the why):
+# with the default fit (anamorphic stretch-to-viewport, per-axis
+# no-upscale clamp; this window's viewport measures ~972x484), the
+# zoom ladder references the FIT face, and a load raster is NEVER
+# smaller than its fit face (raster_target's no-upscale/intermediate
+# arms) - so for ANY two SVGs, image 2's carried 2x-crossing level is
+# >= image 1's own crossing level. Climbing there puts a request in
+# flight on image 1; letting its swap land 1:1 re-bases the ladder and
+# the carry lands BELOW 2x (run 1 measured pos 2, display 80), and
+# carrying while the reply is in flight re-arms the CONTROL exe too via
+# the drain's re-consider: a false PASS. A non-SVG image 1 has no
+# reraster story at all (S3: bitmaps untouched), so it can idle at ANY
+# level with the slot virgin - the only sound anchor.
+#
+#   image 1: stripes.png (the 48x48 striped PNG twin). 6 notches ->
+#     pos 6, display 127 = 2.65x shown point-sampled, no request ever,
+#     slot idle, pos exactly 6, view NOT 1:1.
+#   image 2: carry2.svg, 2048px natural -> load raster 1024 (the
+#     INTERMEDIATE headroom arm, exact scale 0.5 -> crisp B/W). Carried
+#     pos 6 renders it at fit*(1+15*0.1098) = ~2573x~1281 (this
+#     viewport) = 2.51x its 1024 width -> only the FIX exe requests
+#     there. Both axes exceed the viewport, so BOTH arms dump a
+#     full-bleed center crop: the rect asserts "covers the viewport"
+#     (>=800x400; the height is the 200%-DPI chrome reality here),
+#     never a face size.
+#
+# The dump channel renders the settled scene at WM_CLOSE (S1-S7's
+# pattern - there is no live dump readback to poll; adoption is polled
+# via the title, then a fixed settle covers rasterize+kick+drain). The
+# census IS the discriminator (S1's): fix = resvg AA gray columns
+# (mid > 500); control = point-sampled hard stripes (mid ~0 -> FAIL,
+# the expected negative control).
+# ---------------------------------------------------------------------------
+function Invoke-S8 {
+    Reset-Ini ($BaseIni + 'keep_zoom=1' + "`r`n")
+    $out8 = Join-Path $Stage 's8-out.png'
+    if (Test-Path $out8) { Remove-Item $out8 -Force }
+    $p8 = Start-Riv ('"' + $F.pngTwin + '" "' + $F.carry2 + '" -dump-viewport "' + $out8 + '"') 's8.err'
+    $main8 = Wait-Main $p8
+    $adopt1 = Wait-Title $p8 'stripes' 15000
+    Start-Sleep -Milliseconds 600
+    $ok8 = $false
+    $d8 = "exit=-9 adopt1=$adopt1 win=$($main8 -ne [IntPtr]::Zero)"
+    $code8 = -9
+    if ($main8 -ne [IntPtr]::Zero -and $adopt1) {
+        Send-WheelIn $main8 6
+        Start-Sleep -Milliseconds 300
+        [void][S163]::PostMessage($main8, 0x0111, [IntPtr]107, [IntPtr]::Zero)  # NavNext
+        $adopt2 = Wait-Title $p8 'carry2' 15000
+        Start-Sleep -Milliseconds 1500
+        $code8 = Close-Main $p8 $main8
+        $d8 = "exit=$code8 adopt1=$adopt1 carry2=$adopt2"
+        if ($adopt2 -and (Test-Path $out8)) {
+            $q8 = [Px]::Load($out8)
+            $box8 = [Px]::BBoxNotLetterbox($q8.B, $q8.W, $q8.H)
+            if ($box8[0] -ge 0) {
+                $w8 = $box8[2] - $box8[0] + 1
+                $h8 = $box8[3] - $box8[1] + 1
+                $cen8 = [Px]::StripeCensus($q8.B, $q8.W, $q8.H, $box8)
+                # The re-rastered ~2573x1281 face covers the viewport and
+                # carries resvg's AA stripe edges: mid high. The
+                # control's point-sampled 1024 raster: mid ~0 -> FAIL.
+                $ok8 = ($code8 -eq 0) -and ($w8 -ge 800) -and ($h8 -ge 400) -and ($cen8[1] -gt 500) -and ($cen8[0] -gt 5000)
+                $d8 = "rect=${w8}x${h8} ext=$($cen8[0]) mid=$($cen8[1]) exit=$code8 carry2=$adopt2"
+            } else {
+                $d8 = "blank dump exit=$code8 carry2=$adopt2"
+            }
+        }
+    }
+    Check 'S8 keep_zoom carry past 2x: NavNext face re-rastered (AA gray band present)' $ok8 $d8
+}
+if ($OnlyS8) {
+    Invoke-S8
+    Kill-Riviv
+    if (Test-Path $script:Ini) { Remove-Item $script:Ini -Force }
+    Write-Output ('SUMMARY pass=' + $script:pass + ' fail=' + $script:fail)
+    if ($script:fail -gt 0) { exit 1 } else { exit 0 }
+}
 
 # ---------------------------------------------------------------------------
 # S1: 6 notches on the branch exe. Level 6 of a 48px fit: 48 + 720*0.1098
@@ -475,6 +591,8 @@ if ($s7.Box -ne $null -and $s7.Box[0] -ge 0 -and $s7.Code -eq 0 -and $s7.Adopted
     $s7d = "rect=$($s7.Rw)x$($s7.Rh) redPx=$red7 bluePx=$blue7 exit=$($s7.Code)"
 }
 Check 'S7 huge viewBox zoom: clamped interactive raster, halves, exit 0' $s7ok $s7d
+
+Invoke-S8
 
 Kill-Riviv
 if (Test-Path $script:Ini) { Remove-Item $script:Ini -Force }
