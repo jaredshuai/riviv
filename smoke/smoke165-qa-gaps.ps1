@@ -182,16 +182,22 @@ public class S165 {
         WritePng(path, w, h, px, icc);
     }
 
-    /// Hand-built HDROP for one file (smoke78 S4 recipe): a DROPFILES
-    /// header (pFiles=20, fWide=1) followed by the path, double-NUL ended.
+    /// Hand-built HDROP for one file (smoke78 S4 recipe, flag offset
+    /// corrected per the #166 Codex P1): DROPFILES is pshpack1 -
+    /// pFiles@0, pt@4..11, fNC@12, fWide@16. Writing 1 at offset 8 only
+    /// set pt.y and left fWide at whatever GlobalAlloc returned; the wide
+    /// read then worked by accident. The header is now built explicitly
+    /// (zeros + pFiles=20 + fWide=TRUE) so the wide contract is stated,
+    /// not inherited from allocator contents.
     public static IntPtr BuildHdrop(string path) {
         byte[] bytes = Encoding.Unicode.GetBytes(path + "\0\0");
         int total = 20 + bytes.Length;
         IntPtr hmem = GlobalAlloc(0x0002, (uint)total);
         IntPtr mem = GlobalLock(hmem);
-        byte[] off = BitConverter.GetBytes((uint)20);
-        Marshal.Copy(off, 0, mem, 4);
-        Marshal.WriteInt32(mem, 8, 1);
+        byte[] head = new byte[20];
+        BitConverter.GetBytes((uint)20).CopyTo(head, 0);
+        BitConverter.GetBytes((int)1).CopyTo(head, 16);   // fWide = TRUE
+        Marshal.Copy(head, 0, mem, 20);
         Marshal.Copy(bytes, 0, (IntPtr)((long)mem + 20), bytes.Length);
         GlobalUnlock(hmem);
         return hmem;
