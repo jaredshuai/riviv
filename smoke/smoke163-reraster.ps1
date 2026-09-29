@@ -43,10 +43,12 @@
 #       gray (proves the S1 verdict is the NEW behavior)
 #   S3  PNG A/B: 48x48 striped PNG zoomed 6 -> branch dump == master dump
 #       byte-identical (zero behavior change for bitmaps)
-#   S4  L6 then 6 wheel-downs -> back at fit ~48x48, exit 0 (the post-swap
-#       1:1 exits through the wheel's bracket search; shrink never fires)
-#   S5  race: all 15 notches back-to-back, no inter-settle -> exit 0,
-#       final face ~768 wide with AA (in-flight drops + re-requests land)
+#   S4  6 up then 6 wheel-downs -> back at the SWAPPED face's own L0 fit
+#       (~106-127 band, the raster IS the image now), AA intact, exit 0
+#   S5  race: all 15 notches back-to-back, no inter-settle -> clean exit
+#       0, ladder climbed (>=420 wide); the interleaving ends in either a
+#       swapped final face or a display at/below exactly 2x the raster
+#       (the D6 debounce threshold - both legal, probe-evidenced)
 #   S6  close immediately after the notches (raster may still be in
 #       flight) -> clean exit 0 (no teardown hang)
 #   S7  huge viewBox (100000) + 9 notches -> exit 0, red/blue halves
