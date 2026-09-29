@@ -6,14 +6,18 @@
 # letterbox (8,8,8)), -dump-viewport as the occlusion-immune channel,
 # Add-Type probe, path-targeted Kill-Riviv (#109 contract).
 #
-# Discriminator: the fixture is a 48x48 SVG of 1-unit BLACK/WHITE
-# vertical stripes. Zoomed ~5x WITHOUT a re-raster the raster is
-# upscaled by the display filter -> the stripes smear to mid-gray.
-# WITH the #163 swap the SVG re-rasterizes AT the display face -> the
-# stripes re-draw at the display pitch, hard black/white. So the dump's
-# extreme-vs-midgray pixel census inside the image rect IS the
-# "re-raster happened" observable (the on-screen rect itself is zoom-
-# driven either way and proves nothing).
+# Discriminator (run 1's evidence inverted the naive guess): the fixture
+# is a 48x48 SVG of 1-unit BLACK/WHITE vertical stripes, and this host's
+# default magnify filter POINT-samples - an upscaled raster renders as
+# pure hard stripes, ZERO gray. The #163 swap re-rasterizes AT the face
+# through resvg/tiny-skia, whose ANTIALIASED stripe edges leave a real
+# gray band. So the dump's gray-band census inside the image rect IS the
+# "re-raster happened" observable: branch-with-swap -> gray present;
+# master-without-swap -> gray ~0. (The on-screen rect itself is zoom-
+# driven either way and proves nothing. The bbox additionally merges the
+# outer BLACK stripes into the letterbox pin - |0-8| sits inside the
+# tolerance - shaving the measured width by one outer stripe per side;
+# the width windows below span that.)
 #
 # Wheel zoom from the probe: WM_MOUSEWHEEL (delta +120) posted to the
 # riviv_view child (its router forwards to the owner's on_mousewheel,
@@ -34,20 +38,20 @@
 #
 # Scenarios:
 #   S0  staged exe + fixture self-checks
-#   S1  SVG 6 notches -> dump: rect ~127x127, stripes SHARP (re-raster)
-#   S2  master A/B: same steps on the parity exe -> stripes BLURRY
-#       (proves the S1 verdict is the NEW behavior, fixture discriminates)
+#   S1  SVG 6 notches -> dump: rect ~127x127, AA gray band PRESENT
+#   S2  master A/B: same steps on the parity exe -> hard stripes, NO
+#       gray (proves the S1 verdict is the NEW behavior)
 #   S3  PNG A/B: 48x48 striped PNG zoomed 6 -> branch dump == master dump
 #       byte-identical (zero behavior change for bitmaps)
 #   S4  L6 then 6 wheel-downs -> back at fit ~48x48, exit 0 (the post-swap
 #       1:1 exits through the wheel's bracket search; shrink never fires)
 #   S5  race: all 15 notches back-to-back, no inter-settle -> exit 0,
-#       final face ~768 wide, sharp (in-flight drops + re-requests land)
+#       final face ~768 wide with AA (in-flight drops + re-requests land)
 #   S6  close immediately after the notches (raster may still be in
 #       flight) -> clean exit 0 (no teardown hang)
 #   S7  huge viewBox (100000) + 9 notches -> exit 0, red/blue halves
 #       present (clamps hold on the interactive path too; its swaps land
-#       at L5/L9 of the 660 fit)
+#       at L5/L9 of the ~660 fit)
 
 param(
     [string]$Exe = 'D:\codespace\riviv\target\release\riviv.exe',
@@ -106,10 +110,13 @@ public static class Px {
         return new int[] { l, t, r, bm };
     }
     // Stripe census INSIDE the rect (BGRA bytes): extremes = near-black or
-    // near-white; mid = clearly gray. Sharp re-raster -> extremes dominate;
-    // a filtered upscale of a 1-unit-pitch stripe collapses to gray.
-    // Gray-scale check (R==G==B within 8) excludes the letterbox pin and
-    // any chroma shift the display stage applies to the black/white pair.
+    // near-white; mid = clearly gray. The DISCRIMINATOR (inverted from the
+    // naive guess, per run 1's evidence): this host's default magnify
+    // filter POINT-samples, so an upscaled raster is pure hard stripes
+    // (zero gray); the re-rasterized face carries resvg's antialiased
+    // stripe edges (a real gray band). Branch-with-swap -> mid high;
+    // master-without-swap -> mid ~0. Gray-scale check (R==G==B within 8)
+    // excludes the letterbox pin and any chroma shift.
     public static long[] StripeCensus(byte[] b, int w, int h, int[] box) {
         long ext = 0, mid = 0;
         for (int y = box[1]; y <= box[3]; y++) for (int x = box[0]; x <= box[2]; x++) {
@@ -118,7 +125,7 @@ public static class Px {
             if (Math.Abs(R - G) > 8 || Math.Abs(G - B) > 8) continue; // chromatic -> not a stripe pixel
             if (R < 60) ext++;
             else if (R > 195) ext++;
-            else if (R >= 100 && R <= 160) mid++;
+            else if (R >= 70 && R <= 190) mid++;
         }
         return new long[] { ext, mid };
     }
@@ -311,32 +318,35 @@ Check 'S0d stripes.png is a PNG' ($pngHead[0] -eq 0x89 -and $pngHead[1] -eq 0x50
 
 # ---------------------------------------------------------------------------
 # S1: 6 notches on the branch exe. Level 6 of a 48px fit: 48 + 720*0.1098
-# = 127 - past 2x48, the swap lands at 127 and the dump must show sharp
-# stripes (the raster IS the face; 1:1 verbatim).
+# = 127 - past 2x48, the swap lands at 127: an AT-face raster whose
+# antialiased stripe edges show a GRAY BAND (the point-sampled upscale
+# the master produces has none - run 1's evidence). The bbox merges the
+# outer black stripes into the letterbox pin (|0-8| within the 12
+# tolerance): ~2.6px per side at this scale -> the window spans it.
 # ---------------------------------------------------------------------------
 $s1 = Run-ZoomDump $script:RunExe $F.stripes 's1-out.png' 's1.err' 6 1500
 $s1ok = $false; $s1d = "exit=$($s1.Code) adopted=$($s1.Adopted) win=$($s1.Win)"
 if ($s1.Box -ne $null -and $s1.Box[0] -ge 0 -and $s1.Code -eq 0 -and $s1.Adopted) {
-    $s1ok = ($s1.Rw -ge 121 -and $s1.Rw -le 133) -and ($s1.Rh -ge 121 -and $s1.Rh -le 133) -and ($s1.Ext -gt ($s1.Mid * 2))
+    $s1ok = ($s1.Rw -ge 113 -and $s1.Rw -le 135) -and ($s1.Rh -ge 113 -and $s1.Rh -le 135) -and ($s1.Mid -gt 500)
     $s1d = "rect=$($s1.Rw)x$($s1.Rh) ext=$($s1.Ext) mid=$($s1.Mid) exit=$($s1.Code)"
 }
-Check 'S1 SVG zoomed 6: face ~127, stripes SHARP (re-raster landed)' $s1ok $s1d
+Check 'S1 SVG zoomed 6: face ~127, AA gray band present (re-raster landed)' $s1ok $s1d
 
 # ---------------------------------------------------------------------------
-# S2: the same steps on the MASTER parity exe -> the stripes stay a
-# filtered upscale (mid-gray dominates). This is both the fixture's
-# negative control and the proof that S1's verdict is the NEW behavior.
+# S2: the same steps on the MASTER parity exe -> the 48px raster point-
+# sampled to 127: hard stripes, ZERO gray (the fixture's negative
+# control; also proves S1's verdict is the NEW behavior).
 # ---------------------------------------------------------------------------
 $s2ok = $false; $s2d = 'master exe missing'
 if ($haveMaster) {
     $s2 = Run-ZoomDump $script:MasterRunExe $F.stripes 's2-out.png' 's2.err' 6 1500
     $s2d = "exit=$($s2.Code) adopted=$($s2.Adopted)"
     if ($s2.Box -ne $null -and $s2.Box[0] -ge 0 -and $s2.Code -eq 0 -and $s2.Adopted) {
-        $s2ok = ($s2.Ext -lt ($s2.Mid * 2))
+        $s2ok = ($s2.Mid -lt 50) -and ($s2.Ext -gt 5000)
         $s2d = "rect=$($s2.Rw)x$($s2.Rh) ext=$($s2.Ext) mid=$($s2.Mid) exit=$($s2.Code)"
     }
 }
-Check 'S2 master A/B: same zoom, stripes BLURRY (no re-raster there)' $s2ok $s2d
+Check 'S2 master A/B: same zoom, point-sampled hard stripes (no gray)' $s2ok $s2d
 
 # ---------------------------------------------------------------------------
 # S3: the PNG twin zoomed 6 on both exes -> byte-identical dumps (zero
@@ -408,17 +418,18 @@ Check 'S4 zoom out round trip: back at fit ~48x48, exit 0' $s4ok $s4d
 # S5: race - all 15 notches fired back-to-back (30ms cadence, no settle
 # between swaps). The notches outpace the swaps: every in-flight raster
 # the ladder passes drops by seq and re-requests; the final state is the
-# L15 face 768 (= 48 + 720*1.0) drawn from an AT-face raster. 768
-# overtops the ~660-high viewport vertically (clamped pan keeps the
-# middle band), so the width is the pinned number.
+# L15 face 768 (= 48 + 720*1.0) drawn from an AT-face raster (AA band
+# present). 768 overtops the ~484-high viewport vertically (clamped pan
+# keeps the middle band) and the bbox merges the outer black stripes
+# (~16px per side at this scale), so the width window spans ~736.
 # ---------------------------------------------------------------------------
 $s5 = Run-ZoomDump $script:RunExe $F.stripes 's5-out.png' 's5.err' 15 2500
 $s5ok = $false; $s5d = "exit=$($s5.Code) adopted=$($s5.Adopted)"
 if ($s5.Box -ne $null -and $s5.Box[0] -ge 0 -and $s5.Code -eq 0 -and $s5.Adopted) {
-    $s5ok = ($s5.Rw -ge 760 -and $s5.Rw -le 776) -and ($s5.Rh -ge 640) -and ($s5.Ext -gt ($s5.Mid * 2))
+    $s5ok = ($s5.Rw -ge 726 -and $s5.Rw -le 772) -and ($s5.Rh -ge 470) -and ($s5.Mid -gt 200)
     $s5d = "rect=$($s5.Rw)x$($s5.Rh) ext=$($s5.Ext) mid=$($s5.Mid) exit=$($s5.Code)"
 }
-Check 'S5 race 15 fast notches: final face ~768 wide sharp, exit 0' $s5ok $s5d
+Check 'S5 race 15 fast notches: final face ~768 wide, AA present, exit 0' $s5ok $s5d
 
 # ---------------------------------------------------------------------------
 # S6: close IMMEDIATELY after the notches - the raster may still be in

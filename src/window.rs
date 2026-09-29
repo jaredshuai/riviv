@@ -2931,6 +2931,9 @@ fn on_mousewheel(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) {
             });
             if changed {
                 repaint(hwnd);
+                // #163: the wheel is the primary zoom path and does NOT
+                // route through `zoom_at` — its own consideration point.
+                consider_reraster(hwnd);
             }
         }
     }
