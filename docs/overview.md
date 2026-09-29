@@ -100,7 +100,7 @@ L2（ADR 0004）的 AC 会话画在 FP16 scRGB 输出面上：swapchain 与画�
 下面两项是 ADR 里过时的句子，决策或后记已经把行为说清楚，不算上面那种未改写的冲突：
 
 - D5 开头的「默认 gdi」由同文 #81 后记改成缺键即 `auto`。代码默认值是 `auto`。
-- D9 的「现状」句仍写 `SetProcessDPIAware`。决策句是升级到 PerMonitorV2。`run` 已去掉那次调用，并依赖嵌入清单（7976–7980）。
+- D9 的「现状」句仍写 `SetProcessDPIAware`。决策句是升级到 PerMonitorV2。`run` 已去掉那次调用，并依赖嵌入清单（9253–9282）。
 
 ## 未确认
 

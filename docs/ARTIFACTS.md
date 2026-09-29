@@ -46,7 +46,7 @@
 | smoke/ | 验证与观察 | current | 执行者/冒烟脚本增改时 | GUI 冒烟脚本 14 份+golden81/golden90 语料+README;QA 机器面主力(2026-09-29 卫生盘点补登) |
 | docs/spikes/s1-platform-floor.md | 验证与观察 | current | 调查者/平台地板再评估时 | min-OS 钉死 1607 的导入表证据(#97) |
 | docs/spikes/s-svg.md | 验证与观察 | current | 调查者/SVG 复议时 | SVG=resvg-full 体积推迟结论(#97) |
-| docs/spikes/s-avif.md | 验证与观察 | current | 调查者/M8 启动时 | AVIF 三路线推迟 M8 结论(#97) |
+| docs/spikes/s-avif.md | 验证与观察 | current | 调查者/#138 触发器评估时 | AVIF 三路线输入面结论(#97;#136 解绑后=移出 M8 的 L3 观察票 #138) |
 | docs/agents/triage-labels.md | 规则与术语 | current | 规划者/标签词汇变化时 | 五标签分诊词汇 |
 | docs/agents/domain.md | 规则与术语 | current | 规划者/文档架构变化时 | 单上下文+ADR 约定 |
 | docs/plan-26-association-nsis.md | 需求与验收 | reference | 书记员/历史留档 | #26 安装族历史规格;特性已交付,原位保留 |
