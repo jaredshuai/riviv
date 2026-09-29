@@ -472,6 +472,28 @@ impl View {
         self.pos = 0;
         self.set_view(self.view_x, self.view_y, src_w, src_h, vp, fit);
     }
+
+    /// Adopt a re-raster face (#163, ADR 0005 D6): the display's raster
+    /// was rebuilt AT the display face, so from here on the display is
+    /// pixel-exact — enter the 1:1 mode (whose render is the source
+    /// verbatim), keeping the pan offset and the panscan layer untouched
+    /// and re-anchoring through the same `set_view` a resize uses. The
+    /// pre-swap ladder level parks in `saved_pos` exactly like a 1:1
+    /// entry, so the toggle's exit restores it; a wheel exit takes the
+    /// bracket search as always. Callers swap the frame's pixels to
+    /// `(src_w, src_h)` TOGETHER with this — the two halves of one edge.
+    pub(crate) fn adopt_reraster_face(
+        &mut self,
+        src_w: i32,
+        src_h: i32,
+        vp: Viewport,
+        fit: FitPolicy,
+    ) {
+        self.saved_pos = self.pos;
+        self.one_to_one = true;
+        self.pos = 0;
+        self.set_view(self.view_x, self.view_y, src_w, src_h, vp, fit);
+    }
 }
 
 /// The number of zoom levels (upstream `_VIV_ZOOM_MAX`, viv.c:684).
@@ -1250,6 +1272,40 @@ mod tests {
             ..View::new()
         };
         assert_eq!(v.render_size(100, 60, VP, fill), (6400, 3840));
+    }
+
+    #[test]
+    fn adopting_a_reraster_face_freezes_the_display_rect() {
+        // #163 (ADR 0005 D6): a 100×100 source at level 15 in 1000×700
+        // renders 1600×1600 (fit 100 → lerp 100 + 1500×1.0) — past the
+        // 2× reraster threshold, and larger than the viewport so the pan
+        // clamp is ACTIVE. The re-raster rebuilds the raster AT that
+        // display face; adopting it must leave the on-screen rect
+        // pixel-identical (default panscan: render = src verbatim, the
+        // pan offset re-clamps to itself), now drawn crisp from the new
+        // raster instead of upscaled from the old one.
+        use crate::paint::scene_rect;
+        let vp = Viewport {
+            wide: 1000,
+            high: 700,
+        };
+        let mut v = View {
+            pos: 15,
+            ..View::new()
+        };
+        v.scroll_by(-40, 25, 100, 100, vp, FitPolicy::WITHOUT_FILL);
+        let before = scene_rect(&v, FitPolicy::WITHOUT_FILL, 1000, 700, 100, 100);
+        let (_, _, rw, rh) = before;
+        assert_eq!((rw, rh), (1600, 1600), "level 15 of a 100px source");
+        v.adopt_reraster_face(rw, rh, vp, FitPolicy::WITHOUT_FILL);
+        let after = scene_rect(&v, FitPolicy::WITHOUT_FILL, 1000, 700, rw, rh);
+        assert_eq!(after, before, "the swap is invisible on screen");
+        // The adopted state is the 1:1 mode (render = the new source
+        // verbatim); the pre-swap ladder level parks for the exit.
+        assert!(v.is_one_to_one());
+        assert_eq!(v.level(), 0);
+        v.toggle_one_to_one(1600, 1600, vp, FitPolicy::WITHOUT_FILL);
+        assert_eq!(v.level(), 15, "the parked level comes back on the 1:1 exit");
     }
 
     #[test]

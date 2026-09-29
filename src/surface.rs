@@ -163,6 +163,10 @@ impl Surface {
             // Rotation moves geometry, not encoding — the rotated frame
             // stays in its master's content space (#140).
             content_space: self.master.content_space,
+            // #163: the rotated raster is no longer the Tree's face — the
+            // vector source dies with the edit (a re-raster would
+            // un-rotate the display).
+            svg: None,
         };
         true
     }

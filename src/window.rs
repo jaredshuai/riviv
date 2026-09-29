@@ -409,6 +409,15 @@ pub(crate) struct WindowState {
     /// upload compares (gen, level, w, h) against the resident bitmap and
     /// re-uploads on mismatch. Pure bookkeeping.
     pub(crate) frame_gen: u64,
+    /// The in-flight interactive re-raster's reply queue (#163, ADR 0005
+    /// D6); `None` = idle. At most one raster is ever queued — further
+    /// view changes only bump `reraster_seq` and re-consider when the
+    /// in-flight reply lands (or is dropped).
+    pub(crate) reraster_queue: Option<crate::loadthread::RerasterQueue>,
+    /// The view epoch an in-flight re-raster was requested under (#163):
+    /// bumped by every consideration point and every display edge, so a
+    /// reply whose view has moved on is dropped instead of swapped in.
+    pub(crate) reraster_seq: u64,
     /// The CPU mip levels behind the D2D arm's giant path (#82): the
     /// overview/tile sources a frame too large to upload whole is cut
     /// from. Empty until a giant asks for one; cleared with the frame.
@@ -2822,6 +2831,10 @@ fn toggle_fullscreen(hwnd: HWND) {
     // offset — always queue the repaint (CS_HREDRAW/VREDRAW already cover
     // the resize itself).
     repaint(hwnd);
+    // #163: the fullscreen level shift re-derived the face; on_size's own
+    // point already covered the geometry path, this one covers a fail-soft
+    // size pass that produced no WM_SIZE.
+    consider_reraster(hwnd);
 }
 
 /// The signed point packed in a mouse-message LPARAM (GET_X_LPARAM /
@@ -2939,6 +2952,8 @@ fn zoom_at(hwnd: HWND, out: bool, cursor: (i32, i32)) {
         // Upstream's `_viv_zoom_in` ends in `_viv_view_set`, which closes
         // with the toolbar refresh (viv.c:6571).
         refresh_toolbar(hwnd);
+        // #163: the display face moved — maybe the raster should follow.
+        consider_reraster(hwnd);
     }
 }
 
@@ -2951,6 +2966,8 @@ fn panscan_step(hwnd: HWND, dx: i32, dy: i32) {
     let changed = (unsafe { state_of(hwnd) }).is_some_and(|state| state.view.panscan.step(dx, dy));
     if changed {
         repaint(hwnd);
+        // #163: a panscan factor change rescales the on-screen face.
+        consider_reraster(hwnd);
     }
     // The readout flashes even when the step clamped to a no-op (upstream's
     // `_viv_dst_zoom_set` calls the temp text outside the changed check,
@@ -2991,6 +3008,8 @@ fn panscan_reset(hwnd: HWND) {
     }
     repaint(hwnd);
     flash_pos_zoom(hwnd);
+    // #163: the identity factors restore the un-panscanned face.
+    consider_reraster(hwnd);
 }
 
 /// A `+`/`-` keypress zoom step — anchored at the viewport center (upstream
@@ -3005,6 +3024,134 @@ fn zoom_step_centered(hwnd: HWND, out: bool) {
         })
         .unwrap_or((0, 0));
     zoom_at(hwnd, out, center);
+}
+
+/// #163 (ADR 0005 D6): the interactive re-raster consideration point —
+/// the tail of every display-face change (zoom steps, fit/1:1 toggles,
+/// fullscreen, resize, panscan size steps). Bumps the view epoch first
+/// (an in-flight reply from an older epoch drops at its drain), then —
+/// when the on-screen face upscales the SVG raster past the
+/// `needs_reraster` threshold — queues ONE background re-raster on the
+/// load worker (serialized with decodes, #82's budget discipline) at the
+/// display face. The swap itself lands in `drain_reraster_replies`.
+fn consider_reraster(hwnd: HWND) {
+    // SAFETY: the borrow spans the pure gating math and the channel send
+    // — nothing pumps.
+    let Some(state) = (unsafe { state_of(hwnd) }) else {
+        return;
+    };
+    state.reraster_seq += 1;
+    if state.reraster_queue.is_some() {
+        // One raster in flight; its drain re-considers when it lands.
+        return;
+    }
+    let Some(source) = state
+        .image
+        .as_ref()
+        .and_then(|image| image.surface().master().svg_source())
+    else {
+        return;
+    };
+    let (vp, src) = viewport_and_src(hwnd, state);
+    let fit = fit_policy(state);
+    let (_, _, rw, rh) = crate::paint::scene_rect(&state.view, fit, vp.wide, vp.high, src.0, src.1);
+    if !crate::svg::needs_reraster(
+        (src.0.max(0) as u32, src.1.max(0) as u32),
+        (rw.max(0) as u32, rh.max(0) as u32),
+    ) {
+        return;
+    }
+    // The target de-multiplies the panscan factors (identity at the
+    // default — then the target IS the display face and the swap's 1:1
+    // render reproduces it pixel-exactly; an active panscan lands within
+    // a rounding pixel).
+    let target = crate::svg::interactive_target(
+        (rw, rh),
+        crate::panscan::value_at(state.view.panscan.zoom_x),
+        crate::panscan::value_at(state.view.panscan.zoom_y),
+        crate::loader::MAX_TOTAL_FRAME_BYTES,
+    );
+    let seq = state.reraster_seq;
+    let queue = state.load_thread.request_reraster(
+        hwnd,
+        std::sync::Arc::clone(source),
+        target,
+        decode_env(state),
+        seq,
+    );
+    state.reraster_queue = Some(queue);
+}
+
+/// #163: the re-raster replies' drain — the swap half of the recipe. One
+/// reply is ever in flight: one whose seq still matches the view epoch
+/// replaces the frame's pixels at the display face and adopts the 1:1
+/// view (render = the new source verbatim, so the on-screen rect stands
+/// pixel-exact — `View::adopt_reraster_face`); a stale one is dropped.
+/// Either way the idle slot re-considers, so a view that moved on
+/// mid-flight queues its own fresh raster here.
+fn drain_reraster_replies(hwnd: HWND) {
+    let mut swapped = false;
+    {
+        // SAFETY: the borrow spans the queue drain and the frame swap —
+        // plain state writes and arithmetic, nothing pumps.
+        let Some(state) = (unsafe { state_of(hwnd) }) else {
+            return;
+        };
+        let Some(queue) = state.reraster_queue.take() else {
+            return;
+        };
+        let replies: Vec<_> = queue.lock().unwrap().drain(..).collect();
+        if replies.is_empty() {
+            // A decode's kick, not ours: the raster is still queued or
+            // running — put the slot back so "one in flight" keeps
+            // meaning one (a second request here would only duplicate
+            // the job behind it on the same worker).
+            state.reraster_queue = Some(queue);
+            return;
+        }
+        for mut reply in replies {
+            if reply.seq != state.reraster_seq {
+                continue; // the view moved on: drop, no swap
+            }
+            let (vp, _) = viewport_and_src(hwnd, state);
+            let fit = fit_policy(state);
+            let new_w = reply.frame.width as i32;
+            let new_h = reply.frame.height as i32;
+            let Some(image) = state.image.as_mut() else {
+                continue;
+            };
+            // The SVG arm is a one-frame stream (`svg_decode_to_sink`);
+            // an animation can never carry the handle, but the drain
+            // trusts no shape it did not build.
+            if image.is_animated() || new_w <= 0 || new_h <= 0 {
+                continue;
+            }
+            state.view.adopt_reraster_face(new_w, new_h, vp, fit);
+            // The vector handle carries over to the reply frame (the
+            // worker's raster never had one — the swap keeps the ability
+            // for the NEXT zoom step).
+            if let Some(handle) = image.surface().master().svg_source() {
+                reply.frame.attach_svg(std::sync::Arc::clone(handle));
+            }
+            image.frames_mut()[0] = Surface::from_master(reply.frame);
+            // #80 §5: the displayed pixels changed — the D2D upload
+            // refreshes at the next paint (the rotate pass's precedent).
+            state.frame_gen += 1;
+            swapped = true;
+        }
+        // Swapped or dropped, the slot is idle — re-consider (a no-op
+        // unless the current view still wants a bigger raster).
+        consider_reraster(hwnd);
+    }
+    if swapped {
+        // The adoption tail: the status strip's WxH reads the new face,
+        // the toolbar's 1:1 gray flips, the cursor's pixel sample follows
+        // the re-anchored view.
+        refresh_status(hwnd);
+        refresh_toolbar(hwnd);
+        resample_pixel_refresh(hwnd);
+        repaint(hwnd);
+    }
 }
 
 /// The window-size-to-image command (upstream `VIV_ID_VIEW_WINDOW_SIZE_*`,
@@ -3159,6 +3306,9 @@ fn zoom_reset(hwnd: HWND) {
     // The Best Fit gray flips here (upstream's ZOOM_RESET ends in
     // `_viv_view_set` → the toolbar refresh, viv.c:6571).
     refresh_toolbar(hwnd);
+    // #163: back at fit the display never upscales (no-fill), but the
+    // fill modes can — the consideration point covers both.
+    consider_reraster(hwnd);
 }
 
 /// The three View fit rows (#46; upstream viv.c:2015-2044): which config a
@@ -3200,6 +3350,10 @@ fn toggle_fit_input(hwnd: HWND, input: FitInput) {
     }
     on_size(hwnd);
     repaint(hwnd);
+    // #163: the fill flip can re-derive the whole face (fill upscales);
+    // on_size's own point already covers the common path, this covers a
+    // fail-soft size pass.
+    consider_reraster(hwnd);
 }
 
 /// `_viv_refresh` (upstream viv.c:14539-14552) — View→Refresh / F5: drop
@@ -3422,6 +3576,10 @@ fn toggle_one_to_one(hwnd: HWND) {
     // Both the 1:1 and Best Fit grays flip here (upstream's
     // `_viv_view_1to1` ends in `_viv_view_set` → the toolbar refresh).
     refresh_toolbar(hwnd);
+    // #163: 1:1 renders the raster verbatim — at the default panscan the
+    // face equals the raster (no re-raster owed), an active panscan
+    // factor can still upscale past 2×; the consideration settles it.
+    consider_reraster(hwnd);
 }
 
 /// WM_LBUTTONDOWN — show the cursor, restart its cycle, then start a drag
@@ -4013,6 +4171,11 @@ enum DisplayEdge {
 /// fingerprint alike), so smoke132's "exactly one display-stage line
 /// per session" count is untouched.
 fn view_edge(hwnd: HWND, state: &mut WindowState, edge: DisplayEdge) {
+    // #163: a display-content edge invalidates any in-flight re-raster —
+    // the new image (or blank) has its own raster story; the reply drops
+    // at its drain on this seq bump. No request here: a fresh image's
+    // load-time raster already matches its fit face by construction.
+    state.reraster_seq += 1;
     if state.config.keep_zoom == 0 {
         state.view.reset();
     } else if edge == DisplayEdge::NewImage {
@@ -8280,6 +8443,10 @@ fn on_size(hwnd: HWND) {
     // the render-size-dependent 1:1/Best Fit grays track the new
     // viewport).
     refresh_toolbar(hwnd);
+    // #163: the new viewport re-derived the render size (a fit<1 SVG at
+    // a zoom level can cross the 2× threshold purely by the window
+    // growing); fullscreen's level shifts land here too.
+    consider_reraster(hwnd);
 }
 
 /// The screensaver system-command value (winuser.h 0xF140 — the windows
@@ -8795,6 +8962,9 @@ unsafe extern "system" fn wnd_proc(
         // just wakes the UI thread to drain them (upstream _VIV_WM_REPLY).
         REPLY_KICK_MESSAGE => {
             on_load_replies(hwnd);
+            // #163: the same kick wakes the re-raster replies (the worker
+            // posts the identical message for either job kind).
+            drain_reraster_replies(hwnd);
             LRESULT(0)
         }
         // The random-Everything retry (#22; upstream
@@ -9357,6 +9527,8 @@ pub(crate) fn run() -> Result<(), String> {
         gpu_kind: crate::config::RendererKind::Auto,
         renderer_forced: forced_renderer,
         frame_gen: 0,
+        reraster_queue: None,
+        reraster_seq: 0,
         levels: crate::mip::LevelCache::new(crate::mip::LEVEL_CACHE_BYTES),
         tile_edge: None,
         gpu_failures: Vec::new(),

@@ -538,6 +538,13 @@ pub(crate) struct PixelFrame {
     /// aligned `&[u16]` — a `Box<[u8]>` is align-1 — every half goes
     /// through `u16::from_le_bytes`/`to_le_bytes`.
     pub(crate) content_space: ContentSpace,
+    /// The vector source an interactive re-raster rebuilds from (#163,
+    /// ADR 0005 D6 — 「复用 usvg::Tree」): present exactly on the SVG
+    /// arm's frames, `None` everywhere else. Rides the frame through
+    /// the last-cache (a parked SVG keeps its re-raster ability) and
+    /// dies with any pixel-domain edit (rotation rebuilds the frame
+    /// without it — the rotated raster is no longer the Tree's face).
+    pub(crate) svg: Option<std::sync::Arc<crate::svg::SvgSource>>,
 }
 
 impl PixelFrame {
@@ -596,7 +603,19 @@ impl PixelFrame {
             width,
             height,
             content_space,
+            svg: None,
         }
+    }
+
+    /// The #163 vector-source accessors: the SVG decode arm attaches the
+    /// parsed `Tree` (the re-raster channel rebuilds from it without
+    /// re-parsing); every other frame stays `None`.
+    pub(crate) fn svg_source(&self) -> Option<&std::sync::Arc<crate::svg::SvgSource>> {
+        self.svg.as_ref()
+    }
+
+    pub(crate) fn attach_svg(&mut self, source: std::sync::Arc<crate::svg::SvgSource>) {
+        self.svg = Some(source);
     }
 
     /// The f16 master's narrow entry (#142): `halves` holds exactly
@@ -650,6 +669,7 @@ impl PixelFrame {
             width,
             height,
             content_space,
+            svg: None,
         }
     }
 

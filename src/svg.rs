@@ -142,23 +142,7 @@ pub(crate) fn raster_target(
     } else {
         fit.max(intermediate)
     };
-    let mut target = scaled(natural, scale);
-
-    // 荒诞自然尺寸硬顶:常规 SVG 自然尺寸 ≤ 数千,16384 只拦病态值
-    // (1e5 级 viewBox);此路径本就不是真实几何,等比不保可接受。
-    const ABSURD_DIM_CAP: u32 = 16384;
-    target.0 = target.0.min(ABSURD_DIM_CAP);
-    target.1 = target.1.min(ABSURD_DIM_CAP);
-
-    // 字节预算:u64 内必不溢出(16384^2 * 4 < 2^32),等比 sqrt 收缩,
-    // floor 保证收缩后严格不超(floor 之积 ≤ 精确值之积)。
-    let bytes = target.0 as u64 * target.1 as u64 * 4;
-    if bytes > max_frame_bytes as u64 {
-        let shrink = (max_frame_bytes as f64 / bytes as f64).sqrt();
-        target.0 = ((target.0 as f64) * shrink).floor() as u32;
-        target.1 = ((target.1 as f64) * shrink).floor() as u32;
-    }
-    (target.0.max(1), target.1.max(1))
+    clamp_face_to_budget(scaled(natural, scale), max_frame_bytes)
 }
 
 fn scaled(natural: (f32, f32), scale: f32) -> (u32, u32) {
@@ -172,13 +156,30 @@ fn scaled(natural: (f32, f32), scale: f32) -> (u32, u32) {
 /// (放大超过 2 倍后矢量源与位图源的观感差开始刺眼;2× 恰好不触发,
 /// 避免贴着阈值反复抖动)。这是 s-svg.md §3 留档配方(复用 Tree、仅
 /// 尺寸变化重栅、交互缩放退 1024 中间档后台出全分辨率)的判定核心。
-/// 本票交付判定逻辑 + 测试钉面,UI 接线(窗口持有 Tree、后台重栅、
-/// 无闪烁换面)属后续票 — 在那之前生产侧无调用点,dead_code 豁免即
-/// 该状态的显式登记(消费方落地时移除)。
-#[allow(dead_code)]
+/// #163 起 UI 侧消费(考虑点在每次显示面变化后,应用点在回执 drain)。
 pub(crate) fn needs_reraster(raster: (u32, u32), display: (u32, u32)) -> bool {
     display.0 as f64 / raster.0.max(1) as f64 > 2.0
         || display.1 as f64 / raster.1.max(1) as f64 > 2.0
+}
+
+/// 解析后的矢量源(ADR 0005 D6 配方「复用 usvg::Tree」的挂点,#163):
+/// `PixelFrame` 携带它的 `Arc`,交互重栅在后台从 `tree` 直接重光栅,
+/// 不再付解析成本。`natural` 是 viewBox/根尺寸的原始值 — 重光栅的
+/// 缩放比对它计算(光栅面可以合法地超过它:那是缩放显示,不是
+/// 「100%」语义 — no-upscale 约束只辖加载期目标面)。
+pub(crate) struct SvgSource {
+    pub(crate) tree: resvg::usvg::Tree,
+    pub(crate) natural: (f32, f32),
+}
+
+// PixelFrame 派生 Debug,句柄字段跟着要;Tree 自身的 Debug 会倾倒整棵
+// 节点树,这里只记几何。
+impl std::fmt::Debug for SvgSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SvgSource")
+            .field("natural", &self.natural)
+            .finish_non_exhaustive()
+    }
 }
 
 /// 解析 + 光栅化:SVG 字节 →(宽,高,直乘 RGBA)帧缓冲,长度恰为
@@ -186,37 +187,97 @@ pub(crate) fn needs_reraster(raster: (u32, u32), display: (u32, u32)) -> bool {
 /// 直乘后交给共享帧管线 — `composite_over_background_in_place` 的
 /// 语义按直乘写)。产物色彩空间 = sRGB(resvg 自己的文档保证),无
 /// ICC 可言,icm 链结构性缺席 — 与无 profile 的 BMP/ICO/DIB 同类。
-/// 每个失败都是用户级(ADR 0001:保留旧图、不退出、不弹框)。
+/// 每个失败都是用户级(ADR 0001:保留旧图、不退出、不弹框)。#163
+/// 起生产侧走 parse/rasterize 两臂(loader 要留句柄),本组合只剩
+/// 测试面在用。
+#[cfg(test)]
 pub(crate) fn decode(
     bytes: &[u8],
     viewport: (u32, u32),
     max_frame_bytes: usize,
 ) -> Result<(u32, u32, Vec<u8>), String> {
-    // 两个安全默认显式钉住(模块文档三决策之二、之三):
-    // resources_dir=None — 外链隔离;
-    // 系统字体 — 默认空 fontdb 会把 <text> 渲染成空。
+    let source = parse(bytes)?;
+    let target = raster_target(source.natural, viewport, max_frame_bytes);
+    rasterize(&source, target)
+}
+
+/// 解析臂:`Tree::from_data` + 自然尺寸。两个安全默认显式钉住(模块
+/// 文档三决策之二、之三):resources_dir=None — 外链隔离;系统字体 —
+/// 默认空 fontdb 会把 <text> 渲染成空。嗅探只认文本签名,gzip 分支
+/// 不可达;from_data 的 svgz 路径因此不会被触发(排除理由见模块文档)。
+pub(crate) fn parse(bytes: &[u8]) -> Result<SvgSource, String> {
     let options = usvg::Options {
         resources_dir: None,
         fontdb: system_fontdb(),
         ..Default::default()
     };
-    // 嗅探只认文本签名,gzip 分支不可达;from_data 的 svgz 路径因此
-    // 不会被触发(排除理由见模块文档)。
     let tree = usvg::Tree::from_data(bytes, &options)
         .map_err(|e| format!("failed to parse as SVG: {e}"))?;
-
     let size = tree.size();
-    let natural = (nonzero(size.width()), nonzero(size.height()));
-    let target = raster_target(natural, viewport, max_frame_bytes);
+    Ok(SvgSource {
+        tree,
+        natural: (nonzero(size.width()), nonzero(size.height())),
+    })
+}
 
+/// 重光栅臂(#163):既有 `Tree` 按给定目标面出帧 — `decode` 的后半,
+/// 载入与交互重栅共用同一光栅化语义(直乘 RGBA、sRGB、用户级失败)。
+pub(crate) fn rasterize(
+    source: &SvgSource,
+    target: (u32, u32),
+) -> Result<(u32, u32, Vec<u8>), String> {
+    let natural = source.natural;
     let mut pixmap = resvg::tiny_skia::Pixmap::new(target.0, target.1)
         .ok_or("raster target rejected by tiny-skia")?;
     let scale = resvg::tiny_skia::Transform::from_scale(
         target.0 as f32 / natural.0,
         target.1 as f32 / natural.1,
     );
-    resvg::render(&tree, scale, &mut pixmap.as_mut());
+    resvg::render(&source.tree, scale, &mut pixmap.as_mut());
     Ok((target.0, target.1, pixmap.take_demultiplied()))
+}
+
+/// 交互重栅的目标面(#163,ADR 0005 D6):当前显示面(post-panscan)
+/// 按 panscan 因子反除回渲染面(默认因子 1.0 下就是显示面本身 — 换面
+/// 后 `render = src` 逐字,屏幕矩形逐像素恒等),再过加载期同一道
+/// 纪律闸:16384/轴硬顶 + 帧字节预算等比收缩(`raster_target` 的
+/// 第 3 段 — 交互路径没有 fit 语义,只有 clamp)。目标面低于现光栅的
+/// 情形由 `needs_reraster` 在上游拦掉(缩小永不触发)。
+pub(crate) fn interactive_target(
+    display: (i32, i32),
+    factor_x: f32,
+    factor_y: f32,
+    max_frame_bytes: usize,
+) -> (u32, u32) {
+    let demult = |len: i32, factor: f32| {
+        ((len.max(1) as f32) / factor.max(f32::MIN_POSITIVE))
+            .round()
+            .max(1.0) as u32
+    };
+    clamp_face_to_budget(
+        (demult(display.0, factor_x), demult(display.1, factor_y)),
+        max_frame_bytes,
+    )
+}
+
+/// 光栅目标面的公共纪律闸(`raster_target` 第 3 段与
+/// `interactive_target` 共用):逐轴 16384 硬顶,再压帧字节预算。
+fn clamp_face_to_budget(mut target: (u32, u32), max_frame_bytes: usize) -> (u32, u32) {
+    // 荒诞目标面硬顶:常规显示面 ≤ 数千,16384 只拦病态值(交互
+    // 缩放的 16× 档可达 1e5 级);此路径本就不是真实几何,等比不保
+    // 可接受。
+    const ABSURD_DIM_CAP: u32 = 16384;
+    target.0 = target.0.min(ABSURD_DIM_CAP);
+    target.1 = target.1.min(ABSURD_DIM_CAP);
+    // 字节预算:u64 内必不溢出(16384^2 * 4 < 2^32),等比 sqrt 收缩,
+    // floor 保证收缩后严格不超(floor 之积 ≤ 精确值之积)。
+    let bytes = target.0 as u64 * target.1 as u64 * 4;
+    if bytes > max_frame_bytes as u64 {
+        let shrink = (max_frame_bytes as f64 / bytes as f64).sqrt();
+        target.0 = ((target.0 as f64) * shrink).floor() as u32;
+        target.1 = ((target.1 as f64) * shrink).floor() as u32;
+    }
+    (target.0.max(1), target.1.max(1))
 }
 
 fn nonzero(v: f32) -> f32 {
@@ -441,6 +502,76 @@ mod tests {
     #[test]
     fn a_shrinking_display_never_needs_a_reraster() {
         assert!(!needs_reraster((1024, 768), (300, 200)));
+    }
+
+    // ---- interactive_target:交互重栅目标面(#163)----
+
+    #[test]
+    fn the_interactive_target_is_the_display_face_at_identity_panscan() {
+        // 默认 panscan(因子 1.0):目标=显示面 — 换面后 render=src
+        // 逐字,屏幕矩形逐像素恒等。
+        assert_eq!(
+            interactive_target((800, 600), 1.0, 1.0, usize::MAX),
+            (800, 600)
+        );
+    }
+
+    #[test]
+    fn the_interactive_target_demultiplies_active_panscan_factors() {
+        // panscan 横向 2×:显示面 1000 的渲染面是 500 — 目标按渲染面
+        // 取,换面后 panscan 再乘回去仍是 1000。
+        assert_eq!(
+            interactive_target((1000, 300), 2.0, 1.0, usize::MAX),
+            (500, 300)
+        );
+        assert_eq!(
+            interactive_target((300, 1000), 1.0, 4.0, usize::MAX),
+            (300, 250)
+        );
+    }
+
+    #[test]
+    fn the_interactive_target_passes_the_same_discipline_gate() {
+        // 与加载期同一道闸:16384/轴硬顶 + 帧字节预算(16× 档的病态
+        // 显示面与 1 GiB 面都在交互路径可达)。
+        assert_eq!(
+            interactive_target((100_000, 100_000), 1.0, 1.0, usize::MAX),
+            (16384, 16384)
+        );
+        let budget = 512 * 1024 * 1024;
+        let t = interactive_target((8192, 8192), 1.0, 1.0, budget);
+        assert!(t.0 as u64 * t.1 as u64 * 4 <= budget as u64);
+        assert_eq!(t.0, t.1, "等比收缩保持正方形");
+    }
+
+    #[test]
+    fn a_degenerate_interactive_face_clamps_to_one() {
+        assert_eq!(interactive_target((0, -5), 1.0, 1.0, usize::MAX), (1, 1));
+    }
+
+    // ---- parse/rasterize:复用 Tree 的重栅配方(#163)----
+
+    #[test]
+    fn a_parsed_source_rasterizes_repeatedly_at_new_targets() {
+        // D6 配方核心:解析一次,任意目标面重光栅 — 载入小面、交互
+        // 换大面,两次产物自洽。
+        let source = parse(
+            br#"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="8"><rect width="16" height="8" fill="green"/></svg>"#,
+        )
+        .unwrap();
+        assert_eq!(source.natural, (16.0, 8.0));
+        let (w, h, rgba) = rasterize(&source, (16, 8)).unwrap();
+        assert_eq!((w, h), (16, 8));
+        assert_eq!(rgba.len(), 16 * 8 * 4);
+        let (w, h, rgba) = rasterize(&source, (64, 32)).unwrap();
+        assert_eq!((w, h), (64, 32));
+        assert_eq!(rgba.len(), 64 * 32 * 4);
+    }
+
+    #[test]
+    fn parse_reports_a_broken_document_user_level() {
+        let err = parse(b"<svg><unclosed>").unwrap_err();
+        assert!(err.contains("failed to parse as SVG"), "{err}");
     }
 
     // ---- decode:end-to-end 纯逻辑(无 Win32)----
