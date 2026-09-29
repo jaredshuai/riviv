@@ -38,7 +38,7 @@ cargo build --release                      # 产出 target/release/riviv.exe
 
 1. **纯 Rust + 静态链接 + 零外部工具链**:构建不得依赖 nasm/cmake/perl/meson/pkg-config 等外部工具;破例需 ADR。
 2. **新依赖落在纯逻辑层**,不进 unsafe 壳(窗口/GDI/COM 壳保持薄,见上文质量档位)。
-3. **体积/编译预算先有基线再定阈值**:基线 = `cargo build --release` exe 字节数(**现行:6,800,896 B @ #163**(#152 SVG 落地后 6,770,688 B,+29,184 B 纯代码零新依赖的 #163 重栅接线;此前 3,227,648 B @ ff45203 / S1 原始 3,099,648 B @ 559f1cc));单解码格式建议 ≤ +400 KB,超限须 ADR + 用户拍板(SVG resvg full 档已按 [ADR 0005](docs/adr/0005-svg-resvg-full.md) 破例落地,真实增量 +3.38 MiB,用户拍板 2026-09-27;完整渲染引擎与编解码器不同类,阈值单独定,见该 ADR D1)。
+3. **体积/编译预算先有基线再定阈值**:基线 = `cargo build --release` exe 字节数(**现行:6,800,896 B @ #163**(#152 SVG 落地后 6,770,688 B,#163 重栅接线纯代码零新依赖 +30,208 B——2026-09-29 卫生盘点双端亲测订正,原文 +29,184 B 与两端算术不合;此前 3,227,648 B @ ff45203 / S1 原始 3,099,648 B @ 559f1cc));单解码格式建议 ≤ +400 KB,超限须 ADR + 用户拍板(SVG resvg full 档已按 [ADR 0005](docs/adr/0005-svg-resvg-full.md) 破例落地,真实增量 +3.38 MiB,用户拍板 2026-09-27;完整渲染引擎与编解码器不同类,阈值单独定,见该 ADR D1)。
 4. **新解码器必须过同一套管线**:魔数嗅探(`with_guessed_format`)+ icm 链(`icc_profile` 取用)+ 帧时序契约(动画帧走现有帧管线),不得旁路自建。
 5. **优先 image 组织同族 crate**(png/gif/webp 同生态,API 与维护节奏一致)。
 6. **系统能力仅在「装机≈100% 且无授权费」时采用**:WCS/mscms 合格;WIC 的 AVIF/HEIF 依赖商店扩展装配,永不作唯一路径、只可探测登记(见 [s-avif](docs/spikes/s-avif.md))。
