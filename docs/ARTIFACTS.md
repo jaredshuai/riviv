@@ -38,12 +38,15 @@
 <!-- 示例：| specs/pay-v1.md | 需求与验收 | superseded | 规划者 / 历史保留 | 初版支付规格；superseded by specs/pay-v2.md；原位保留 | -->
 <!-- 示例：| docs/ideas/inbox.md | 来源材料 | exploration | 团队与规划者 / 讨论产生新想法时 | 规划研讨碎片想法池，非现行基准 | -->
 | docs/overview.md | 现状与使用说明 | current | 书记员/架构变化时 | 项目总览与「给图→上屏」流程(#111 起) |
-| CONTEXT.md | 规则与术语 | current | 规划者/术语或决策变化时 | 单一上下文领域文档(docs/agents/domain.md 约定) |
 | docs/adr/0001-fail-loud.md | 设计与决策 | current | 规划者/错误处理策略变化时 | ADR:系统级失败显式直报 |
 | docs/adr/0002-d2d-wcs-render-stack.md | 设计与决策 | current | 规划者/渲染栈变化时 | ADR:D2D/WCS 渲染栈(M6 基石) |
+| docs/adr/0003-fp16-srgb-master.md | 设计与决策 | current | 规划者/精度链变化时 | ADR:L1 FP16 gamma-sRGB master(#137 探针钉) |
+| docs/adr/0004-ac-aware-wcg-output.md | 设计与决策 | current | 规划者/输出级变化时 | ADR:L2 AC 感知宽色域输出(#151/#157;D4 两态实证 2026-09-29) |
+| docs/adr/0005-svg-resvg-full.md | 设计与决策 | current | 规划者/SVG 依赖复议时 | ADR:resvg-full 体积破例(#152;D6 交互式重栅) |
+| smoke/ | 验证与观察 | current | 执行者/冒烟脚本增改时 | GUI 冒烟脚本 14 份+golden81/golden90 语料+README;QA 机器面主力(2026-09-29 卫生盘点补登) |
 | docs/spikes/s1-platform-floor.md | 验证与观察 | current | 调查者/平台地板再评估时 | min-OS 钉死 1607 的导入表证据(#97) |
 | docs/spikes/s-svg.md | 验证与观察 | current | 调查者/SVG 复议时 | SVG=resvg-full 体积推迟结论(#97) |
-| docs/spikes/s-avif.md | 验证与观察 | current | 调查者/M8 启动时 | AVIF 三路线推迟 M8 结论(#97) |
+| docs/spikes/s-avif.md | 验证与观察 | current | 调查者/#138 触发器评估时 | AVIF 三路线输入面结论(#97;#136 解绑后=移出 M8 的 L3 观察票 #138) |
 | docs/agents/triage-labels.md | 规则与术语 | current | 规划者/标签词汇变化时 | 五标签分诊词汇 |
 | docs/agents/domain.md | 规则与术语 | current | 规划者/文档架构变化时 | 单上下文+ADR 约定 |
 | docs/plan-26-association-nsis.md | 需求与验收 | reference | 书记员/历史留档 | #26 安装族历史规格;特性已交付,原位保留 |
