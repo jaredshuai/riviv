@@ -178,7 +178,10 @@ try {
     $mem = [S78]::GlobalLock($hmem)
     $drop = [BitConverter]::GetBytes([UInt32]20)
     [Runtime.InteropServices.Marshal]::Copy($drop, 0, $mem, 4)
-    [Runtime.InteropServices.Marshal]::WriteInt32($mem, 8, 1)  # fWide
+    # fWide lives at byte offset 16 (DROPFILES is pshpack1: pFiles@0, pt@4,
+    # fNC@12, fWide@16) - the historical write at offset 8 only set pt.y and
+    # left the flag to allocator luck (#166 Codex P1, same-origin fix).
+    [Runtime.InteropServices.Marshal]::WriteInt32($mem, 16, 1)  # fWide
     [Runtime.InteropServices.Marshal]::Copy($bytes, 0, [IntPtr]::Add($mem, 20), $bytes.Length)
     [S78]::GlobalUnlock($hmem) | Out-Null
     [S78]::PostMessage($view, $WM_DROPFILES, $hmem, [IntPtr]::Zero) | Out-Null
