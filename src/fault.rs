@@ -14,7 +14,11 @@
 //! decrements one. Injection happens where the real call SUCCEEDED — the
 //! ladder/ratchet/drain/rebuild/re-derive/re-paint machinery downstream
 //! of the classification runs for real; only the OS→HRESULT leg is
-//! synthetic (the loss codes themselves are upstream-documented).
+//! synthetic (the loss codes themselves are upstream-documented). Note
+//! the unit is the BOUNDARY CALL, not the paint: the AC face's dump
+//! channel draws two passes (warm-up + timed), so a dump consumes
+//! `device` twice (both passes' draw entries) and `effect` once (the
+//! second pass only) — size counts accordingly in scripted scenarios.
 //!
 //! Contract: with `RIVIV_FAULT` unset every counter is zero and every
 //! consume answers false — the seam is behaviorally inert in production
@@ -38,10 +42,12 @@ pub(crate) struct FaultPlan {
 }
 
 /// Grammar: comma-separated `kind=count` tokens, whitespace-tolerant;
-/// counts clamp to 1..=255 (`device=0` and `device=999` both mean "as
-/// armed as the clamp allows" — 0 stores 0, i.e. disarmed); unknown kinds
-/// and malformed tokens are SKIPPED, never a parse failure (a typo must
-/// not abort startup and must not arm the wrong slot either).
+/// counts clamp to 0..=255 (0 = disarmed; values above `u8::MAX` clamp
+/// DOWN, e.g. `device=999` arms 255 — but a token that does not parse as
+/// `u32` at all, like `device=4294967296` or `device=-1`, is SKIPPED
+/// like any garbage, not clamped); unknown kinds and malformed tokens
+/// are SKIPPED, never a parse failure (a typo must not abort startup and
+/// must not arm the wrong slot either).
 pub(crate) fn parse(value: &str) -> FaultPlan {
     let mut plan = FaultPlan::default();
     for token in value.split(',') {
@@ -64,16 +70,21 @@ pub(crate) fn parse(value: &str) -> FaultPlan {
     plan
 }
 
-/// Read the env once at startup and arm the counters. Unset (or empty) =
-/// all zero = the seam stays inert. The arming breadcrumb goes to stderr
-/// ONLY when the knob is set, so a production session's stderr contract
-/// is untouched.
+/// Read the env once at startup and arm the counters. Unset (or a value
+/// that parses to all-zero — an empty string or pure garbage) = the seam
+/// stays inert, and the arming breadcrumb is NOT printed for the
+/// all-zero case (external review P3: an `RIVIV_FAULT=""` must not lie
+/// "armed"). The breadcrumb therefore only ever accompanies a live
+/// arming, so a production session's stderr contract is untouched.
 pub(crate) fn init_from_env() {
     let Some(value) = std::env::var_os("RIVIV_FAULT") else {
         return;
     };
     let value = value.to_string_lossy();
     let plan = parse(&value);
+    if plan == FaultPlan::default() {
+        return;
+    }
     DEVICE_LOSS_REMAINING.store(plan.device, Ordering::Relaxed);
     EFFECT_REMAINING.store(plan.effect, Ordering::Relaxed);
     AC_CREATE_REMAINING.store(plan.ac_create, Ordering::Relaxed);
@@ -182,6 +193,14 @@ mod tests {
     fn counts_clamp_into_the_u8_range() {
         assert_eq!(plan_of("device=99999").device, u8::MAX);
         assert_eq!(plan_of("device=0").device, 0);
+    }
+
+    #[test]
+    fn a_count_beyond_u32_is_skipped_not_clamped() {
+        // 4294967296 does not parse as u32: the token is garbage, so the
+        // slot stays disarmed (it never clamps down to 255).
+        assert_eq!(plan_of("device=4294967296"), FaultPlan::default());
+        assert_eq!(plan_of("device=-1"), FaultPlan::default());
     }
 
     #[test]

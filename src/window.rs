@@ -9820,7 +9820,10 @@ pub(crate) fn run() -> Result<(), String> {
         })
         // The fallback mirrors the config default (auto); the path is
         // unreachable in practice (state missing = the window is going
-        // away) and fatals below either way.
+        // away) and fatals below either way. The fourth item (Srgb) is
+        // bit-for-bit the pre-#175 hardcoded frame_space default and
+        // self-consistent with the Legacy face (external review P3
+        // verified the equivalence).
         .unwrap_or((
             RendererKind::Auto,
             HWND::default(),

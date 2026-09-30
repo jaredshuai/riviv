@@ -1225,13 +1225,6 @@ impl GpuStack {
         diag: Diagnostics,
         src: &mut dyn LevelSource,
     ) -> Result<(), String> {
-        // #172's fault seam: a consumed count refuses the upload — the
-        // paint blanks the frame and the consecutive-failure counter
-        // feeds the prepare escalation (itself an entry into the
-        // device-loss ladder). Inert unless RIVIV_FAULT armed it.
-        if crate::fault::consume_prepare() {
-            return Err("fault-injected upload failure (RIVIV_FAULT seam)".to_string());
-        }
         self.forced_edge = diag.tile_edge.filter(|edge| *edge > 0);
         // Reset first, assign on success: an Err exit below (a refused
         // level, a failed base upload) must not leave the PREVIOUS frame's
@@ -1251,6 +1244,20 @@ impl GpuStack {
                 self.tiles.remove(&key);
             }
             self.tile_owner = Some((frame_gen, content_space));
+        }
+        // #172's fault seam, placed at the HEAD of the fallible region —
+        // deliberately AFTER the stamp above (external review P2): a real
+        // prepare failure (a refused level, a failed upload) always
+        // happens with the stamp already written, so the synthetic one
+        // must too — an entry-point injection on a stack whose stamp is
+        // stale (an arm flip without a face rebuild) would feed the
+        // mismatch table a bogus "wiring bug" refusal. With the stamp
+        // done, a consumed count refuses the upload exactly like a real
+        // one: the paint blanks the frame and the consecutive-failure
+        // counter feeds the prepare escalation. Inert unless RIVIV_FAULT
+        // armed it.
+        if crate::fault::consume_prepare() {
+            return Err("fault-injected upload failure (RIVIV_FAULT seam)".to_string());
         }
         let dest = crate::tile::Rect::new(plan.dx, plan.dy, plan.rw, plan.rh);
         let viewport = crate::tile::Rect::new(0, 0, plan.cw, plan.ch);
