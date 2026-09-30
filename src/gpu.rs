@@ -896,6 +896,13 @@ pub(crate) fn create(
     // color). The stack keeps the plain IDXGISwapChain1; the QI'd
     // interface drops after the call.
     if face == OutputSurface::AcScRgb {
+        // #172's fault seam: a consumed count refuses the declaration
+        // BEFORE the QI — create fails on the AC face, the caller's D6
+        // ratchet latches ac_surface_latched at creation and folds the
+        // session to the legacy face. Inert unless RIVIV_FAULT armed it.
+        if crate::fault::consume_ac_create() {
+            return Err("fault-injected AC surface refusal (RIVIV_FAULT seam)".to_string());
+        }
         let sc3: IDXGISwapChain3 = swapchain
             .cast()
             .map_err(|e| format!("cast to IDXGISwapChain3 failed: {e}"))?;
@@ -1204,6 +1211,13 @@ impl GpuStack {
         diag: Diagnostics,
         src: &mut dyn LevelSource,
     ) -> Result<(), String> {
+        // #172's fault seam: a consumed count refuses the upload — the
+        // paint blanks the frame and the consecutive-failure counter
+        // feeds the prepare escalation (itself an entry into the
+        // device-loss ladder). Inert unless RIVIV_FAULT armed it.
+        if crate::fault::consume_prepare() {
+            return Err("fault-injected upload failure (RIVIV_FAULT seam)".to_string());
+        }
         self.forced_edge = diag.tile_edge.filter(|edge| *edge > 0);
         // Reset first, assign on success: an Err exit below (a refused
         // level, a failed base upload) must not leave the PREVIOUS frame's
@@ -1799,6 +1813,17 @@ impl GpuStack {
     /// failure reports the no-present failure instead, and the face-arm
     /// gate below blanks anything that does not match the face.
     fn draw_pass(&mut self, bg: [u8; 3], plan: Option<&DrawPlan>) -> Result<(), DrawFailure> {
+        // #172's fault seam: a consumed count reclassifies this
+        // about-to-succeed pass as a device loss raised at draw entry —
+        // the stderr line, the verdict and the rebuild downstream are the
+        // real machinery (nothing was drawn, so there is no mid-bracket
+        // state to restore; the ladder drops and rebuilds the whole stack
+        // either way). Inert unless RIVIV_FAULT armed a count.
+        if crate::fault::consume_device_loss() {
+            return Err(DrawFailure::Renderer(windows::core::Error::from_hresult(
+                DXGI_ERROR_DEVICE_REMOVED,
+            )));
+        }
         // SAFETY: read-only target-size query on the live context (the
         // target is the swapchain's bitmap on entry — set by
         // create/resize and restored by every effect-pass exit).
@@ -1898,6 +1923,16 @@ impl GpuStack {
     /// target is restored on every exit so a later direct pass never
     /// draws into the stale intermediate.
     fn effect_pass(&mut self, bg: [u8; 3], plan: Option<&DrawPlan>) -> Result<(), DrawFailure> {
+        // #172's fault seam: a consumed count refuses the pass before any
+        // bracket opens — the failure routes with the CURRENT arm's class
+        // (AcFace on the scRGB arm, WideLegacy on the legacy wide arms),
+        // exactly like a real two-phase failure. E_FAIL is not a loss
+        // code, so it can never leak into the ladder. Inert unless armed.
+        if crate::fault::consume_effect() {
+            return Err(DrawFailure::Effect(windows::core::Error::from_hresult(
+                windows::core::HRESULT(0x8000_4005u32 as i32),
+            )));
+        }
         // The caller's ensure_effect_graph just proved the graph alive.
         let graph = self.display.graph.as_ref().expect("graph ensured");
         let arm = self.current_arm();

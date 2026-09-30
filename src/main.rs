@@ -101,6 +101,7 @@ mod custom_rate_dlg;
 mod dib;
 mod display_profile;
 mod everything;
+mod fault;
 mod filemgmt;
 mod fit;
 mod frame;
@@ -137,6 +138,9 @@ mod zoom;
 use crate::window::run;
 
 fn main() {
+    // #172's test-only fault seam: arm before anything GPU-shaped runs.
+    // Unset env = all counters zero = behaviorally inert (fault.rs).
+    fault::init_from_env();
     // The whole command line — install pass, then the second pass's
     // config switches and file words — is read raw inside `run` (#48:
     // the second pass needs the quoting `args_os` cannot see).

@@ -43,7 +43,8 @@
 | docs/adr/0003-fp16-srgb-master.md | 设计与决策 | current | 规划者/精度链变化时 | ADR:L1 FP16 gamma-sRGB master(#137 探针钉) |
 | docs/adr/0004-ac-aware-wcg-output.md | 设计与决策 | current | 规划者/输出级变化时 | ADR:L2 AC 感知宽色域输出(#151/#157;D4 两态实证 2026-09-29) |
 | docs/adr/0005-svg-resvg-full.md | 设计与决策 | current | 规划者/SVG 依赖复议时 | ADR:resvg-full 体积破例(#152;D6 交互式重栅) |
-| smoke/ | 验证与观察 | current | 执行者/冒烟脚本增改时 | GUI 冒烟脚本 14 份+golden81/golden90 语料+README;QA 机器面主力(2026-09-29 卫生盘点补登) |
+| smoke/ | 验证与观察 | current | 执行者/冒烟脚本增改时 | GUI 冒烟脚本 15 份(smoke173=故障注入矩阵,#172)+golden81/golden90 语料+README;QA 机器面主力(2026-09-29 卫生盘点补登) |
+| docs/spikes/s-fault-injection.md | 验证与观察 | current | 调查者/故障注入手段复议时 | 注入手段选型证据链:合成弦被忽略/TDR 框弃/PnP-VM 需提权→seam 定案(#172) |
 | docs/spikes/s1-platform-floor.md | 验证与观察 | current | 调查者/平台地板再评估时 | min-OS 钉死 1607 的导入表证据(#97) |
 | docs/spikes/s-svg.md | 验证与观察 | current | 调查者/SVG 复议时 | SVG=resvg-full 体积推迟结论(#97) |
 | docs/spikes/s-avif.md | 验证与观察 | current | 调查者/#138 触发器评估时 | AVIF 三路线输入面结论(#97;#136 解绑后=移出 M8 的 L3 观察票 #138) |
