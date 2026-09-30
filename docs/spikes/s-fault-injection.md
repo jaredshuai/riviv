@@ -37,6 +37,7 @@
 
 - `src/fault.rs` 纯逻辑解析器:`RIVIV_FAULT=device=3,effect=4,ac_create=1,prepare=5`(逗号分隔 kind=count,容忍非法 token),启动 `init_from_env()` 读一次进 AtomicU8 余量;env 未设=全零=行为逐位不变(零扰动负控必测)。
 - 注入点全在既有失败边界旁的「成功侧」:device→draw_pass EndDraw 成功后重分类 DEVICE_REMOVED(count=3 时三次重排毫秒级自然落进 10s 窗,无需计时);effect→effect_pass 按当前臂合成失败(AcFace 一次 latch,折回 legacy 宽后继续消耗即 WideLegacy×3,一次 env 钉完整三层棘轮);ac_create→`gpu::create` AC 臂 SetColorspace1 前合成失败;prepare→prepare 合成上传失败。
+- **落地偏差注记(2026-09-30 外部评审 P3 处置,实现时相对本节前移)**:device 实际落在 **draw_pass 入口**(BeginDraw 之前)——比「EndDraw 成功后」更优:无 mid-bracket 状态需恢复,分类路径(enddraw_outcome)同一;ac_create 实际落在 **QI(cast IDXGISwapChain3)之前**——比「SetColorSpace1 前」更早一层,同走创建期 latch;prepare 落在 **stamp(frame_space 写入)之后的失败区头部**(评审 P2:真实失败必然已 stamp,合成失败必须等价,否则陈旧 stamp 会喂出虚假 wiring-bug 拒绝——S7s 场景双向钉)。
 - 语义边界:seam 不测 OS→HRESULT plumbing(DEVICE_REMOVED/RESET/DRIVER_INTERNAL_ERROR 三码由文档+`is_device_loss` 分类表覆盖);测的是我们自己的全部接线与恢复行为。
 
 ## 决策影响
