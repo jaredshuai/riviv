@@ -85,7 +85,7 @@ L2（ADR 0004）的 AC 会话画在 FP16 scRGB 输出面上：swapchain 与画�
 - 文件不存在：第 3 步即停，旧图还在，状态栏是 “File not found.”。
 - 解不出或预算溢出，且第一帧还没换上画面：`FailedUser` 不退出进程。ADR 0001 要求保留旧图。README 同时写了：第一帧已经在屏幕上时，同一次加载的后续失败会清成空窗口，标题仍是失败文件名。
 - D2D 初始化失败：自 #90 起没有 GDI 臂可降——`auto` 在 `create` 内已试完硬件与 WARP，仍失败则 fatal 直报（`src/window.rs` 9765–9803）。这偏离了 ADR 0002 D5 正文的「初始化失败温和降级」，README Differences 的 #90 段已记录。
-- 运行中的设备丢失：10 秒内累计后再升级到 WARP；WARP 仍在这个窗口里失败，则推迟到绘制借用结束之后 fatal（`gpu_runtime_failure`，`src/window.rs` 2023；`is_device_loss`，`src/gpu.rs` 449）。非丢失类的 EndDraw / Present 失败自 #90 起按不可恢复处置——拆栈并推迟 fatal，不再有「整段会话留在 GDI」这条路（`src/gpu.rs` 1977–1988；`src/window.rs` 1260–1275）。后一种和 ADR 正文的阶梯不同，见下节。
+- 运行中的设备丢失：10 秒内累计后再升级到 WARP；WARP 仍在这个窗口里失败，则推迟到绘制借用结束之后 fatal（`gpu_runtime_failure`，`src/window.rs` 2023；`is_device_loss`，`src/gpu.rs` 449）。非丢失类的 EndDraw / Present 失败自 #90 起按不可恢复处置——拆栈并推迟 fatal，不再有「整段会话留在 GDI」这条路（`src/gpu.rs` 1977–1988；`src/window.rs` 1260–1275）。后一种和 ADR 正文的阶梯不同，见下节。这条阶梯连同三层会话棘轮与 prepare 升级的**接线面**，自 #172 起可由测试专用 env 旋钮 `RIVIV_FAULT`（`src/fault.rs`，`main` 启动时 `init_from_env` 读一次；未设=逐位惰性）在 gpu.rs 四个分类边界注入合成失败活体验证——注入手段选型与「真实驱动重置只能物理触发」的取证见 `docs/spikes/s-fault-injection.md`，冒烟矩阵 `smoke/smoke173-faultinjection.ps1`。
 
 ## 设计与现状不一致
 
