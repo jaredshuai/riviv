@@ -49,12 +49,22 @@
 #       (frame_space seeded at create) the escalation fires with ZERO
 #       ac-surface latching; pre-fix evidence: s7-prefix-red.err
 #       (feeding=0 + a bogus ac latch with a "wiring bug" diagnostic).
+#   S0e set-but-EMPTY env: zero armed lines (the breadcrumb never lies).
 #   S7s the stale-stamp pin (external review P2): the prepare injection
 #       must sit AFTER prepare's frame_space stamp - ac_create=1 folds
 #       to legacy, prepare#1 blanks the wide, the settle repaint stamps
 #       F16P3, NavNext flips the arm to SrgbToDisplay on the SAME stack,
 #       and prepare#2 must inject post-stamp (ZERO wiring-bug lines);
 #       pre-fix red: s7s-prefix-red.err.
+#   S7t the dual direction (stale NARROW stamp + WIDE arm): wide stamps
+#       F16P3, NavNext's narrow stamps Srgb, NavPrev's wide must stamp
+#       back before its refusal; red ancestor: s7-prefix-red.err.
+#   S7p the PRODUCTION stale-stamp pin (external review #2 P1, no
+#       prepare injection): F5 refresh clears the display while the
+#       folded legacy stack keeps the wide's F16P3 stamp - the blank
+#       window must draw with the ARM's implied space (pre-fix red
+#       s7p-prefix-red.err: 3x wiring-bug + a SPURIOUS degrade latch
+#       that killed the session's display-profile correction).
 #   S3  STRETCH device=6: six ladder lines + backend=warp + the deferred
 #       fatal modal (class #32770) dismissed via GetDlgItem(IDOK=2) +
 #       BM_CLICK (WM_CLOSE fallback); exit code recorded; SKIP when the
@@ -478,6 +488,30 @@ Check 'S0n-3 output-surface=ac-scrgb present (this machine AC arm baseline)' ((G
 Check 'S0n-4 exit 0' ($r0n.Code -eq 0) ('exit=' + $r0n.Code)
 
 # ---------------------------------------------------------------------------
+# S0e: set-but-EMPTY env (external review #2 P3). RIVIV_FAULT="" parses to
+# the all-zero plan: the seam must stay inert AND the arming breadcrumb
+# must NOT print (a lie of "armed" would mislead any test scaffolding
+# gating on that line). Manual launch - Start-Scenario would unset the
+# env instead of setting it to the empty string.
+# ---------------------------------------------------------------------------
+Reset-Ini $IniText
+Clear-FaultEnv
+$env:RIVIV_FAULT = ''
+$p0e = Start-Riv ('"' + $Wide + '"') 's0e.err'
+$main0e = Wait-Main $p0e
+[void](Wait-Title $p0e 'wide' 15000)
+Start-Sleep -Milliseconds 1500
+$alive0e = Test-Alive $p0e
+$code0e = Close-Main $p0e $main0e
+Clear-FaultEnv
+Reset-Ini ''
+Kill-StagedRiviv
+$err0e = Read-Err 's0e.err'
+Check 'S0e-1 set-but-empty env prints ZERO armed lines' ((Get-Lines $err0e 'fault injection armed').Count -eq 0) ("count=" + (Get-Lines $err0e 'fault injection armed').Count)
+Check 'S0e-2 blank session lines otherwise normal (display-stage present)' ((Get-Lines $err0e 'display-stage=').Count -ge 1) ("count=" + (Get-Lines $err0e 'display-stage=').Count)
+Check 'S0e-3 exit 0' ($code0e -eq 0) ('exit=' + $code0e)
+
+# ---------------------------------------------------------------------------
 # S1: device=1 - one synthetic loss, the ladder answers with a same-kind
 # rebuild (backend stays hw, zero warp), the window survives, exit 0.
 # ---------------------------------------------------------------------------
@@ -672,6 +706,112 @@ Check 'S7s-4 window alive before close' $alive7s ('alive=' + $alive7s)
 Check 'S7s-5 exit 0' ($code7s -eq 0) ('exit=' + $code7s)
 
 # ---------------------------------------------------------------------------
+# S7t: the DUAL direction of the stale-stamp pin (external review #2 P2's
+# missing half): stale NARROW stamp + WIDE arm on the legacy face. The
+# ac latch folds to a legacy stack; the wide stamps F16P3, NavNext's
+# narrow stamps Srgb, and NavPrev's wide prepare must stamp F16P3 back
+# BEFORE its injected refusal - zero mismatch, zero ratchet feed in BOTH
+# directions. (Red ancestor: s7-prefix-red.err's P3ToDisplay-vs-Srgb
+# lines from the first matrix run's entry-point injection era.)
+# ---------------------------------------------------------------------------
+Reset-Ini $IniText
+Clear-FaultEnv
+$env:RIVIV_FAULT = 'ac_create=1,prepare=3'
+$ps7t = Start-Riv ('"' + $Wide + '" "' + $Probe + '"') 's7t.err'
+$main7t = Wait-Main $ps7t
+[void](Wait-Title $ps7t 'wide' 15000)
+$latch7t = $false
+$dl7t = [DateTime]::UtcNow.AddSeconds(20)
+while ([DateTime]::UtcNow -lt $dl7t) {
+    if ((Get-Lines (Read-Err 's7t.err') 'ac surface latched').Count -ge 1) { $latch7t = $true; break }
+    if ($ps7t.HasExited) { break }
+    Start-Sleep -Milliseconds 200
+}
+Start-Sleep -Milliseconds 4000   # wide repaint: the F16P3 stamp lands
+if ($main7t -ne [IntPtr]::Zero) {
+    [void][S173]::PostMessage($main7t, 0x0111, [IntPtr]107, [IntPtr]::Zero)  # NavNext -> probe
+}
+$dl7t2 = [DateTime]::UtcNow.AddSeconds(20)
+while ([DateTime]::UtcNow -lt $dl7t2) {
+    if ((Get-Lines (Read-Err 's7t.err') 'frame upload failed').Count -ge 2) { break }
+    if ($ps7t.HasExited) { break }
+    Start-Sleep -Milliseconds 200
+}
+Start-Sleep -Milliseconds 4000   # narrow repaint: the Srgb stamp lands
+if ($main7t -ne [IntPtr]::Zero) {
+    [void][S173]::PostMessage($main7t, 0x0111, [IntPtr]108, [IntPtr]::Zero)  # NavPrev -> wide again
+}
+$dl7t3 = [DateTime]::UtcNow.AddSeconds(20)
+while ([DateTime]::UtcNow -lt $dl7t3) {
+    if ((Get-Lines (Read-Err 's7t.err') 'frame upload failed').Count -ge 3) { break }
+    if ($ps7t.HasExited) { break }
+    Start-Sleep -Milliseconds 200
+}
+Start-Sleep -Milliseconds 1500
+$alive7t = (($main7t -ne [IntPtr]::Zero) -and (-not $ps7t.HasExited))
+if (-not $ps7t.HasExited -and $main7t -ne [IntPtr]::Zero) {
+    [void][S173]::PostMessage($main7t, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero)
+}
+$code7t = Wait-Exit $ps7t 30000
+if ($code7t -eq $null) { Stop-Process -Id $ps7t.Id -Force -ErrorAction SilentlyContinue; $code7t = -1 }
+Clear-FaultEnv
+Reset-Ini ''
+Kill-StagedRiviv
+$err7t = Read-Err 's7t.err'
+Check 'S7t-0 ac surface latched (the fold that keeps a legacy stack)' ($latch7t -and ((Get-Lines $err7t 'ac surface latched.*fault-injected AC surface refusal').Count -ge 1)) ("latchWaited=" + $latch7t)
+Check 'S7t-1 frame upload failed lines == 3 (wide, narrow, wide-again)' ((Get-Lines $err7t 'frame upload failed').Count -eq 3) ("count=" + (Get-Lines $err7t 'frame upload failed').Count)
+Check 'S7t-2 ZERO wiring-bug lines (dual-direction stale-stamp pin)' ((Get-Lines $err7t 'wiring bug').Count -eq 0) ("count=" + (Get-Lines $err7t 'wiring bug').Count + " lines=[" + ((Get-Lines $err7t 'wiring bug') -join ' | ') + "]")
+Check 'S7t-3 ZERO display effect failure lines (no spurious ratchet feed)' ((Get-Lines $err7t 'display effect failure').Count -eq 0) ("count=" + (Get-Lines $err7t 'display effect failure').Count)
+Check 'S7t-4 window alive before close' $alive7t ('alive=' + $alive7t)
+Check 'S7t-5 exit 0' ($code7t -eq 0) ('exit=' + $code7t)
+
+# ---------------------------------------------------------------------------
+# S7p: the PRODUCTION stale-stamp pin (external review #2 P1 - no prepare
+# injection involved). A latched session's folded legacy stack carries the
+# wide's F16P3 stamp; F5 refresh -> clear_display_state -> state.image=None
+# (the STACK survives) -> the blank window's paints sync the narrow arm
+# SrgbToDisplay. PRE-FIX (archived s7p-prefix-red.err): three bogus
+# wiring-bug refusal lines and a SPURIOUS display-stage degrade latch -
+# the session permanently lost its display-profile correction. POST-FIX
+# (plan-less draws feed the ARM's implied space): zero of everything,
+# the reload lands, exit 0.
+# ---------------------------------------------------------------------------
+Reset-Ini $IniText
+Clear-FaultEnv
+$env:RIVIV_FAULT = 'ac_create=1'
+$ps7p = Start-Riv ('"' + $Wide + '"') 's7p.err'
+$main7p = Wait-Main $ps7p
+[void](Wait-Title $ps7p 'wide' 15000)
+$latch7p = $false
+$dl7p = [DateTime]::UtcNow.AddSeconds(20)
+while ([DateTime]::UtcNow -lt $dl7p) {
+    if ((Get-Lines (Read-Err 's7p.err') 'ac surface latched').Count -ge 1) { $latch7p = $true; break }
+    if ($ps7p.HasExited) { break }
+    Start-Sleep -Milliseconds 200
+}
+Start-Sleep -Milliseconds 4000   # wide repaint: the F16P3 stamp lands
+if ($main7p -ne [IntPtr]::Zero) {
+    [void][S173]::PostMessage($main7p, 0x0111, [IntPtr]41, [IntPtr]::Zero)  # ViewRefresh (F5) -> clear + reload
+}
+Start-Sleep -Milliseconds 3000   # the blank window + reload cycle
+$alive7p = (($main7p -ne [IntPtr]::Zero) -and (-not $ps7p.HasExited))
+if (-not $ps7p.HasExited -and $main7p -ne [IntPtr]::Zero) {
+    [void][S173]::PostMessage($main7p, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero)
+}
+$code7p = Wait-Exit $ps7p 30000
+if ($code7p -eq $null) { Stop-Process -Id $ps7p.Id -Force -ErrorAction SilentlyContinue; $code7p = -1 }
+Clear-FaultEnv
+Reset-Ini ''
+Kill-StagedRiviv
+$err7p = Read-Err 's7p.err'
+Check 'S7p-0 ac surface latched (the folded legacy stack carries the wide stamp)' ($latch7p -and ((Get-Lines $err7p 'ac surface latched.*fault-injected AC surface refusal').Count -ge 1)) ("latchWaited=" + $latch7p)
+Check 'S7p-1 ZERO wiring-bug lines across the F5 clear window (review P1 pin)' ((Get-Lines $err7p 'wiring bug').Count -eq 0) ("count=" + (Get-Lines $err7p 'wiring bug').Count + " lines=[" + ((Get-Lines $err7p 'wiring bug') -join ' | ') + "]")
+Check 'S7p-2 ZERO display effect failure lines (no spurious ratchet feed)' ((Get-Lines $err7p 'display effect failure').Count -eq 0) ("count=" + (Get-Lines $err7p 'display effect failure').Count)
+Check 'S7p-3 ZERO degrade-latch lines (pre-fix red latched the segment spuriously)' ((Get-Lines $err7p 'degrade latched').Count -eq 0) ("count=" + (Get-Lines $err7p 'degrade latched').Count)
+Check 'S7p-4 window alive before close' $alive7p ('alive=' + $alive7p)
+Check 'S7p-5 exit 0' ($code7p -eq 0) ('exit=' + $code7p)
+
+# ---------------------------------------------------------------------------
 # S3 STRETCH: device=6 - two same-kind rebuilds, the 3rd escalates to WARP,
 # three more on WARP trip the deferred fatal: a modal dialog (class
 # #32770) blocks exit. Dismissed via GetDlgItem(IDOK=2) + BM_CLICK (the
@@ -756,7 +896,7 @@ Check 'S9 teardown: stage ini removed, no staged riviv left' ($iniCleaned -and (
 $total = $script:pass + $script:fail
 if ($script:fail -gt 0) {
     Write-Output ('FAILURES: per-scenario stderr follows (archive dir ' + $Stage + ').')
-    foreach ($e in @(@('S0n', (Read-Err 's0n.err')), @('S1', (Read-Err 's1.err')), @('S2', (Read-Err 's2.err')), @('S2b', (Read-Err 's2b.err')), @('S4', (Read-Err 's4.err')), @('S6', (Read-Err 's6.err')), @('S7', (Read-Err 's7.err')), @('S7w', (Read-Err 's7w.err')), @('S7s', (Read-Err 's7s.err')), @('S3', (Read-Err 's3.err')))) {
+    foreach ($e in @(@('S0n', (Read-Err 's0n.err')), @('S0e', (Read-Err 's0e.err')), @('S1', (Read-Err 's1.err')), @('S2', (Read-Err 's2.err')), @('S2b', (Read-Err 's2b.err')), @('S4', (Read-Err 's4.err')), @('S6', (Read-Err 's6.err')), @('S7', (Read-Err 's7.err')), @('S7w', (Read-Err 's7w.err')), @('S7s', (Read-Err 's7s.err')), @('S7t', (Read-Err 's7t.err')), @('S7p', (Read-Err 's7p.err')), @('S3', (Read-Err 's3.err')))) {
         Write-Output ('--- scenario ' + $e[0] + ' stderr ---')
         Write-Output $e[1]
     }

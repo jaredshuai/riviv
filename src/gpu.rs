@@ -719,13 +719,17 @@ pub(crate) struct GpuStack {
     /// ladder rebuilds, so it sits on the window state (the same split
     /// as the device-loss timestamps).
     display: DisplaySegment,
-    /// The content space of the master the last `prepare` served (#143):
-    /// the effect graph's intermediate format dispatches on it (an F16Srgb
-    /// master's composite input is an f16 bitmap, an Srgb master's stays
-    /// BGRA8), so `draw_pass` hands it to the lazy builder. A space change
-    /// mismatches `built_for` and rebuilds the graph lazily — the same
-    /// mechanism a viewport resize uses. Plain Copy data, safe between
-    /// the COM fields.
+    /// The content space of the master the last `prepare` served (#143) —
+    /// or, before the first successful prepare, the session content class
+    /// the stack was SEEDED with at create (#173). The effect graph's
+    /// intermediate format dispatches on it (an F16Srgb master's composite
+    /// input is an f16 bitmap, an Srgb master's stays BGRA8), so
+    /// `draw_pass` hands it to the lazy builder — for CONTENT frames;
+    /// blank (plan-less) draws read the ARM's implied space instead
+    /// (external review P1: the stamp may describe a dead frame across a
+    /// display clear). A space change mismatches `built_for` and rebuilds
+    /// the graph lazily — the same mechanism a viewport resize uses.
+    /// Plain Copy data, safe between the COM fields.
     frame_space: ContentSpace,
     /// The OUTPUT FACE this stack was built for (#156, ADR 0004 D3): the
     /// swapchain format and color-space declaration follow it
@@ -1534,11 +1538,14 @@ impl GpuStack {
     ///
     /// A (space, arm) mismatch is a WIRING BUG: rejected in debug via
     /// the assert and in release via an explicit Err (never a silently
-    /// mis-colored graph). #173 closed the one reachable NON-bug shape
-    /// (a blank draw on a fresh, never-prepared stack) by seeding
-    /// frame_space with the session's content class at create — every
-    /// remaining mismatch really is a wiring bug again. Property writes
-    /// as before (pointer values /
+    /// mis-colored graph). The two reachable NON-bug shapes are closed
+    /// at the CALLERS, not here: #173 seeds frame_space with the
+    /// session's content class at create (a blank on a fresh,
+    /// never-prepared stack), and the external-review follow-up makes
+    /// plan-less draws feed the ARM'S OWN implied space (a blank after
+    /// clear_display_state would otherwise carry a dead frame's stamp) —
+    /// with both, every remaining mismatch really is a wiring bug again.
+    /// Property writes as before (pointer values /
     /// enum values; both intents RELATIVE_COLORIMETRIC; PREMULTIPLIED;
     /// BEST). Everything here is device-object creation — device losses
     /// do not happen at construction; every error is a context/profile
@@ -1853,11 +1860,21 @@ impl GpuStack {
         // target is the swapchain's bitmap on entry — set by
         // create/resize and restored by every effect-pass exit).
         let size = unsafe { self.context.GetPixelSize() };
-        // The prepared master's space (Copy — read before the &mut borrow
-        // the ensure call takes): the intermediate's format follows it
-        // (#143).
-        let frame_space = self.frame_space;
+        // The current arm (Copy — read before the &mut borrow the ensure
+        // call takes).
         let arm = self.current_arm();
+        // The graph's space input: a CONTENT frame carries the prepare
+        // stamp (#143), but a BLANK (plan-less) draw has no master
+        // behind it — the stamp may describe a dead frame (a wide
+        // master's stamp surviving clear_display_state while the arm
+        // already answers the now-narrow session, external review P1).
+        // Blanks read the ARM'S OWN implication instead, the one input
+        // that always reads the current class.
+        let frame_space = if plan.is_none() {
+            crate::transform_stage::arm_master_space(arm)
+        } else {
+            self.frame_space
+        };
         // The face-arm gate FIRST: a (face, arm) mismatch (a dying
         // session's windows, or WideBlank's own contract) draws the blank
         // letterbox — no content, in any shape, ever reaches a face its

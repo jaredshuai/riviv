@@ -16,9 +16,10 @@
 //! of the classification runs for real; only the OS→HRESULT leg is
 //! synthetic (the loss codes themselves are upstream-documented). Note
 //! the unit is the BOUNDARY CALL, not the paint: the AC face's dump
-//! channel draws two passes (warm-up + timed), so a dump consumes
-//! `device` twice (both passes' draw entries) and `effect` once (the
-//! second pass only) — size counts accordingly in scripted scenarios.
+//! channel draws two passes (warm-up first, then the timed one) and a
+//! consumed count fails THE PASS THAT REACHES IT — with any armed count
+//! the dump aborts at the warm-up pass and the timed pass never runs.
+//! Size counts accordingly in scripted scenarios.
 //!
 //! Contract: with `RIVIV_FAULT` unset every counter is zero and every
 //! consume answers false — the seam is behaviorally inert in production
@@ -45,9 +46,11 @@ pub(crate) struct FaultPlan {
 /// counts clamp to 0..=255 (0 = disarmed; values above `u8::MAX` clamp
 /// DOWN, e.g. `device=999` arms 255 — but a token that does not parse as
 /// `u32` at all, like `device=4294967296` or `device=-1`, is SKIPPED
-/// like any garbage, not clamped); unknown kinds and malformed tokens
-/// are SKIPPED, never a parse failure (a typo must not abort startup and
-/// must not arm the wrong slot either).
+/// like any garbage, not clamped); a duplicate kind takes the LAST
+/// token (`device=1,device=2` arms 2) and a leading `+` parses (Rust
+/// `u32` semantics); unknown kinds and malformed tokens are SKIPPED,
+/// never a parse failure (a typo must not abort startup and must not
+/// arm the wrong slot either).
 pub(crate) fn parse(value: &str) -> FaultPlan {
     let mut plan = FaultPlan::default();
     for token in value.split(',') {

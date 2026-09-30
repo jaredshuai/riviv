@@ -323,6 +323,27 @@ pub(crate) fn clamped_surface(
     }
 }
 
+/// The master space an effect ARM implies (#175's follow-up, external
+/// review P1): the P3 arms only ever serve `F16P3` masters, the narrow
+/// effect arm narrow ones. A BLANK draw (no plan — a cleared or failed
+/// display, a refused upload's letterbox) has no master behind it, so
+/// gpu.rs's `draw_pass` feeds the graph build the ARM'S OWN implication
+/// instead of the prepare stamp: the stamp may describe a dead frame
+/// (a wide master's stamp surviving `clear_display_state` while the arm
+/// already answers the now-narrow session), while the arm always reads
+/// the current class. `Direct`/`WideBlank` never build a graph — they
+/// map to `Srgb` as an inert default no consumer reads.
+pub(crate) fn arm_master_space(arm: DisplayArm) -> ContentSpace {
+    match arm {
+        DisplayArm::P3ToSrgb | DisplayArm::P3ToDisplay | DisplayArm::P3ToScRgb => {
+            ContentSpace::F16P3
+        }
+        DisplayArm::Direct | DisplayArm::WideBlank | DisplayArm::SrgbToDisplay => {
+            ContentSpace::Srgb
+        }
+    }
+}
+
 /// The legacy face's wide stage for the JUDGE's answer (the fold-back
 /// target of a latched AC arm and the pre-reconciliation legacy-face
 /// arm): a custom display profile earns the P3→display leg, every other
@@ -730,6 +751,34 @@ mod tests {
     use super::*;
     use crate::config::RendererKind;
     use crate::tile::TileKey;
+
+    #[test]
+    fn arm_master_space_answers_each_graph_arm_s_own_family() {
+        // Every arm that builds a graph must imply a space its own check
+        // row accepts (gpu.rs build_effect_graph's table): the P3 arms
+        // are wide-only, the narrow effect arm narrow-only — a blank
+        // draw fed the arm's implication can never meet the _ row.
+        for arm in [
+            DisplayArm::SrgbToDisplay,
+            DisplayArm::P3ToSrgb,
+            DisplayArm::P3ToDisplay,
+            DisplayArm::P3ToScRgb,
+        ] {
+            let space = arm_master_space(arm);
+            assert_eq!(
+                matches!(space, ContentSpace::F16P3),
+                matches!(
+                    arm,
+                    DisplayArm::P3ToSrgb | DisplayArm::P3ToDisplay | DisplayArm::P3ToScRgb
+                ),
+                "arm {arm:?} implies {space:?}"
+            );
+        }
+        // The graph-less arms' mapping is inert (no consumer reads it)
+        // but pinned so a future arm lands consciously.
+        assert_eq!(arm_master_space(DisplayArm::Direct), ContentSpace::Srgb);
+        assert_eq!(arm_master_space(DisplayArm::WideBlank), ContentSpace::Srgb);
+    }
 
     /// The full judge space: every `DisplayProfileQuery` shape the
     /// wiring can ever resolve a query to.
