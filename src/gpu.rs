@@ -814,11 +814,22 @@ fn bitmap_properties_for(
 /// `auto` has already tried hardware AND WARP by the time the error
 /// surfaces), and a mid-session rebuild failure lands in the same
 /// deferred fatal.
+///
+/// `content` seeds [`GpuStack::frame_space`] with the SESSION's content
+/// class (#173): between creation and the first successful prepare the
+/// stamp does not exist yet, but a blank draw (a failed prepare's
+/// `present_clear`) already answers the synced arm — without the seed
+/// the default `Srgb` meets a wide arm as a bogus "wiring bug" refusal
+/// and reroutes prepare failures into the display ratchets. The seed is
+/// the same input the arm derivation reads, so seed-vs-arm mismatch is
+/// structurally impossible and the stamp stays the truth from the first
+/// prepare on.
 pub(crate) fn create(
     view: HWND,
     top: HWND,
     request: RendererKind,
     face: OutputSurface,
+    content: ContentSpace,
 ) -> Result<(GpuStack, RendererKind), String> {
     // 1. The D3D device. The request picks the driver ladder: `warp` and
     //    `d2d` are single-driver diagnostics (a failing `d2d` request fails
@@ -1000,8 +1011,11 @@ pub(crate) fn create(
         // (#130), not here: the window state owns the decision point.
         display: DisplaySegment::default(),
         // The first paint's prepare stamps the master's own space in
-        // before any draw reads it (#143).
-        frame_space: ContentSpace::Srgb,
+        // before any draw reads it (#143) — but until that first
+        // successful prepare the SEED (the session's content class,
+        // create's `content`) answers, so a blank draw on a fresh stack
+        // can never meet its own arm as a mismatch (#173).
+        frame_space: content,
         // The face `create` was called with (#156): the swapchain and the
         // target bitmap were literally built for it.
         face,
@@ -1513,7 +1527,11 @@ impl GpuStack {
     ///
     /// A (space, arm) mismatch is a WIRING BUG: rejected in debug via
     /// the assert and in release via an explicit Err (never a silently
-    /// mis-colored graph). Property writes as before (pointer values /
+    /// mis-colored graph). #173 closed the one reachable NON-bug shape
+    /// (a blank draw on a fresh, never-prepared stack) by seeding
+    /// frame_space with the session's content class at create — every
+    /// remaining mismatch really is a wiring bug again. Property writes
+    /// as before (pointer values /
     /// enum values; both intents RELATIVE_COLORIMETRIC; PREMULTIPLIED;
     /// BEST). Everything here is device-object creation — device losses
     /// do not happen at construction; every error is a context/profile
