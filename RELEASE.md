@@ -41,6 +41,8 @@
 - **首发已发生**(2026-09-29 卫生盘点订正,原文「首发尚未发生」已过时):v0.1.0 于 2026-09-25 发布——tag `a671835` 指向发布提交,GitHub Release `riviv v0.1.0` 现为 Latest。日期双口径注记:发布提交本身是 2026-09-24(a671835 提交时间,git-cliff/CHANGELOG 按提交日期取数,故 CHANGELOG 头是 `[0.1.0] - 2026-09-24`),打标与 GitHub Release 动作在 2026-09-25——README/本文件的「09-25 发布」取的是发布动作日。后续发版沿用同一发布前清单:①核对 `Cargo.toml` 与 `version.nsh` 版本一致;②跑齐四门禁 + `cargo build --release` + 安装器构建 + AGENTS.md 要求的 GUI QA 清单;③CHANGELOG 自动编译流程**已建成**(2026-09-23):git-cliff 2.14.2 + `cliff.toml` 策略(复合类型前缀分类、仅收 feat/fix/perf/refactor、`tag_pattern` 排除上游参考标签、历史起点=首个 riviv 提交 `0b370db`),再生成命令 `git-cliff -o CHANGELOG.md 0b370db^..HEAD`;发版打标签后重跑同一命令即产出 `vX.Y.Z` 分段,禁止手写篡改生成结果。
 - 现状：无 CI 发版流水线（CI 仅跑门禁，#93）；标签由人手打。
 
-### 发布命令（对外发布链部分未验证）
+### 发布命令（对外发布链已两度验证：v0.1.0 网页、v0.2.0 CLI）
 
-v0.1.0 已实走:人手 `git tag -a v0.1.0` + GitHub 网页建 Release(无命令留档)。**未验证**的是安装包对外发布命令——本机试打（`installer/build-installer.ps1`）不等于发版,Release 资产上传与人手网页等价物均无命令留档。
+- **发版**（v0.2.0 实走,2026-09-30）:`git push origin v0.2.0` 推 annotated tag → `gh release create v0.2.0 --title "…" --notes-file <说明稿> --latest <portable.exe> <zh-CN-Setup.exe> <en-US-Setup.exe>`——三资产一次上传,Latest 标记即时生效;portable 资产=release exe 改名复制。
+- v0.1.0 为网页手建(无命令留档,历史形态)。
+- **未验证**的仅剩:安装包对外发布命令自动化(以上 CLI 为单机手工链;无 CI 发版流水线,CI 仅跑门禁 #93)。本机试打（`installer/build-installer.ps1`）不等于发版。
