@@ -33,14 +33,25 @@
 # 0.1098 -> 127), L11 (127 -> 0.4007 -> 336), L15 (336 -> 1.0 -> 768).
 # S1 therefore fires 6 notches (ends ON the first swap, face 127 crisp);
 # S5 fires 15 (walks all three swaps, face 768 crisp); S4 rounds L6 back
-# down to fit. The master exe never swaps - its 48px raster upscales to
-# 127 as filtered mush (the S2 negative control).
+# down to fit.
+#
+# NOTE 2026-09-30 (v0.2.0 release run): the original S2 was a NEGATIVE
+# control ("master never swaps -> hard stripes, no gray") written when
+# master was pre-SVG. #164/#169 landed re-raster on master, so the
+# premise died (S2 run vs master 76abbe0 showed mid=847 - a reraster AA
+# signature; the 0.2.0 exe's S1 dump and master's S2 dump were
+# byte-identical, the cleanest possible no-regression proof). S2 is now
+# a POSITIVE master control: the staged parity exe must re-raster too -
+# which also guards the parity staging itself (a stale/wrong parity exe
+# fails here). Bitmap-identity A/B stays S3's job; SVG-dump identity
+# across the two exes is empirically byte-identical but rides the
+# reraster's async settle, so it is deliberately not a pinned assertion.
 #
 # Scenarios:
 #   S0  staged exe + fixture self-checks
 #   S1  SVG 6 notches -> dump: rect ~127x127, AA gray band PRESENT
-#   S2  master A/B: same steps on the parity exe -> hard stripes, NO
-#       gray (proves the S1 verdict is the NEW behavior)
+#   S2  master A/B: same steps on the parity exe -> the parity exe
+#       ALSO re-rasters (AA gray band present; positive control)
 #   S3  PNG A/B: 48x48 striped PNG zoomed 6 -> branch dump == master dump
 #       byte-identical (zero behavior change for bitmaps)
 #   S4  6 up then 6 wheel-downs -> back at the SWAPPED face's own L0 fit
@@ -451,20 +462,22 @@ if ($s1.Box -ne $null -and $s1.Box[0] -ge 0 -and $s1.Code -eq 0 -and $s1.Adopted
 Check 'S1 SVG zoomed 6: face ~127, AA gray band present (re-raster landed)' $s1ok $s1d
 
 # ---------------------------------------------------------------------------
-# S2: the same steps on the MASTER parity exe -> the 48px raster point-
-# sampled to 127: hard stripes, ZERO gray (the fixture's negative
-# control; also proves S1's verdict is the NEW behavior).
+# S2: the same steps on the MASTER parity exe. Since #164/#169, master
+# re-rasters too: the positive control asserts the parity exe's dump
+# carries the same AA gray band as S1's (mid > 500) - a stale or wrong
+# parity staging fails here. (History: pre-#163 master showed mid ~0;
+# see the NOTE at the file head.)
 # ---------------------------------------------------------------------------
 $s2ok = $false; $s2d = 'master exe missing'
 if ($haveMaster) {
     $s2 = Run-ZoomDump $script:MasterRunExe $F.stripes 's2-out.png' 's2.err' 6 1500
     $s2d = "exit=$($s2.Code) adopted=$($s2.Adopted)"
     if ($s2.Box -ne $null -and $s2.Box[0] -ge 0 -and $s2.Code -eq 0 -and $s2.Adopted) {
-        $s2ok = ($s2.Mid -lt 50) -and ($s2.Ext -gt 5000)
+        $s2ok = ($s2.Mid -gt 500) -and ($s2.Ext -gt 5000)
         $s2d = "rect=$($s2.Rw)x$($s2.Rh) ext=$($s2.Ext) mid=$($s2.Mid) exit=$($s2.Code)"
     }
 }
-Check 'S2 master A/B: same zoom, point-sampled hard stripes (no gray)' $s2ok $s2d
+Check 'S2 master A/B: parity exe also re-rasters (AA gray band present)' $s2ok $s2d
 
 # ---------------------------------------------------------------------------
 # S3: the PNG twin zoomed 6 on both exes -> byte-identical dumps (zero

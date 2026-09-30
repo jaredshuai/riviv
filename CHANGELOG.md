@@ -5,6 +5,43 @@ history by git-cliff (cliff.toml is the policy; do not hand-edit the output).
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+## [0.2.0] - 2026-09-30
+### Added
+
+- Feat(about): #124 About 文案补实——版权/上游作者归属入框(text.rs 纯函数下沉) (17e871e)
+- Feat(transform-stage): #127 决策表纯函数落地——P3 探针撤 WARP cpu 格,OutputIdentity 输出级键+R2 契约钉 (db87100)
+- Feat(renderer): #126 M8-1 回读底座——-renderer sticky 开关 + dump output_gen (2cf3e0f)
+- Feat(display-stage): #130 M8-3 静态 gpu_effect——WCS 判据接线 + D2D ColorManagement 视口 pass + 棘轮/指纹真值化 (a5e948d)
+- Feat(display-stage): #132 M8-4 profile 热重载——WM_DISPLAYCHANGE+2s 新鲜度计时器双通道 + WM_MOVE 跨屏监视器比对 (a063a20)
+- Feat(display-stage): #134 M8-5 ACM 声明=不声明——type 9 bit1 换指纹最后一个占位 + 新鲜度门扩级名字或ac + 面包屑/冒烟合同加 ac 字段 + D10 记档 (d1358e4)
+- Feat(loader): #140 L1 地基——into_rgba8() 截断移除(16-bit 直系经 f16 master 换算)+ ContentSpace 扩 F16Srgb + master 择型 gate + PixelFrame 携带标记 (03f0051)
+- Feat(cache): #141 L1——四层缓存 content-space 键 + 直读接缝分派(status RGB/clipboard) (ec61098)
+- Feat(icm): #142 L1——Stage-1 BM_16b_RGB 链 + CPU 转码 + f16 master 落储(ADR 0003 D6 条目 3) (f3d76cb)
+- Feat(gpu): #143 GPU 上传键 R16G16B16A16_FLOAT 臂 + gpu_effect f16 中间面 (ff6c888)
+- Feat(loader): #144 M8-11 L1 收官——f16 预算两腿重推导落档(cap 全维持)+ charged 边界测试五钉 + README L1 收口 (4452071)
+- Feat(transform-stage): #154 M8-12 L2 决策表第三维——desired_output 四维纯函数 + F16P3 ContentSpace + 指纹 surface 项 (4992516)
+- Feat(icm): #155 M8-13 L2 Stage-1 宽域链——P3-D65 目的地 + F16P3 生产门 + 迁移失效 (5ec935a)
+- Feat(gpu): #156 M8-14 L2 GPU AC 臂——FP16 交换链+SetColorSpace1(scRGB)+effect P3→scRGB+D6 棘轮+dump FP16 回读 (6585692)
+- Feat(loader): #152 SVG 解码臂——resvg full 接入(ADR 0005 破例,+3.38 MiB 实录) (b45cd52)
+- Feat(loader): #163 SVG 交互式重栅接线——Tree 随帧携带+后台重栅+1:1 换面保持 zoom/pan(ADR 0005 D6) (1955856)
+### Fixed
+
+- Fix(transform-stage): 采纳 Codex P2——OutputTracker 撤 memo,转移递增 gen+指纹复用键职责分离 (59df8bf)
+- Fix(display-stage): 采纳 Codex P2×2——构建失败驱动重绘(静态图棘轮可达闩)+ source-name 查询换 sourceInfo.adapterId (77ffd49)
+- Fix(display-stage): 采纳预审 P2×2——iconic 窗口 WM_MOVE 假跨屏守卫 + A→B→A gen 措辞订正(转移恒新 gen,PR #128 已撤 memo) (2bf0281)
+- Fix(display-stage): 采纳 Codex P2×2——计时器失_arm 直报(ADR 0001)+ 不可读 profile 转可重试态(读失败=name None 下拍重试,分类拒绝=Some(raw) 稳定判决) (cdd9f10)
+- Fix(smoke): #134 矩阵首跑抓脚本回归——Get-Stage-Line 尾锚改正则锚定 ac 值(行尾是 ac=<值> 非 ' ac='),smoke130 12/12、smoke132 5/5 复绿,矩阵 9/9 (dbc742f)
+- Fix(display-stage): 采纳预审 P3——display_profile 两处 family-failure 陈旧注释统一改 #134 P1 勘误口径 + smoke132 删零调用死函数 Ac-Of(新锚已隐式钉 ac 在场) (a21232f)
+- Fix(loader): #142 采纳 Codex P1——动画预算按 f16 帧实际字节记账 (8a60da0)
+- Fix(loader): #142 采纳 Codex P1 第二轮——累计口径 + APNG 构造门均按 charged 计价 (17623c2)
+- Fix(loader): #142 采纳 Codex P1 第三轮——charged_frame_bytes 倍增饱和不回绕 (5586431)
+- Fix(gpu): #142 采纳 Codex P2 第四轮——F16 基座上传 staging 进 in-flight 记账 (2df8259)
+- Fix(window): #154 采纳 Codex R1 P2 的滞留半——类翻转静默刷新身份记录,gen 不动 (2693a69)
+- Fix(playlist): #152 Codex P2——EXTENSIONS 补 svg,导航/文件夹扫描/Everything 查询认 SVG (2f55214)
+- Fix(window): #163 wheel 路径补 consider_reraster 触点;smoke163 判别器倒置修正 (01b4405)
+- Fix(smoke): #166 Codex P1 采纳——HDROP fWide 写入修正到真实 offset 16 (a2fa547)
+- Fix(reraster): #164 Codex 补审三采纳——keep_zoom 携带重栅(P1)+失败回执退役槽(P2)+kick 有界重试(P2) (6eb0f7b)
+
 ## [0.1.0] - 2026-09-24
 ### Added
 
