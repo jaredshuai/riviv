@@ -1375,7 +1375,11 @@ fn create_stack_with_face(
     } else {
         face
     };
-    match crate::gpu::create(view, crate::gpu::owner_of(view), kind, face) {
+    // #173: seed frame_space with the session's content class — the
+    // pre-first-prepare blank window must answer the synced arm without
+    // a bogus mismatch (create's doc has the full story).
+    let content = current_content_class(state);
+    match crate::gpu::create(view, crate::gpu::owner_of(view), kind, face, content) {
         Ok(pair) => Some(pair),
         Err(e) if face == crate::transform_stage::OutputSurface::AcScRgb => {
             // The D6 surface ratchet: draw-before-present failed at
@@ -1384,9 +1388,13 @@ fn create_stack_with_face(
             state.ac_surface_latched = true;
             eprintln!("riviv: ac surface latched ({e}) - ac arm off for the session");
             identify_output(state);
-            match crate::gpu::create(view, crate::gpu::owner_of(view), kind, {
-                crate::transform_stage::OutputSurface::Legacy
-            }) {
+            match crate::gpu::create(
+                view,
+                crate::gpu::owner_of(view),
+                kind,
+                crate::transform_stage::OutputSurface::Legacy,
+                content,
+            ) {
                 Ok(pair) => Some(pair),
                 Err(e2) => {
                     latch_renderer_fatal(state, e2.to_string());
@@ -9796,7 +9804,7 @@ pub(crate) fn run() -> Result<(), String> {
     // create — a failure means the environment has no D2D renderer at all,
     // so we fatal with the diagnosis string.
     // SAFETY: the read-only borrow ends inside the map.
-    let (request, view_target, startup_face) = (unsafe { state_of(hwnd) })
+    let (request, view_target, startup_face, startup_content) = (unsafe { state_of(hwnd) })
         .map(|state| {
             (
                 state.renderer_forced.unwrap_or(state.config.renderer),
@@ -9805,6 +9813,9 @@ pub(crate) fn run() -> Result<(), String> {
                 // blank display's decision is the legacy face — and the
                 // AC latch cannot have fired yet).
                 desired_output_face(state),
+                // #173: the frame_space seed (Srgb here — nothing has
+                // been decoded yet; create's doc has the full story).
+                current_content_class(state),
             )
         })
         // The fallback mirrors the config default (auto); the path is
@@ -9814,20 +9825,22 @@ pub(crate) fn run() -> Result<(), String> {
             RendererKind::Auto,
             HWND::default(),
             crate::transform_stage::OutputSurface::Legacy,
+            crate::transform_stage::ContentSpace::Srgb,
         ));
     // Startup AC-face creation failure fatals here on purpose (ADR 0001:
     // the startup path has no ratchet behind it — the session has no
     // display history to protect; a mid-session AC failure takes the
     // D6 latch instead).
-    let (stack, effective) = match crate::gpu::create(view_target, hwnd, request, startup_face) {
-        Ok(built) => built,
-        Err(e) => {
-            fatal(&format!(
-                "no D2D renderer available (renderer={}, {e})",
-                request.to_ini()
-            ));
-        }
-    };
+    let (stack, effective) =
+        match crate::gpu::create(view_target, hwnd, request, startup_face, startup_content) {
+            Ok(built) => built,
+            Err(e) => {
+                fatal(&format!(
+                    "no D2D renderer available (renderer={}, {e})",
+                    request.to_ini()
+                ));
+            }
+        };
     // SAFETY: the borrow spans only the field stores; nothing pumps.
     if let Some(state) = unsafe { state_of(hwnd) } {
         state.gpu = Some(stack);

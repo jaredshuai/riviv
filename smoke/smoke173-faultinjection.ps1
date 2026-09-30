@@ -45,10 +45,10 @@
 #       failed upload (the pre-#90 blank-and-wait note in gpu.rs), so the
 #       script supplies the paint pressure the escalation needs; three
 #       consecutive upload failures then feed the device-loss ladder.
-#       NARROW on purpose: on a fresh AC stack a first-prepare failure is
-#       rerouted by the blank path into a display-effect failure (issue
-#       #173's wart), which starves this escalation; the narrow arm's
-#       frame_space matches and the ladder is reachable deterministically.
+#   S7w the same on WIDE wide.png: #173's regression pin - post-fix
+#       (frame_space seeded at create) the escalation fires with ZERO
+#       ac-surface latching; pre-fix evidence: s7-prefix-red.err
+#       (feeding=0 + a bogus ac latch with a "wiring bug" diagnostic).
 #   S3  STRETCH device=6: six ladder lines + backend=warp + the deferred
 #       fatal modal (class #32770) dismissed via GetDlgItem(IDOK=2) +
 #       BM_CLICK (WM_CLOSE fallback); exit code recorded; SKIP when the
@@ -565,34 +565,48 @@ Check 'S6-2 zero output-surface=ac-scrgb lines all session (AC face never built)
 Check 'S6-3 exit 0' ($r6.Code -eq 0) ('exit=' + $r6.Code)
 
 # ---------------------------------------------------------------------------
-# S7: prepare=3 on the NARROW fixture. A static image parks at one failed
-# upload (the pre-#90 blank-and-wait note), so the script drives paint
-# pressure from outside: InvalidateRect on the riviv_view child every
-# 200ms until the escalation line lands. Narrow on purpose - on a fresh
-# AC stack the first prepare failure is rerouted into a display-effect
-# failure (#173's wart), starving this escalation; the narrow arm's
-# frame_space matches the default and the ladder is deterministically
-# reachable. See the S7 block comment up top for the full story.
+# S7 + S7w: the prepare escalation on BOTH fixtures (a static image parks
+# at one failed upload - the pre-#90 blank-and-wait note - so the script
+# drives paint pressure from outside: InvalidateRect on the riviv_view
+# child every 200ms until the escalation line lands).
+#   S7  narrow probe.png: the plain escalation path.
+#   S7w WIDE wide.png: #173's regression pin. Pre-fix (archived
+#       s7-prefix-red.err of the first matrix run) the first prepare
+#       failure on a fresh AC stack was rerouted by the blank path into a
+#       display-effect failure: feeding=0 AND an ac-surface latch with a
+#       bogus "wiring bug" diagnostic. Post-fix (frame_space seeded with
+#       the session's content class at create) the blank draws through
+#       the effect and the escalation fires with ZERO latching.
 # ---------------------------------------------------------------------------
-$sc = Start-Scenario 'prepare=3' ('"' + $Probe + '"') 's7.err' 'probe'
-$view7 = [S173]::FindWindowExW($sc.Main, [IntPtr]::Zero, 'riviv_view', [NullString]::Value)
-$driveDeadline = [DateTime]::UtcNow.AddSeconds(30)
-while ([DateTime]::UtcNow -lt $driveDeadline) {
-    $e7 = Read-Err 's7.err'
-    if ((Get-Lines $e7 'feeding the device-loss ladder').Count -ge 1) { break }
-    if ($sc.P.HasExited) { break }
-    if ($view7 -ne [IntPtr]::Zero) { [void][S173]::InvalidateRect($view7, [IntPtr]::Zero, $false) }
-    Start-Sleep -Milliseconds 200
+$s7cases = @(
+    @{ Name = 'S7';  Fixture = $Probe; Leaf = 'probe'; BanLatch = $false },
+    @{ Name = 'S7w'; Fixture = $Wide;  Leaf = 'wide';  BanLatch = $true }
+)
+foreach ($c7 in $s7cases) {
+    $errName7 = $c7.Name.ToLower() + '.err'
+    $sc = Start-Scenario 'prepare=3' ('"' + $c7.Fixture + '"') $errName7 $c7.Leaf
+    $view7 = [S173]::FindWindowExW($sc.Main, [IntPtr]::Zero, 'riviv_view', [NullString]::Value)
+    $driveDeadline = [DateTime]::UtcNow.AddSeconds(30)
+    while ([DateTime]::UtcNow -lt $driveDeadline) {
+        $e7 = Read-Err $errName7
+        if ((Get-Lines $e7 'feeding the device-loss ladder').Count -ge 1) { break }
+        if ($sc.P.HasExited) { break }
+        if ($view7 -ne [IntPtr]::Zero) { [void][S173]::InvalidateRect($view7, [IntPtr]::Zero, $false) }
+        Start-Sleep -Milliseconds 200
+    }
+    Start-Sleep -Milliseconds 1000
+    $alive7 = Test-Alive $sc.P
+    $r7 = End-Scenario $sc $errName7
+    $err7 = $r7.Err
+    Check ($c7.Name + '-0 paint driver had a view child to press') ($view7 -ne [IntPtr]::Zero) ('view=' + $view7)
+    Check ($c7.Name + '-1 frame upload failed lines == 3') ((Get-Lines $err7 'frame upload failed').Count -eq 3) ("count=" + (Get-Lines $err7 'frame upload failed').Count)
+    Check ($c7.Name + '-2 feeding-the-device-loss-ladder escalation line == 1') ((Get-Lines $err7 'feeding the device-loss ladder').Count -eq 1) ("count=" + (Get-Lines $err7 'feeding the device-loss ladder').Count + " lines=[" + ((Get-Lines $err7 'feeding the device-loss ladder') -join ' | ') + "]")
+    if ($c7.BanLatch) {
+        Check ($c7.Name + '-3 ZERO ac surface latched lines (#173 regression pin: no reroute)') ((Get-Lines $err7 'ac surface latched').Count -eq 0) ("count=" + (Get-Lines $err7 'ac surface latched').Count + " lines=[" + ((Get-Lines $err7 'ac surface latched') -join ' | ') + "]")
+    }
+    Check ($c7.Name + '-4 window alive before close') $alive7 ('alive=' + $alive7)
+    Check ($c7.Name + '-5 exit 0') ($r7.Code -eq 0) ('exit=' + $r7.Code)
 }
-Start-Sleep -Milliseconds 1000
-$alive7 = Test-Alive $sc.P
-$r7 = End-Scenario $sc 's7.err'
-$err7 = $r7.Err
-Check 'S7-0 paint driver had a view child to press' ($view7 -ne [IntPtr]::Zero) ('view=' + $view7)
-Check 'S7-1 frame upload failed lines == 3' ((Get-Lines $err7 'frame upload failed').Count -eq 3) ("count=" + (Get-Lines $err7 'frame upload failed').Count)
-Check 'S7-2 feeding-the-device-loss-ladder escalation line == 1' ((Get-Lines $err7 'feeding the device-loss ladder').Count -eq 1) ("count=" + (Get-Lines $err7 'feeding the device-loss ladder').Count + " lines=[" + ((Get-Lines $err7 'feeding the device-loss ladder') -join ' | ') + "]")
-Check 'S7-3 window alive before close' $alive7 ('alive=' + $alive7)
-Check 'S7-4 exit 0' ($r7.Code -eq 0) ('exit=' + $r7.Code)
 
 # ---------------------------------------------------------------------------
 # S3 STRETCH: device=6 - two same-kind rebuilds, the 3rd escalates to WARP,
@@ -679,7 +693,7 @@ Check 'S9 teardown: stage ini removed, no staged riviv left' ($iniCleaned -and (
 $total = $script:pass + $script:fail
 if ($script:fail -gt 0) {
     Write-Output ('FAILURES: per-scenario stderr follows (archive dir ' + $Stage + ').')
-    foreach ($e in @(@('S0n', (Read-Err 's0n.err')), @('S1', (Read-Err 's1.err')), @('S2', (Read-Err 's2.err')), @('S2b', (Read-Err 's2b.err')), @('S4', (Read-Err 's4.err')), @('S6', (Read-Err 's6.err')), @('S7', (Read-Err 's7.err')), @('S3', (Read-Err 's3.err')))) {
+    foreach ($e in @(@('S0n', (Read-Err 's0n.err')), @('S1', (Read-Err 's1.err')), @('S2', (Read-Err 's2.err')), @('S2b', (Read-Err 's2b.err')), @('S4', (Read-Err 's4.err')), @('S6', (Read-Err 's6.err')), @('S7', (Read-Err 's7.err')), @('S7w', (Read-Err 's7w.err')), @('S3', (Read-Err 's3.err')))) {
         Write-Output ('--- scenario ' + $e[0] + ' stderr ---')
         Write-Output $e[1]
     }
