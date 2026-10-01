@@ -400,13 +400,29 @@ pub(crate) enum UndoDeleteError {
     RestoreFailed(std::io::Error),
 }
 
+/// The `$R` twin's path — the name swap plus the requirement that the
+/// twin actually EXISTS as a file: a ghost `$I` (a failed cleanup after
+/// a successful move) must not win a scan over older complete pairs.
+fn twin_of(i_path: &std::path::Path) -> Option<std::path::PathBuf> {
+    let wide: Vec<u16> = i_path
+        .file_name()
+        .map(|name| name.encode_wide().collect())
+        .unwrap_or_default();
+    let name = r_twin(&wide)?;
+    let twin = i_path.with_file_name(std::ffi::OsString::from_wide(&name));
+    std::fs::metadata(&twin)
+        .is_ok_and(|m| m.is_file())
+        .then_some(twin)
+}
+
 /// Scan one volume's `$Recycle.Bin` for the `$I` whose stored original
 /// path matches, returning it with its `$R` twin. Every owner-SID
 /// subdirectory is scanned (other users' are unreadable by design and
 /// skip silently); among duplicates the NEWEST deletion time wins — a
-/// delete → restore → delete cycle recycles the same path twice, and the
-/// freshest pair is the latest delete's. `volume_root` is a parameter
-/// (not derived here) so tests can point the scan at a fabricated bin.
+/// delete → restore → delete cycle recycles the same path twice, and
+/// the freshest pair is the latest delete's — but only pairs whose
+/// `$R` twin is present compete. `volume_root` is a parameter (not
+/// derived here) so tests can point the scan at a fabricated bin.
 fn find_pair(
     volume_root: &std::path::Path,
     original_path: &[u16],
@@ -436,36 +452,52 @@ fn find_pair(
             if !path_eq_folded(&meta.original_path, original_path) {
                 continue;
             }
+            if twin_of(&path).is_none() {
+                continue; // ghost index — its data half is already gone
+            }
             if best.as_ref().is_none_or(|(t, _)| meta.deleted_at > *t) {
                 best = Some((meta.deleted_at, path));
             }
         }
     }
     let (_, i_path) = best?;
-    let twin = {
-        let wide: Vec<u16> = i_path
-            .file_name()
-            .map(|name| name.encode_wide().collect())
-            .unwrap_or_default();
-        let name = r_twin(&wide)?;
-        i_path.with_file_name(std::ffi::OsString::from_wide(&name))
-    };
+    let twin = twin_of(&i_path)?;
     Some((i_path, twin))
+}
+
+/// The delete-time half of #178's pair binding: identify the `$I` the
+/// shell just wrote for THIS window's delete (called right after
+/// `shell_delete` succeeds, so the newest path match is ours). The undo
+/// prefers this recorded index over a fresh scan, so an EXTERNAL actor
+/// recycling the same path later cannot shadow our pair (its newer
+/// timestamp would win the scan). None = no pair found (bin disabled,
+/// non-volume path) — the undo falls back to the scan, which will find
+/// nothing either.
+pub(crate) fn find_recycle_pair_for(path: &OsStr) -> Option<std::path::PathBuf> {
+    let recorded: Vec<u16> = path.encode_wide().collect();
+    let root = drive_root(&recorded)?;
+    let root = std::path::PathBuf::from(std::ffi::OsString::from_wide(&root));
+    find_pair(&root, &recorded).map(|(i_path, _)| i_path)
 }
 
 /// The restore half of #178's undo-delete: move the `$R` twin back to the
 /// original path and drop the `$I` index. The pair is touched only after
-/// every precondition holds; a failed rename leaves the bin exactly as
-/// it was. Cleaning the `$I` after a successful move is fail-soft — the
+/// every precondition holds; a failed move leaves the bin exactly as it
+/// was. Cleaning the `$I` after a successful move is fail-soft — the
 /// file is already back, and a ghost index at worst shows a broken bin
-/// entry.
-pub(crate) fn recycle_restore(path: &OsStr) -> Result<(), UndoDeleteError> {
+/// entry. `recorded_i` is the delete-time pair capture; when its index
+/// still stands (parses, path-matches, twin present) it wins over the
+/// scan, else the scan answers.
+pub(crate) fn recycle_restore(
+    path: &OsStr,
+    recorded_i: Option<&std::path::Path>,
+) -> Result<(), UndoDeleteError> {
     let recorded: Vec<u16> = path.encode_wide().collect();
     let Some(root) = drive_root(&recorded) else {
         return Err(UndoDeleteError::NoVolumeRoot);
     };
     let root = std::path::PathBuf::from(std::ffi::OsString::from_wide(&root));
-    restore_under(&root, path, &recorded)
+    restore_under(&root, path, &recorded, recorded_i)
 }
 
 /// `recycle_restore` with the volume root supplied — the seam the unit
@@ -474,11 +506,18 @@ fn restore_under(
     root: &std::path::Path,
     path: &OsStr,
     recorded: &[u16],
+    recorded_i: Option<&std::path::Path>,
 ) -> Result<(), UndoDeleteError> {
     if std::path::Path::new(path).exists() {
         return Err(UndoDeleteError::TargetExists);
     }
-    let Some((i_path, r_path)) = find_pair(root, recorded) else {
+    let recorded_pair = recorded_i.and_then(|i| {
+        let meta = std::fs::read(i).ok().and_then(|b| parse_i_file(&b))?;
+        path_eq_folded(&meta.original_path, recorded)
+            .then(|| twin_of(i).map(|twin| (i.to_path_buf(), twin)))
+            .flatten()
+    });
+    let Some((i_path, r_path)) = recorded_pair.or_else(|| find_pair(root, recorded)) else {
         return Err(UndoDeleteError::NotInBin);
     };
     // The move itself carries the no-overwrite promise: MoveFileExW with
@@ -500,15 +539,24 @@ fn restore_under(
         )
     };
     if let Err(err) = moved {
-        if err.code().0 == ERROR_ALREADY_EXISTS.0 as i32
-            || err.code().0 == ERROR_FILE_EXISTS.0 as i32
-        {
+        if is_target_exists(&err) {
             return Err(UndoDeleteError::TargetExists);
         }
         return Err(UndoDeleteError::RestoreFailed(std::io::Error::other(err)));
     }
     let _ = std::fs::remove_file(&i_path);
     Ok(())
+}
+
+/// A refused MoveFileExW means "target exists" exactly when the OS error
+/// is ERROR_ALREADY_EXISTS / ERROR_FILE_EXISTS. Compared as HRESULTs —
+/// the API reports errors through HRESULT_FROM_WIN32 (0x8007xxxx), so a
+/// raw number compare against the bare error code never fires (Codex
+/// #179 P2).
+fn is_target_exists(err: &windows::core::Error) -> bool {
+    let code = err.code();
+    code == windows::core::HRESULT::from_win32(ERROR_ALREADY_EXISTS.0)
+        || code == windows::core::HRESULT::from_win32(ERROR_FILE_EXISTS.0)
 }
 
 #[cfg(test)]
@@ -761,6 +809,10 @@ mod tests {
         drop_i(&root, "S-1-5-21-a", "$IOLD1.png", r"D:\pics\a.png", 100);
         drop_i(&root, "S-1-5-21-b", "$INEW1.png", r"d:\PICS\A.png", 200);
         drop_i(&root, "S-1-5-21-a", "$IOTH.png", r"D:\pics\other.png", 300);
+        // The ghost filter (twin must exist) applies to path matches —
+        // write both matching pairs' data twins.
+        std::fs::write(root.join("$Recycle.Bin/S-1-5-21-a/$ROLD1.png"), b"old").unwrap();
+        std::fs::write(root.join("$Recycle.Bin/S-1-5-21-b/$RNEW1.png"), b"new").unwrap();
         let victim: Vec<u16> = OsStr::new(r"D:\pics\a.png").encode_wide().collect();
         let (i_path, r_path) = find_pair(&root, &victim).expect("a match exists");
         assert_eq!(i_path, root.join("$Recycle.Bin/S-1-5-21-b/$INEW1.png"));
@@ -782,7 +834,7 @@ mod tests {
         .unwrap();
         drop_i(&root, "S-1-5-21-a", "$I2222.png", r"D:\pics\a.png", 50);
         let recorded: Vec<u16> = OsStr::new(r"D:\pics\a.png").encode_wide().collect();
-        restore_under(&root, target.as_os_str(), &recorded).expect("restore succeeds");
+        restore_under(&root, target.as_os_str(), &recorded, None).expect("restore succeeds");
         assert_eq!(std::fs::read(&target).unwrap(), b"recycled bytes");
         assert!(!root.join("$Recycle.Bin/S-1-5-21-a/$R2222.png").exists());
         assert!(!root.join("$Recycle.Bin/S-1-5-21-a/$I2222.png").exists());
@@ -797,7 +849,7 @@ mod tests {
         drop_i(&root, "S-1-5-21-a", "$I3333.png", r"D:\a.png", 50);
         std::fs::write(root.join("$Recycle.Bin/S-1-5-21-a/$R3333.png"), b"old").unwrap();
         let recorded: Vec<u16> = OsStr::new(r"D:\a.png").encode_wide().collect();
-        match restore_under(&root, target.as_os_str(), &recorded) {
+        match restore_under(&root, target.as_os_str(), &recorded, None) {
             Err(UndoDeleteError::TargetExists) => {}
             other => panic!("expected TargetExists, got {:?}", other),
         }
@@ -807,7 +859,7 @@ mod tests {
         assert_eq!(std::fs::read(&target).unwrap(), b"new occupant");
         // A recorded path with no pair at all → NotInBin.
         let never: Vec<u16> = OsStr::new(r"D:\never.png").encode_wide().collect();
-        match restore_under(&root, root.join("absent.png").as_os_str(), &never) {
+        match restore_under(&root, root.join("absent.png").as_os_str(), &never, None) {
             Err(UndoDeleteError::NotInBin) => {}
             other => panic!("expected NotInBin, got {:?}", other),
         }
@@ -816,9 +868,83 @@ mod tests {
 
     #[test]
     fn recycle_restore_refuses_paths_without_a_volume_root() {
-        match recycle_restore(OsStr::new(r"\\srv\share\a.png")) {
+        match recycle_restore(OsStr::new(r"\\srv\share\a.png"), None) {
             Err(UndoDeleteError::NoVolumeRoot) => {}
             other => panic!("expected NoVolumeRoot, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn find_pair_skips_ghost_indexes_whose_twin_is_gone() {
+        // The NEWEST pair for the path carries no `$R` (a ghost from a
+        // failed cleanup); the scan must fall to the older COMPLETE pair
+        // instead of returning an un-restorable winner (Codex/cubic
+        // #179 P2).
+        let root = fake_bin("ghost");
+        drop_i(&root, "S-1-5-21-a", "$IGHOST.png", r"D:\pics\a.png", 300);
+        // No $R twin written — the index is a ghost.
+        drop_i(&root, "S-1-5-21-b", "$ILIVE.png", r"D:\pics\a.png", 100);
+        std::fs::write(root.join("$Recycle.Bin/S-1-5-21-b/$RLIVE.png"), b"alive").unwrap();
+        let victim: Vec<u16> = OsStr::new(r"D:\pics\a.png").encode_wide().collect();
+        let (i_path, r_path) = find_pair(&root, &victim).expect("the complete pair wins");
+        assert_eq!(i_path, root.join("$Recycle.Bin/S-1-5-21-b/$ILIVE.png"));
+        assert_eq!(r_path, root.join("$Recycle.Bin/S-1-5-21-b/$RLIVE.png"));
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[test]
+    fn the_recorded_pair_wins_over_a_newer_scan_match() {
+        // Pair binding (cubic #179 P2): the delete-time `$I` capture is
+        // the identity — an external recycle of the same path (newer
+        // FILETIME, different contents) must not shadow it. And a
+        // recorded GHOST falls back to the scan.
+        let root = fake_bin("binding");
+        drop_i(&root, "S-1-5-21-a", "$IOLD.png", r"D:\pics\a.png", 100);
+        std::fs::write(root.join("$Recycle.Bin/S-1-5-21-a/$ROLD.png"), b"ours").unwrap();
+        drop_i(&root, "S-1-5-21-b", "$INEW.png", r"D:\pics\a.png", 200);
+        std::fs::write(root.join("$Recycle.Bin/S-1-5-21-b/$RNEW.png"), b"foreign").unwrap();
+        let target = root.join("out.png");
+        let recorded: Vec<u16> = OsStr::new(r"D:\pics\a.png").encode_wide().collect();
+        // Recorded identity restores OUR bytes, not the newer foreign
+        // pair the scan alone would pick.
+        restore_under(
+            &root,
+            target.as_os_str(),
+            &recorded,
+            Some(&root.join("$Recycle.Bin/S-1-5-21-a/$IOLD.png")),
+        )
+        .expect("restore succeeds");
+        assert_eq!(std::fs::read(&target).unwrap(), b"ours");
+        // A recorded ghost (its $R already gone) falls back to the scan.
+        std::fs::remove_file(&target).unwrap();
+        drop_i(&root, "S-1-5-21-a", "$IGHOST2.png", r"D:\pics\a.png", 400);
+        restore_under(
+            &root,
+            target.as_os_str(),
+            &recorded,
+            Some(&root.join("$Recycle.Bin/S-1-5-21-a/$IGHOST2.png")),
+        )
+        .expect("fallback scan answers");
+        // The scan picks the newest COMPLETE pair: foreign (t=200) over
+        // ours (t=100) — the binding's absence is exactly the corner
+        // the capture exists to close.
+        assert_eq!(std::fs::read(&target).unwrap(), b"foreign");
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[test]
+    fn target_exists_recognizes_the_win32_error_codes_through_hresult() {
+        // The API reports errors as HRESULT_FROM_WIN32 (0x8007xxxx) — a
+        // raw number compare never fires (Codex #179 P2).
+        let as_error = |code: u32| {
+            windows::core::Error::from_hresult(windows::core::HRESULT::from_win32(code))
+        };
+        assert!(is_target_exists(&as_error(183))); // ERROR_ALREADY_EXISTS
+        assert!(is_target_exists(&as_error(80))); // ERROR_FILE_EXISTS
+        assert!(!is_target_exists(&as_error(5))); // ERROR_ACCESS_DENIED
+        // A non-win32 HRESULT carries no win32 code — not "exists".
+        let non_win32 =
+            windows::core::Error::from_hresult(windows::core::HRESULT(0x8000_FFFF_u32 as i32));
+        assert!(!is_target_exists(&non_win32));
     }
 }

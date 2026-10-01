@@ -40,7 +40,14 @@
 #   S5  NavNext -> b.png; id 13 + Yes: b.png recycled; squatter new
 #       b.png bytes + id 122: restore refused (new bytes intact, title
 #       stays a.png); squatter removed + id 122 retry: ORIGINAL b.png
-#       bytes back, title b.png
+#       bytes back, title b.png; THEN the record-retirement proof
+#       (review round 2, item 4, folded into S5's tally because its
+#       recycled victim is the b.png S5 just restored): recycle b
+#       (fresh record) -> permanent a (retires it) -> id 122 no-op,
+#       b.png stays in the bin (fixture gains d.png as the scan-arm
+#       landing pad; the stranded pair is name-scoped-cleaned at
+#       teardown and a.png is recreated from the deterministic writer
+#       for launch 2)
 #   S6  (launch 2) id 122 right after the direct-open adopt: no-op -
 #       title unchanged, a.png intact, process alive
 #   S7  WM_INITMENU -> GetMenuState(122) is MF_GRAYED; id 13 + Yes ->
@@ -174,7 +181,8 @@ $Fx = Join-Path $Stage 'fx'
 $Afx = Join-Path $Fx 'a.png'
 $Bfx = Join-Path $Fx 'b.png'
 $Cfx = Join-Path $Fx 'c.png'
-$Ini = 'D:\codespace\riviv\target\release\riviv.ini'
+$Dfx = Join-Path $Fx 'd.png'
+$Ini = Join-Path (Split-Path $Exe -Parent) 'riviv.ini'
 $LogPath = Join-Path $Stage 'smoke178-run1.log'
 
 # ---------------------------------------------------------------------------
@@ -277,6 +285,18 @@ function Wait-TitleLacks($main, $leaf, $ms) {
         Start-Sleep -Milliseconds 100
     }
     return -not (Get-Title $main).Contains($leaf)
+}
+function Wait-TitleStays($main, $baseline, $ms) {
+    # No-op guard (review round 2, item 3): the title must EQUAL the
+    # baseline THROUGHOUT the window - any flip (to b.png, c.png, the app
+    # name, anything) fails it, closing the "flipped elsewhere but the
+    # lacks-check passed" hole.
+    $deadline = [DateTime]::UtcNow.AddMilliseconds($ms)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        if ((Get-Title $main) -ne $baseline) { return $false }
+        Start-Sleep -Milliseconds 100
+    }
+    return ((Get-Title $main) -eq $baseline)
 }
 function Post-Cmd($main, $id) {
     # WM_COMMAND(wParam = command id, lParam = 0) to the owner main window.
@@ -403,14 +423,54 @@ function Wait-Menu122Enabled($main, $ms) {
     $ok = Wait-Until { $s = Menu-State122 $main; (($s -ne [uint32]4294967295) -and (($s -band [uint32]1) -eq 0)) } $ms
     return @{ Ok = $ok; State = (Menu-State122 $main) }
 }
+function Clean-FxPairs {
+    # Targeted recycle-bin residue cleanup (review round 2 companion to
+    # S4x, which strands one pair ON PURPOSE): delete ONLY the $I/$R pairs
+    # whose stored original path sits INSIDE our fx directory (byte-needle
+    # = fx dir path + backslash, so nothing outside fx can match). The
+    # SHEmptyRecycleBin family stays absolutely banned; a deletion that
+    # fails is reported, never retried with force beyond -Force.
+    # Returns a @{ Cleaned = names; Failed = names } report.
+    $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $dir = Join-Path 'C:\' '$Recycle.Bin'
+    $dir = Join-Path $dir $sid
+    $report = @{ Cleaned = @(); Failed = @() }
+    if (-not (Test-Path $dir)) { return $report }
+    $needle = [System.Text.Encoding]::Unicode.GetBytes($Fx + '\')
+    $names = @()
+    Get-ChildItem $dir -Force -Filter '$I*' -ErrorAction SilentlyContinue | ForEach-Object {
+        $b = [IO.File]::ReadAllBytes($_.FullName)
+        for ($i = 0; $i -le $b.Length - $needle.Length; $i++) {
+            $m = $true
+            for ($j = 0; $j -lt $needle.Length; $j++) { if ($b[$i + $j] -ne $needle[$j]) { $m = $false; break } }
+            if ($m) { $names += $_.Name; $names += ('$R' + $_.Name.Substring(2)); break }
+        }
+    }
+    foreach ($n in $names) {
+        $p = Join-Path $dir $n
+        try {
+            Remove-Item -LiteralPath $p -Force -ErrorAction Stop
+            $report.Cleaned += $n
+        } catch {
+            $report.Failed += $n
+            Write-Host ('  [teardown.bin] could not delete ' + $n + ': ' + $_.Exception.Message)
+        }
+    }
+    return $report
+}
 
 [void][S178]::SetProcessDPIAware()
 
 # ---------------------------------------------------------------------------
-# Fixtures: 8x8 solid PNGs, three distinct colors, mtimes staged
-# c -> (1.1s) -> b -> (1.1s) -> a so DateModified-descending nav order is
-# a, b, c. Original byte hashes recorded for the byte-identity assertions.
+# Fixtures: 8x8 solid PNGs, four distinct colors, mtimes staged
+# d -> c -> (1.1s) -> b -> (1.1s) -> a so DateModified-descending nav order
+# over the launched a,b,c is a, b, c (d is the OLDEST - it exists on disk
+# from the start but is NOT in the launch playlist; only S4x's scan-arm
+# landing ever reaches it). Original byte hashes recorded for the
+# byte-identity assertions.
 # ---------------------------------------------------------------------------
+[S178]::WritePng8($Dfx, 30, 220, 220)   # cyan
+Start-Sleep -Milliseconds 1100
 [S178]::WritePng8($Cfx, 30, 30, 220)    # blue
 Start-Sleep -Milliseconds 1100
 [S178]::WritePng8($Bfx, 30, 220, 30)    # green
@@ -419,13 +479,16 @@ Start-Sleep -Milliseconds 1100
 $ma = (Get-Item $Afx).LastWriteTimeUtc
 $mb = (Get-Item $Bfx).LastWriteTimeUtc
 $mc = (Get-Item $Cfx).LastWriteTimeUtc
+$md = (Get-Item $Dfx).LastWriteTimeUtc
 $hA0 = Hash-Of $Afx
 $hB0 = Hash-Of $Bfx
 $hC0 = Hash-Of $Cfx
-$fixtureOk = ($ma -gt $mb) -and ($mb -gt $mc) -and
-    (($hA0 -ne $hB0) -and ($hB0 -ne $hC0) -and ($hA0 -ne $hC0))
-Write-Host ('  [fixtures] ok=' + $fixtureOk + ' mtimes a>b,c: ' + $ma.ToString('HH:mm:ss.fff') + ' / ' + $mb.ToString('HH:mm:ss.fff') + ' / ' + $mc.ToString('HH:mm:ss.fff'))
-Write-Host ('  [fixtures] sha256 a=' + $hA0 + ' b=' + $hB0 + ' c=' + $hC0)
+$hD0 = Hash-Of $Dfx
+$hashes = @($hA0, $hB0, $hC0, $hD0)
+$fixtureOk = ($ma -gt $mb) -and ($mb -gt $mc) -and ($mc -gt $md) -and
+    (((($hashes | Select-Object -Unique)).Count) -eq 4)
+Write-Host ('  [fixtures] ok=' + $fixtureOk + ' mtimes a>b>c>d: ' + $ma.ToString('HH:mm:ss.fff') + ' / ' + $mb.ToString('HH:mm:ss.fff') + ' / ' + $mc.ToString('HH:mm:ss.fff') + ' / ' + $md.ToString('HH:mm:ss.fff'))
+Write-Host ('  [fixtures] sha256 a=' + $hA0 + ' b=' + $hB0 + ' c=' + $hC0 + ' d=' + $hD0)
 if (-not $fixtureOk) {
     Write-Output 'FIXTURES: FAIL - mtime order or byte distinctness broken; matrix aborted.'
     Stop-Log
@@ -475,18 +538,18 @@ if ($ok1) {
 }
 $aGone1 = $false
 if ($ok1) {
-    $aGone1 = Wait-FileState $Afx $false 10000
+    $aGone1 = Wait-FileState $Afx $false 30000
     Det 'S1.file' $aGone1 ('a.png gone from disk: ' + (-not (Test-Path $Afx)))
     if (-not $aGone1) { $ok1 = $false; $ev1 = 'a.png still on disk 10s after the delete' }
+    else { [void]$script:binOutstanding.Add('a.png') }   # residue registered the moment the recycle is confirmed
 }
 $t1 = ''
 if ($ok1) {
-    $t1 = Wait-TitleHas $main1 'b.png' 10000
+    $t1 = Wait-TitleHas $main1 'b.png' 30000
     Det 'S1.title' $t1 ('title=[' + (Get-Title $main1) + ']')
     if (-not $t1) { $ok1 = $false; $ev1 = 'title never showed b.png (actual: [' + (Get-Title $main1) + '])' }
 }
 if ($ok1) {
-    if ($aGone1) { $script:binOutstanding.Add('a.png') }
     $ev1 = 'a.png recycled (title=[' + (Get-Title $main1) + '])'
     if ($d1.AutoNoDialog) { $ev1 = 'ANOMALY no-confirm-dialog but ' + $ev1 }
 }
@@ -501,7 +564,7 @@ $ev2 = ''
 $aBack2 = $false
 if ($ok2) {
     Post-Cmd $main1 122
-    $aBack2 = Wait-Until { (Test-Path $Afx) -and ((Hash-Of $Afx) -eq $hA0) } 10000
+    $aBack2 = Wait-Until { (Test-Path $Afx) -and ((Hash-Of $Afx) -eq $hA0) } 30000
     Det 'S2.file' $aBack2 ('a.png back, hash==' + $aBack2 + ' sha256=' + (Hash-Of $Afx))
     if (-not $aBack2) { $ok2 = $false; $ev2 = 'a.png not restored byte-identical within 10s (exists=' + (Test-Path $Afx) + ')' }
 }
@@ -534,11 +597,12 @@ Emit-S 'S2' $ok2 $ev2
 $ok3 = $ok2
 $ev3 = 'cascade: S2 red (a.png left in the recycle bin by the failed restore)'
 if ($ok3) {
+    $t3a = Get-Title $main1
     Post-Cmd $main1 122
-    Start-Sleep -Milliseconds 800
-    $stillA = Wait-TitleLacks $main1 'b.png' 2000   # any flip to b/c = the no-op lied
-    Det 'S3.title' $stillA ('title after consumed undo=[' + (Get-Title $main1) + ']')
-    if (-not $stillA) { $ok3 = $false; $ev3 = 'second 122 changed the display (title=[' + (Get-Title $main1) + '])' }
+    Start-Sleep -Milliseconds 500
+    $stillA = Wait-TitleStays $main1 $t3a 2000   # ANY flip (b/c/blank) within the window = the no-op lied
+    Det 'S3.title' $stillA ('title before=[' + $t3a + '] stays=[' + (Get-Title $main1) + ']')
+    if (-not $stillA) { $ok3 = $false; $ev3 = 'second 122 changed the display: [' + $t3a + '] -> [' + (Get-Title $main1) + ']' }
 }
 $f3 = $false
 if ($ok3) {
@@ -590,13 +654,13 @@ if ($ok4) {
 }
 $cGone4 = $false
 if ($ok4) {
-    $cGone4 = Wait-FileState $Cfx $false 10000
+    $cGone4 = Wait-FileState $Cfx $false 30000
     Det 'S4.file' $cGone4 ('c.png permanently gone: ' + (-not (Test-Path $Cfx)))
     if (-not $cGone4) { $ok4 = $false; $ev4 = 'c.png still on disk 10s after permanent delete' }
 }
 $t4 = $false
 if ($ok4) {
-    $t4 = (Wait-TitleHas $main1 'a.png' 10000) -and (Wait-TitleLacks $main1 'c.png' 1000)
+    $t4 = (Wait-TitleHas $main1 'a.png' 30000) -and (Wait-TitleLacks $main1 'c.png' 1000)
     Det 'S4.title' $t4 ('title wrapped to=[' + (Get-Title $main1) + ']')
     if (-not $t4) { $ok4 = $false; $ev4 = 'title did not wrap to a.png after deleting c (actual: [' + (Get-Title $main1) + '])' }
 }
@@ -636,14 +700,14 @@ if ($ok5) {
     }
 }
 if ($ok5) {
-    $bGone5 = Wait-FileState $Bfx $false 10000
+    $bGone5 = Wait-FileState $Bfx $false 30000
     Det 'S5.file' $bGone5 ('b.png recycled: ' + (-not (Test-Path $Bfx)))
     if (-not $bGone5) { $ok5 = $false; $ev5 = 'b.png still on disk 10s after the delete' }
 }
 $t5 = $false
 if ($ok5) {
     if ($bGone5) { $script:binOutstanding.Add('b.png') }
-    $t5 = Wait-TitleHas $main1 'a.png' 10000
+    $t5 = Wait-TitleHas $main1 'a.png' 30000
     Det 'S5.title' $t5 ('title=[' + (Get-Title $main1) + ']')
     if (-not $t5) { $ok5 = $false; $ev5 = 'title did not fall back to a.png (actual: [' + (Get-Title $main1) + '])' }
 }
@@ -654,17 +718,27 @@ if ($ok5) {
     [S178]::WritePng8($Bfx, 220, 30, 220)
     $hBNew = Hash-Of $Bfx
     Write-Host ('  [S5.squatter] new b.png sha256=' + $hBNew)
+    # Refuse window (review round 2, items 3+5): poll the WHOLE window
+    # checking BOTH the title stays exactly the baseline AND the squatter
+    # bytes stay unperturbed - any deviation on either axis is red.
+    $t5base = Get-Title $main1
     Post-Cmd $main1 122
-    Start-Sleep -Milliseconds 800
-    $refused5 = ((Hash-Of $Bfx) -eq $hBNew) -and (Wait-TitleLacks $main1 'b.png' 2000)
-    Det 'S5.refuse' $refused5 ('squatter intact=' + ((Hash-Of $Bfx) -eq $hBNew) + ' title=[' + (Get-Title $main1) + ']')
-    if (-not $refused5) { $ok5 = $false; $ev5 = 'undo OVERWROTE the squatter or switched the display (title=[' + (Get-Title $main1) + '])' }
+    $refused5 = $true
+    $refuseWhy = ''
+    $dlRefuse = [DateTime]::UtcNow.AddMilliseconds(2000)
+    while ([DateTime]::UtcNow -lt $dlRefuse) {
+        Start-Sleep -Milliseconds 100
+        if ((Get-Title $main1) -ne $t5base) { $refused5 = $false; $refuseWhy = 'title changed during the refuse window'; break }
+        if ((Hash-Of $Bfx) -ne $hBNew) { $refused5 = $false; $refuseWhy = 'squatter bytes perturbed during the refuse window'; break }
+    }
+    Det 'S5.refuse' $refused5 ('squatter intact=' + ((Hash-Of $Bfx) -eq $hBNew) + ' title=[' + (Get-Title $main1) + ']' + $(if ($refuseWhy -ne '') { ' why=' + $refuseWhy } else { '' }))
+    if (-not $refused5) { $ok5 = $false; $ev5 = 'undo OVERWROTE the squatter or switched the display (' + $refuseWhy + '; title=[' + (Get-Title $main1) + '])' }
     if ($refused5) {
         # Remove the obstruction (never was in the bin - direct delete).
         Remove-Item $Bfx -Force
         Start-Sleep -Milliseconds 200
         Post-Cmd $main1 122   # the task-prescribed RETRY undo (record survives the refusal)
-        $retry5 = Wait-Until { (Test-Path $Bfx) -and ((Hash-Of $Bfx) -eq $hB0) } 10000
+        $retry5 = Wait-Until { (Test-Path $Bfx) -and ((Hash-Of $Bfx) -eq $hB0) } 30000
         Det 'S5.retry' $retry5 ('retry restore: b.png sha256=' + (Hash-Of $Bfx))
         if (-not $retry5) { $ok5 = $false; $ev5 = 'retry undo did not restore the ORIGINAL b.png bytes (exists=' + (Test-Path $Bfx) + ')' }
         else {
@@ -676,9 +750,84 @@ if ($ok5) {
     }
 }
 if ($ok5) { $ev5 = 'refuse+retry both correct (squatter untouched, then ORIGINAL bytes back, title=[' + (Get-Title $main1) + '])' }
+
+# ---------------------------------------------------------------------------
+# S4x (folds into S5's tally; review round 2, item 4; the choreography MUST
+# follow S5 because its recycled victim is the b.png that S5 just restored):
+# DIRECT evidence that a permanent delete RETIRES the undo record.
+#   recycle-delete b (current, fresh record) -> permanent-delete a (retires
+#   it) -> id 122 must be a no-op and b.png stays in the bin.
+# d.png (fixture-time, oldest, NOT a playlist member) is the scan-arm
+# landing pad once the playlist empties. The stranded b.png pair is
+# name-scoped-cleaned at teardown; a.png (the PERMANENT victim - no bin
+# pair involved) is recreated from the deterministic writer for launch 2.
+# ---------------------------------------------------------------------------
+if ($ok5) {
+    Post-Cmd $main1 13   # recycle b (current) -> NEW undo record
+    $d1x = Invoke-ConfirmYes $p1.Id $Bfx 10000
+    Det 'S4x.dlg1' ($d1x.Dlg -ne [IntPtr]::Zero -or $d1x.AutoNoDialog) ('recycle b: dlg=' + $d1x.Dlg + ' yesClicked=' + $d1x.YesClicked + ' gone=' + $d1x.Gone + ' autoNoDialog=' + $d1x.AutoNoDialog)
+    if ($d1x.Children -ne '') { Write-Host ('  [S4x.dlg1 children] ' + $d1x.Children) }
+    if ($d1x.Dlg -ne [IntPtr]::Zero) {
+        if (-not $d1x.Gone) { $ok5 = $false; $ev5 = 'S4x: recycle confirm dialog refused to dismiss' }
+    } elseif (-not $d1x.AutoNoDialog) { $ok5 = $false; $ev5 = 'S4x: no confirm dialog and b.png still on disk' }
+}
+$bxGone = $false
+if ($ok5) {
+    $bxGone = Wait-FileState $Bfx $false 30000
+    if ($bxGone) { [void]$script:binOutstanding.Add('b.png') }   # stranded on purpose - teardown cleans it
+    Det 'S4x.file' $bxGone ('b.png recycled (fresh record): ' + (-not (Test-Path $Bfx)))
+    if (-not $bxGone) { $ok5 = $false; $ev5 = 'S4x: b.png still on disk after the recycle delete' }
+}
+if ($ok5) {
+    $n4x = Wait-TitleHas $main1 'a.png' 30000
+    Det 'S4x.nav' $n4x ('after recycle-b title=[' + (Get-Title $main1) + ']')
+    if (-not $n4x) { $ok5 = $false; $ev5 = 'S4x: nav after recycle-b did not reach a.png (actual: [' + (Get-Title $main1) + '])' }
+}
+if ($ok5) {
+    Post-Cmd $main1 14   # permanent a -> record RETIRED
+    $d2x = Invoke-ConfirmYes $p1.Id $Afx 10000
+    Det 'S4x.dlg2' ($d2x.Dlg -ne [IntPtr]::Zero -or $d2x.AutoNoDialog) ('permanent a: dlg=' + $d2x.Dlg + ' yesClicked=' + $d2x.YesClicked + ' gone=' + $d2x.Gone + ' autoNoDialog=' + $d2x.AutoNoDialog)
+    if ($d2x.Children -ne '') { Write-Host ('  [S4x.dlg2 children] ' + $d2x.Children) }
+    if ($d2x.Dlg -ne [IntPtr]::Zero) {
+        if (-not $d2x.Gone) { $ok5 = $false; $ev5 = 'S4x: permanent confirm dialog refused to dismiss' }
+    } elseif (-not $d2x.AutoNoDialog) { $ok5 = $false; $ev5 = 'S4x: no confirm dialog and a.png still on disk' }
+}
+$axGone = $false
+if ($ok5) {
+    $axGone = Wait-FileState $Afx $false 30000
+    Det 'S4x.file2' $axGone ('a.png permanently gone: ' + (-not (Test-Path $Afx)))
+    if (-not $axGone) { $ok5 = $false; $ev5 = 'S4x: a.png still on disk after the permanent delete' }
+}
+if ($ok5) {
+    $n4xb = Wait-TitleHas $main1 'd.png' 30000   # empty playlist -> live folder scan lands on d
+    Det 'S4x.nav2' $n4xb ('after permanent-a title=[' + (Get-Title $main1) + ']')
+    if (-not $n4xb) { $ok5 = $false; $ev5 = 'S4x: nav after permanent-a did not reach d.png (actual: [' + (Get-Title $main1) + '])' }
+}
+if ($ok5) {
+    $t5xa = Get-Title $main1
+    Post-Cmd $main1 122   # record retired -> no-op; b.png must STAY in the bin
+    Start-Sleep -Milliseconds 500
+    $noop4x = Wait-TitleStays $main1 $t5xa 2000
+    Det 'S4x.noop' $noop4x ('title before=[' + $t5xa + '] stays=[' + (Get-Title $main1) + ']')
+    if (-not $noop4x) { $ok5 = $false; $ev5 = 'S4x: 122 after retirement changed the display: [' + $t5xa + '] -> [' + (Get-Title $main1) + ']' }
+}
+if ($ok5) {
+    $u4x = (-not (Test-Path $Bfx)) -and (-not (Wait-TitleHas $main1 'b.png' 1000))
+    Det 'S4x.norestore' $u4x ('retired-record 122 restored nothing: b.png exists=' + (Test-Path $Bfx) + ' title=[' + (Get-Title $main1) + ']')
+    if (-not $u4x) { $ok5 = $false; $ev5 = 'S4x: 122 restored the RECYCLED file after a retirement (b.png exists=' + (Test-Path $Bfx) + ')' }
+}
+# Deterministic recreation of a.png for launch 2 (same writer, same args =
+# byte-identical original; a was the PERMANENT victim - no bin pair).
+# UNCONDITIONAL fixture management: even a red S4x must not cascade-blind
+# launch 2. The stranded b.png pair goes at teardown.
+[S178]::WritePng8($Afx, 220, 30, 30)
+if ($ok5) {
+    $ev5 = 'refuse+retry + retirement proof (recycle b -> permanent a -> 122 no-op, title=[' + (Get-Title $main1) + '], b.png left in bin, cleaned at teardown)'
+}
 Emit-S 'S5' $ok5 $ev5
 
-# Launch 1 teardown: WM_CLOSE, poll exit.
+# Launch 1 teardown: WM_CLOSE, poll exit. A forced kill or an abnormal
+# exit code is a FAIL tally (review round 2, item 6) - never a silent note.
 if ($main1 -ne [IntPtr]::Zero) { [void][S178]::PostMessage($main1, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero) }
 $code1 = Wait-Exit $p1 30000
 if ($code1 -eq $null) {
@@ -686,6 +835,14 @@ if ($code1 -eq $null) {
     Stop-Process -Id $p1.Id -Force -ErrorAction SilentlyContinue
     $p1.WaitForExit(3000) | Out-Null
     $exitNote1 = 'FORCE-KILLED'
+    $script:fail++
+    $script:total++
+    Det 'launch1.close' $false 'forced kill after 30s'
+} elseif ($code1 -ne 0) {
+    $exitNote1 = 'exit=' + $code1
+    $script:fail++
+    $script:total++
+    Det 'launch1.close' $false ('abnormal exit code ' + $code1)
 } else { $exitNote1 = 'exit=' + $code1 }
 Write-Host ('  [launch1] closed: ' + $exitNote1)
 
@@ -700,6 +857,7 @@ Write-Host ('  [launch1] closed: ' + $exitNote1)
 # ===========================================================================
 Remove-Item $Bfx -Force -ErrorAction SilentlyContinue
 Remove-Item $Cfx -Force -ErrorAction SilentlyContinue
+Remove-Item $Dfx -Force -ErrorAction SilentlyContinue
 $p2 = Start-Riv ('"' + $Afx + '"') 'launch2.err'
 $main2 = Wait-Main $p2
 $adopt2 = Wait-TitleHas $main2 'a.png' 15000
@@ -765,27 +923,44 @@ if ($ok7) {
 }
 $t7a = $false
 if ($ok7) {
-    $aGone7 = Wait-FileState $Afx $false 10000
+    $aGone7 = Wait-FileState $Afx $false 30000
     Det 'S7.file' $aGone7 ('a.png recycled: ' + (-not (Test-Path $Afx)))
     if (-not $aGone7) { $ok7 = $false; $ev7 = 'a.png still on disk 10s after the delete' }
+    else { [void]$script:binOutstanding.Add('a.png') }   # residue registered the moment the recycle is confirmed
 }
 if ($ok7) {
-    if ($aGone7) { $script:binOutstanding.Add('a.png') }
     # Blank display: the title drops the filename clause (app name only).
-    $t7a = Wait-TitleLacks $main2 'a.png' 10000
+    $t7a = Wait-TitleLacks $main2 'a.png' 30000
     Det 'S7.blank' $t7a ('blanked title=[' + (Get-Title $main2) + ']')
-    if (-not $t7a) { $ok7 = $false; $ev7 = 'title still shows a.png after deleting the only file (actual: [' + (Get-Title $main2) + '])' }
+    if (-not $t7a) {
+        $ok7 = $false; $ev7 = 'title still shows a.png after deleting the only file (actual: [' + (Get-Title $main2) + '])'
+        # Extended diagnostic observation (EVIDENCE ONLY - the 10s contract
+        # already failed): tick the title and count ANY #32770 of the pid.
+        # A lingering shell progress dialog (no Yes button - invisible to
+        # the confirm ladder) would stall the handler's nav/blank tail.
+        Write-Host '  [S7.blank-diag] extended 15s observation:'
+        $diagDeadline = [DateTime]::UtcNow.AddMilliseconds(15000)
+        while ([DateTime]::UtcNow -lt $diagDeadline) {
+            Start-Sleep -Milliseconds 500
+            $dlgsDiag = Find-OwnDialogs $p2.Id
+            Write-Host ('    title=[' + (Get-Title $main2) + '] aExists=' + (Test-Path $Afx) + ' dlgCount=' + $dlgsDiag.Count)
+            if (-not (Get-Title $main2).Contains('a.png')) { break }
+        }
+    }
 }
 $g2 = $false; $st2 = $u32max
-if ($ok7) {
+if ($ok6) {
+    # NOT gated on the blank check (evidence independence): the graying
+    # flip reads the RECORD state, which exists no matter what the title
+    # did.
     $r2m = Wait-Menu122Enabled $main2 5000
     $g2 = $r2m.Ok; $st2 = $r2m.State
     Det 'S7.enable' $g2 ('GetMenuState(122)=0x' + $st2.ToString('X') + ' after the delete (not grayed)')
     if (-not $g2) { $ok7 = $false; $ev7 = 'id 122 still grayed WITH an undo record standing (state=0x' + $st2.ToString('X') + ')' }
 }
-if ($ok7) {
+if ($ok6) {
     Post-Cmd $main2 122
-    $r7 = Wait-Until { (Test-Path $Afx) -and ((Hash-Of $Afx) -eq $hA0) } 10000
+    $r7 = Wait-Until { (Test-Path $Afx) -and ((Hash-Of $Afx) -eq $hA0) } 30000
     Det 'S7.restore' $r7 ('a.png sha256=' + (Hash-Of $Afx))
     if (-not $r7) { $ok7 = $false; $ev7 = 'direct-open undo did not restore a.png byte-identical (exists=' + (Test-Path $Afx) + ')' }
     else {
@@ -798,7 +973,7 @@ if ($ok7) {
 if ($ok7) { $ev7 = 'grayed->delete->blank title->enabled->restored (title=[' + (Get-Title $main2) + '], grayState=0x' + $st1.ToString('X') + '->0x' + $st2.ToString('X') + ')' }
 Emit-S 'S7' $ok7 $ev7
 
-# Launch 2 teardown.
+# Launch 2 teardown: WM_CLOSE, poll exit. Same fail tally as launch 1.
 if ($main2 -ne [IntPtr]::Zero) { [void][S178]::PostMessage($main2, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero) }
 $code2 = Wait-Exit $p2 30000
 if ($code2 -eq $null) {
@@ -806,6 +981,14 @@ if ($code2 -eq $null) {
     Stop-Process -Id $p2.Id -Force -ErrorAction SilentlyContinue
     $p2.WaitForExit(3000) | Out-Null
     $exitNote2 = 'FORCE-KILLED'
+    $script:fail++
+    $script:total++
+    Det 'launch2.close' $false 'forced kill after 30s'
+} elseif ($code2 -ne 0) {
+    $exitNote2 = 'exit=' + $code2
+    $script:fail++
+    $script:total++
+    Det 'launch2.close' $false ('abnormal exit code ' + $code2)
 } else { $exitNote2 = 'exit=' + $code2 }
 Write-Host ('  [launch2] closed: ' + $exitNote2)
 
@@ -832,19 +1015,37 @@ Write-Host ('  [launch2] closed: ' + $exitNote2)
 
 # ---------------------------------------------------------------------------
 # Teardown: the ini generated by THIS RUN (the gate guaranteed it was absent
-# at start) is deleted; no riviv left behind; stderr dumps on failure.
+# at start) is deleted; no riviv left behind; the S4x-stranded pair (and any
+# older fx-path pair) is name-scoped-cleaned from the bin. EVERY teardown
+# failure tallies a FAIL (review round 2, item 6) - the run must not exit
+# all-green with a dirty teardown.
 # ---------------------------------------------------------------------------
 $iniRemoved = $true
 if (Test-Path $Ini) {
     Remove-Item $Ini -Force -ErrorAction SilentlyContinue
     $iniRemoved = -not (Test-Path $Ini)
 }
-Det 'teardown.ini' $iniRemoved ('this-run ini removed from target\release: ' + $iniRemoved)
+Det 'teardown.ini' $iniRemoved ('this-run ini removed from the exe dir: ' + $iniRemoved)
+if (-not $iniRemoved) { $script:fail++; $script:total++ }
 $leftover = @(Get-Process riviv -ErrorAction SilentlyContinue)
 Det 'teardown.procs' ($leftover.Count -eq 0) ('riviv processes left: ' + (($leftover | ForEach-Object { $_.Id }) -join ','))
-
+if ($leftover.Count -gt 0) {
+    # The BLOCKED gate guarantees no riviv was alive at script start, so
+    # any leftover here is OUR launch - safe to clear by pid.
+    $leftover | Stop-Process -Force -ErrorAction SilentlyContinue
+    $script:fail++
+    $script:total++
+}
+$binReport = Clean-FxPairs
+if ($binReport.Cleaned.Count -gt 0) {
+    Write-Output ('TEARDOWN BIN CLEANUP (name-scoped to fx pairs): ' + (($binReport.Cleaned) -join ', '))
+    if ($binReport.Failed.Count -eq 0) { [void]$script:binOutstanding.Clear() }
+}
+if ($binReport.Failed.Count -gt 0) {
+    Write-Output ('NOTE: fx-path pairs the teardown could not delete (left in place): ' + (($binReport.Failed) -join ', '))
+}
 if ($script:binOutstanding.Count -gt 0) {
-    Write-Output ('NOTE: fixture residue possibly in the recycle bin: ' + (($script:binOutstanding) -join ', ') + ' (the bin was never emptied; restore manually if unwanted)')
+    Write-Output ('NOTE: fixture residue possibly still in the recycle bin: ' + (($script:binOutstanding) -join ', ') + ' (the bin was never emptied; restore manually if unwanted)')
 }
 
 if ($script:fail -gt 0) {

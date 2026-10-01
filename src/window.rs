@@ -5491,12 +5491,16 @@ fn playlist_add_current_if_empty(state: &mut WindowState) {
 /// What #178's undo needs to put a delete back: the entry as it stood
 /// (id and metadata intact), where it sat — `None` when the deleted
 /// current was NOT in the playlist (a direct open; undo re-adds at the
-/// tail) — and its shuffle slot, both read BEFORE the remove.
+/// tail) — and its shuffle slot, both read BEFORE the remove; plus the
+/// delete-time `$I` capture binding the undo to the pair THIS window's
+/// delete created (an external actor recycling the same path later must
+/// not shadow it in the scan).
 #[derive(Clone)]
 struct UndoDeleteRecord {
     entry: PlaylistEntry,
     index: Option<usize>,
     order_slot: Option<u32>,
+    pair: Option<std::path::PathBuf>,
 }
 
 /// #43 `_viv_delete` (viv.c:7200-7229): FO_DELETE the current file — the
@@ -5514,13 +5518,22 @@ fn delete_current(hwnd: HWND, permanently: bool) {
     if let crate::filemgmt::ShellOutcome::Done =
         crate::filemgmt::shell_delete(hwnd, &current.path, permanently)
     {
+        // #178's pair binding: capture the `$I` the shell just wrote for
+        // THIS delete (newest match is ours right here), so the undo is
+        // not hostage to a later external recycle of the same path.
+        // Recycle arm only — a permanent delete leaves no pair.
+        let pair = if permanently {
+            None
+        } else {
+            crate::filemgmt::find_recycle_pair_for(&current.path)
+        };
         // SAFETY: a short plain-field borrow — the navigation below
         // runs after it drops.
         if let Some(state) = unsafe { state_of(hwnd) } {
             // #178: only the recycle arm is undoable, and a permanent
             // delete RETIRES any standing record — "undo the last
             // delete" cannot reach past an un-undoable one.
-            let positions = state.playlist.undo_positions(current.id);
+            let positions = state.playlist.undo_positions(&current);
             state.undo_delete = if permanently {
                 None
             } else {
@@ -5528,6 +5541,7 @@ fn delete_current(hwnd: HWND, permanently: bool) {
                     entry: current.clone(),
                     index: positions.map(|(index, _)| index),
                     order_slot: positions.and_then(|(_, slot)| slot),
+                    pair,
                 })
             };
             state.playlist.remove_by_id(current.id);
@@ -5554,7 +5568,7 @@ fn undo_delete_current(hwnd: HWND) {
     let Some(record) = (unsafe { state_of(hwnd) }).and_then(|s| s.undo_delete.clone()) else {
         return; // nothing recorded — the row grays, the key is a no-op
     };
-    match crate::filemgmt::recycle_restore(&record.entry.path) {
+    match crate::filemgmt::recycle_restore(&record.entry.path, record.pair.as_deref()) {
         Ok(()) => {
             // SAFETY: the borrow spans the record consume, the re-insert
             // and the entry clone-out — plain data work, nothing pumps.

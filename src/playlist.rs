@@ -349,34 +349,43 @@ impl Playlist {
     /// #178 undo-delete's bookkeeping half, read BEFORE the matching
     /// `remove_by_id`: where the entry sits (the `entries` index) and,
     /// with a shuffle order standing at remove time, its slot in that
-    /// order. The node is resolved EXACTLY as `remove_by_id` resolves it
-    /// (order-first with a shuffle standing, entries-first otherwise) —
-    /// under duplicate ids the two scans could otherwise name different
-    /// nodes and the record would describe one entry while the remove
-    /// took another (预审 #179 P3). A `None` slot means no order existed
-    /// yet (shuffle off, or built later). None overall = the id is not
-    /// in the playlist (a direct-open current): undo re-ADDS such an
+    /// order. The node must match BOTH id and path, byte-exact — under
+    /// the id-0 direct-open collision a bare id match names the OTHER
+    /// file's node and the record would describe an entry the undo never
+    /// deleted (cubic #179 P2). The node is otherwise resolved EXACTLY
+    /// as `remove_by_id` resolves it (order-first with a shuffle
+    /// standing, entries-first otherwise). A `None` slot means no order
+    /// existed yet (shuffle off, or built later). None overall = the
+    /// deleted current is not a playlist node: undo re-ADDS such an
     /// entry at the tail instead of re-inserting positionally.
-    pub(crate) fn undo_positions(&self, id: u64) -> Option<(usize, Option<u32>)> {
+    pub(crate) fn undo_positions(&self, entry: &PlaylistEntry) -> Option<(usize, Option<u32>)> {
+        let is_node = |e: &PlaylistEntry| e.id == entry.id && e.path == entry.path;
         if let Some(order) = self.shuffle_order.as_ref() {
             let slot = order
                 .iter()
-                .position(|&i| self.entries[i as usize].id == id)?;
+                .position(|&i| is_node(&self.entries[i as usize]))?;
             return Some((order[slot] as usize, Some(slot as u32)));
         }
-        let index = self.entries.iter().position(|e| e.id == id)?;
+        let index = self.entries.iter().position(is_node)?;
         Some((index, None))
     }
 
     /// #178 undo-delete's restore half — the exact inverse of
     /// `remove_by_id`: the entry returns at its recorded index (clamped
     /// into range — the playlist may have shrunk meanwhile) with its id
-    /// and metadata intact, not a fresh `add`. A shuffle order standing
-    /// NOW must re-cover the new index whatever happened since the
-    /// remove: every order value at or past the index shifts up one, and
-    /// the index itself re-enters the order at the recorded slot — or at
-    /// the order's END when the order was built after the delete (a
-    /// deterministic stand-in for `add`'s random join, viv.c:9496-9531).
+    /// and metadata intact, not a fresh `add`. The id counter advances
+    /// past the restored id — a `clear` in between resets `next_id`, and
+    /// re-inserting an old id unchanged would hand the NEXT `add` the
+    /// same id (Codex/cubic #179 P1): `max(next_id, id + 1)` keeps every
+    /// future assignment collision-free whatever the gap. A shuffle
+    /// order standing NOW must re-cover the new index whatever happened
+    /// since the remove: every order value at or past the index shifts
+    /// up one, and the index itself re-enters the order at the recorded
+    /// slot — or at the order's END when the order was built after the
+    /// delete (a deterministic stand-in for `add`'s random join,
+    /// viv.c:9496-9531; a slot recorded against a LATER-rebuilt order
+    /// lands somewhere arbitrary in it, which sits inside the same
+    /// any-position-is-valid envelope the random join already occupies).
     pub(crate) fn insert_restored(
         &mut self,
         entry: PlaylistEntry,
@@ -384,6 +393,7 @@ impl Playlist {
         order_slot: Option<u32>,
     ) {
         let index = index.min(self.entries.len());
+        self.next_id = self.next_id.max(entry.id + 1);
         if let Some(order) = self.shuffle_order.as_mut() {
             for v in order.iter_mut() {
                 if *v as usize >= index {
@@ -1802,7 +1812,8 @@ mod tests {
         let entries_before = pl.entries().to_vec();
         let order_before = pl.shuffle_order.clone().expect("built");
         // Snapshot the middle entry's positions, remove, re-insert.
-        let (index, slot) = pl.undo_positions(1).expect("b is in the playlist");
+        let victim = entries_before[1].clone();
+        let (index, slot) = pl.undo_positions(&victim).expect("b is in the playlist");
         assert_eq!(index, 1);
         let restored = entries_before[index].clone();
         assert!(pl.remove_by_id(1));
@@ -1842,19 +1853,42 @@ mod tests {
     }
 
     #[test]
-    fn undo_positions_reads_none_for_an_absent_id() {
+    fn undo_positions_reads_none_for_an_absent_node() {
         let mut pl = Playlist::new();
         pl.add(OsString::from("a.png"), 1, 0, 0);
-        assert_eq!(pl.undo_positions(0), Some((0, None)));
-        assert_eq!(pl.undo_positions(42), None);
+        let own = pl.entries()[0].clone();
+        assert_eq!(pl.undo_positions(&own), Some((0, None)));
+        // A foreign id is absent, and so — the #179 collision rule — is
+        // an id-0 direct open whose PATH is not the playlist node's.
+        let foreign_id = PlaylistEntry {
+            path: OsString::from("other.png"),
+            modified: 1,
+            created: 0,
+            size: 0,
+            id: 42,
+        };
+        assert_eq!(pl.undo_positions(&foreign_id), None);
+        let direct_open = PlaylistEntry {
+            path: OsString::from("dropped.png"),
+            modified: 1,
+            created: 0,
+            size: 0,
+            id: 0,
+        };
+        assert_eq!(
+            pl.undo_positions(&direct_open),
+            None,
+            "same id, different file — not a playlist node (cubic #179 P2)"
+        );
     }
 
     #[test]
     fn undo_positions_resolves_the_node_remove_by_id_will_remove() {
         // The id-0 direct-open collision (the struct's own doc) under a
         // shuffle order whose FIRST id-0 slot is the LATER duplicate:
-        // the record must describe the node the remove actually takes
-        // (预审 #179 P3 — the two scans' orders differ under duplicates).
+        // with the path now part of the identity, each twin resolves to
+        // ITS OWN node — and the duplicate (the order's first id-0) is
+        // the one remove_by_id takes (预审 #179 P3).
         let mut pl = Playlist::new();
         pl.add(OsString::from("first.png"), 1, 0, 0); // id 0
         pl.add(OsString::from("mid.png"), 1, 0, 0); // id 1
@@ -1867,7 +1901,8 @@ mod tests {
         });
         // Index 2 (dup.png) is the first id-0 in the order.
         pl.shuffle_order = Some(vec![2, 0, 1]);
-        let (index, slot) = pl.undo_positions(0).expect("present");
+        let dup = pl.entries[2].clone();
+        let (index, slot) = pl.undo_positions(&dup).expect("present");
         assert_eq!(slot, Some(0));
         assert_eq!(index, 2);
         assert!(pl.remove_by_id(0));
@@ -1878,6 +1913,50 @@ mod tests {
         assert!(
             pl.entries.iter().any(|e| e.path == *"first.png"),
             "the entries-first twin survives"
+        );
+    }
+
+    #[test]
+    fn insert_restored_advances_the_id_counter_past_the_restored_id() {
+        // Codex/cubic #179 P1/P2: the insert bypasses `add`'s id
+        // allocation, so the counter must still move past the restored
+        // id or the next `add` hands out a duplicate.
+        let mut pl = Playlist::new(); // next_id 0
+        pl.insert_restored(
+            PlaylistEntry {
+                path: OsString::from("direct.png"),
+                modified: 1,
+                created: 0,
+                size: 0,
+                id: 0,
+            },
+            0,
+            None,
+        );
+        pl.add(OsString::from("next.png"), 1, 0, 0);
+        assert_eq!(pl.entries()[1].id, 1, "no id-0 duplicate");
+        // The clear-in-between form: a rebuilt playlist's counter sits
+        // BELOW the restored entry's old id.
+        let mut rebuilt = Playlist::new(); // clear() reset next_id to 0
+        rebuilt.add(OsString::from("x.png"), 1, 0, 0); // id 0
+        rebuilt.insert_restored(
+            PlaylistEntry {
+                path: OsString::from("old.png"),
+                modified: 1,
+                created: 0,
+                size: 0,
+                id: 7,
+            },
+            1,
+            None,
+        );
+        rebuilt.add(OsString::from("y.png"), 1, 0, 0);
+        assert_eq!(rebuilt.entries()[2].id, 8, "jumped past the restored id 7");
+        assert!(
+            !rebuilt.entries()[1..2]
+                .iter()
+                .any(|e| e.id == rebuilt.entries()[2].id),
+            "no collision with the restored node"
         );
     }
 
