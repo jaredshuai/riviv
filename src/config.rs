@@ -155,6 +155,15 @@ pub(crate) struct Config {
     /// at every image change like upstream's `_viv_clear`, 1 = carry the
     /// level/1:1/pan onto the next image.
     pub(crate) keep_zoom: i32,
+    /// riviv-authored key (#185, ADR 0006 D6/D7; upstream has no setting —
+    /// its wishlist notes sharpening at viv.c:76): the user display-effect
+    /// chain's sharpen level, the docs enum page's 0.0–10.0 domain as an
+    /// integer 0..=10 scale, off = 0. Display-only (non-destructive, O1=A):
+    /// the master bytes, the read side, and saves never see it. The ini
+    /// keeps the RAW int (out-of-domain values persist untouched like
+    /// every other int key; the consumption point —
+    /// [`crate::transform_stage::EffectChain::from_config`] — clamps).
+    pub(crate) sharpen: i32,
     /// riviv-authored key (#80; upstream has no such setting): which paint
     /// backend the viewport uses — `auto | d2d | warp` (a STRING key;
     /// missing or unrecognized falls back to the `auto` default; a legacy
@@ -233,6 +242,7 @@ impl Default for Config {
             title_bar_format: 1,
             add_command_line_timeout: 500,
             keep_zoom: 0,
+            sharpen: 0,
             renderer: RendererKind::Auto,
             keys: KeyMap::default(),
         }
@@ -410,6 +420,7 @@ impl Config {
         apply_byte!(title_bar_format = "title_bar_format");
         apply_int!(add_command_line_timeout = "add_command_line_timeout");
         apply_byte!(keep_zoom = "keep_zoom");
+        apply_int!(sharpen = "sharpen");
         // The renderer is a STRING key (riviv-authored, #80): an
         // unrecognized value is a user typo — it falls to the safe `auto`
         // baseline (design §2, the #81 default) in BOTH overlay passes,
@@ -460,7 +471,7 @@ impl Config {
         if root && self.appdata != 0 {
             return vec![("appdata".to_string(), i(self.appdata))];
         }
-        let int_pairs: [(&str, String); 62] = [
+        let int_pairs: [(&str, String); 63] = [
             ("x", i(self.x)),
             ("y", i(self.y)),
             ("wide", i(self.wide)),
@@ -545,6 +556,9 @@ impl Config {
             // riviv-authored keys sit at the table's tail (#68) — the
             // upstream block above keeps its exact key-for-key order.
             ("keep_zoom", i(self.keep_zoom)),
+            // #185 appends the sharpen int key after keep_zoom (#80's
+            // renderer STRING key stays last).
+            ("sharpen", i(self.sharpen)),
             // #80 appends the renderer STRING key after keep_zoom.
             ("renderer", self.renderer.to_ini().to_string()),
         ];
@@ -672,23 +686,24 @@ mod tests {
             pixel_info: 1,
             shuffle: 1,
             keep_zoom: 1,
+            sharpen: 7,
             renderer: RendererKind::Warp,
             ..Config::default()
         };
         let text = ini::serialize(SECTION, &c.to_pairs(false));
         let back = parse_apply(&text, true);
         assert_eq!(back, c, "every save key must be a load key");
-        // 61 int keys + the riviv-authored keep_zoom (#68) + the renderer
-        // string key (#80) + one *_keys line per command in Cmd::ALL
-        // order — bound rows and empty rows alike (#42's shell septet,
-        // #43's file-management octet, #178's tail-appended Undo Delete
-        // among them; no bound-row count is pinned here — the DEFAULT_KEYS
-        // table is its own source of truth and a hand-counted number
-        // would only drift).
+        // 61 int keys + the riviv-authored keep_zoom (#68) + sharpen
+        // (#185) + the renderer string key (#80) + one *_keys line per
+        // command in Cmd::ALL order — bound rows and empty rows alike
+        // (#42's shell septet, #43's file-management octet, #178's and
+        // #185's tail-appended rows among them; no bound-row count is
+        // pinned here — the DEFAULT_KEYS table is its own source of truth
+        // and a hand-counted number would only drift).
         assert_eq!(
             c.to_pairs(false).len(),
-            184,
-            "the save table + keep_zoom + renderer"
+            186,
+            "the save table + keep_zoom + sharpen + renderer"
         );
     }
 
@@ -739,7 +754,7 @@ mod tests {
         let c = Config::default();
         assert_eq!(
             c.to_pairs(true).len(),
-            184,
+            186,
             "active store writes the full table"
         );
         let c = Config {

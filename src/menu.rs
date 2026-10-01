@@ -359,12 +359,20 @@ pub(crate) enum Cmd {
     /// menu. Appended at the enum's tail so every existing command id
     /// stays pinned for the smoke scripts (the id test's own rule).
     EditUndoDelete,
+    /// View → Sharpen (#185 — riviv-authored; upstream has no row, only
+    /// the viv.c:76 wishlist note naming sharpening). Ctrl+S. The user
+    /// display-effect chain's quick toggle (ADR 0006): the checkmark
+    /// reads the gpu side's LIVE chain, never the config key (D9 — a
+    /// build-failure drop unchecks the row honestly). LAST row of the
+    /// View menu, past Options behind a separator. Tail-appended for the
+    /// same id-pinning reason as #178.
+    ViewSharpen,
 }
 
 impl Cmd {
     /// Variant count; also the id space size (ids are 1-based — 0 is the
     /// separator/no-command id in Win32 menus and must stay unassigned).
-    pub(crate) const COUNT: usize = Self::EditUndoDelete as usize + 1;
+    pub(crate) const COUNT: usize = Self::ViewSharpen as usize + 1;
 
     /// The WM_COMMAND command id (upstream uses the `VIV_ID_*` enum values;
     /// riviv's ids are app-internal — nothing interoperates — so they run
@@ -564,6 +572,8 @@ impl Cmd {
         // #178's tail append (id 122 — after every upstream-aligned id;
         // see the variant's doc).
         Self::EditUndoDelete,
+        // #185's tail append (id 123, same id-pinning reason).
+        Self::ViewSharpen,
     ];
 }
 
@@ -1122,6 +1132,15 @@ pub(crate) const ENTRIES: &[Entry] = &[
         loc: loc::Id::MenuOptions,
         parent: Slot::View,
         cmd: Cmd::ViewOptions,
+    },
+    // #185 (beyond upstream — viv.c:76's wishlist note, no upstream row):
+    // the riviv-authored Sharpen toggle closes the View menu behind a
+    // separator, so the upstream block above keeps its exact shape.
+    Entry::Separator { parent: Slot::View },
+    Entry::Item {
+        loc: loc::Id::MenuSharpen,
+        parent: Slot::View,
+        cmd: Cmd::ViewSharpen,
     },
     // Slideshow (#37; upstream viv.c:892-918 — a root menu between View
     // and Navigate, its Rate submenu after Play/Pause and a separator).
@@ -1696,6 +1715,11 @@ pub(crate) struct MenuState {
     /// View → Controls' checkmark (#45): `config_show_controls`
     /// (viv.c:7126).
     pub(crate) show_controls: bool,
+    /// View → Sharpen's checkmark (#185, riviv-authored): the gpu side's
+    /// LIVE chain, non-empty = checked (ADR 0006 D9 — the config key is
+    /// persistence only; a build-failure drop must uncheck the row, and
+    /// reading the key would lie).
+    pub(crate) effect_chain_on: bool,
     /// View → Fullscreen's checkmark: `_viv_is_fullscreen` (viv.c:7132).
     pub(crate) fullscreen: bool,
     /// View → 1:1's checkmark: render size == image size (viv.c:7131).
@@ -1758,6 +1782,8 @@ pub(crate) fn checked(cmd: Cmd, state: &MenuState) -> bool {
         Cmd::ViewMenu => state.show_menu,
         Cmd::ViewStatus => state.show_status,
         Cmd::ViewControls => state.show_controls,
+        // #185: the live gpu chain, not the config key (D9).
+        Cmd::ViewSharpen => state.effect_chain_on,
         Cmd::ViewFullscreen => state.fullscreen,
         Cmd::ViewOneToOne => state.one_to_one,
         Cmd::ViewSlideshow | Cmd::SlideshowPause => state.slideshow,
@@ -2110,6 +2136,7 @@ mod tests {
             show_menu: true,
             show_status: true,
             show_controls: true,
+            effect_chain_on: true,
             fullscreen: true,
             one_to_one: true,
             slideshow: true,
@@ -2130,6 +2157,7 @@ mod tests {
             show_menu: false,
             show_status: false,
             show_controls: false,
+            effect_chain_on: false,
             fullscreen: false,
             one_to_one: false,
             slideshow: false,
@@ -2165,6 +2193,7 @@ mod tests {
                     | Cmd::ViewKeepAspect
                     | Cmd::ViewFillWindow
                     | Cmd::ViewOntopAlways
+                    | Cmd::ViewSharpen
             );
             assert_eq!(checked(cmd, &on), expected_on, "{cmd:?} with everything on");
             let expected_off = matches!(
@@ -2331,6 +2360,7 @@ mod tests {
             show_menu: false,
             show_status: false,
             show_controls: false,
+            effect_chain_on: false,
             fullscreen: false,
             one_to_one: false,
             slideshow: false,
@@ -2508,7 +2538,8 @@ mod tests {
         // #178's tail append: the first riviv-authored id past upstream's
         // whole table — every upstream id above stands unshifted.
         assert_eq!(Cmd::EditUndoDelete.id(), 122);
-        assert_eq!(Cmd::COUNT, 122);
+        assert_eq!(Cmd::ViewSharpen.id(), 123);
+        assert_eq!(Cmd::COUNT, 123);
     }
 
     #[test]

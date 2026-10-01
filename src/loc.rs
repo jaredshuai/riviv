@@ -505,12 +505,34 @@ pub(crate) enum Id {
     /// Status flash prefix when the `$R` twin refused to move back; the
     /// OS error text follows after ": ".
     UndoFailedMove,
+    /// ---- #185: sharpen display effect ----
+    /// View → "Sharpen" (#185, riviv-authored — no upstream row; the
+    /// viv.c:76 wishlist note has no string). No mnemonic: the View
+    /// dropdown's S already belongs to "&Slideshow" (the no-mnemonic
+    /// precedent: MenuCopyFilename).
+    MenuSharpen,
+    /// Options View page: the sharpen combo's static label (#185).
+    OptionsSharpen,
+    /// The sharpen combo's off row — the docs domain's 0 (#185).
+    OptionsSharpenOff,
+    /// The sharpen combo's level rows 1..=10 (#185; numerals are their
+    /// own localization in both tables).
+    OptionsSharpen1,
+    OptionsSharpen2,
+    OptionsSharpen3,
+    OptionsSharpen4,
+    OptionsSharpen5,
+    OptionsSharpen6,
+    OptionsSharpen7,
+    OptionsSharpen8,
+    OptionsSharpen9,
+    OptionsSharpen10,
 }
 
 impl Id {
     /// Variant count; array-typing both tables against this keeps them
     /// length-locked to the enum by construction.
-    pub(crate) const COUNT: usize = Self::UndoFailedMove as usize + 1;
+    pub(crate) const COUNT: usize = Self::OptionsSharpen10 as usize + 1;
 }
 
 /// Table choice (upstream `LOCALIZATION_LANGUAGE_*`, localization.h:30-32).
@@ -798,6 +820,19 @@ const EN_US: [&str; Id::COUNT] = [
     "Not found in the Recycle Bin",               // UndoFailedNotInBin (#178, riviv)
     "A file already exists at the original path", // UndoFailedTargetExists (#178, riviv)
     "Restore failed",                             // UndoFailedMove (#178, riviv)
+    "Sharpen",                                    // MenuSharpen (#185, riviv)
+    "Sharpen:",                                   // OptionsSharpen (#185, riviv)
+    "Off",                                        // OptionsSharpenOff (#185, riviv)
+    "1",                                          // OptionsSharpen1 (#185, riviv)
+    "2",                                          // OptionsSharpen2 (#185, riviv)
+    "3",                                          // OptionsSharpen3 (#185, riviv)
+    "4",                                          // OptionsSharpen4 (#185, riviv)
+    "5",                                          // OptionsSharpen5 (#185, riviv)
+    "6",                                          // OptionsSharpen6 (#185, riviv)
+    "7",                                          // OptionsSharpen7 (#185, riviv)
+    "8",                                          // OptionsSharpen8 (#185, riviv)
+    "9",                                          // OptionsSharpen9 (#185, riviv)
+    "10",                                         // OptionsSharpen10 (#185, riviv)
 ];
 
 /// zh-CN table — upstream localization_zh_cn.h:31/197-199/261-263.
@@ -1076,6 +1111,19 @@ const ZH_CN: [&str; Id::COUNT] = [
     "回收站中未找到该文件",     // UndoFailedNotInBin (#178, riviv)
     "原路径已存在同名文件",     // UndoFailedTargetExists (#178, riviv)
     "恢复失败",                 // UndoFailedMove (#178, riviv)
+    "锐化",                     // MenuSharpen (#185, riviv)
+    "锐化:",                    // OptionsSharpen (#185, riviv)
+    "关",                       // OptionsSharpenOff (#185, riviv)
+    "1",                        // OptionsSharpen1 (#185, riviv)
+    "2",                        // OptionsSharpen2 (#185, riviv)
+    "3",                        // OptionsSharpen3 (#185, riviv)
+    "4",                        // OptionsSharpen4 (#185, riviv)
+    "5",                        // OptionsSharpen5 (#185, riviv)
+    "6",                        // OptionsSharpen6 (#185, riviv)
+    "7",                        // OptionsSharpen7 (#185, riviv)
+    "8",                        // OptionsSharpen8 (#185, riviv)
+    "9",                        // OptionsSharpen9 (#185, riviv)
+    "10",                       // OptionsSharpen10 (#185, riviv)
 ];
 
 /// Map a `GetUserDefaultUILanguage` LANGID onto the table choice

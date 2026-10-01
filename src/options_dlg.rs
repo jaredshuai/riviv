@@ -1352,6 +1352,11 @@ fn on_ok(dlg: HWND) {
     let effects = unsafe {
         state_of(owner).map(|owner_state| {
             let effects = model.commit(&mut owner_state.config);
+            // #185: the freshly committed sharpen key is the user's
+            // edited truth — replay it onto the live display chain
+            // (re-keys the effect graph when it moved; the gate stays
+            // silent when it did not). Idempotent, so unconditional.
+            crate::window::apply_config_effect_chain(owner_state);
             if effects.refit {
                 // Re-anchor the pan offset against the new render size
                 // before repainting — upstream's FILL WINDOW menu command

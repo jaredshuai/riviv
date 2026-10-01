@@ -142,6 +142,59 @@ pub(crate) const BLIT_MODES: &[ComboEntry] = &[
     },
 ];
 
+/// The sharpen combo (#185, riviv-authored; ADR 0006 D6/D7): the docs
+/// enum page's 0.0–10.0 SHARPNESS domain as the integer 0..=10 scale,
+/// off = 0. The index is NOT the value's only mapping — the table is
+/// (value 0 carries its own "Off" label; the numerals 1..=10 are their
+/// own values). An out-of-domain ini key shows blank and OK preserves
+/// it, like every other combo.
+pub(crate) const SHARPEN_LEVELS: &[ComboEntry] = &[
+    ComboEntry {
+        label: loc::Id::OptionsSharpenOff,
+        value: 0,
+    },
+    ComboEntry {
+        label: loc::Id::OptionsSharpen1,
+        value: 1,
+    },
+    ComboEntry {
+        label: loc::Id::OptionsSharpen2,
+        value: 2,
+    },
+    ComboEntry {
+        label: loc::Id::OptionsSharpen3,
+        value: 3,
+    },
+    ComboEntry {
+        label: loc::Id::OptionsSharpen4,
+        value: 4,
+    },
+    ComboEntry {
+        label: loc::Id::OptionsSharpen5,
+        value: 5,
+    },
+    ComboEntry {
+        label: loc::Id::OptionsSharpen6,
+        value: 6,
+    },
+    ComboEntry {
+        label: loc::Id::OptionsSharpen7,
+        value: 7,
+    },
+    ComboEntry {
+        label: loc::Id::OptionsSharpen8,
+        value: 8,
+    },
+    ComboEntry {
+        label: loc::Id::OptionsSharpen9,
+        value: 9,
+    },
+    ComboEntry {
+        label: loc::Id::OptionsSharpen10,
+        value: 10,
+    },
+];
+
 /// The title-bar-format combo (#47; upstream
 /// IDC_TITLE_BAR_FORMAT on the View page, viv.c:8372-8376 — the index IS
 /// the config value: 0 full path / 1 filename / 2 none).
@@ -199,6 +252,11 @@ pub(crate) enum Field {
     /// The keep-zoom-on-image-change checkbox (#68; a riviv-authored row —
     /// upstream's viv.c:41 wishlist note has no Options UI).
     KeepZoom,
+    /// The sharpen combo (#185; a riviv-authored row — upstream's
+    /// viv.c:76 wishlist note has no Options UI). Edits the persistent
+    /// level; the OK arm replays it onto the live chain (the toggle's
+    /// display state reads the chain, not this key — ADR 0006 D9).
+    Sharpen,
     WindowedBg,
     FullscreenBg,
     LeftClickAction,
@@ -358,8 +416,10 @@ pub(crate) const VIEW: &[Ctrl] = &[
     },
     // Loop animations once (upstream IDD_VIEW's own order right after the
     // auto-size pair; #38). The tail rows below the auto-size pair run a
-    // 16-du pitch (#68 squeezed the old 17/18-du tail to fit the keep-zoom
-    // row inside the page host's 233-du height).
+    // 14-du pitch (#185 squeezed #68's 16-du tail once more — three more
+    // rows landed since the rc: keep-zoom, the color pair's move-down,
+    // and sharpen — so all eight tail rows + the last control's extent
+    // stay inside the page host's 233-du height).
     Ctrl {
         kind: Kind::Checkbox,
         label: loc::Id::OptionsLoopAnimationsOnce,
@@ -378,7 +438,7 @@ pub(crate) const VIEW: &[Ctrl] = &[
         field: Field::PreloadNext,
         label_w: 0,
         x: 0,
-        y: 136,
+        y: 134,
         w: 186,
         h: 10,
     },
@@ -388,7 +448,7 @@ pub(crate) const VIEW: &[Ctrl] = &[
         field: Field::CacheLast,
         label_w: 0,
         x: 0,
-        y: 152,
+        y: 148,
         w: 186,
         h: 10,
     },
@@ -398,7 +458,7 @@ pub(crate) const VIEW: &[Ctrl] = &[
         field: Field::FrameMinus,
         label_w: 0,
         x: 0,
-        y: 168,
+        y: 162,
         w: 186,
         h: 10,
     },
@@ -410,7 +470,7 @@ pub(crate) const VIEW: &[Ctrl] = &[
         field: Field::KeepZoom,
         label_w: 0,
         x: 0,
-        y: 184,
+        y: 176,
         w: 186,
         h: 10,
     },
@@ -420,7 +480,7 @@ pub(crate) const VIEW: &[Ctrl] = &[
         field: Field::WindowedBg,
         label_w: 96,
         x: 0,
-        y: 200,
+        y: 204,
         w: 50,
         h: 14,
     },
@@ -430,9 +490,25 @@ pub(crate) const VIEW: &[Ctrl] = &[
         field: Field::FullscreenBg,
         label_w: 96,
         x: 0,
-        y: 216,
+        y: 218,
         w: 50,
         h: 14,
+    },
+    // Sharpen (#185; a riviv-authored row — upstream has no Options UI
+    // for its viv.c:76 wishlist note). GEOMETRICALLY it sits between the
+    // keep-zoom row and the color pair (y=190); TABLE-wise it is the
+    // page's LAST control on purpose — `ctrl_id` derives from the table
+    // index, and appending keeps every existing control id stable for
+    // the smoke scripts that address them numerically.
+    Ctrl {
+        kind: Kind::Combo(SHARPEN_LEVELS),
+        label: loc::Id::OptionsSharpen,
+        field: Field::Sharpen,
+        label_w: 74,
+        x: 0,
+        y: 190,
+        w: 119,
+        h: 30,
     },
 ];
 
@@ -521,6 +597,7 @@ pub(crate) struct OptionsModel {
     pub(crate) preload_next: bool,
     pub(crate) cache_last: bool,
     pub(crate) keep_zoom: bool,
+    pub(crate) sharpen: Option<i32>,
     pub(crate) windowed_bg: [u8; 3],
     pub(crate) fullscreen_bg: [u8; 3],
     pub(crate) left_click_action: Option<i32>,
@@ -576,6 +653,7 @@ impl OptionsModel {
             Field::MagFilter => self.mag_filter,
             Field::TitleBarFormat => self.title_bar_format,
             Field::AutoZoomType => self.auto_zoom_type,
+            Field::Sharpen => self.sharpen,
             Field::LeftClickAction => self.left_click_action,
             Field::RightClickAction => self.right_click_action,
             Field::MouseWheelAction => self.mouse_wheel_action,
@@ -590,6 +668,7 @@ impl OptionsModel {
             Field::MagFilter => self.mag_filter = Some(value),
             Field::TitleBarFormat => self.title_bar_format = Some(value),
             Field::AutoZoomType => self.auto_zoom_type = Some(value),
+            Field::Sharpen => self.sharpen = Some(value),
             Field::LeftClickAction => self.left_click_action = Some(value),
             Field::RightClickAction => self.right_click_action = Some(value),
             Field::MouseWheelAction => self.mouse_wheel_action = Some(value),
@@ -635,6 +714,7 @@ impl OptionsModel {
             preload_next: to_bool(config.preload_next),
             cache_last: to_bool(config.cache_last),
             keep_zoom: to_bool(config.keep_zoom),
+            sharpen: Some(config.sharpen),
             windowed_bg: config.windowed_bg(),
             fullscreen_bg: config.fullscreen_bg(),
             left_click_action: Some(config.left_click_action),
@@ -655,7 +735,8 @@ impl OptionsModel {
     pub(crate) fn commit(&self, config: &mut Config) -> Effects {
         // Both verdicts compare against the config as it stands NOW —
         // before this method writes anything.
-        let repaint = repaint_filters_colors(config, self);
+        let repaint = repaint_filters_colors(config, self)
+            || self.sharpen.is_some_and(|v| v != config.sharpen);
         let refit = fit_inputs_changed(config, self);
         if let Some(v) = self.shrink_blit_mode {
             config.shrink_blit_mode = v;
@@ -668,6 +749,13 @@ impl OptionsModel {
         }
         if let Some(v) = self.auto_zoom_type {
             config.auto_zoom_type = v;
+        }
+        // #185: a moved sharpen level re-keys the display chain — the OK
+        // arm replays the key onto the live chain after this commit; the
+        // repaint flag rides the same filter/color family (the viewport
+        // must redraw through the re-keyed graph).
+        if let Some(v) = self.sharpen {
+            config.sharpen = v;
         }
         if let Some(v) = self.left_click_action {
             config.left_click_action = v;
@@ -775,7 +863,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!((bools, values, colors), (11, 8, 2));
+        assert_eq!((bools, values, colors), (11, 9, 2));
     }
 
     #[test]
@@ -792,6 +880,9 @@ mod tests {
         assert_eq!(values(XBUTTON_ACTIONS), vec![1, 2]);
         assert_eq!(values(AUTO_ZOOM_TYPES), vec![0, 1, 2, 3]);
         assert_eq!(values(BLIT_MODES), vec![0, 1]);
+        // #185: the sharpen scale is the docs domain 0..=10 verbatim, off
+        // first (the combo's own order).
+        assert_eq!(values(SHARPEN_LEVELS), (0..=10).collect::<Vec<_>>());
     }
 
     #[test]
@@ -805,6 +896,10 @@ mod tests {
         assert_eq!(combo_index(LEFT_CLICK_ACTIONS, 5), None);
         assert_eq!(combo_index(AUTO_ZOOM_TYPES, 7), None);
         assert_eq!(combo_index(BLIT_MODES, 2), None);
+        // #185: the scale's domain ends at 10 — an out-of-domain ini key
+        // shows blank and OK preserves it.
+        assert_eq!(combo_index(SHARPEN_LEVELS, 11), None);
+        assert_eq!(combo_index(SHARPEN_LEVELS, 300), None);
     }
 
     #[test]
@@ -823,7 +918,7 @@ mod tests {
                 );
             }
         }
-        assert_eq!(seen.len(), 21);
+        assert_eq!(seen.len(), 22);
     }
 
     #[test]
@@ -890,6 +985,7 @@ mod tests {
             preload_next: false,
             cache_last: true,
             keep_zoom: true,
+            sharpen: Some(6),
             windowed_bg: [10, 20, 30],
             fullscreen_bg: [1, 2, 3],
             left_click_action: Some(3),
@@ -914,6 +1010,7 @@ mod tests {
         assert_eq!(config.preload_next, 0);
         assert_eq!(config.cache_last, 1);
         assert_eq!(config.keep_zoom, 1);
+        assert_eq!(config.sharpen, 6);
         assert_eq!(config.windowed_background_color_r, 10);
         assert_eq!(config.fullscreen_background_color_b, 3);
         assert_eq!(config.left_click_action, 3);
@@ -941,18 +1038,21 @@ mod tests {
             left_click_action: 5,
             auto_zoom_type: 7,
             shrink_blit_mode: 9,
+            sharpen: 300,
             ..Config::default()
         };
         let model = OptionsModel {
             left_click_action: None,
             auto_zoom_type: None,
             shrink_blit_mode: None,
+            sharpen: Some(300),
             ..OptionsModel::from_config(&config)
         };
         let effects = model.commit(&mut config);
-        assert!(!effects.repaint);
+        assert!(!effects.repaint, "an unrepresented value did not move");
         assert_eq!(config.left_click_action, 5);
         assert_eq!(config.auto_zoom_type, 7);
         assert_eq!(config.shrink_blit_mode, 9);
+        assert_eq!(config.sharpen, 300, "out-of-domain sharpen preserves");
     }
 }
