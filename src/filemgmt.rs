@@ -12,7 +12,8 @@
 //! leans on; the shells stay thin so every decision is testable without
 //! the file system.
 
-use windows::Win32::Foundation::{HANDLE, HWND};
+use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, ERROR_FILE_EXISTS, HANDLE, HWND};
+use windows::Win32::Storage::FileSystem::{MOVE_FILE_FLAGS, MoveFileExW};
 use windows::Win32::UI::Shell::{
     FO_COPY, FO_DELETE, FO_MOVE, FO_RENAME, FOF_ALLOWUNDO, FOF_WANTMAPPINGHANDLE, SHFILEOPSTRUCTW,
     SHFileOperationW, SHFreeNameMappings, SHNAMEMAPPINGW,
@@ -368,15 +369,15 @@ fn drive_root(path: &[u16]) -> Option<Vec<u16>> {
 
 /// Path equality with ASCII case-folding: the recorded path and the
 /// `$I`'s stored copy come from different directory listings, and NTFS
-/// matches ASCII case-insensitively. Non-ASCII units compare exactly —
+/// matches ASCII case-insensitively. Separators fold too — a CLI-opened
+/// path may carry forward slashes where the `$I` stores the canonical
+/// backslash spelling of the same file. Non-ASCII units compare exactly —
 /// the full Unicode upcase table is the filesystem's job, not ours.
 fn path_eq_folded(a: &[u16], b: &[u16]) -> bool {
-    let fold = |unit: u16| {
-        if (u16::from(b'A')..=u16::from(b'Z')).contains(&unit) {
-            unit + 32
-        } else {
-            unit
-        }
+    let fold = |unit: u16| match unit {
+        u if (u16::from(b'A')..=u16::from(b'Z')).contains(&u) => u + 32,
+        u if u == u16::from(b'/') => u16::from(b'\\'),
+        u => u,
     };
     a.len() == b.len() && a.iter().zip(b).all(|(x, y)| fold(*x) == fold(*y))
 }
@@ -480,7 +481,32 @@ fn restore_under(
     let Some((i_path, r_path)) = find_pair(root, recorded) else {
         return Err(UndoDeleteError::NotInBin);
     };
-    std::fs::rename(&r_path, path).map_err(UndoDeleteError::RestoreFailed)?;
+    // The move itself carries the no-overwrite promise: MoveFileExW with
+    // NO flags fails ATOMICALLY when a squatter has appeared at the
+    // target since the precheck above (the bin scan in between widens
+    // that window). `std::fs::rename` would silently replace it — on
+    // Windows it IS MoveFileExW with REPLACE_EXISTING (config.rs's own
+    // recorded evidence). (预审 #179 P2)
+    let src = to_wide_os(r_path.as_os_str());
+    let dst = to_wide_os(path);
+    // SAFETY: both wide strings are NUL-terminated (`to_wide_os`) and
+    // outlive the call; the API touches only the files they name and
+    // writes nothing into either buffer.
+    let moved = unsafe {
+        MoveFileExW(
+            PCWSTR(src.as_ptr()),
+            PCWSTR(dst.as_ptr()),
+            MOVE_FILE_FLAGS(0),
+        )
+    };
+    if let Err(err) = moved {
+        if err.code().0 == ERROR_ALREADY_EXISTS.0 as i32
+            || err.code().0 == ERROR_FILE_EXISTS.0 as i32
+        {
+            return Err(UndoDeleteError::TargetExists);
+        }
+        return Err(UndoDeleteError::RestoreFailed(std::io::Error::other(err)));
+    }
     let _ = std::fs::remove_file(&i_path);
     Ok(())
 }
@@ -695,10 +721,13 @@ mod tests {
     }
 
     #[test]
-    fn path_eq_folded_folds_ascii_only() {
+    fn path_eq_folded_folds_ascii_and_separators_only() {
         assert!(path_eq_folded(&s(r"C:\Pics\A.PNG"), &s(r"c:\pics\a.png")));
         // The case difference in the ASCII segment folds.
         assert!(path_eq_folded(&s("图\\a.png"), &s("图\\A.png")));
+        // A CLI-opened forward-slash spelling matches the `$I`'s
+        // canonical backslash form (预审 #179 P3).
+        assert!(path_eq_folded(&s("D:/pics/a.png"), &s(r"D:\pics\a.png")));
         // Full-width Ａ/ａ are non-ASCII lookalikes of A/a: we do NOT
         // fold them — the upcase table is the filesystem's, not ours.
         assert!(!path_eq_folded(&s("Ａ.png"), &s("ａ.png")));

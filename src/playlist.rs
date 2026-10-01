@@ -349,22 +349,23 @@ impl Playlist {
     /// #178 undo-delete's bookkeeping half, read BEFORE the matching
     /// `remove_by_id`: where the entry sits (the `entries` index) and,
     /// with a shuffle order standing at remove time, its slot in that
-    /// order. A `None` slot means no order existed yet (shuffle off, or
-    /// built later). None overall = the id is not in the playlist (a
-    /// direct-open current): undo re-ADDS such an entry at the tail
-    /// instead of re-inserting positionally.
+    /// order. The node is resolved EXACTLY as `remove_by_id` resolves it
+    /// (order-first with a shuffle standing, entries-first otherwise) —
+    /// under duplicate ids the two scans could otherwise name different
+    /// nodes and the record would describe one entry while the remove
+    /// took another (预审 #179 P3). A `None` slot means no order existed
+    /// yet (shuffle off, or built later). None overall = the id is not
+    /// in the playlist (a direct-open current): undo re-ADDS such an
+    /// entry at the tail instead of re-inserting positionally.
     pub(crate) fn undo_positions(&self, id: u64) -> Option<(usize, Option<u32>)> {
+        if let Some(order) = self.shuffle_order.as_ref() {
+            let slot = order
+                .iter()
+                .position(|&i| self.entries[i as usize].id == id)?;
+            return Some((order[slot] as usize, Some(slot as u32)));
+        }
         let index = self.entries.iter().position(|e| e.id == id)?;
-        let order_slot = self
-            .shuffle_order
-            .as_ref()
-            .and_then(|order| {
-                order
-                    .iter()
-                    .position(|&i| self.entries[i as usize].id == id)
-            })
-            .map(|slot| slot as u32);
-        Some((index, order_slot))
+        Some((index, None))
     }
 
     /// #178 undo-delete's restore half — the exact inverse of
@@ -1846,6 +1847,38 @@ mod tests {
         pl.add(OsString::from("a.png"), 1, 0, 0);
         assert_eq!(pl.undo_positions(0), Some((0, None)));
         assert_eq!(pl.undo_positions(42), None);
+    }
+
+    #[test]
+    fn undo_positions_resolves_the_node_remove_by_id_will_remove() {
+        // The id-0 direct-open collision (the struct's own doc) under a
+        // shuffle order whose FIRST id-0 slot is the LATER duplicate:
+        // the record must describe the node the remove actually takes
+        // (预审 #179 P3 — the two scans' orders differ under duplicates).
+        let mut pl = Playlist::new();
+        pl.add(OsString::from("first.png"), 1, 0, 0); // id 0
+        pl.add(OsString::from("mid.png"), 1, 0, 0); // id 1
+        pl.entries.push(PlaylistEntry {
+            path: OsString::from("dup.png"),
+            modified: 1,
+            created: 0,
+            size: 0,
+            id: 0,
+        });
+        // Index 2 (dup.png) is the first id-0 in the order.
+        pl.shuffle_order = Some(vec![2, 0, 1]);
+        let (index, slot) = pl.undo_positions(0).expect("present");
+        assert_eq!(slot, Some(0));
+        assert_eq!(index, 2);
+        assert!(pl.remove_by_id(0));
+        assert!(
+            !pl.entries.iter().any(|e| e.path == *"dup.png"),
+            "the node the record described is the one removed"
+        );
+        assert!(
+            pl.entries.iter().any(|e| e.path == *"first.png"),
+            "the entries-first twin survives"
+        );
     }
 
     // #43: rename sync — first exact path match, byte compare (case
