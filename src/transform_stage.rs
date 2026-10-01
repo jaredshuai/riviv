@@ -302,6 +302,29 @@ pub(crate) enum DisplayArm {
     WideBlank,
 }
 
+/// The user display-effect chain (#183, ADR 0006): a DISPLAY-ONLY,
+/// non-destructive effect stack (O1=A — the master bytes, the read side
+/// (status-bar RGB / clipboard / copy) and the save path never see it;
+/// only the viewport and the dump do, per #156's contract). The first
+/// knife carries a single sharpen stage (O2=A); `sharpen` is the docs
+/// enum page's 0.0–10.0 SHARPNESS domain as an integer 0..=10 scale
+/// (O4=A — the int-key config family, `off = 0`). `Eq`/`Hash` make the
+/// chain a graph-identity term (`built_for`) and later a fingerprint
+/// policy term — an f32 could never key either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub(crate) struct EffectChain {
+    pub(crate) sharpen: u8,
+}
+
+impl EffectChain {
+    /// The chain's own off state — and the zero-perturbation contract's
+    /// structural term: an empty chain must collapse every (backend, arm)
+    /// cell onto the pre-#183 dispatch shape (see [`pass_shape`]).
+    pub(crate) fn is_empty(&self) -> bool {
+        self.sharpen == 0
+    }
+}
+
 /// The output face a frame's decision lands on AFTER the AC surface
 /// ratchet's clamp (D6): [`desired_output`]'s face, folded back to
 /// Legacy once the session latched the AC arm off. One function, three
@@ -442,6 +465,50 @@ pub(crate) fn display_arm(
                 }
             }
         },
+    }
+}
+
+/// The pass SHAPE of a draw — orthogonal to the color arm (#183): whether
+/// the pass needs the two-stage form (scene → intermediate → effect
+/// graph → target) or composites straight into the target. The color arms
+/// have been two-stage since #130 for their own reason (the
+/// ColorManagement effect); #183 adds the second, independent reason (a
+/// user effect chain on the Direct arm, hardware only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PassShape {
+    /// BeginDraw → Clear → scene → EndDraw, straight into the target.
+    Direct,
+    /// Phase 1 composites into the intermediate, phase 2 draws the graph's
+    /// output image 1:1 into the target (the one post-composition
+    /// viewport pass — #130's ruling, never per-tile).
+    TwoStage,
+}
+
+/// #183's decision table (#127's decision-table-first landing order): the
+/// pass shape per (backend, arm, chain) cell.
+///
+/// - An EMPTY chain reproduces today's dispatch on every cell — the
+///   zero-perturbation negative control as a structural guarantee.
+/// - A non-empty chain forces TwoStage on the hardware Direct arm — the
+///   one NEW shape (the CM-less chain graph of ADR 0006).
+/// - WARP NEVER runs the chain: #127's hard exclusion INHERITED (O3=B);
+///   unlifting needs the WARP two-stage path plus an 8 ms timing case
+///   (ADR 0006 D5), not a table edit.
+/// - The color arms stay two-stage whatever the chain: the chain rides
+///   INSIDE their graph (before the ColorManagement effect, so the
+///   convolution runs in the master's gamma-like domain on every arm).
+/// - `WideBlank` stays direct: blank is a constant field, and a
+///   convolution of a constant is itself.
+pub(crate) fn pass_shape(backend: Backend, arm: DisplayArm, chain: EffectChain) -> PassShape {
+    match arm {
+        DisplayArm::Direct if backend == Backend::Hardware && !chain.is_empty() => {
+            PassShape::TwoStage
+        }
+        DisplayArm::Direct | DisplayArm::WideBlank => PassShape::Direct,
+        DisplayArm::SrgbToDisplay
+        | DisplayArm::P3ToSrgb
+        | DisplayArm::P3ToDisplay
+        | DisplayArm::P3ToScRgb => PassShape::TwoStage,
     }
 }
 
@@ -2119,6 +2186,110 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    // ---- pass_shape: #183's decision table ----
+
+    fn all_arms() -> [DisplayArm; 6] {
+        [
+            DisplayArm::Direct,
+            DisplayArm::SrgbToDisplay,
+            DisplayArm::P3ToSrgb,
+            DisplayArm::P3ToDisplay,
+            DisplayArm::P3ToScRgb,
+            DisplayArm::WideBlank,
+        ]
+    }
+
+    /// The zero-perturbation contract, cell by cell: with the EMPTY chain
+    /// every (backend, arm) pair answers exactly the pre-#183 dispatch
+    /// shape (Direct/WideBlank draw direct, the color arms stay
+    /// two-stage).
+    #[test]
+    fn empty_chain_reproduces_the_pre_effect_chain_dispatch() {
+        for backend in both_backends() {
+            for arm in all_arms() {
+                let expected = match arm {
+                    DisplayArm::Direct | DisplayArm::WideBlank => PassShape::Direct,
+                    _ => PassShape::TwoStage,
+                };
+                assert_eq!(
+                    pass_shape(backend, arm, EffectChain { sharpen: 0 }),
+                    expected,
+                    "{backend:?}/{arm:?}"
+                );
+            }
+        }
+    }
+
+    /// The one NEW shape: a user chain on the hardware Direct arm forces
+    /// the two-stage form (scene → intermediate → chain → target, no
+    /// ColorManagement — ADR 0006's CM-less graph form).
+    #[test]
+    fn chain_forces_two_stage_on_the_hardware_direct_arm() {
+        for sharpen in 1..=10u8 {
+            assert_eq!(
+                pass_shape(
+                    Backend::Hardware,
+                    DisplayArm::Direct,
+                    EffectChain { sharpen }
+                ),
+                PassShape::TwoStage,
+                "sharpen={sharpen}"
+            );
+        }
+    }
+
+    /// O3=B's executable cell: WARP never runs the chain — #127's hard
+    /// exclusion inherited, so a non-empty chain on a WARP session's
+    /// Direct arm stays a direct pass (the effect is dropped, the content
+    /// still draws).
+    #[test]
+    fn warp_inherits_the_127_exclusion_the_chain_never_runs() {
+        assert_eq!(
+            pass_shape(
+                Backend::Warp,
+                DisplayArm::Direct,
+                EffectChain { sharpen: 10 }
+            ),
+            PassShape::Direct
+        );
+    }
+
+    /// The color arms own their two-stage shape (the ColorManagement
+    /// effect needs the intermediate); the chain rides INSIDE their graph
+    /// and never changes the shape, on either backend.
+    #[test]
+    fn color_arms_stay_two_stage_whatever_the_chain() {
+        for backend in both_backends() {
+            for sharpen in [0u8, 5, 10] {
+                for arm in [
+                    DisplayArm::SrgbToDisplay,
+                    DisplayArm::P3ToSrgb,
+                    DisplayArm::P3ToDisplay,
+                    DisplayArm::P3ToScRgb,
+                ] {
+                    assert_eq!(
+                        pass_shape(backend, arm, EffectChain { sharpen }),
+                        PassShape::TwoStage,
+                        "{backend:?}/{arm:?}/sharpen={sharpen}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// WideBlank is blank by contract — a constant field convolved is
+    /// itself, and no content may reach the target in any shape (spike
+    /// s-d2d-effects, hook evidence 5).
+    #[test]
+    fn wide_blank_stays_direct_whatever_the_chain() {
+        for backend in both_backends() {
+            assert_eq!(
+                pass_shape(backend, DisplayArm::WideBlank, EffectChain { sharpen: 10 }),
+                PassShape::Direct
+            );
         }
     }
 }

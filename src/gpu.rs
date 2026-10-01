@@ -33,16 +33,16 @@ use windows::Win32::Graphics::Direct2D::Common::{
     D2D_RECT_F, D2D_RECT_U, D2D_SIZE_U, D2D1_ALPHA_MODE_IGNORE, D2D1_COLOR_F, D2D1_PIXEL_FORMAT,
 };
 use windows::Win32::Graphics::Direct2D::{
-    CLSID_D2D1ColorManagement, D2D1_ANTIALIAS_MODE_ALIASED, D2D1_BITMAP_OPTIONS,
+    CLSID_D2D1ColorManagement, CLSID_D2D1Sharpen, D2D1_ANTIALIAS_MODE_ALIASED, D2D1_BITMAP_OPTIONS,
     D2D1_BITMAP_OPTIONS_CANNOT_DRAW, D2D1_BITMAP_OPTIONS_CPU_READ, D2D1_BITMAP_OPTIONS_NONE,
     D2D1_BITMAP_OPTIONS_TARGET, D2D1_BITMAP_PROPERTIES1, D2D1_COLOR_SPACE_CUSTOM,
     D2D1_COLOR_SPACE_SCRGB, D2D1_COLOR_SPACE_SRGB, D2D1_DEVICE_CONTEXT_OPTIONS_NONE,
     D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_INTERPOLATION_MODE,
     D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, D2D1_INTERPOLATION_MODE_LINEAR,
     D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, D2D1_MAP_OPTIONS_READ, D2D1_PRIMITIVE_BLEND_COPY,
-    D2D1_PROPERTY_TYPE_COLOR_CONTEXT, D2D1_PROPERTY_TYPE_ENUM, D2D1_UNIT_MODE_PIXELS,
-    D2D1CreateFactory, ID2D1Bitmap, ID2D1ColorContext, ID2D1Device, ID2D1DeviceContext,
-    ID2D1Effect, ID2D1Factory1, ID2D1Image, ID2D1RenderTarget,
+    D2D1_PROPERTY_TYPE_COLOR_CONTEXT, D2D1_PROPERTY_TYPE_ENUM, D2D1_PROPERTY_TYPE_FLOAT,
+    D2D1_UNIT_MODE_PIXELS, D2D1CreateFactory, ID2D1Bitmap, ID2D1ColorContext, ID2D1Device,
+    ID2D1DeviceContext, ID2D1Effect, ID2D1Factory1, ID2D1Image, ID2D1RenderTarget,
 };
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP};
 use windows::Win32::Graphics::Direct3D11::{
@@ -67,7 +67,9 @@ use windows::core::Interface;
 
 use crate::config::RendererKind;
 use crate::paint::scene_rect;
-use crate::transform_stage::{ContentSpace, DisplayArm, OutputSurface};
+use crate::transform_stage::{
+    Backend, ContentSpace, DisplayArm, EffectChain, OutputSurface, PassShape,
+};
 use crate::window::{fatal, state_of};
 
 // ---------------------------------------------------------------------------
@@ -547,12 +549,29 @@ const D2D1_COLORMANAGEMENT_ALPHA_MODE_PREMULTIPLIED: u32 = 1;
 /// re-keys the output identity through the fingerprint's policy term).
 const D2D1_COLORMANAGEMENT_QUALITY_BEST: u32 = 2;
 
+/// `D2D1_SHARPEN_PROP_SHARPNESS = 0` (d2d1effects_2.h:271-285 — the #130
+/// transcribe-from-the-header precedent; the docs effect page is a stub,
+/// the domain lives on the ENUM page, see ADR 0006 D6). The value domain
+/// is SHARPNESS 0.0–10.0 default 0.0; the config scale is that float
+/// domain as the integer 0..=10 (O4=A).
+const D2D1_SHARPEN_PROP_SHARPNESS: u32 = 0;
+/// `D2D1_SHARPEN_PROP_THRESHOLD = 1` (same header, pinned by test). The
+/// domain is 0.0–1.0 default 0.0; the value is PINNED to the default as
+/// an internal constant (O6=A — no second knob until a real use case
+/// asks for one).
+const D2D1_SHARPEN_PROP_THRESHOLD: u32 = 1;
+
 /// The built effect graph: the intermediate the scene composites into,
-/// the ColorManagement effect wired sRGB->display-profile, and the
-/// contexts the effect's properties reference (held so their lifetime is
-/// visibly the graph's, though the property system AddRefs them anyway).
-/// Everything here is UI-thread only and dies with the stack (or with an
-/// intent/size change — `built_for` is what the lazy builder checks).
+/// the chain wired `intermediate → [user effects] → ColorManagement →
+/// target` (#183 — the user chain rides BEFORE the ColorManagement
+/// effect, so the convolution runs in the master's gamma-like domain on
+/// every arm; a Direct-arm chain skips the ColorManagement stage
+/// entirely, the chain's tail is the graph's output), and the contexts
+/// the ColorManagement stage's properties reference (held so their
+/// lifetime is visibly the graph's, though the property system AddRefs
+/// them anyway). Everything here is UI-thread only and dies with the
+/// stack (or with an intent/chain/size change — `built_for` is what the
+/// lazy builder checks).
 struct EffectGraph {
     /// The composite surface, TARGET-only (sized to the viewport; the
     /// resize path drops the whole graph and the next paint rebuilds).
@@ -564,12 +583,21 @@ struct EffectGraph {
     /// #143), an Srgb master's stays BGRA8 (the 8-bit effect path is
     /// byte-identical). `F16P3` shares the f16 layout (ADR 0004 D2).
     intermediate: ID2D1Image,
-    /// The effect, already holding `intermediate` as input 0.
+    /// The chain's FINAL output (the ColorManagement effect's image where
+    /// the arm has one, the user chain's tail otherwise) — what phase 2
+    /// draws into the target.
     effect_image: ID2D1Image,
-    _effect: ID2D1Effect,
-    _src_ctx: ID2D1ColorContext,
-    _dst_ctx: ID2D1ColorContext,
-    built_for: (u32, u32, ContentSpace, DisplayArm),
+    /// Every effect in the chain, in wiring order (user effects first,
+    /// ColorManagement last) — held so their lifetime is visibly the
+    /// graph's (each AddRefs its input; the Vec's drop order is the
+    /// chain's own order).
+    _effects: Vec<ID2D1Effect>,
+    _src_ctx: Option<ID2D1ColorContext>,
+    _dst_ctx: Option<ID2D1ColorContext>,
+    /// The lazy rebuild key: size, master space, arm AND chain (#183) —
+    /// a chain change (the toggle, once the surface ticket wires it)
+    /// re-keys the graph exactly like an intent flip.
+    built_for: (u32, u32, ContentSpace, DisplayArm, EffectChain),
 }
 
 /// WHO owns a display-segment failure's recovery (#130's narrow ratchet,
@@ -599,6 +627,11 @@ pub(crate) enum DisplayFailureClass {
 struct DisplaySegment {
     intent: Option<(DisplayArm, Option<std::path::PathBuf>)>,
     graph: Option<EffectGraph>,
+    /// The user display-effect chain (#183): display-only, default EMPTY.
+    /// A change re-keys the graph like an intent flip (the lazy builder
+    /// compares it in `built_for`); the config-side setter arrives with
+    /// the surface ticket (sharpen key + toggle).
+    chain: EffectChain,
     /// This frame's effect failure (construction or effect draw),
     /// drained by the paint caller to feed the session ratchets. None on
     /// every clean frame.
@@ -672,6 +705,10 @@ pub(crate) struct GpuStack {
     d3d_device: ID3D11Device,
     /// The effective backend label (About line / status suffix / stderr).
     pub(crate) backend: &'static str,
+    /// The effective backend as the decision-table enum (#183): the label
+    /// above is for humans, `pass_shape` reads this one (its WARP row is
+    /// #127's inherited exclusion, O3=B).
+    backend_kind: Backend,
     /// The largest single bitmap this device can create (runtime query —
     /// never the hardcoded 16384, design §3-6). The giant path reads it
     /// per paint: a level whose dimensions fit is drawn as ONE bitmap, a
@@ -1000,6 +1037,11 @@ pub(crate) fn create(
         factory,
         d3d_device,
         backend: backend_label(effective != RendererKind::Warp),
+        backend_kind: if effective != RendererKind::Warp {
+            Backend::Hardware
+        } else {
+            Backend::Warp
+        },
         max_bitmap,
         uploaded: None,
         tile_owner: None,
@@ -1490,19 +1532,38 @@ impl GpuStack {
         if w == 0 || h == 0 {
             return false;
         }
+        let chain = self.display.chain;
         if let Some(graph) = self.display.graph.as_ref()
-            && graph.built_for == (w, h, space, self.current_arm())
+            && graph.built_for == (w, h, space, self.current_arm(), chain)
         {
             return true;
         }
         self.display.graph = None;
-        match self.build_effect_graph(w, h, space) {
+        match self.build_effect_graph(w, h, space, chain) {
             Ok(graph) => {
                 self.display.graph = Some(graph);
                 true
             }
             Err(e) => {
                 let class = self.failure_class();
+                // #184 Codex P1: a chain that will not build must be
+                // dropped for the session HERE. The narrow latch cannot
+                // end this failure sequence — it only re-keys the CM
+                // stage inside `display_arm`, while `pass_shape` would
+                // keep answering TwoStage for a non-empty chain, so every
+                // paint would rebuild-and-fail again (a repaint loop).
+                // Clearing the chain collapses the next paint onto the
+                // direct / CM-only shape, which succeeds — the sequence
+                // ends the way every latch's does. Ticket ② must keep the
+                // toggle's shown state reading THIS chain (the config key
+                // is persistence only), or the drop would desync (ADR
+                // 0006 D9).
+                if !self.display.chain.is_empty() {
+                    eprintln!(
+                        "riviv: user effect chain dropped for the session (build failed: {e})"
+                    );
+                    self.display.chain = EffectChain::default();
+                }
                 self.display
                     .failure
                     .get_or_insert_with(|| (class, format!("display effect build failed: {e}")));
@@ -1555,17 +1616,26 @@ impl GpuStack {
         w: u32,
         h: u32,
         space: ContentSpace,
+        chain: EffectChain,
     ) -> Result<EffectGraph, String> {
         let (arm, profile) = match self.display.intent.as_ref() {
             Some((arm, path)) => (*arm, path.as_deref()),
             None => (DisplayArm::Direct, None),
         };
+        // The (space, arm) gate: which graph FORMS this build serves — the
+        // color arms (any chain) take the ColorManagement form, a Direct
+        // arm with a non-empty chain takes the CM-less form (#183); every
+        // other pairing is a wiring bug. `pass_shape` already keeps the
+        // CM-less form off WARP (#127's inherited exclusion), so a WARP
+        // chain never reaches here.
+        let chained = !chain.is_empty();
         match (space, arm) {
             (
                 ContentSpace::F16P3,
                 DisplayArm::P3ToSrgb | DisplayArm::P3ToDisplay | DisplayArm::P3ToScRgb,
             ) => {}
             (ContentSpace::Srgb | ContentSpace::F16Srgb, DisplayArm::SrgbToDisplay) => {}
+            (ContentSpace::Srgb | ContentSpace::F16Srgb, DisplayArm::Direct) if chained => {}
             _ => {
                 debug_assert!(
                     false,
@@ -1598,6 +1668,63 @@ impl GpuStack {
             .cast()
             .map_err(|e| format!("cast intermediate to ID2D1Image failed: {e}"))?;
         drop(intermediate); // the Image reference keeps the object alive
+        // The user chain's stage (#183, ADR 0006 D4): wired BEFORE the
+        // ColorManagement effect, so the convolution runs in the master's
+        // gamma-like encoding domain on every arm (BGRA8 code values /
+        // gamma-sRGB f16 / the same f16 layout for F16P3 — after the CM
+        // the AC arm would convolve in linear scRGB, a different look per
+        // arm). An empty chain skips the block entirely: the wiring below
+        // is the pre-#183 graph byte-for-byte.
+        let mut effects: Vec<ID2D1Effect> = Vec::new();
+        let mut chain_tail: Option<ID2D1Image> = None;
+        if chained {
+            // SAFETY: the context is live; the CLSID is a static constant.
+            let sharpen = unsafe { self.context.CreateEffect(&CLSID_D2D1Sharpen) }
+                .map_err(|e| format!("CreateEffect(Sharpen) failed: {e}"))?;
+            // SAFETY: property writes on the live effect; FLOAT properties
+            // take 4 bytes; sharpness ≤ 10.0 and threshold 0.0 sit inside
+            // the docs enum page's domains (ADR 0006 D6).
+            unsafe {
+                let sharpness = f32::from(chain.sharpen);
+                sharpen
+                    .SetValue(
+                        D2D1_SHARPEN_PROP_SHARPNESS,
+                        D2D1_PROPERTY_TYPE_FLOAT,
+                        &sharpness.to_ne_bytes(),
+                    )
+                    .map_err(|e| format!("SetValue(sharpness) failed: {e}"))?;
+                let threshold = 0.0f32;
+                sharpen
+                    .SetValue(
+                        D2D1_SHARPEN_PROP_THRESHOLD,
+                        D2D1_PROPERTY_TYPE_FLOAT,
+                        &threshold.to_ne_bytes(),
+                    )
+                    .map_err(|e| format!("SetValue(threshold) failed: {e}"))?;
+                // Input 0 = the intermediate (the chain's head); the effect
+                // holds its own reference.
+                sharpen.SetInput(0, Some(&intermediate_img), false);
+            }
+            chain_tail = Some(
+                sharpen
+                    .cast()
+                    .map_err(|e| format!("cast sharpen to ID2D1Image failed: {e}"))?,
+            );
+            effects.push(sharpen);
+        }
+        // The CM-less form's early exit (#183): a Direct arm reaches here
+        // only WITH a chain (the gate above), and its tail is the graph's
+        // whole output — no ColorManagement stage, no contexts.
+        if matches!(arm, DisplayArm::Direct) {
+            return Ok(EffectGraph {
+                intermediate: intermediate_img,
+                effect_image: chain_tail.expect("the gate passes a Direct arm only with a chain"),
+                _effects: effects,
+                _src_ctx: None,
+                _dst_ctx: None,
+                built_for: (w, h, space, arm, chain),
+            });
+        }
         // SAFETY: the context is live; the CLSID is a static constant.
         let effect = unsafe { self.context.CreateEffect(&CLSID_D2D1ColorManagement) }
             .map_err(|e| format!("CreateEffect(ColorManagement) failed: {e}"))?;
@@ -1651,8 +1778,8 @@ impl GpuStack {
                 }
                 .map_err(|e| format!("CreateColorContext(scRGB) failed: {e}"))?
             }
-            // The (space, arm) gate above rejected every other pairing;
-            // this arm is total over the gate's accepted set only.
+            // The gate and the CM-less early exit above kept both arms
+            // out of here; this branch is the unreachable-cell defense.
             DisplayArm::Direct | DisplayArm::WideBlank => {
                 return Err(format!(
                     "effect graph cannot serve the {arm:?} arm — display intent wiring bug"
@@ -1711,20 +1838,26 @@ impl GpuStack {
                     &D2D1_COLORMANAGEMENT_QUALITY_BEST.to_ne_bytes(),
                 )
                 .map_err(|e| format!("SetValue(quality) failed: {e}"))?;
-            // Input 0 = the intermediate, set once here (the effect holds
-            // its own reference); no invalidation flag.
-            effect.SetInput(0, Some(&intermediate_img), false);
+            // Input 0 = the user chain's tail when the chain ran, the
+            // intermediate itself otherwise (the effect holds its own
+            // reference); no invalidation flag.
+            effect.SetInput(
+                0,
+                Some(chain_tail.as_ref().unwrap_or(&intermediate_img)),
+                false,
+            );
         }
         let effect_image: ID2D1Image = effect
             .cast()
             .map_err(|e| format!("cast effect to ID2D1Image failed: {e}"))?;
+        effects.push(effect);
         Ok(EffectGraph {
             intermediate: intermediate_img,
             effect_image,
-            _effect: effect,
-            _src_ctx: src_ctx,
-            _dst_ctx: dst_ctx,
-            built_for: (w, h, space, arm),
+            _effects: effects,
+            _src_ctx: Some(src_ctx),
+            _dst_ctx: Some(dst_ctx),
+            built_for: (w, h, space, arm, chain),
         })
     }
 
@@ -1882,26 +2015,40 @@ impl GpuStack {
         if !self.face_allows_content(arm) {
             return self.direct_pass(bg, None);
         }
-        match arm {
-            DisplayArm::Direct => self.direct_pass(bg, plan),
-            DisplayArm::WideBlank => self.direct_pass(bg, None),
-            DisplayArm::SrgbToDisplay => {
+        // #183: the pass SHAPE comes from the decision table now — a
+        // dimension orthogonal to the arm (`transform_stage::pass_shape`).
+        // An empty chain keeps every arm on its pre-#183 shape (the
+        // zero-perturbation contract); a chain forces the two-stage form
+        // on the hardware Direct arm; WARP's inherited exclusion (#127,
+        // O3=B) is a table row, not a scattered arm here.
+        match (
+            crate::transform_stage::pass_shape(self.backend_kind, arm, self.display.chain),
+            arm,
+        ) {
+            // The blank contract stays arm-local: no content in any shape
+            // (the face gate above already catches WideBlank; this keeps
+            // the contract even if that ever changes).
+            (_, DisplayArm::WideBlank) => self.direct_pass(bg, None),
+            (PassShape::Direct, _) => self.direct_pass(bg, plan),
+            // The narrow contract (#130, unchanged; #183 extends it to the
+            // chain-only Direct form — content visible without the effect
+            // beats blank): draw direct on a build failure, the ratchet
+            // counts the failure (already recorded).
+            (PassShape::TwoStage, DisplayArm::Direct | DisplayArm::SrgbToDisplay) => {
                 if self.ensure_effect_graph(size.width, size.height, frame_space) {
                     self.effect_pass(bg, plan)
                 } else {
-                    // #130's narrow contract, unchanged: draw direct, the
-                    // ratchet counts the failure (already recorded).
                     self.direct_pass(bg, plan)
                 }
             }
-            DisplayArm::P3ToSrgb | DisplayArm::P3ToDisplay | DisplayArm::P3ToScRgb => {
+            // A wide graph that will not build: NO present, NO direct
+            // draw (fake color is the one forbidden outcome) — the
+            // failure is recorded with the arm's class; the ratchets
+            // take it from here.
+            (PassShape::TwoStage, _) => {
                 if self.ensure_effect_graph(size.width, size.height, frame_space) {
                     self.effect_pass(bg, plan)
                 } else {
-                    // A wide graph that will not build: NO present, NO
-                    // direct draw (fake color is the one forbidden
-                    // outcome) — the failure is recorded with the arm's
-                    // class; the ratchets take it from here.
                     Err(DrawFailure::EffectNotBuilt)
                 }
             }
@@ -3009,6 +3156,17 @@ mod tests {
             face_format(OutputSurface::AcScRgb),
             "the arms are distinct formats — a same-format pair would hide a face mixup"
         );
+    }
+
+    #[test]
+    fn the_sharpen_property_indices_match_the_sdk_header() {
+        // d2d1effects_2.h:271-285, the #130 transcribe-from-the-header
+        // precedent (the docs effect page is a stub): SHARPNESS is index
+        // 0, THRESHOLD is index 1 — pinned so a transcription slip cannot
+        // silently move a SetValue onto the wrong property (ADR 0006 D6).
+        assert_eq!(D2D1_SHARPEN_PROP_SHARPNESS, 0);
+        assert_eq!(D2D1_SHARPEN_PROP_THRESHOLD, 1);
+        assert_ne!(D2D1_SHARPEN_PROP_SHARPNESS, D2D1_SHARPEN_PROP_THRESHOLD);
     }
 
     #[test]
