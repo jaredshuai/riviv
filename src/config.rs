@@ -679,13 +679,15 @@ mod tests {
         let back = parse_apply(&text, true);
         assert_eq!(back, c, "every save key must be a load key");
         // 61 int keys + the riviv-authored keep_zoom (#68) + the renderer
-        // string key (#80) + one *_keys line per command in Cmd::ALL order —
-        // 92 bound, the rest empty (#42 adds the shell septet: three
-        // bound, four empty; #43 adds the file-management octet: Del /
-        // Shift+Del / F2 bound, five empty).
+        // string key (#80) + one *_keys line per command in Cmd::ALL
+        // order — bound rows and empty rows alike (#42's shell septet,
+        // #43's file-management octet, #178's tail-appended Undo Delete
+        // among them; no bound-row count is pinned here — the DEFAULT_KEYS
+        // table is its own source of truth and a hand-counted number
+        // would only drift).
         assert_eq!(
             c.to_pairs(false).len(),
-            183,
+            184,
             "the save table + keep_zoom + renderer"
         );
     }
@@ -737,7 +739,7 @@ mod tests {
         let c = Config::default();
         assert_eq!(
             c.to_pairs(true).len(),
-            183,
+            184,
             "active store writes the full table"
         );
         let c = Config {

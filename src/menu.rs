@@ -354,12 +354,17 @@ pub(crate) enum Cmd {
     HelpCommandLineOptions,
     /// Help → About (`VIV_ID_HELP_ABOUT`).
     HelpAbout,
+    /// Edit → Undo Delete (#178 — riviv-authored; upstream has no row,
+    /// only the viv.c:47 wishlist note). Ctrl+Z. FIRST row of the Edit
+    /// menu. Appended at the enum's tail so every existing command id
+    /// stays pinned for the smoke scripts (the id test's own rule).
+    EditUndoDelete,
 }
 
 impl Cmd {
     /// Variant count; also the id space size (ids are 1-based — 0 is the
     /// separator/no-command id in Win32 menus and must stay unassigned).
-    pub(crate) const COUNT: usize = Self::HelpAbout as usize + 1;
+    pub(crate) const COUNT: usize = Self::EditUndoDelete as usize + 1;
 
     /// The WM_COMMAND command id (upstream uses the `VIV_ID_*` enum values;
     /// riviv's ids are app-internal — nothing interoperates — so they run
@@ -556,6 +561,9 @@ impl Cmd {
         Self::NavJumpTo,
         Self::HelpCommandLineOptions,
         Self::HelpAbout,
+        // #178's tail append (id 122 — after every upstream-aligned id;
+        // see the variant's doc).
+        Self::EditUndoDelete,
     ];
 }
 
@@ -778,6 +786,15 @@ pub(crate) const ENTRIES: &[Entry] = &[
         parent: Slot::Root,
         slot: Slot::Edit,
     },
+    // #178 (beyond upstream — viv.c:47's wishlist note, no upstream row):
+    // the riviv-authored Undo Delete opens the Edit menu, separator
+    // after it, so the upstream rows (Cut first) start a clean block.
+    Entry::Item {
+        loc: loc::Id::MenuUndoDelete,
+        parent: Slot::Edit,
+        cmd: Cmd::EditUndoDelete,
+    },
+    Entry::Separator { parent: Slot::Edit },
     Entry::Item {
         loc: loc::Id::MenuCut,
         parent: Slot::Edit,
@@ -1717,6 +1734,11 @@ pub(crate) struct MenuState {
     /// `image_enabled` (upstream's is_image_enabled covers them together);
     /// the two differ only when frames exist without a current file.
     pub(crate) display_enabled: bool,
+    /// Whether a recycle-bin delete stands un-undoed in THIS session
+    /// (#178, riviv-authored): the record exists — a permanent delete
+    /// clears it, a restore consumes it. Gates the Undo Delete row
+    /// (nothing recorded = the row grays; the key is a harmless no-op).
+    pub(crate) can_undo_delete: bool,
     /// The Allow Shrinking / Keep Aspect / Fill Window trio's config
     /// snapshot (#46; upstream viv.c:7127-7129): the Fill row reads the
     /// fullscreen or windowed `fill_window` flag per the CURRENT mode
@@ -1826,6 +1848,10 @@ pub(crate) fn enabled(cmd: Cmd, state: &MenuState) -> bool {
         // empty clipboard no-ops and the hidden rows' handlers carry the
         // bare current-file guard, viv.c:7202.)
         Cmd::EditCopyImage | Cmd::FileClose => state.display_enabled,
+        // #178: the undo record itself is the gate — an image may or may
+        // not be showing; what matters is that a recycle delete stands
+        // unconsumed in this session.
+        Cmd::EditUndoDelete => state.can_undo_delete,
         _ => true,
     }
 }
@@ -2094,6 +2120,7 @@ mod tests {
             shuffle: true,
             image_enabled: true,
             display_enabled: true,
+            can_undo_delete: true,
             allow_shrinking: true,
             keep_aspect: true,
             fill_window: true,
@@ -2113,6 +2140,7 @@ mod tests {
             shuffle: false,
             image_enabled: true,
             display_enabled: true,
+            can_undo_delete: false,
             allow_shrinking: false,
             keep_aspect: false,
             fill_window: false,
@@ -2313,11 +2341,30 @@ mod tests {
             shuffle: false,
             image_enabled: true,
             display_enabled: true,
+            can_undo_delete: true,
             allow_shrinking: false,
             keep_aspect: false,
             fill_window: false,
             ontop: 0,
         }
+    }
+
+    #[test]
+    fn undo_delete_gates_only_on_its_own_record() {
+        // #178: the record is the ONLY input — neither the image gate nor
+        // the display gate touches it (an undo works on a blank viewer
+        // after the last list entry died, and the row grays with an
+        // image showing when nothing stands recorded).
+        let mut state = plain_state();
+        state.can_undo_delete = false;
+        state.image_enabled = true;
+        state.display_enabled = true;
+        assert!(!enabled(Cmd::EditUndoDelete, &state));
+        let mut blank = plain_state();
+        blank.can_undo_delete = true;
+        blank.image_enabled = false;
+        blank.display_enabled = false;
+        assert!(enabled(Cmd::EditUndoDelete, &blank));
     }
 
     #[test]
@@ -2458,7 +2505,10 @@ mod tests {
         assert_eq!(Cmd::AnimationRateDecrease.id(), 104);
         assert_eq!(Cmd::NavNext.id(), 107); // smoke65 posts Next by raw id
         assert_eq!(Cmd::HelpAbout.id(), 121);
-        assert_eq!(Cmd::COUNT, 121);
+        // #178's tail append: the first riviv-authored id past upstream's
+        // whole table — every upstream id above stands unshifted.
+        assert_eq!(Cmd::EditUndoDelete.id(), 122);
+        assert_eq!(Cmd::COUNT, 122);
     }
 
     #[test]

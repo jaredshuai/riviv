@@ -50,6 +50,8 @@ L2（ADR 0004）的 AC 会话画在 FP16 scRGB 输出面上：swapchain 与画�
 
 **现状（只核对了入口，没有重读每个命令）。** 导航打开调用 `request_open`（`src/window.rs` home 4827、next/prev 5010、5035、5066）。Everything 随机结果打开也调用 `request_open`（`on_random_reply` 5980 → 6017）。播放列表、预加载、上一张缓存是 `request_open` 开头的旁路（4324–4359），命中则不再解码。
 
+文件管理里有一条 riviv 自著的 undo-delete（#178，Ctrl+Z / Edit → Undo Delete，命令 id 122 尾追加在全部上游 id 之后）：`delete_current` 的回收站臂在删除成功时记下条目克隆与列表位置（`src/window.rs` `UndoDeleteRecord`），Ctrl+Z 时 `filemgmt::recycle_restore` 直读回收站 `$I`/`$R` 对（偏移 24 是 u32 路径单元数前缀、路径在 28 起，按 ASCII 折叠匹配、多条取最新）把 `$R` 搬回原路径、`playlist::insert_restored` 原位回插（含 shuffle 槽逆缝合），再走 `request_open` 的 Nav 臂跳回显示。深度 1、会话内、permanent 删除清记录；失败（回收站无对/目标被占/无盘符）不弹框，状态栏闪 3 秒原因，记录保留可重试。纯逻辑解析与回插各有单测钉死；真实 `$I` 布局以 smoke178 第一轮的字节级 dump 修正过一次（首版按 NUL 结尾读路径是错的）。
+
 ## 关键关系
 
 用户动作进主窗口。打开请求进那一个解码线程——交互重栅（#163）也排在这同一条队列上，解码与重栅永不并发持帧（`src/loadthread.rs` 194–197、280–303）。线程把回复放进这次加载的队列，并用 `WM_APP+1` 叫醒 UI（`REPLY_KICK_MESSAGE`，`src/loadthread.rs` 52；主窗口在 8966–8971 交给 `on_load_replies`，同一脚踢也放行重栅回执 `drain_reraster_replies`）。UI 收下第一帧，改当前显示，再让视口重画。视口从 CPU 帧画出像素。菜单和状态栏不保存这帧的像素。
