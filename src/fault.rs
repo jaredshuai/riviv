@@ -8,7 +8,11 @@
 //! exists on the dev machine (docs/spikes/s-fault-injection.md: the
 //! graphics-reset hotkey ignores synthetic input, a TDR storm courts a
 //! bugcheck, PnP/VM need elevation); the real-chain confirmation is a
-//! one-minute manual runbook item instead.
+//! one-minute manual runbook item instead. The `chain` kind (#187, ADR
+//! 0006 D9) drives the user effect chain's build failure: a consumed
+//! count refuses a chain build whose CreateEffect(Sharpen) genuinely
+//! succeeded, so the session-level drop (not the narrow latch) ends the
+//! failure sequence.
 //!
 //! Semantics: a count is a number of REMAINING injections; every consume
 //! decrements one. Injection happens where the real call SUCCEEDED — the
@@ -32,6 +36,7 @@ static DEVICE_LOSS_REMAINING: AtomicU8 = AtomicU8::new(0);
 static EFFECT_REMAINING: AtomicU8 = AtomicU8::new(0);
 static AC_CREATE_REMAINING: AtomicU8 = AtomicU8::new(0);
 static PREPARE_REMAINING: AtomicU8 = AtomicU8::new(0);
+static CHAIN_BUILD_REMAINING: AtomicU8 = AtomicU8::new(0);
 
 /// The parsed knob: how many synthetic failures each boundary still owes.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -40,6 +45,7 @@ pub(crate) struct FaultPlan {
     pub(crate) effect: u8,
     pub(crate) ac_create: u8,
     pub(crate) prepare: u8,
+    pub(crate) chain: u8,
 }
 
 /// Grammar: comma-separated `kind=count` tokens, whitespace-tolerant;
@@ -67,6 +73,7 @@ pub(crate) fn parse(value: &str) -> FaultPlan {
             "effect" => plan.effect = count,
             "ac_create" => plan.ac_create = count,
             "prepare" => plan.prepare = count,
+            "chain" => plan.chain = count,
             _ => {}
         }
     }
@@ -92,9 +99,10 @@ pub(crate) fn init_from_env() {
     EFFECT_REMAINING.store(plan.effect, Ordering::Relaxed);
     AC_CREATE_REMAINING.store(plan.ac_create, Ordering::Relaxed);
     PREPARE_REMAINING.store(plan.prepare, Ordering::Relaxed);
+    CHAIN_BUILD_REMAINING.store(plan.chain, Ordering::Relaxed);
     eprintln!(
-        "riviv: fault injection armed (device={} effect={} ac_create={} prepare={})",
-        plan.device, plan.effect, plan.ac_create, plan.prepare
+        "riviv: fault injection armed (device={} effect={} ac_create={} prepare={} chain={})",
+        plan.device, plan.effect, plan.ac_create, plan.prepare, plan.chain
     );
 }
 
@@ -124,6 +132,16 @@ pub(crate) fn consume_prepare() -> bool {
     take_one(&PREPARE_REMAINING)
 }
 
+/// Take one synthetic user-chain build failure (#187, ADR 0006 D9): the
+/// CreateEffect(Sharpen) call itself SUCCEEDED, then the build refuses —
+/// `ensure_effect_graph`'s Err arm drops the chain for the session (the
+/// breadcrumb line) and the next paint collapses onto the chain-less
+/// shape, ending the failure sequence. Driving this proves the drop
+/// actually happens and never loops.
+pub(crate) fn consume_chain_build() -> bool {
+    take_one(&CHAIN_BUILD_REMAINING)
+}
+
 fn take_one(slot: &AtomicU8) -> bool {
     loop {
         let n = slot.load(Ordering::Relaxed);
@@ -149,7 +167,7 @@ mod tests {
 
     #[test]
     fn a_full_line_arms_every_slot() {
-        let plan = plan_of("device=3,effect=4,ac_create=1,prepare=5");
+        let plan = plan_of("device=3,effect=4,ac_create=1,prepare=5,chain=2");
         assert_eq!(
             plan,
             FaultPlan {
@@ -157,6 +175,7 @@ mod tests {
                 effect: 4,
                 ac_create: 1,
                 prepare: 5,
+                chain: 2,
             }
         );
     }

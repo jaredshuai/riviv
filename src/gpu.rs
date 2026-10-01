@@ -1701,6 +1701,17 @@ impl GpuStack {
             // SAFETY: the context is live; the CLSID is a static constant.
             let sharpen = unsafe { self.context.CreateEffect(&CLSID_D2D1Sharpen) }
                 .map_err(|e| format!("CreateEffect(Sharpen) failed: {e}"))?;
+            // #187's fault seam (ADR 0006 D9): a consumed count refuses
+            // the build AFTER the create genuinely succeeded — the Err
+            // arm of `ensure_effect_graph` drops the chain for the
+            // session, and the next paint collapses onto the chain-less
+            // shape. The smoke pin drives exactly that hand-off. Inert
+            // unless RIVIV_FAULT armed a count.
+            if crate::fault::consume_chain_build() {
+                return Err(
+                    "fault-injected effect chain build failure (RIVIV_FAULT seam)".to_string(),
+                );
+            }
             // SAFETY: property writes on the live effect; FLOAT properties
             // take 4 bytes; sharpness ≤ 10.0 and threshold 0.0 sit inside
             // the docs enum page's domains (ADR 0006 D6).
@@ -3260,5 +3271,115 @@ mod tests {
                 hr.0 as u32
             );
         }
+    }
+
+    /// The A4 negative-control probe (#187, ADR 0006 D6): pins the LIVE
+    /// runtime's own sharpen-property behavior instead of trusting the
+    /// docs enum page — defaults read back 0.0 and out-of-domain writes
+    /// are refused without changing the value. Effect-object creation
+    /// needs no hardware, so a WARP device context carries the probe.
+    /// Ignored: an instrument touching the live D2D runtime (the smoke
+    /// drives it via `cargo test -- --ignored`), not pure logic.
+    #[test]
+    #[ignore = "smoke #187 A4 probe: pins the live D2D sharpen defaults"]
+    fn smoke187_sharpen_property_domain_probe() {
+        let d3d = create_d3d_device(true).expect("a WARP D3D device always exists");
+        let dxgi_device: IDXGIDevice = d3d.cast().expect("QI IDXGIDevice");
+        // SAFETY: process-wide factory creation taking only the enum +
+        // options None; the result is checked.
+        let factory: ID2D1Factory1 =
+            unsafe { D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None) }
+                .expect("D2D1CreateFactory");
+        // SAFETY: both operands are live; the result is checked.
+        let d2d_device = unsafe { factory.CreateDevice(&dxgi_device) }.expect("D2D CreateDevice");
+        // SAFETY: the device is live; the options enum is a plain value.
+        let context: ID2D1DeviceContext =
+            unsafe { d2d_device.CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE) }
+                .expect("CreateDeviceContext");
+        // SAFETY: the context is live; the CLSID is a static constant.
+        let sharpen = unsafe { context.CreateEffect(&CLSID_D2D1Sharpen) }
+            .expect("CreateEffect(Sharpen) on WARP");
+        fn read_f32(effect: &ID2D1Effect, index: u32) -> f32 {
+            let mut buf = [0u8; 4];
+            // SAFETY: read-only property query on the live effect; FLOAT
+            // properties read 4 bytes; the buffer outlives the call.
+            unsafe { effect.GetValue(index, D2D1_PROPERTY_TYPE_FLOAT, &mut buf) }
+                .unwrap_or_else(|e| panic!("GetValue({index}) failed: {e}"));
+            f32::from_ne_bytes(buf)
+        }
+        fn write_f32(effect: &ID2D1Effect, index: u32, value: f32) -> windows::core::Result<()> {
+            // SAFETY: property write on the live effect; a FLOAT writes
+            // 4 bytes; the value outlives the call.
+            unsafe { effect.SetValue(index, D2D1_PROPERTY_TYPE_FLOAT, &value.to_ne_bytes()) }
+        }
+        // The defaults the docs enum page promises (SHARPNESS/THRESHOLD
+        // both 0.0): read back from the real effect object.
+        assert_eq!(
+            read_f32(&sharpen, D2D1_SHARPEN_PROP_SHARPNESS),
+            0.0,
+            "SHARPNESS default reads back 0.0"
+        );
+        assert_eq!(
+            read_f32(&sharpen, D2D1_SHARPEN_PROP_THRESHOLD),
+            0.0,
+            "THRESHOLD default reads back 0.0"
+        );
+        // In-domain boundary writes succeed (the page's 0.0..=10.0 and
+        // 0.0..=1.0 are CLOSED domains per the config int scale 0..=10).
+        for value in [0.0f32, 10.0] {
+            write_f32(&sharpen, D2D1_SHARPEN_PROP_SHARPNESS, value)
+                .unwrap_or_else(|e| panic!("in-domain SHARPNESS {value} refused: {e}"));
+        }
+        // What the runtime ACTUALLY does with out-of-domain FLOAT writes
+        // (probed 2026-10-01, pinned here — the pre-probe assumption that
+        // D2D refuses them was wrong): NOTHING is refused. SHARPNESS
+        // clamps into the documented domain on both sides; THRESHOLD
+        // stores an over-domain write VERBATIM (1.5 reads back 1.5 — the
+        // upper bound is not enforced) while the negative side clamps to
+        // 0.0. Each step departs from a distinguishable prior value (a
+        // "left unchanged" outcome can never alias the clamped one):
+        // re-seed SHARPNESS to 5.0 first, so -0.5 reading back 0.0 (not
+        // 5.0) proves the write took effect, then 10.5/100.0 reading
+        // back 10.0 (not 0.0) prove the clamp. This is WHY riviv never
+        // relies on platform-side enforcement: the config int key
+        // 0..=10 (ADR 0006 D6) is the ONLY gate, and THRESHOLD is the
+        // pinned in-code constant 0.0.
+        write_f32(&sharpen, D2D1_SHARPEN_PROP_SHARPNESS, 5.0)
+            .unwrap_or_else(|e| panic!("mid-domain SHARPNESS re-seed refused: {e}"));
+        write_f32(&sharpen, D2D1_SHARPEN_PROP_SHARPNESS, -0.5)
+            .unwrap_or_else(|e| panic!("out-of-domain write unexpectedly refused: {e}"));
+        assert_eq!(
+            read_f32(&sharpen, D2D1_SHARPEN_PROP_SHARPNESS),
+            0.0,
+            "SHARPNESS -0.5 clamps to the domain floor (5.0 was the prior value)"
+        );
+        write_f32(&sharpen, D2D1_SHARPEN_PROP_SHARPNESS, 10.5)
+            .unwrap_or_else(|e| panic!("out-of-domain write unexpectedly refused: {e}"));
+        assert_eq!(
+            read_f32(&sharpen, D2D1_SHARPEN_PROP_SHARPNESS),
+            10.0,
+            "SHARPNESS 10.5 clamps to the domain ceiling (0.0 was the prior value)"
+        );
+        write_f32(&sharpen, D2D1_SHARPEN_PROP_SHARPNESS, 100.0)
+            .unwrap_or_else(|e| panic!("out-of-domain write unexpectedly refused: {e}"));
+        assert_eq!(
+            read_f32(&sharpen, D2D1_SHARPEN_PROP_SHARPNESS),
+            10.0,
+            "SHARPNESS 100.0 clamps to the domain ceiling"
+        );
+        write_f32(&sharpen, D2D1_SHARPEN_PROP_THRESHOLD, 1.5)
+            .unwrap_or_else(|e| panic!("out-of-domain write unexpectedly refused: {e}"));
+        assert_eq!(
+            read_f32(&sharpen, D2D1_SHARPEN_PROP_THRESHOLD),
+            1.5,
+            "THRESHOLD 1.5 is stored VERBATIM (the platform does not enforce the ceiling)"
+        );
+        write_f32(&sharpen, D2D1_SHARPEN_PROP_THRESHOLD, -0.1)
+            .unwrap_or_else(|e| panic!("out-of-domain write unexpectedly refused: {e}"));
+        assert_eq!(
+            read_f32(&sharpen, D2D1_SHARPEN_PROP_THRESHOLD),
+            0.0,
+            "THRESHOLD -0.1 clamps to the floor (1.5 was the prior value)"
+        );
     }
 }
