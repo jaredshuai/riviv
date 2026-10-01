@@ -230,6 +230,13 @@ pub(crate) struct WindowState {
     /// in flight; a direct open that never got as far as `_viv_open` —
     /// unstatable path — leaves it untouched).
     pub(crate) nav_current: Option<PlaylistEntry>,
+    /// #178 undo-delete: the one recycle-bin delete standing un-undoed in
+    /// this session (depth 1). Set by `delete_current`'s recycle arm,
+    /// cleared by a permanent delete, consumed by the undo itself. No
+    /// upstream counterpart — viv.c:47's wishlist note, never implemented
+    /// there. (Module-private: only window.rs's own delete/undo arms and
+    /// the menu snapshot touch it.)
+    undo_delete: Option<UndoDeleteRecord>,
     /// Zoom/pan view of the displayed image (#7; upstream's
     /// `_viv_zoom_pos`/`_viv_view_*` globals, viv.c:677-683). Reset on
     /// every display swap and blank, exactly where upstream runs
@@ -5481,6 +5488,17 @@ fn playlist_add_current_if_empty(state: &mut WindowState) {
     }
 }
 
+/// What #178's undo needs to put a delete back: the entry as it stood
+/// (id and metadata intact), where it sat — `None` when the deleted
+/// current was NOT in the playlist (a direct open; undo re-adds at the
+/// tail) — and its shuffle slot, both read BEFORE the remove.
+#[derive(Clone)]
+struct UndoDeleteRecord {
+    entry: PlaylistEntry,
+    index: Option<usize>,
+    order_slot: Option<u32>,
+}
+
 /// #43 `_viv_delete` (viv.c:7200-7229): FO_DELETE the current file — the
 /// shell's own confirmation dialog appears (upstream passes no
 /// FOF_NOCONFIRMATION) — then, only on a clean success, converge the
@@ -5499,12 +5517,83 @@ fn delete_current(hwnd: HWND, permanently: bool) {
         // SAFETY: a short plain-field borrow — the navigation below
         // runs after it drops.
         if let Some(state) = unsafe { state_of(hwnd) } {
+            // #178: only the recycle arm is undoable, and a permanent
+            // delete RETIRES any standing record — "undo the last
+            // delete" cannot reach past an un-undoable one.
+            let positions = state.playlist.undo_positions(current.id);
+            state.undo_delete = if permanently {
+                None
+            } else {
+                Some(UndoDeleteRecord {
+                    entry: current.clone(),
+                    index: positions.map(|(index, _)| index),
+                    order_slot: positions.and_then(|(_, slot)| slot),
+                })
+            };
             state.playlist.remove_by_id(current.id);
         }
         if !nav_next(hwnd, false, true, false, false) {
             blank_display(hwnd);
         }
     }
+}
+
+/// #178 undo-delete (Ctrl+Z / Edit → Undo Delete, riviv-authored —
+/// viv.c:47's wishlist note, never implemented upstream): restore the
+/// recorded file from the recycle bin (the `$R` twin back to its
+/// original path, the `$I` index dropped), re-insert the entry —
+/// positionally when it came from the playlist, at the tail when it was
+/// a direct open — and navigate onto it ("undo the delete and re-add
+/// the image to the playlist", the wishlist's own wording). A restore
+/// that cannot happen leaves everything as it stands and flashes why on
+/// the status bar; the record SURVIVES a failure, so an obstruction the
+/// user clears (a squatter at the target path) can be retried.
+fn undo_delete_current(hwnd: HWND) {
+    // SAFETY: read-only clone out of the borrow; the restore below runs
+    // with no borrow held.
+    let Some(record) = (unsafe { state_of(hwnd) }).and_then(|s| s.undo_delete.clone()) else {
+        return; // nothing recorded — the row grays, the key is a no-op
+    };
+    match crate::filemgmt::recycle_restore(&record.entry.path) {
+        Ok(()) => {
+            // SAFETY: the borrow spans the record consume, the re-insert
+            // and the entry clone-out — plain data work, nothing pumps.
+            let nav_entry = (unsafe { state_of(hwnd) }).and_then(|state| {
+                state.undo_delete = None;
+                let index = record.index.unwrap_or(usize::MAX);
+                state
+                    .playlist
+                    .insert_restored(record.entry.clone(), index, record.order_slot);
+                state
+                    .playlist
+                    .entries()
+                    .iter()
+                    .find(|e| **e == record.entry)
+                    .cloned()
+            });
+            if let Some(entry) = nav_entry {
+                request_open(hwnd, &entry.path, OpenOrigin::Nav(&entry));
+            }
+        }
+        Err(why) => flash_undo_failed(hwnd, why),
+    }
+}
+
+/// The #178 failure flash — the `flash_pos_zoom` 3-second pattern, with
+/// the reason in the user's language (the OS error text verbatim for a
+/// refused move).
+fn flash_undo_failed(hwnd: HWND, why: crate::filemgmt::UndoDeleteError) {
+    use crate::filemgmt::UndoDeleteError;
+    let text = match why {
+        UndoDeleteError::NoVolumeRoot | UndoDeleteError::NotInBin => {
+            loc::get(loc::Id::UndoFailedNotInBin).to_string()
+        }
+        UndoDeleteError::TargetExists => loc::get(loc::Id::UndoFailedTargetExists).to_string(),
+        UndoDeleteError::RestoreFailed(err) => {
+            format!("{}: {}", loc::get(loc::Id::UndoFailedMove), err)
+        }
+    };
+    status_set_temp_text(hwnd, Some(text));
 }
 
 /// #43 `_viv_edit_rotate` (viv.c:7715-7768): fire the shell rotate90/
@@ -7142,6 +7231,8 @@ fn refresh_menu_state(hwnd: HWND, target: HMENU) {
                 state.status_file_not_found,
                 state.status_load_failed,
             ),
+            // #178: a recycle delete stands un-undoed in this session.
+            can_undo_delete: state.undo_delete.is_some(),
             // The #46 fit trio and on-top radios (viv.c:7127-7136): the
             // Fill row reads the CURRENT mode's fill config (upstream's
             // `_viv_check_menus` branch, viv.c:7098-7100).
@@ -7384,6 +7475,8 @@ fn on_command(hwnd: HWND, cmd: menu::Cmd) {
         }
         menu::Cmd::FileDeleteRecycle => delete_current(hwnd, false),
         menu::Cmd::FileDeletePermanently => delete_current(hwnd, true),
+        // #178 (riviv-authored; viv.c:47's wishlist note).
+        menu::Cmd::EditUndoDelete => undo_delete_current(hwnd),
         // `_viv_rename` (viv.c:7365-7371): the bare current-file gate,
         // then the modal (its OK arm owns the shell call and the state
         // follow-up).
@@ -9527,6 +9620,7 @@ pub(crate) fn run() -> Result<(), String> {
         pending_file_bytes: None,
         playlist: Playlist::new(),
         nav_current: None,
+        undo_delete: None,
         view: View::new(),
         drag: None,
         mscroll: None,

@@ -345,6 +345,55 @@ impl Playlist {
             false
         }
     }
+
+    /// #178 undo-delete's bookkeeping half, read BEFORE the matching
+    /// `remove_by_id`: where the entry sits (the `entries` index) and,
+    /// with a shuffle order standing at remove time, its slot in that
+    /// order. A `None` slot means no order existed yet (shuffle off, or
+    /// built later). None overall = the id is not in the playlist (a
+    /// direct-open current): undo re-ADDS such an entry at the tail
+    /// instead of re-inserting positionally.
+    pub(crate) fn undo_positions(&self, id: u64) -> Option<(usize, Option<u32>)> {
+        let index = self.entries.iter().position(|e| e.id == id)?;
+        let order_slot = self
+            .shuffle_order
+            .as_ref()
+            .and_then(|order| {
+                order
+                    .iter()
+                    .position(|&i| self.entries[i as usize].id == id)
+            })
+            .map(|slot| slot as u32);
+        Some((index, order_slot))
+    }
+
+    /// #178 undo-delete's restore half — the exact inverse of
+    /// `remove_by_id`: the entry returns at its recorded index (clamped
+    /// into range — the playlist may have shrunk meanwhile) with its id
+    /// and metadata intact, not a fresh `add`. A shuffle order standing
+    /// NOW must re-cover the new index whatever happened since the
+    /// remove: every order value at or past the index shifts up one, and
+    /// the index itself re-enters the order at the recorded slot — or at
+    /// the order's END when the order was built after the delete (a
+    /// deterministic stand-in for `add`'s random join, viv.c:9496-9531).
+    pub(crate) fn insert_restored(
+        &mut self,
+        entry: PlaylistEntry,
+        index: usize,
+        order_slot: Option<u32>,
+    ) {
+        let index = index.min(self.entries.len());
+        if let Some(order) = self.shuffle_order.as_mut() {
+            for v in order.iter_mut() {
+                if *v as usize >= index {
+                    *v += 1;
+                }
+            }
+            let slot = order_slot.map_or(order.len(), |slot| (slot as usize).min(order.len()));
+            order.insert(slot, index as u32);
+        }
+        self.entries.insert(index, entry);
+    }
 }
 
 /// One xorshift64* draw reduced into `[0, modulus)` (the shuffle's
@@ -1738,6 +1787,65 @@ mod tests {
         assert_eq!(names_after, names_before);
         // And a miss inside a built order still no-ops everything.
         assert!(!pl.remove_by_id(77));
+    }
+
+    // #178: undo positions + positional re-insert — the round trip with
+    // `remove_by_id` must restore BOTH arrays byte-for-byte.
+    #[test]
+    fn insert_restored_undoes_remove_by_id_exactly() {
+        let mut pl = Playlist::new();
+        for name in ["a.png", "b.png", "c.png", "d.png"] {
+            pl.add(OsString::from(name), 1, 0, 0);
+        }
+        pl.ensure_shuffle(7);
+        let entries_before = pl.entries().to_vec();
+        let order_before = pl.shuffle_order.clone().expect("built");
+        // Snapshot the middle entry's positions, remove, re-insert.
+        let (index, slot) = pl.undo_positions(1).expect("b is in the playlist");
+        assert_eq!(index, 1);
+        let restored = entries_before[index].clone();
+        assert!(pl.remove_by_id(1));
+        pl.insert_restored(restored, index, slot);
+        assert_eq!(pl.entries(), entries_before.as_slice());
+        assert_eq!(
+            pl.shuffle_order.as_ref().expect("still built"),
+            &order_before
+        );
+    }
+
+    #[test]
+    fn insert_restored_clamps_and_joins_a_later_built_order_at_its_end() {
+        let mut pl = Playlist::new();
+        for name in ["a.png", "b.png"] {
+            pl.add(OsString::from(name), 1, 0, 0);
+        }
+        // Delete happened with NO order standing (slot None); the order
+        // was built after. A record past the shrunken tail clamps.
+        let victim = pl.entries()[1].clone();
+        assert!(pl.remove_by_id(1));
+        pl.ensure_shuffle(9);
+        pl.insert_restored(victim, 99, None);
+        assert_eq!(pl.entries().len(), 2);
+        // The order covers the re-added index, at its end.
+        let order = pl.shuffle_order.as_ref().expect("built");
+        assert_eq!(order.len(), 2);
+        assert_eq!(*order.last().expect("non-empty"), 1);
+        // And with the order STILL absent, a plain positional insert is
+        // order-free.
+        let mut bare = Playlist::new();
+        bare.add(OsString::from("a.png"), 1, 0, 0);
+        let tail = bare.entries()[0].clone();
+        bare.insert_restored(tail, 0, Some(4)); // a slot nobody records
+        assert_eq!(bare.entries().len(), 2);
+        assert!(bare.shuffle_order.is_none(), "no order was ever built");
+    }
+
+    #[test]
+    fn undo_positions_reads_none_for_an_absent_id() {
+        let mut pl = Playlist::new();
+        pl.add(OsString::from("a.png"), 1, 0, 0);
+        assert_eq!(pl.undo_positions(0), Some((0, None)));
+        assert_eq!(pl.undo_positions(42), None);
     }
 
     // #43: rename sync — first exact path match, byte compare (case

@@ -682,10 +682,11 @@ mod tests {
         // string key (#80) + one *_keys line per command in Cmd::ALL order —
         // 92 bound, the rest empty (#42 adds the shell septet: three
         // bound, four empty; #43 adds the file-management octet: Del /
-        // Shift+Del / F2 bound, five empty).
+        // Shift+Del / F2 bound, five empty; #178 appends the riviv-authored
+        // Undo Delete, bound to Ctrl+Z — 93 bound).
         assert_eq!(
             c.to_pairs(false).len(),
-            183,
+            184,
             "the save table + keep_zoom + renderer"
         );
     }
@@ -737,7 +738,7 @@ mod tests {
         let c = Config::default();
         assert_eq!(
             c.to_pairs(true).len(),
-            183,
+            184,
             "active store writes the full table"
         );
         let c = Config {

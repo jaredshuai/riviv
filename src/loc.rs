@@ -67,6 +67,9 @@ pub(crate) enum Id {
     /// Edit → "&Paste" (#41; viv.c:830 — MF_OWNERDRAW upstream, keyboard
     /// Ctrl+V).
     MenuPaste,
+    /// Edit → "&Undo Delete" (#178 — riviv-authored, no upstream row;
+    /// viv.c:47's wishlist note. Ctrl+Z).
+    MenuUndoDelete,
     /// "&View" top-level caption (viv.c:839).
     MenuView,
     /// View → "Menu" toggle (viv.c:842).
@@ -491,12 +494,23 @@ pub(crate) enum Id {
     /// Options View page: keep-zoom checkbox (riviv-authored — upstream's
     /// viv.c:41 wishlist note has no string).
     OptionsKeepZoom,
+    /// ---- #178: undo-delete ----
+    /// Status flash when the restore finds no matching recycle pair (the
+    /// bin was emptied / already restored / disabled at delete time), or
+    /// the path carries no volume root to scan.
+    UndoFailedNotInBin,
+    /// Status flash when a file already occupies the original path — the
+    /// restore refuses to overwrite it and leaves the pair intact.
+    UndoFailedTargetExists,
+    /// Status flash prefix when the `$R` twin refused to move back; the
+    /// OS error text follows after ": ".
+    UndoFailedMove,
 }
 
 impl Id {
     /// Variant count; array-typing both tables against this keeps them
     /// length-locked to the enum by construction.
-    pub(crate) const COUNT: usize = Self::OptionsKeepZoom as usize + 1;
+    pub(crate) const COUNT: usize = Self::UndoFailedMove as usize + 1;
 }
 
 /// Table choice (upstream `LOCALIZATION_LANGUAGE_*`, localization.h:30-32).
@@ -527,6 +541,7 @@ const EN_US: [&str; Id::COUNT] = [
     "Copy Filename",     // MenuCopyFilename — no mnemonic upstream
     "Cop&y Image",       // MenuCopyImage
     "&Paste",            // MenuPaste
+    "&Undo Delete",      // MenuUndoDelete (#178 — riviv-authored)
     "&View",             // MenuView
     "&Menu",             // MenuMenu
     "F&ullscreen",       // MenuFullscreen
@@ -761,25 +776,28 @@ const EN_US: [&str; Id::COUNT] = [
     "&While Playing Slideshow or Animating", // MenuWhilePlaying (en_us.h:113)
     "&Never",                                // MenuNever (en_us.h:114)
     // The #42 shell verb block (en_us.h:41-46/51).
-    "Open File &Location...",                  // MenuOpenFileLocation
-    "&Edit...",                                // MenuFileEdit
-    "Pre&view...",                             // MenuPreview
-    "&Print...",                               // MenuPrint
-    "Set Des&ktop Wallpaper",                  // MenuSetDesktopWallpaper
-    "&Close",                                  // MenuClose
-    "P&roperties",                             // MenuProperties
-    "&Delete",                                 // MenuDelete (#43)
-    "Delete (Recycle)",                        // MenuDeleteRecycle (#43)
-    "Delete (Permanently)",                    // MenuDeletePermanently (#43)
-    "Rena&me",                                 // MenuRename (#43)
-    "Rotate Cloc&kwise",                       // MenuRotateClockwise (#43)
-    "Rotate Cou&nterclockwise",                // MenuRotateCounterclockwise (#43)
-    "Copy to &Folder...",                      // MenuCopyTo (#43)
-    "Mo&ve to Folder...",                      // MenuMoveTo (#43)
-    "Rename",                                  // RenameCaption (#43)
-    "Copy To",                                 // CopyToCaption (#43)
-    "Move To",                                 // MoveToCaption (#43)
-    "Keep &zoom and pan when changing images", // OptionsKeepZoom (#68, riviv)
+    "Open File &Location...",                     // MenuOpenFileLocation
+    "&Edit...",                                   // MenuFileEdit
+    "Pre&view...",                                // MenuPreview
+    "&Print...",                                  // MenuPrint
+    "Set Des&ktop Wallpaper",                     // MenuSetDesktopWallpaper
+    "&Close",                                     // MenuClose
+    "P&roperties",                                // MenuProperties
+    "&Delete",                                    // MenuDelete (#43)
+    "Delete (Recycle)",                           // MenuDeleteRecycle (#43)
+    "Delete (Permanently)",                       // MenuDeletePermanently (#43)
+    "Rena&me",                                    // MenuRename (#43)
+    "Rotate Cloc&kwise",                          // MenuRotateClockwise (#43)
+    "Rotate Cou&nterclockwise",                   // MenuRotateCounterclockwise (#43)
+    "Copy to &Folder...",                         // MenuCopyTo (#43)
+    "Mo&ve to Folder...",                         // MenuMoveTo (#43)
+    "Rename",                                     // RenameCaption (#43)
+    "Copy To",                                    // CopyToCaption (#43)
+    "Move To",                                    // MoveToCaption (#43)
+    "Keep &zoom and pan when changing images",    // OptionsKeepZoom (#68, riviv)
+    "Not found in the Recycle Bin",               // UndoFailedNotInBin (#178, riviv)
+    "A file already exists at the original path", // UndoFailedTargetExists (#178, riviv)
+    "Restore failed",                             // UndoFailedMove (#178, riviv)
 ];
 
 /// zh-CN table — upstream localization_zh_cn.h:31/197-199/261-263.
@@ -803,6 +821,7 @@ const ZH_CN: [&str; Id::COUNT] = [
     "复制文件名",        // MenuCopyFilename — no mnemonic upstream
     "复制图像(&Y)",      // MenuCopyImage
     "粘贴(&P)",          // MenuPaste
+    "撤销删除(&U)",      // MenuUndoDelete (#178 — riviv-authored)
     "视图(&V)",          // MenuView
     "菜单(&M)",          // MenuMenu
     "全屏(&F)",          // MenuFullscreen
@@ -1054,6 +1073,9 @@ const ZH_CN: [&str; Id::COUNT] = [
     "复制到",                   // CopyToCaption (#43)
     "移动到",                   // MoveToCaption (#43)
     "换图时保持缩放与平移(&Z)", // OptionsKeepZoom (#68, riviv)
+    "回收站中未找到该文件",     // UndoFailedNotInBin (#178, riviv)
+    "原路径已存在同名文件",     // UndoFailedTargetExists (#178, riviv)
+    "恢复失败",                 // UndoFailedMove (#178, riviv)
 ];
 
 /// Map a `GetUserDefaultUILanguage` LANGID onto the table choice

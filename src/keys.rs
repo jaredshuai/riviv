@@ -142,6 +142,10 @@ const DEFAULT_KEYS: &[(Cmd, &[KeyDef])] = &[
         &[key(true, false, true, b'C' as u16)],
     ),
     (Cmd::EditPaste, &[key(true, false, false, b'V' as u16)]),
+    // #178 undo-delete (beyond upstream — viv.c:47's wishlist note; the
+    // upstream table registers no Z row). Ctrl+Z directly after the
+    // clipboard quartet, the conventional slot.
+    (Cmd::EditUndoDelete, &[key(true, false, false, b'Z' as u16)]),
     // The #46 view-preset trio (viv.c:991-993, right after the clipboard
     // quartet and before the 1:1 row — bare digit keys).
     (Cmd::ViewPreset1, &[key(false, false, false, b'1' as u16)]),
@@ -675,6 +679,11 @@ mod tests {
         assert!(vks(Cmd::EditRotate270).is_empty());
         assert!(vks(Cmd::EditCopyTo).is_empty());
         assert!(vks(Cmd::EditMoveTo).is_empty());
+        // #178 (beyond upstream — viv.c:47's wishlist note): Ctrl+Z.
+        assert_eq!(
+            vks(Cmd::EditUndoDelete),
+            vec![k(true, false, false, b'Z' as u16)]
+        );
         // The #46 additions: presets on bare digits, window sizes on
         // Alt+digits, Ctrl+T on-top, F5 refresh (viv.c:991-993/997-1000/
         // 1024/1026).

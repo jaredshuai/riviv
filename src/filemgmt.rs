@@ -1,5 +1,7 @@
 //! #43 file-management actions: the rename-dialog composition (pure) and
-//! the SHFileOperation shells (delete / rename / copy-to / move-to).
+//! the SHFileOperation shells (delete / rename / copy-to / move-to), plus
+//! #178's recycle-bin pair restore (the `$I`/`$R` metadata parse and the
+//! move-back).
 //!
 //! Upstream anchors: `_viv_delete` viv.c:7200-7229 (FO_DELETE, recycle vs
 //! permanent, playlist+nav follow-up in the caller), `_viv_rename_proc`
@@ -19,6 +21,7 @@ use windows::core::PCWSTR;
 
 use crate::text::to_wide_os;
 use std::ffi::OsStr;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 
 // ---------- pure: the rename OK arm's composition ----------
 
@@ -269,6 +272,219 @@ fn outcome_of(ret: i32, aborted: windows::core::BOOL) -> ShellOutcome {
     }
 }
 
+// ---------- #178 pure + fs: the recycle-bin pair restore ----------
+
+/// One parsed `$I` metadata file — the index half of the Vista+ recycle
+/// bin's `$I`/`$R` pair (the `$R` twin carries the data). Layout,
+/// byte-verified against this machine's real writer (smoke178 run 1's
+/// ground-truth dump): u64 LE version (2), u64 LE original size, u64 LE
+/// deletion FILETIME, then a u32 LE path length in UTF-16 units, then
+/// exactly that many path units — no terminator on the writer observed
+/// here; some writers count a trailing NUL, which the parse tolerates.
+/// There is no public per-item enumeration API (the crate ships only
+/// SHEmptyRecycleBin/SHQueryRecycleBin, and upstream's own note says "no
+/// undo api", viv.c:138) — this format is the de-facto standard every
+/// recycle-bin tool reads.
+struct RecycleMeta {
+    deleted_at: u64,
+    original_path: Vec<u16>,
+}
+
+/// The fixed `$I` header: version + size + deletion FILETIME, u64 LE each.
+const I_HEADER: usize = 24;
+/// The only `$I` version a supported OS writes (min-OS Win10 1607; the
+/// pre-Vista `INFO` format died with 9x).
+const I_VERSION: u64 = 2;
+
+fn parse_i_file(bytes: &[u8]) -> Option<RecycleMeta> {
+    let header: &[u8; I_HEADER] = bytes.get(..I_HEADER)?.try_into().ok()?;
+    let word = |at: usize| -> Option<u64> {
+        Some(u64::from_le_bytes(header[at..at + 8].try_into().ok()?))
+    };
+    if word(0)? != I_VERSION {
+        return None;
+    }
+    let deleted_at = word(16)?;
+    // The u32 length prefix right past the fixed header, then exactly
+    // that many UTF-16 units — a count overrunning the file is malformed.
+    let count = u32::from_le_bytes(bytes.get(I_HEADER..I_HEADER + 4)?.try_into().ok()?) as usize;
+    let path = bytes.get(I_HEADER + 4..I_HEADER + 4 + count * 2)?;
+    let units: Vec<u16> = path
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u16::from_le_bytes(*pair))
+        .collect();
+    // Tolerate a trailing NUL inside the declared count (writer
+    // variance); a NUL anywhere else ends the path early.
+    let end = units
+        .iter()
+        .position(|&unit| unit == 0)
+        .unwrap_or(units.len());
+    Some(RecycleMeta {
+        deleted_at,
+        original_path: units[..end].to_vec(),
+    })
+}
+
+/// The `$R` twin's path: an `$I` file's name with the `I` flipped to `R`
+/// (`$I3F9A.png` ↔ `$R3F9A.png`). None when the name is not an `$I` file.
+fn r_twin(i_path: &[u16]) -> Option<Vec<u16>> {
+    let name_at = i_path
+        .iter()
+        .rposition(|&unit| unit == u16::from(b'\\'))
+        .map_or(0, |at| at + 1);
+    if i_path.get(name_at) == Some(&u16::from(b'$'))
+        && i_path.get(name_at + 1) == Some(&u16::from(b'I'))
+    {
+        let mut twin = i_path.to_vec();
+        twin[name_at + 1] = u16::from(b'R');
+        Some(twin)
+    } else {
+        None
+    }
+}
+
+/// The volume root whose `$Recycle.Bin` holds a deleted file's pair
+/// (`C:\a.png` → `C:\` — the bin is per-volume, so the pair sits on the
+/// file's own drive). None for UNC / drive-relative / relative paths:
+/// undo refuses to guess there.
+fn drive_root(path: &[u16]) -> Option<Vec<u16>> {
+    let is_letter = |unit: u16| {
+        (unit >= u16::from(b'a') && unit <= u16::from(b'z'))
+            || (unit >= u16::from(b'A') && unit <= u16::from(b'Z'))
+    };
+    let sep = u16::from(b'\\');
+    if path.len() >= 3
+        && is_letter(path[0])
+        && path[1] == u16::from(b':')
+        && (path[2] == sep || path[2] == u16::from(b'/'))
+    {
+        Some(vec![path[0], path[1], sep])
+    } else {
+        None
+    }
+}
+
+/// Path equality with ASCII case-folding: the recorded path and the
+/// `$I`'s stored copy come from different directory listings, and NTFS
+/// matches ASCII case-insensitively. Non-ASCII units compare exactly —
+/// the full Unicode upcase table is the filesystem's job, not ours.
+fn path_eq_folded(a: &[u16], b: &[u16]) -> bool {
+    let fold = |unit: u16| {
+        if (u16::from(b'A')..=u16::from(b'Z')).contains(&unit) {
+            unit + 32
+        } else {
+            unit
+        }
+    };
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| fold(*x) == fold(*y))
+}
+
+/// Why an undo-delete restore could not happen (the status flash's text).
+#[derive(Debug)]
+pub(crate) enum UndoDeleteError {
+    /// The recorded path carries no volume root (UNC, relative) — there
+    /// is no `$Recycle.Bin` location to scan.
+    NoVolumeRoot,
+    /// No `$I` pair matched the original path: the bin was emptied, the
+    /// pair was already restored (Explorer's own undo), or the bin was
+    /// disabled at delete time so the file left permanently.
+    NotInBin,
+    /// A file already sits at the original path — restore never
+    /// overwrites it.
+    TargetExists,
+    /// The `$R` twin refused to move back (parent directory gone, ACL,
+    /// drive absent). The pair stays intact — Explorer's undo still can.
+    RestoreFailed(std::io::Error),
+}
+
+/// Scan one volume's `$Recycle.Bin` for the `$I` whose stored original
+/// path matches, returning it with its `$R` twin. Every owner-SID
+/// subdirectory is scanned (other users' are unreadable by design and
+/// skip silently); among duplicates the NEWEST deletion time wins — a
+/// delete → restore → delete cycle recycles the same path twice, and the
+/// freshest pair is the latest delete's. `volume_root` is a parameter
+/// (not derived here) so tests can point the scan at a fabricated bin.
+fn find_pair(
+    volume_root: &std::path::Path,
+    original_path: &[u16],
+) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+    let bin = volume_root.join("$Recycle.Bin");
+    let Ok(sids) = std::fs::read_dir(&bin) else {
+        return None;
+    };
+    let mut best: Option<(u64, std::path::PathBuf)> = None;
+    for sid in sids.flatten() {
+        let Ok(files) = std::fs::read_dir(sid.path()) else {
+            continue; // another user's SID directory — unreadable by design
+        };
+        for entry in files.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name() else {
+                continue;
+            };
+            // The $I prefix is pure ASCII, so encoded-byte prefix checks
+            // are encoding-safe.
+            if !name.as_encoded_bytes().starts_with(b"$I") {
+                continue;
+            }
+            let Some(meta) = std::fs::read(&path).ok().and_then(|b| parse_i_file(&b)) else {
+                continue;
+            };
+            if !path_eq_folded(&meta.original_path, original_path) {
+                continue;
+            }
+            if best.as_ref().is_none_or(|(t, _)| meta.deleted_at > *t) {
+                best = Some((meta.deleted_at, path));
+            }
+        }
+    }
+    let (_, i_path) = best?;
+    let twin = {
+        let wide: Vec<u16> = i_path
+            .file_name()
+            .map(|name| name.encode_wide().collect())
+            .unwrap_or_default();
+        let name = r_twin(&wide)?;
+        i_path.with_file_name(std::ffi::OsString::from_wide(&name))
+    };
+    Some((i_path, twin))
+}
+
+/// The restore half of #178's undo-delete: move the `$R` twin back to the
+/// original path and drop the `$I` index. The pair is touched only after
+/// every precondition holds; a failed rename leaves the bin exactly as
+/// it was. Cleaning the `$I` after a successful move is fail-soft — the
+/// file is already back, and a ghost index at worst shows a broken bin
+/// entry.
+pub(crate) fn recycle_restore(path: &OsStr) -> Result<(), UndoDeleteError> {
+    let recorded: Vec<u16> = path.encode_wide().collect();
+    let Some(root) = drive_root(&recorded) else {
+        return Err(UndoDeleteError::NoVolumeRoot);
+    };
+    let root = std::path::PathBuf::from(std::ffi::OsString::from_wide(&root));
+    restore_under(&root, path, &recorded)
+}
+
+/// `recycle_restore` with the volume root supplied — the seam the unit
+/// tests aim at a fabricated `$Recycle.Bin` tree.
+fn restore_under(
+    root: &std::path::Path,
+    path: &OsStr,
+    recorded: &[u16],
+) -> Result<(), UndoDeleteError> {
+    if std::path::Path::new(path).exists() {
+        return Err(UndoDeleteError::TargetExists);
+    }
+    let Some((i_path, r_path)) = find_pair(root, recorded) else {
+        return Err(UndoDeleteError::NotInBin);
+    };
+    std::fs::rename(&r_path, path).map_err(UndoDeleteError::RestoreFailed)?;
+    let _ = std::fs::remove_file(&i_path);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -348,5 +564,232 @@ mod tests {
     fn rename_stem_of_a_leading_dot_name_is_empty() {
         // string_remove_extension cuts at the only dot: ".hidden" -> "".
         assert_eq!(rename_stem(&s(r"C:\dir\.hidden")), s(""));
+    }
+
+    // ---------- #178: the $I parse and the pair surgery ----------
+
+    /// A minimal valid `$I` body in the REAL layout this machine's
+    /// writer produces (byte-verified by smoke178 run 1): version 2,
+    /// size 7, deletion FILETIME, u32 unit count, the path units with no
+    /// terminator.
+    fn i_file(path: &str, deleted_at: u64) -> Vec<u8> {
+        let units: Vec<u16> = path.encode_utf16().collect();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&2u64.to_le_bytes());
+        bytes.extend_from_slice(&7u64.to_le_bytes());
+        bytes.extend_from_slice(&deleted_at.to_le_bytes());
+        bytes.extend_from_slice(&(units.len() as u32).to_le_bytes());
+        for unit in units {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        bytes
+    }
+
+    #[test]
+    fn i_file_v2_parses_time_and_path() {
+        let meta = parse_i_file(&i_file(r"C:\pics\a.png", 0x1122_3344_5566_7788))
+            .expect("valid v2 body parses");
+        assert_eq!(meta.deleted_at, 0x1122_3344_5566_7788);
+        assert_eq!(meta.original_path, s(r"C:\pics\a.png"));
+        // Bytes past the declared path are ignored (alignment padding).
+        let mut padded = i_file(r"C:\pics\a.png", 1);
+        padded.extend_from_slice(&[0xCC; 4]);
+        assert_eq!(
+            parse_i_file(&padded)
+                .expect("padding is not fatal")
+                .original_path,
+            s(r"C:\pics\a.png")
+        );
+        // A writer that counts its trailing NUL parses to the same path.
+        let mut with_nul = i_file(r"C:\a", 2);
+        let count_at = I_HEADER;
+        let count =
+            u32::from_le_bytes(with_nul[count_at..count_at + 4].try_into().unwrap()) as usize;
+        with_nul[count_at..count_at + 4].copy_from_slice(&((count + 1) as u32).to_le_bytes());
+        with_nul.push(0);
+        with_nul.push(0);
+        assert_eq!(
+            parse_i_file(&with_nul)
+                .expect("NUL inside the count is tolerated")
+                .original_path,
+            s(r"C:\a")
+        );
+    }
+
+    /// The first bytes smoke178 run 1 dumped off a REAL pair this
+    /// machine's shell wrote (v2 | size 0x4f | FILETIME | count 0x3b |
+    /// "C:\U...") — the ground truth the length-prefix layout came from.
+    /// The dump cut at 48 bytes; reconstructing the exact temp path gives
+    /// 58 units, so the writer's count 0x3b=59 INCLUDES the trailing
+    /// NUL the tolerance arm already covers.
+    #[test]
+    fn i_file_parses_the_captured_real_writer_bytes() {
+        let path = "C:\\Users\\jared\\AppData\\Local\\Temp\\riviv-178-smoke\\fx\\a.png";
+        let units: Vec<u16> = path.encode_utf16().collect();
+        assert_eq!(units.len(), 58, "58 units + NUL = the captured 0x3b");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&2u64.to_le_bytes());
+        bytes.extend_from_slice(&0x4fu64.to_le_bytes());
+        bytes.extend_from_slice(&0x01dd_514e_e7b4_aee0u64.to_le_bytes());
+        bytes.extend_from_slice(&0x3bu32.to_le_bytes());
+        for unit in &units {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        let meta = parse_i_file(&bytes).expect("the real writer's shape");
+        assert_eq!(meta.deleted_at, 0x01dd_514e_e7b4_aee0);
+        assert_eq!(meta.original_path, units);
+    }
+
+    #[test]
+    fn i_file_rejects_short_wrong_version_and_overrun_counts() {
+        assert!(parse_i_file(&[]).is_none(), "empty");
+        assert!(
+            parse_i_file(&i_file(r"C:\a", 1)[..23]).is_none(),
+            "truncated header"
+        );
+        let mut v1 = i_file(r"C:\a", 1);
+        v1[0] = 1; // version 1 — the pre-Vista layout, unsupported
+        assert!(parse_i_file(&v1).is_none(), "version 1");
+        // A count that overruns the file is malformed, not a short read.
+        let mut overrun = i_file(r"C:\a", 1);
+        let count_at = I_HEADER;
+        overrun[count_at..count_at + 4].copy_from_slice(&9u32.to_le_bytes());
+        assert!(parse_i_file(&overrun).is_none(), "count overruns EOF");
+        // The length prefix itself truncated.
+        assert!(
+            parse_i_file(&i_file(r"C:\a", 1)[..26]).is_none(),
+            "prefix cut"
+        );
+    }
+
+    #[test]
+    fn r_twin_flips_the_i_prefix_in_place() {
+        assert_eq!(
+            r_twin(&s(r"C:\$Recycle.Bin\S-1-5\$I3F9A.png")).as_deref(),
+            Some(&s(r"C:\$Recycle.Bin\S-1-5\$R3F9A.png")[..])
+        );
+        assert_eq!(r_twin(&s("plain.png")), None, "not an $I name");
+        assert_eq!(r_twin(&s(r"C:\x\$R3F9A.png")), None, "already the twin");
+    }
+
+    #[test]
+    fn drive_root_accepts_only_drive_absolute_paths() {
+        assert_eq!(
+            drive_root(&s(r"C:\pics\a.png")).as_deref(),
+            Some(&s("C:\\")[..])
+        );
+        assert_eq!(
+            drive_root(&s(r"d:\a")).as_deref(),
+            Some(&s(r"d:\")[..]),
+            "lowercase drive letter"
+        );
+        assert_eq!(
+            drive_root(&s(r"E:/a.png")).as_deref(),
+            Some(&s(r"E:\")[..]),
+            "forward slash accepted, normalized to backslash"
+        );
+        assert_eq!(drive_root(&s(r"\\srv\share\a.png")), None, "UNC");
+        assert_eq!(drive_root(&s(r"C:a.png")), None, "drive-relative");
+        assert_eq!(drive_root(&s("a.png")), None, "bare relative");
+    }
+
+    #[test]
+    fn path_eq_folded_folds_ascii_only() {
+        assert!(path_eq_folded(&s(r"C:\Pics\A.PNG"), &s(r"c:\pics\a.png")));
+        // The case difference in the ASCII segment folds.
+        assert!(path_eq_folded(&s("图\\a.png"), &s("图\\A.png")));
+        // Full-width Ａ/ａ are non-ASCII lookalikes of A/a: we do NOT
+        // fold them — the upcase table is the filesystem's, not ours.
+        assert!(!path_eq_folded(&s("Ａ.png"), &s("ａ.png")));
+    }
+
+    /// A fabricated bin under a unique temp directory, the shape
+    /// `find_pair`/`restore_under` walk: `<root>/$Recycle.Bin/<sid>/$I..`.
+    fn fake_bin(tag: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir()
+            .join(format!("riviv-178-i-{}", tag))
+            .join("vol");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("$Recycle.Bin").join("S-1-5-21-a")).unwrap();
+        std::fs::create_dir_all(root.join("$Recycle.Bin").join("S-1-5-21-b")).unwrap();
+        root
+    }
+
+    fn drop_i(root: &std::path::Path, sid: &str, name: &str, path: &str, deleted_at: u64) {
+        std::fs::write(
+            root.join("$Recycle.Bin").join(sid).join(name),
+            i_file(path, deleted_at),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn find_pair_matches_folded_and_takes_the_newest() {
+        let root = fake_bin("find");
+        // Same original path in two owner dirs plus a case-variant copy
+        // and an unrelated pair; the newest match wins.
+        drop_i(&root, "S-1-5-21-a", "$IOLD1.png", r"D:\pics\a.png", 100);
+        drop_i(&root, "S-1-5-21-b", "$INEW1.png", r"d:\PICS\A.png", 200);
+        drop_i(&root, "S-1-5-21-a", "$IOTH.png", r"D:\pics\other.png", 300);
+        let victim: Vec<u16> = OsStr::new(r"D:\pics\a.png").encode_wide().collect();
+        let (i_path, r_path) = find_pair(&root, &victim).expect("a match exists");
+        assert_eq!(i_path, root.join("$Recycle.Bin/S-1-5-21-b/$INEW1.png"));
+        assert_eq!(r_path, root.join("$Recycle.Bin/S-1-5-21-b/$RNEW1.png"));
+        let absent: Vec<u16> = OsStr::new(r"D:\pics\gone.png").encode_wide().collect();
+        assert!(find_pair(&root, &absent).is_none());
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[test]
+    fn restore_under_moves_the_twin_back_and_cleans_the_index() {
+        let root = fake_bin("restore");
+        let target = root.join("pics").join("a.png");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(
+            root.join("$Recycle.Bin/S-1-5-21-a/$R2222.png"),
+            b"recycled bytes",
+        )
+        .unwrap();
+        drop_i(&root, "S-1-5-21-a", "$I2222.png", r"D:\pics\a.png", 50);
+        let recorded: Vec<u16> = OsStr::new(r"D:\pics\a.png").encode_wide().collect();
+        restore_under(&root, target.as_os_str(), &recorded).expect("restore succeeds");
+        assert_eq!(std::fs::read(&target).unwrap(), b"recycled bytes");
+        assert!(!root.join("$Recycle.Bin/S-1-5-21-a/$R2222.png").exists());
+        assert!(!root.join("$Recycle.Bin/S-1-5-21-a/$I2222.png").exists());
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[test]
+    fn restore_under_never_overwrites_and_reports_why() {
+        let root = fake_bin("refuse");
+        let target = root.join("a.png");
+        std::fs::write(&target, b"new occupant").unwrap();
+        drop_i(&root, "S-1-5-21-a", "$I3333.png", r"D:\a.png", 50);
+        std::fs::write(root.join("$Recycle.Bin/S-1-5-21-a/$R3333.png"), b"old").unwrap();
+        let recorded: Vec<u16> = OsStr::new(r"D:\a.png").encode_wide().collect();
+        match restore_under(&root, target.as_os_str(), &recorded) {
+            Err(UndoDeleteError::TargetExists) => {}
+            other => panic!("expected TargetExists, got {:?}", other),
+        }
+        // The pair is untouched — Explorer's undo still can.
+        assert!(root.join("$Recycle.Bin/S-1-5-21-a/$I3333.png").exists());
+        assert!(root.join("$Recycle.Bin/S-1-5-21-a/$R3333.png").exists());
+        assert_eq!(std::fs::read(&target).unwrap(), b"new occupant");
+        // A recorded path with no pair at all → NotInBin.
+        let never: Vec<u16> = OsStr::new(r"D:\never.png").encode_wide().collect();
+        match restore_under(&root, root.join("absent.png").as_os_str(), &never) {
+            Err(UndoDeleteError::NotInBin) => {}
+            other => panic!("expected NotInBin, got {:?}", other),
+        }
+        let _ = std::fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    #[test]
+    fn recycle_restore_refuses_paths_without_a_volume_root() {
+        match recycle_restore(OsStr::new(r"\\srv\share\a.png")) {
+            Err(UndoDeleteError::NoVolumeRoot) => {}
+            other => panic!("expected NoVolumeRoot, got {:?}", other),
+        }
     }
 }
