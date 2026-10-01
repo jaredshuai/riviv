@@ -48,6 +48,7 @@
 | docs/spikes/s1-platform-floor.md | 验证与观察 | current | 调查者/平台地板再评估时 | min-OS 钉死 1607 的导入表证据(#97) |
 | docs/spikes/s-svg.md | 验证与观察 | current | 调查者/SVG 复议时 | SVG=resvg-full 体积推迟结论(#97) |
 | docs/spikes/s-avif.md | 验证与观察 | current | 调查者/#138 触发器评估时 | AVIF 三路线输入面结论(#97;#136 解绑后=移出 M8 的 L3 观察票 #138) |
+| docs/spikes/s-d2d-effects.md | 验证与观察 | current | 调查者/effect chain 咨询复议时 | D2D 显示效果链开题证据:挂点/API/语义/表面 + 开放问题 O1-O6(#180) |
 | docs/agents/triage-labels.md | 规则与术语 | current | 规划者/标签词汇变化时 | 五标签分诊词汇 |
 | docs/agents/domain.md | 规则与术语 | current | 规划者/文档架构变化时 | 单上下文+ADR 约定 |
 | docs/plan-26-association-nsis.md | 需求与验收 | reference | 书记员/历史留档 | #26 安装族历史规格;特性已交付,原位保留 |
