@@ -1300,7 +1300,20 @@ fn paint_view(view: HWND, owner: HWND) {
     // effect re-derives its masters (OUTSIDE any borrow, the
     // flipped_to_warp precedent), a latched AC face reconciles through
     // its repaint.
-    match drain_display_failure(owner) {
+    let drained = drain_display_failure(owner);
+    if !matches!(drained, DrainAction::None) {
+        // #185 (ADR 0006 D9): a drained failure may have dropped the
+        // user chain mid-paint (the build-failure Err arm clears it for
+        // the session) — that is an output-decision change, and the
+        // identity must chase it or the gen channel misses the drop.
+        // Gated: a draw-phase failure that dropped nothing leaves the
+        // fingerprint unchanged and this stays silent.
+        // SAFETY: the borrow spans the gated recompute — nothing pumps.
+        if let Some(state) = unsafe { state_of(owner) } {
+            reidentify_output_on_transition(state);
+        }
+    }
+    match drained {
         DrainAction::None => {}
         DrainAction::Repaint => {
             // SAFETY: invalidates our own child; no borrow is live (this
@@ -1360,6 +1373,15 @@ fn desired_output_face(state: &WindowState) -> crate::transform_stage::OutputSur
     )
 }
 
+/// The chain seed every stack (re)installation replays (#185): the
+/// config key clamped into the docs domain. A rebuild after a device
+/// loss re-arms a chain the old device's build failure dropped (D9's
+/// verdict is about one device's context, not the user's wish) — a
+/// failing fresh device drops it again with the same breadcrumb.
+fn seed_effect_chain(state: &WindowState) -> crate::transform_stage::EffectChain {
+    crate::transform_stage::EffectChain::from_config(state.config.sharpen)
+}
+
 /// One `create` call with the D6 AC-face fallback (#156), shared by every
 /// create site: an AC-face creation failure (FP16 swapchain, `SwapChain3`
 /// QI, `SetColorSpace1` — the "before any draw" verdicts) latches the
@@ -1386,12 +1408,20 @@ fn create_stack_with_face(
     // pre-first-prepare blank window must answer the synced arm without
     // a bogus mismatch (create's doc has the full story).
     let content = current_content_class(state);
+    // #185: every stack this helper hands out carries the seeded chain
+    // BEFORE the caller installs and establishes — the establishment's
+    // fingerprint reads the live chain, so seeding after would leave the
+    // first identity a beat behind.
+    let chain = seed_effect_chain(state);
     match crate::gpu::create(view, crate::gpu::owner_of(view), kind, face, content) {
-        Ok(pair) => Some(pair),
+        Ok((mut stack, effective)) => {
+            stack.set_effect_chain(chain);
+            Some((stack, effective))
+        }
         Err(e) if face == crate::transform_stage::OutputSurface::AcScRgb => {
             // The D6 surface ratchet: draw-before-present failed at
-            // creation — latch the arm off for the session and fall to
-            // the legacy face (correct, clipped, never fake).
+            // creation — latch the arm off for the session and fall to the
+            // legacy face (correct, clipped, never fake).
             state.ac_surface_latched = true;
             eprintln!("riviv: ac surface latched ({e}) - ac arm off for the session");
             identify_output(state);
@@ -1402,7 +1432,10 @@ fn create_stack_with_face(
                 crate::transform_stage::OutputSurface::Legacy,
                 content,
             ) {
-                Ok(pair) => Some(pair),
+                Ok((mut stack, effective)) => {
+                    stack.set_effect_chain(chain);
+                    Some((stack, effective))
+                }
                 Err(e2) => {
                     latch_renderer_fatal(state, e2.to_string());
                     None
@@ -1468,6 +1501,13 @@ fn surface_rebuild_if_due(view: HWND, owner: HWND) {
         if let Some((stack, effective)) = create_stack_with_face(view, kind, desired_face, state) {
             state.gpu = Some(stack);
             state.gpu_kind = effective;
+            // No establish here (pre-#185 shape: the fingerprint tracks
+            // the DESIRED face, which did not change) — but the new
+            // stack carries the SEEDED chain, which may re-arm one the
+            // old stack had dropped (#185): that IS a fingerprint
+            // change, and the gate below mints it (silent when the
+            // chain survived the swap, the only normal case).
+            reidentify_output_on_transition(state);
         }
     }
 }
@@ -1678,7 +1718,11 @@ fn current_content_class(state: &WindowState) -> crate::transform_stage::Content
 /// computation behind `identify_output` and the transition gate below
 /// (#154): the same real inputs as before (#130/#134 — backend, judge,
 /// latch, profile bytes, ACM diagnostic) plus the display content's
-/// real class, the third dimension's input (ADR 0004 D4).
+/// real class, the third dimension's input (ADR 0004 D4), plus the
+/// LIVE user effect chain off the gpu stack (#185, ADR 0006 D7/D9) —
+/// never the config key: a build-failure drop is an output decision
+/// change and must surface as a fingerprint transition. A stackless
+/// (dying) session reads as the empty chain.
 fn current_output_fingerprint(state: &WindowState) -> crate::transform_stage::OutputFingerprint {
     crate::transform_stage::fingerprint_for(
         crate::transform_stage::Backend::from_effective(state.gpu_kind),
@@ -1688,6 +1732,12 @@ fn current_output_fingerprint(state: &WindowState) -> crate::transform_stage::Ou
         state.display_query.ac,
         current_content_class(state),
         state.ac_surface_latched,
+        state
+            .gpu
+            .as_ref()
+            .map_or_else(crate::transform_stage::EffectChain::default, |gpu| {
+                gpu.effect_chain()
+            }),
     )
 }
 
@@ -2106,8 +2156,14 @@ fn gpu_runtime_failure(owner: HWND) {
                     } else {
                         effective
                     };
-                    establish_output_identity(state);
+                    // Install BEFORE establishing (#185): the identity's
+                    // fingerprint reads the live chain off the installed
+                    // stack — establishing first would fingerprint the
+                    // stackless default and leave the first identity a
+                    // beat behind (the install already carries the seeded
+                    // chain; the helper guarantees it).
                     state.gpu = Some(stack);
+                    establish_output_identity(state);
                     // #155 (D5): an escalation flip onto WARP invalidates
                     // every F16P3 master — same re-derivation the rebuild
                     // gate runs (the Fatal arm below is terminal, nothing
@@ -7219,6 +7275,13 @@ fn refresh_menu_state(hwnd: HWND, target: HMENU) {
             show_menu: state.config.show_menu != 0,
             show_status: state.config.show_status != 0,
             show_controls: state.config.show_controls != 0,
+            // #185 (ADR 0006 D9): the LIVE gpu chain, not the config key —
+            // a build-failure drop unchecks the row honestly. A stackless
+            // (dying) session reads as off.
+            effect_chain_on: state
+                .gpu
+                .as_ref()
+                .is_some_and(|gpu| !gpu.effect_chain().is_empty()),
             fullscreen: state.fullscreen,
             one_to_one,
             slideshow: state.slideshow,
@@ -7539,6 +7602,8 @@ fn on_command(hwnd: HWND, cmd: menu::Cmd) {
         menu::Cmd::ViewMenu => toggle_menu(hwnd),
         menu::Cmd::ViewStatus => toggle_status(hwnd),
         menu::Cmd::ViewControls => toggle_controls(hwnd),
+        // The sharpen toggle (#185, riviv-authored; ADR 0006).
+        menu::Cmd::ViewSharpen => toggle_sharpen(hwnd),
         // The Preset trio (#46; viv.c:1990-2013 — assign all five configs,
         // one frame rebuild).
         menu::Cmd::ViewPreset1 => apply_preset(hwnd, crate::frame::Preset::Minimal),
@@ -8153,6 +8218,49 @@ fn toggle_controls(hwnd: HWND) {
         state.config.show_controls = i32::from(state.config.show_controls == 0);
     }
     update_frame(hwnd);
+}
+
+/// View → Sharpen (#185, riviv-authored; ADR 0006): the user display
+/// effect chain's quick toggle. The toggle's direction reads the LIVE
+/// gpu chain (D9) — an unchecked row after a build-failure drop toggles
+/// ON, re-arming the persisted level (a same-device retry; a fresh
+/// failure drops again with the same breadcrumb). The config key is the
+/// persistence and the re-arm source, never the display state. The
+/// gated re-identity mints the `output_gen` exactly when the
+/// fingerprint really moved — it does not on WARP, where the D5
+/// exclusion normalizes the chain term (the toggle still flips the key
+/// and the chain; the output was and stays chain-free there).
+fn toggle_sharpen(hwnd: HWND) {
+    // SAFETY: the borrow spans the chain read, the config write, the
+    // chain set and the gated re-identity — nothing pumps.
+    if let Some(state) = unsafe { state_of(hwnd) } {
+        let target = state
+            .gpu
+            .as_ref()
+            .map_or_else(crate::transform_stage::EffectChain::default, |gpu| {
+                gpu.effect_chain()
+            })
+            .toggle_target(state.config.sharpen);
+        state.config.sharpen = i32::from(target.sharpen);
+        if let Some(gpu) = state.gpu.as_mut() {
+            gpu.set_effect_chain(target);
+        }
+        reidentify_output_on_transition(state);
+    }
+    repaint(hwnd);
+}
+
+/// The Options-OK arm (#185): the freshly committed config key IS the
+/// user's edited truth — replay it onto the live chain and re-identify
+/// through the same gate as the toggle (silent when the level did not
+/// move). Idempotent by construction: an unchanged key is a set no-op
+/// and a gate that stays closed.
+pub(crate) fn apply_config_effect_chain(state: &mut WindowState) {
+    let chain = crate::transform_stage::EffectChain::from_config(state.config.sharpen);
+    if let Some(gpu) = state.gpu.as_mut() {
+        gpu.set_effect_chain(chain);
+    }
+    reidentify_output_on_transition(state);
 }
 
 /// `_viv_start_move_window` (viv.c:14720-14729): enter the system move
@@ -9956,6 +10064,13 @@ pub(crate) fn run() -> Result<(), String> {
     if let Some(state) = unsafe { state_of(hwnd) } {
         state.gpu = Some(stack);
         state.gpu_kind = effective;
+        // #185: the startup stack carries the seeded chain before the
+        // establishment reads it (the helper does this for every other
+        // create site; this one calls gpu::create directly).
+        let chain = seed_effect_chain(state);
+        if let Some(gpu) = state.gpu.as_mut() {
+            gpu.set_effect_chain(chain);
+        }
         establish_output_identity(state);
     }
     // #132/#134: arm the display-freshness timer — the load-bearing

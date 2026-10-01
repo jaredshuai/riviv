@@ -266,6 +266,11 @@ const DEFAULT_KEYS: &[(Cmd, &[KeyDef])] = &[
     ),
     (Cmd::ViewOptions, &[key(false, false, false, b'O' as u16)]),
     (Cmd::ViewRefresh, &[key(false, false, false, VK_F5)]),
+    // The sharpen toggle (#185, riviv-authored — no upstream binding).
+    // Ctrl+S: the natural mnemonic, and free — upstream has no save
+    // command (its only file-output rows are the shell Copy To verb's
+    // dialog, Ctrl-less), so the chord carries no muscle-memory debt.
+    (Cmd::ViewSharpen, &[key(true, false, false, b'S' as u16)]),
     // The slideshow trio lands right after the Refresh row in upstream's
     // table (viv.c:1027-1029, between Refresh and the animation rows).
     (Cmd::SlideshowPause, &[key(false, false, false, VK_SPACE)]),

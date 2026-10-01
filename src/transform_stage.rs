@@ -316,12 +316,51 @@ pub(crate) struct EffectChain {
     pub(crate) sharpen: u8,
 }
 
+/// The level a fresh toggle-ON lands on when the config key carries no
+/// non-zero level to restore (#185; the single-int-key design has no
+/// second "last level" to remember): a gentle but clearly visible third
+/// of the docs domain. The Options combo stays the level editor; the
+/// toggle is the quick switch.
+pub(crate) const SHARPEN_TOGGLE_ON: u8 = 3;
+
 impl EffectChain {
     /// The chain's own off state — and the zero-perturbation contract's
     /// structural term: an empty chain must collapse every (backend, arm)
     /// cell onto the pre-#183 dispatch shape (see [`pass_shape`]).
     pub(crate) fn is_empty(&self) -> bool {
         self.sharpen == 0
+    }
+
+    /// The toggle's target chain (#185): on flips off, off flips on. The
+    /// ON level re-arms from the config key when it carries one (a
+    /// dropped-then-retoggled chain retries the persisted level — D9's
+    /// drop is session-scoped, the user's standing wish is not), else
+    /// falls to [`SHARPEN_TOGGLE_ON`]. A hand-edited out-of-domain key
+    /// clamps here, never at parse (the raw int stays in the ini like
+    /// every other int key).
+    pub(crate) fn toggle_target(&self, config_sharpen: i32) -> EffectChain {
+        if !self.is_empty() {
+            EffectChain { sharpen: 0 }
+        } else if config_sharpen <= 0 {
+            EffectChain {
+                sharpen: SHARPEN_TOGGLE_ON,
+            }
+        } else {
+            EffectChain::from_config(config_sharpen)
+        }
+    }
+
+    /// The chain a config key implies — the SEED every stack
+    /// (re)installation replays (#185): `0..=10` clamped, off = 0. The
+    /// seed runs at stack creation AND every rebuild, so a device-loss
+    /// rebuild re-arms a chain the old device's build failure had
+    /// dropped (D9's drop is a verdict about one device's context, not
+    /// the user's wish — a fresh device gets a fresh try, its failure
+    /// would drop again with the same breadcrumb).
+    pub(crate) fn from_config(config_sharpen: i32) -> EffectChain {
+        EffectChain {
+            sharpen: config_sharpen.clamp(0, 10) as u8,
+        }
     }
 }
 
@@ -641,6 +680,16 @@ pub(crate) enum RenderQuality {
 pub(crate) struct OutputPolicy {
     pub(crate) intent: RenderIntent,
     pub(crate) quality: RenderQuality,
+    /// The user display-effect chain (#185, ADR 0006 D7): a chain change
+    /// re-keys the output the same way an intent flip does — the toggle
+    /// must show as a new `output_gen` on #126's dump channel. The term
+    /// is the LIVE chain (what the gpu segment actually runs), never the
+    /// config key: a D9 build-failure drop is an output decision change
+    /// too, and the config key is persistence only. On WARP the term
+    /// normalizes to empty inside [`fingerprint_for`] — the D5 exclusion
+    /// means the chain cannot change the output there, so two chain
+    /// states with identical output must fingerprint identically.
+    pub(crate) chain: EffectChain,
 }
 
 /// The ACM diagnostic from `DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO` —
@@ -734,7 +783,12 @@ pub(crate) fn profile_hash(bytes: &[u8]) -> u64 {
 /// latch deliberately does NOT enter — it is a transient on the way to a
 /// re-derivation, after which the content class turns narrow and the
 /// stage words change on their own (a fingerprint term would mint a gen
-/// for a state that exists for one paint).
+/// for a state that exists for one paint). The chain term (#185) is the
+/// caller's LIVE chain normalized for WARP (see [`OutputPolicy::chain`]).
+// The spec's own signature, like `display_arm` above it: each term names
+// the input its ratchet or decision owns — collapsing them into a struct
+// would hide exactly that mapping.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn fingerprint_for(
     backend: Backend,
     query: DisplayProfileQuery,
@@ -743,6 +797,7 @@ pub(crate) fn fingerprint_for(
     ac: AcState,
     content_class: ContentSpace,
     ac_surface_latched: bool,
+    chain: EffectChain,
 ) -> OutputFingerprint {
     let desired = desired_output(backend, query, ac, content_class);
     let surface = clamped_surface(backend, query, ac, content_class, ac_surface_latched);
@@ -754,6 +809,16 @@ pub(crate) fn fingerprint_for(
     } else {
         effective_stage(desired.stage, degraded_latched)
     };
+    // ADR 0006 D5: WARP never runs the chain (#127's hard exclusion,
+    // inherited) — the exclusion is a decision-table row, so the
+    // fingerprint folds it in here: on WARP every chain state produces
+    // the identical output and must fingerprint identically (a WARP
+    // toggle mints no generation).
+    let chain = if backend == Backend::Warp {
+        EffectChain::default()
+    } else {
+        chain
+    };
     OutputFingerprint {
         stage,
         profile_hash: profile_hash(profile_bytes.unwrap_or(&[])),
@@ -763,6 +828,7 @@ pub(crate) fn fingerprint_for(
         policy: OutputPolicy {
             intent: RenderIntent::RelativeColorimetric,
             quality: RenderQuality::Best,
+            chain,
         },
     }
 }
@@ -872,8 +938,35 @@ mod tests {
             policy: OutputPolicy {
                 intent: RenderIntent::RelativeColorimetric,
                 quality: RenderQuality::Best,
+                chain: EffectChain::default(),
             },
         }
+    }
+
+    /// The pre-#185 pins' call shape: every table test below answers for
+    /// a session with NO user effect chain — the empty chain is exactly
+    /// the zero-perturbation posture (D8), so the wrapper pins it once
+    /// instead of spelling it at every call site. The chain TERM itself
+    /// has its own tests (see the fingerprint-chain block).
+    fn fp(
+        backend: Backend,
+        query: DisplayProfileQuery,
+        degraded_latched: bool,
+        profile_bytes: Option<&[u8]>,
+        ac: AcState,
+        content_class: ContentSpace,
+        ac_surface_latched: bool,
+    ) -> OutputFingerprint {
+        fingerprint_for(
+            backend,
+            query,
+            degraded_latched,
+            profile_bytes,
+            ac,
+            content_class,
+            ac_surface_latched,
+            EffectChain::default(),
+        )
     }
 
     // ---- the table, cell by cell ----
@@ -1104,7 +1197,7 @@ mod tests {
             for query in all_queries() {
                 for latched in [false, true] {
                     for ac in [AcState::Off, AcState::On, AcState::Unknown] {
-                        let fp = fingerprint_for(
+                        let cell = fp(
                             backend,
                             query,
                             latched,
@@ -1115,17 +1208,20 @@ mod tests {
                         );
                         let expected_stage =
                             effective_stage(desired_stage(backend, query), latched);
-                        assert_eq!(fp.stage, expected_stage, "{backend:?}/{query:?}/{latched}");
-                        assert_eq!(fp.surface, OutputSurface::Legacy);
-                        assert_eq!(fp.profile_hash, profile_hash(bytes));
-                        assert_eq!(fp.ac, ac, "the ac diagnostic passes through verbatim");
-                        assert_eq!(fp.backend, backend);
-                        assert_eq!(fp.policy.intent, RenderIntent::RelativeColorimetric);
-                        assert_eq!(fp.policy.quality, RenderQuality::Best);
+                        assert_eq!(
+                            cell.stage, expected_stage,
+                            "{backend:?}/{query:?}/{latched}"
+                        );
+                        assert_eq!(cell.surface, OutputSurface::Legacy);
+                        assert_eq!(cell.profile_hash, profile_hash(bytes));
+                        assert_eq!(cell.ac, ac, "the ac diagnostic passes through verbatim");
+                        assert_eq!(cell.backend, backend);
+                        assert_eq!(cell.policy.intent, RenderIntent::RelativeColorimetric);
+                        assert_eq!(cell.policy.quality, RenderQuality::Best);
 
                         // No bytes to hash: the pinned empty digest — an
                         // absent term must never drift.
-                        let fp_empty = fingerprint_for(
+                        let fp_empty = fp(
                             backend,
                             query,
                             latched,
@@ -1156,7 +1252,7 @@ mod tests {
         let adobe = b"TPLCD_8BAF_AdobeRGB.icm-bytes".as_slice();
         let mut tracker = OutputTracker::default();
         // hw + custom + unlatched: the effect stage.
-        let hw_effect = fingerprint_for(
+        let hw_effect = fp(
             Backend::Hardware,
             Profile(Custom),
             false,
@@ -1171,7 +1267,7 @@ mod tests {
             1
         );
         // The session latch flips the effective stage: a transition.
-        let hw_latched = fingerprint_for(
+        let hw_latched = fp(
             Backend::Hardware,
             Profile(Custom),
             true,
@@ -1186,7 +1282,7 @@ mod tests {
             2
         );
         // A backend flip on top: another transition.
-        let warp = fingerprint_for(
+        let warp = fp(
             Backend::Warp,
             Profile(Custom),
             false,
@@ -1199,7 +1295,7 @@ mod tests {
         assert_eq!(tracker.identify(warp, ContentSpace::Srgb).output_gen, 3);
         // New profile bytes under the same decision shape: the digest is
         // a fingerprint term, so a profile change mints a new gen too.
-        let other = fingerprint_for(
+        let other = fp(
             Backend::Warp,
             Profile(Custom),
             false,
@@ -1225,7 +1321,7 @@ mod tests {
         let bytes: &[u8] = &[0xde, 0xad, 0xbe, 0xef];
         let query = DisplayProfileQuery::Profile(DisplayProfileSpace::Custom);
         let mut tracker = OutputTracker::default();
-        let off = fingerprint_for(
+        let off = fp(
             Backend::Hardware,
             query,
             false,
@@ -1235,7 +1331,7 @@ mod tests {
             false,
         );
         assert_eq!(tracker.identify(off, ContentSpace::Srgb).output_gen, 1);
-        let on = fingerprint_for(
+        let on = fp(
             Backend::Hardware,
             query,
             false,
@@ -1257,7 +1353,7 @@ mod tests {
             "the Off→On→Off round trip walks gens 1, 2, 3"
         );
         // A read failure joining the mix is a third state, also a move.
-        let unknown = fingerprint_for(
+        let unknown = fp(
             Backend::Hardware,
             query,
             false,
@@ -1287,7 +1383,7 @@ mod tests {
                     let stages: Vec<_> = [AcState::Off, AcState::On, AcState::Unknown]
                         .iter()
                         .map(|&ac| {
-                            fingerprint_for(
+                            fp(
                                 backend,
                                 query,
                                 latched,
@@ -1305,7 +1401,7 @@ mod tests {
                     );
                     // And the rest of the fingerprint agrees too: equal
                     // except for the ac term itself.
-                    let a = fingerprint_for(
+                    let a = fp(
                         backend,
                         query,
                         latched,
@@ -1314,7 +1410,7 @@ mod tests {
                         ContentSpace::Srgb,
                         false,
                     );
-                    let b = fingerprint_for(
+                    let b = fp(
                         backend,
                         query,
                         latched,
@@ -1562,7 +1658,7 @@ mod tests {
                 for latched in [false, true] {
                     for ac in [AcState::Off, AcState::On, AcState::Unknown] {
                         for with_bytes in [Some(bytes), None] {
-                            let srgb = fingerprint_for(
+                            let srgb = fp(
                                 backend,
                                 query,
                                 latched,
@@ -1571,7 +1667,7 @@ mod tests {
                                 ContentSpace::Srgb,
                                 false,
                             );
-                            let f16 = fingerprint_for(
+                            let f16 = fp(
                                 backend,
                                 query,
                                 latched,
@@ -1604,7 +1700,7 @@ mod tests {
         let bytes: &[u8] = &[0xab, 0xcd, 0xef];
         for query in all_queries() {
             for latched in [false, true] {
-                let on = fingerprint_for(
+                let on = fp(
                     Backend::Hardware,
                     query,
                     latched,
@@ -1620,7 +1716,7 @@ mod tests {
                     "{query:?}/{latched}"
                 );
                 for ac in [AcState::Off, AcState::Unknown] {
-                    let fp = fingerprint_for(
+                    let fp = fp(
                         Backend::Hardware,
                         query,
                         latched,
@@ -1655,7 +1751,7 @@ mod tests {
         // (F16P3) -> A walks three gens, never memoizing an old one.
         let bytes: &[u8] = &[0xde, 0xad];
         let query = DisplayProfileQuery::Profile(DisplayProfileSpace::Custom);
-        let narrow = fingerprint_for(
+        let narrow = fp(
             Backend::Hardware,
             query,
             false,
@@ -1664,7 +1760,7 @@ mod tests {
             ContentSpace::F16Srgb,
             false,
         );
-        let wide = fingerprint_for(
+        let wide = fp(
             Backend::Hardware,
             query,
             false,
@@ -2088,7 +2184,7 @@ mod tests {
         // reproduce the #154 matrix exactly.
         let bytes: &[u8] = &[0xab, 0xcd, 0xef];
         let query = DisplayProfileQuery::Profile(DisplayProfileSpace::Custom);
-        let open = fingerprint_for(
+        let open = fp(
             Backend::Hardware,
             query,
             false,
@@ -2099,7 +2195,7 @@ mod tests {
         );
         assert_eq!(open.surface, OutputSurface::AcScRgb);
         assert_eq!(open.stage, TransformStage::GpuEffectP3ToScRgb);
-        let folded = fingerprint_for(
+        let folded = fp(
             Backend::Hardware,
             query,
             false,
@@ -2120,7 +2216,7 @@ mod tests {
             DisplayProfileQuery::Unknown,
             DisplayProfileQuery::Profile(DisplayProfileSpace::SrgbEquivalent),
         ] {
-            let folded = fingerprint_for(
+            let folded = fp(
                 Backend::Hardware,
                 q,
                 false,
@@ -2133,7 +2229,7 @@ mod tests {
             assert_eq!(folded.stage, TransformStage::GpuEffectP3ToSrgb, "{q:?}");
         }
         // The narrow latch does not clamp a wide stage (unlatched AC arm).
-        let latched_narrow = fingerprint_for(
+        let latched_narrow = fp(
             Backend::Hardware,
             query,
             true,
@@ -2159,7 +2255,7 @@ mod tests {
                     for ac in [AcState::Off, AcState::On, AcState::Unknown] {
                         for with_bytes in [Some(bytes), None] {
                             for content_class in [ContentSpace::Srgb, ContentSpace::F16Srgb] {
-                                let off = fingerprint_for(
+                                let off = fp(
                                     backend,
                                     query,
                                     latched,
@@ -2168,7 +2264,7 @@ mod tests {
                                     content_class,
                                     false,
                                 );
-                                let on = fingerprint_for(
+                                let on = fp(
                                     backend,
                                     query,
                                     latched,
@@ -2291,5 +2387,101 @@ mod tests {
                 PassShape::Direct
             );
         }
+    }
+
+    // ---- the fingerprint's chain term (#185, ADR 0006 D7/D5) ----
+
+    /// The fixed-args cell every chain-term test starts from: hardware,
+    /// a custom-profile judge (the SrgbToDisplay row), a narrow class.
+    fn chain_term_fp(backend: Backend, chain: EffectChain) -> OutputFingerprint {
+        fingerprint_for(
+            backend,
+            DisplayProfileQuery::Profile(DisplayProfileSpace::Custom),
+            false,
+            Some(b"profile-bytes"),
+            AcState::Off,
+            ContentSpace::Srgb,
+            false,
+            chain,
+        )
+    }
+
+    /// D7: the chain is a fingerprint policy term — a chain change is an
+    /// output decision change and must mint a new `output_gen` through
+    /// the tracker (the toggle's observable on #126's dump channel).
+    #[test]
+    fn a_chain_change_is_a_fingerprint_transition_the_tracker_mints() {
+        let off = chain_term_fp(Backend::Hardware, EffectChain::default());
+        let on = chain_term_fp(Backend::Hardware, EffectChain { sharpen: 3 });
+        assert_ne!(off, on, "the chain term must ride the policy");
+        // A->B->A walks gens 1, 2, 3 — the round trip is a change signal
+        // too (OutputTracker's own contract, restated for the chain arm).
+        let mut tracker = OutputTracker::default();
+        let g1 = tracker.identify(off, ContentSpace::Srgb).output_gen;
+        let g2 = tracker.identify(on, ContentSpace::Srgb).output_gen;
+        let g3 = tracker.identify(off, ContentSpace::Srgb).output_gen;
+        assert_eq!((g1, g2, g3), (1, 2, 3));
+    }
+
+    /// D5: WARP never runs the chain, so the term normalizes to empty —
+    /// two chain states with byte-identical output fingerprint
+    /// identically, and a WARP toggle mints no generation.
+    #[test]
+    fn warp_normalizes_the_chain_term_the_exclusion_is_a_table_row() {
+        let off = chain_term_fp(Backend::Warp, EffectChain::default());
+        let on = chain_term_fp(Backend::Warp, EffectChain { sharpen: 10 });
+        assert_eq!(
+            off, on,
+            "a WARP session's chain cannot change the output, the fingerprints must agree"
+        );
+        assert_eq!(off.policy.chain, EffectChain::default());
+    }
+
+    /// Every chain level is its own identity on hardware (the combo's 11
+    /// values must not collide).
+    #[test]
+    fn every_sharpen_level_fingerprints_apart_on_hardware() {
+        let fps: Vec<_> = (0..=10u8)
+            .map(|s| chain_term_fp(Backend::Hardware, EffectChain { sharpen: s }))
+            .collect();
+        for i in 0..fps.len() {
+            for j in i + 1..fps.len() {
+                assert_ne!(fps[i], fps[j], "sharpen {i} collides with sharpen {j}");
+            }
+        }
+    }
+
+    // ---- the toggle and the seed (#185) ----
+
+    /// The toggle's pure core: on flips off, off re-arms from the config
+    /// key, a zero config falls to SHARPEN_TOGGLE_ON, and a hand-edited
+    /// out-of-domain key clamps at the edge (the raw int stays in the
+    /// ini like every other int key).
+    #[test]
+    fn toggle_target_flips_off_rearms_from_config_and_clamps() {
+        let off = EffectChain::default();
+        let on3 = EffectChain { sharpen: 3 };
+        // On -> off, whatever the config says.
+        assert_eq!(on3.toggle_target(7).sharpen, 0);
+        assert_eq!(EffectChain { sharpen: 10 }.toggle_target(10).sharpen, 0);
+        // Off -> the config's standing level.
+        assert_eq!(off.toggle_target(7).sharpen, 7);
+        assert_eq!(off.toggle_target(1).sharpen, 1);
+        // Off with no standing level -> the documented default.
+        assert_eq!(off.toggle_target(0).sharpen, SHARPEN_TOGGLE_ON);
+        assert_eq!(off.toggle_target(-4).sharpen, SHARPEN_TOGGLE_ON);
+        // Out-of-domain configs clamp at 10.
+        assert_eq!(off.toggle_target(999).sharpen, 10);
+    }
+
+    /// The stack-seed clamp: the config key is the ini's raw int, the
+    /// chain's domain is the docs enum page's 0..=10.
+    #[test]
+    fn from_config_clamps_into_the_docs_domain() {
+        assert_eq!(EffectChain::from_config(0).sharpen, 0);
+        assert_eq!(EffectChain::from_config(5).sharpen, 5);
+        assert_eq!(EffectChain::from_config(10).sharpen, 10);
+        assert_eq!(EffectChain::from_config(300).sharpen, 10);
+        assert_eq!(EffectChain::from_config(-1).sharpen, 0);
     }
 }

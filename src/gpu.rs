@@ -1506,6 +1506,26 @@ impl GpuStack {
         self.display.failure.take()
     }
 
+    /// The LIVE user effect chain (#185, ADR 0006 D9): the toggle's shown
+    /// state and the output fingerprint's chain term read THIS, never the
+    /// config key — a build failure drops the chain for the session here
+    /// (`ensure_effect_graph`'s Err arm), and every consumer must see the
+    /// drop or the display lies about what is running.
+    pub(crate) fn effect_chain(&self) -> EffectChain {
+        self.display.chain
+    }
+
+    /// Set the chain (the toggle, the Options OK, and every stack
+    /// (re)installation's seed): an unchanged chain is a no-op; a change
+    /// re-keys the graph exactly like an intent flip (`built_for` carries
+    /// the chain — the lazy builder rebuilds on the next paint).
+    pub(crate) fn set_effect_chain(&mut self, chain: EffectChain) {
+        if self.display.chain != chain {
+            self.display.chain = chain;
+            self.display.graph = None;
+        }
+    }
+
     /// The failure class the CURRENT intent arm feeds (the drain routes
     /// by it): the AC arm's failures latch the face, the legacy-wide
     /// arms' re-derive, the narrow arm's degrade the sRGB segment.
