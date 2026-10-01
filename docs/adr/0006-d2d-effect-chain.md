@@ -49,6 +49,12 @@ View 菜单行 + 热键 + Options 一行;`Cmd` 枚举尾追加 id 123(#178 手�
 
 链空 ⇒ `pass_shape` 逐格回到 pre-#183 分派(全 (backend, arm) 单测钉死);Direct 臂链空不建 intermediate、不 CreateEffect;`EffectGraph::built_for` 携链身份(空链 = 现状四元组语义原样);票①合入 = 零用户可见变化(无键/无命令/无菜单)。票③冒烟补机器面:效果 off 逐字节比对、WARP 链非空输出与现状逐字节同。
 
+### D9. 用户链失败姿态:会话级弃链,不依赖 narrow latch(#184 Codex P1 采纳)
+
+链构建失败(CreateEffect(Sharpen)/SetValue 失败)的失败 class 走窄臂(`failure_class` 对 Direct 臂 → `Narrow`),但 narrow latch **救不了链**:latch 只在 `display_arm` 表内降级 CM 的 stage 词,`pass_shape` 对 (Hardware, Direct, 链非空) 恒 TwoStage——不清链则每帧重建-失败,failure drain 的 Repaint 构成循环(#130 latch 注释「the next paint draws direct and succeeds」的前提=失效源在 display_arm 表内,用户链不在)。
+
+**裁定**:build 失败 ⇒ **本会话弃链**(`ensure_effect_graph` Err 分支清链 + stderr 面包屑),下一帧塌回 direct/纯 CM 形态即成功,失败序列自然终止——与既有 latch 的「ended the failure sequence」语义同构。**票②接线约束**:toggle 显示态必须读 gpu 侧实际链(config 键仅作跨会话持久),否则弃链后显示失同步;票③补故障注入注点(build 失败)钉测此转移。
+
 ## 实现票族
 
 | 票 | 内容 | 状态 |

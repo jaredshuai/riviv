@@ -1546,6 +1546,24 @@ impl GpuStack {
             }
             Err(e) => {
                 let class = self.failure_class();
+                // #184 Codex P1: a chain that will not build must be
+                // dropped for the session HERE. The narrow latch cannot
+                // end this failure sequence — it only re-keys the CM
+                // stage inside `display_arm`, while `pass_shape` would
+                // keep answering TwoStage for a non-empty chain, so every
+                // paint would rebuild-and-fail again (a repaint loop).
+                // Clearing the chain collapses the next paint onto the
+                // direct / CM-only shape, which succeeds — the sequence
+                // ends the way every latch's does. Ticket ② must keep the
+                // toggle's shown state reading THIS chain (the config key
+                // is persistence only), or the drop would desync (ADR
+                // 0006 D9).
+                if !self.display.chain.is_empty() {
+                    eprintln!(
+                        "riviv: user effect chain dropped for the session (build failed: {e})"
+                    );
+                    self.display.chain = EffectChain::default();
+                }
                 self.display
                     .failure
                     .get_or_insert_with(|| (class, format!("display effect build failed: {e}")));
