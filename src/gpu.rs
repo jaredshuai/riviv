@@ -33,16 +33,17 @@ use windows::Win32::Graphics::Direct2D::Common::{
     D2D_RECT_F, D2D_RECT_U, D2D_SIZE_U, D2D1_ALPHA_MODE_IGNORE, D2D1_COLOR_F, D2D1_PIXEL_FORMAT,
 };
 use windows::Win32::Graphics::Direct2D::{
-    CLSID_D2D1ColorManagement, CLSID_D2D1Sharpen, D2D1_ANTIALIAS_MODE_ALIASED, D2D1_BITMAP_OPTIONS,
-    D2D1_BITMAP_OPTIONS_CANNOT_DRAW, D2D1_BITMAP_OPTIONS_CPU_READ, D2D1_BITMAP_OPTIONS_NONE,
-    D2D1_BITMAP_OPTIONS_TARGET, D2D1_BITMAP_PROPERTIES1, D2D1_COLOR_SPACE_CUSTOM,
-    D2D1_COLOR_SPACE_SCRGB, D2D1_COLOR_SPACE_SRGB, D2D1_DEVICE_CONTEXT_OPTIONS_NONE,
-    D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_INTERPOLATION_MODE,
+    CLSID_D2D1ColorManagement, CLSID_D2D1Contrast, CLSID_D2D1Sharpen, D2D1_ANTIALIAS_MODE_ALIASED,
+    D2D1_BITMAP_OPTIONS, D2D1_BITMAP_OPTIONS_CANNOT_DRAW, D2D1_BITMAP_OPTIONS_CPU_READ,
+    D2D1_BITMAP_OPTIONS_NONE, D2D1_BITMAP_OPTIONS_TARGET, D2D1_BITMAP_PROPERTIES1,
+    D2D1_COLOR_SPACE_CUSTOM, D2D1_COLOR_SPACE_SCRGB, D2D1_COLOR_SPACE_SRGB,
+    D2D1_DEVICE_CONTEXT_OPTIONS_NONE, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_INTERPOLATION_MODE,
     D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, D2D1_INTERPOLATION_MODE_LINEAR,
     D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR, D2D1_MAP_OPTIONS_READ, D2D1_PRIMITIVE_BLEND_COPY,
-    D2D1_PROPERTY_TYPE_COLOR_CONTEXT, D2D1_PROPERTY_TYPE_ENUM, D2D1_PROPERTY_TYPE_FLOAT,
-    D2D1_UNIT_MODE_PIXELS, D2D1CreateFactory, ID2D1Bitmap, ID2D1ColorContext, ID2D1Device,
-    ID2D1DeviceContext, ID2D1Effect, ID2D1Factory1, ID2D1Image, ID2D1RenderTarget,
+    D2D1_PROPERTY_TYPE_BOOL, D2D1_PROPERTY_TYPE_COLOR_CONTEXT, D2D1_PROPERTY_TYPE_ENUM,
+    D2D1_PROPERTY_TYPE_FLOAT, D2D1_UNIT_MODE_PIXELS, D2D1CreateFactory, ID2D1Bitmap,
+    ID2D1ColorContext, ID2D1Device, ID2D1DeviceContext, ID2D1Effect, ID2D1Factory1, ID2D1Image,
+    ID2D1RenderTarget,
 };
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP};
 use windows::Win32::Graphics::Direct3D11::{
@@ -584,6 +585,24 @@ const D2D1_TEMPERATUREANDTINT_PROP_TEMPERATURE: u32 = 0;
 /// sharpen's THRESHOLD precedent — tint stays unexposed until a real
 /// use case asks).
 const D2D1_TEMPERATUREANDTINT_PROP_TINT: u32 = 1;
+
+/// `D2D1_CONTRAST_PROP_CONTRAST = 0` (d2d1effects_2.h:71-87 — the same
+/// header as both prior knives; #193, the chain's third knife). windows
+/// 0.62.2 binds this enum AND the effect's CLSID natively — the first
+/// knife with NOTHING transcribed — so these locals are aliases pinned
+/// against the crate's own exports by test (two independent sources:
+/// the SDK header transcription and the crate's metadata). The value
+/// domain is CONTRAST −1.0..1.0 default 0.0f, negative reduces /
+/// positive increases (the docs ENUM page's Constants table, the D6
+/// source-of-truth shape); the config scale is that float domain as
+/// the integer −10..=10, off = 0 (the docs default IS the identity).
+const D2D1_CONTRAST_PROP_CONTRAST: u32 = 0;
+/// `D2D1_CONTRAST_PROP_CLAMP_INPUT = 1` (same header, pinned by test).
+/// The domain is BOOL default FALSE; the value is PINNED to the default
+/// with an explicit SetValue (O6's no-second-knob ruling — sharpen's
+/// THRESHOLD and wb's TINT precedent, no reliance on the driver
+/// default).
+const D2D1_CONTRAST_PROP_CLAMP_INPUT: u32 = 1;
 
 /// The built effect graph: the intermediate the scene composites into,
 /// the chain wired `intermediate → [user effects] → ColorManagement →
@@ -1723,11 +1742,12 @@ impl GpuStack {
         let mut chain_tail: Option<ID2D1Image> = None;
         if chained {
             // The chain's fixed stage order: sharpen → white balance →
-            // [ColorManagement] (#185/#191). A stage at 0 is ABSENT, not
-            // present-at-zero — the zero-perturbation contract keeps off
-            // bit-identical to the effect's absence per stage. The stages
-            // commute visually (a convolution vs a channel mix); the fixed
-            // order makes the graph's identity deterministic.
+            // contrast → [ColorManagement] (#185/#191/#193). A stage at 0
+            // is ABSENT, not present-at-zero — the zero-perturbation
+            // contract keeps off bit-identical to the effect's absence per
+            // stage. The stages commute visually (a convolution and two
+            // channel mixers); the fixed order makes the graph's identity
+            // deterministic.
             let sharpen_img: Option<ID2D1Image> = if chain.sharpen != 0 {
                 // SAFETY: the context is live; the CLSID is a static constant.
                 let sharpen = unsafe { self.context.CreateEffect(&CLSID_D2D1Sharpen) }
@@ -1830,7 +1850,64 @@ impl GpuStack {
             } else {
                 None
             };
-            chain_tail = white_balance_img.or(sharpen_img);
+            let contrast_img: Option<ID2D1Image> = if chain.contrast != 0 {
+                // SAFETY: the context is live; the CLSID is the crate's
+                // own export (a Win10 built-in effect, nothing
+                // transcribed — #193).
+                let contrast = unsafe { self.context.CreateEffect(&CLSID_D2D1Contrast) }
+                    .map_err(|e| format!("CreateEffect(Contrast) failed: {e}"))?;
+                if sharpen_img.is_none() && white_balance_img.is_none() {
+                    // #187's seam for the contrast-only chain: this create
+                    // is the block's first — the identical after-create
+                    // refusal contract as the arms above.
+                    if crate::fault::consume_chain_build() {
+                        return Err(
+                            "fault-injected effect chain build failure (RIVIV_FAULT seam)"
+                                .to_string(),
+                        );
+                    }
+                }
+                // SAFETY: property writes on the live effect; FLOAT and
+                // BOOL properties take 4 bytes each; contrast ∈ −1.0..1.0
+                // (the int scale over ten) sits inside the docs enum
+                // page's domain and clamp_input FALSE is that page's
+                // default (#193, the D6 source-of-truth shape).
+                unsafe {
+                    let contrast_value = f32::from(chain.contrast) / 10.0;
+                    contrast
+                        .SetValue(
+                            D2D1_CONTRAST_PROP_CONTRAST,
+                            D2D1_PROPERTY_TYPE_FLOAT,
+                            &contrast_value.to_ne_bytes(),
+                        )
+                        .map_err(|e| format!("SetValue(contrast) failed: {e}"))?;
+                    let clamp_input: u32 = 0;
+                    contrast
+                        .SetValue(
+                            D2D1_CONTRAST_PROP_CLAMP_INPUT,
+                            D2D1_PROPERTY_TYPE_BOOL,
+                            &clamp_input.to_ne_bytes(),
+                        )
+                        .map_err(|e| format!("SetValue(clamp_input) failed: {e}"))?;
+                    // Input 0 = the chain's running tail — the wb or
+                    // sharpen output when those stages run, else the
+                    // intermediate head; the effect holds its own
+                    // reference.
+                    let head: &ID2D1Image = white_balance_img
+                        .as_ref()
+                        .or(sharpen_img.as_ref())
+                        .unwrap_or(&intermediate_img);
+                    contrast.SetInput(0, Some(head), false);
+                }
+                let img: ID2D1Image = contrast
+                    .cast()
+                    .map_err(|e| format!("cast contrast to ID2D1Image failed: {e}"))?;
+                effects.push(contrast);
+                Some(img)
+            } else {
+                None
+            };
+            chain_tail = contrast_img.or(white_balance_img).or(sharpen_img);
         }
         // The CM-less form's early exit (#183): a Direct arm reaches here
         // only WITH a chain (the gate above), and its tail is the graph's
@@ -3309,6 +3386,49 @@ mod tests {
             D2D1_TEMPERATUREANDTINT_PROP_TEMPERATURE,
             D2D1_TEMPERATUREANDTINT_PROP_TINT
         );
+    }
+
+    /// #193's pins are the strongest of the three knives: windows 0.62.2
+    /// binds the Contrast CLSID AND its property enum natively, so both
+    /// sides are checked against independent sources — the property
+    /// indices against the crate's own enum export, the CLSID against
+    /// the SDK header's DEFINE_GUID (d2d1effects_2.h:26, hand-read —
+    /// the crate's metadata cannot be asked for its source line).
+    #[test]
+    fn the_contrast_property_indices_match_the_crate_export() {
+        use windows::Win32::Graphics::Direct2D as d2d;
+        assert_eq!(
+            D2D1_CONTRAST_PROP_CONTRAST,
+            d2d::D2D1_CONTRAST_PROP_CONTRAST.0 as u32
+        );
+        assert_eq!(
+            D2D1_CONTRAST_PROP_CLAMP_INPUT,
+            d2d::D2D1_CONTRAST_PROP_CLAMP_INPUT.0 as u32
+        );
+        assert_ne!(D2D1_CONTRAST_PROP_CONTRAST, D2D1_CONTRAST_PROP_CLAMP_INPUT);
+        // d2d1effects_2.h:26 — DEFINE_GUID(CLSID_D2D1Contrast,
+        // 0xb648a78a, 0x0ed5, 0x4f80, 0xa9, 0x4a, 0x8e, 0x82, 0x5a,
+        // 0xca, 0x6b, 0x77).
+        assert_eq!(
+            d2d::CLSID_D2D1Contrast,
+            GUID::from_u128(0xb648a78a_0ed5_4f80_a94a_8e825aca6b77)
+        );
+    }
+
+    /// #193: the config's −10..=10 integer scale maps onto the docs
+    /// enum page's −1.0..1.0 CONTRAST domain exactly — the same exact-
+    /// arithmetic shape as the white-balance scale (0.1 per step, no
+    /// rounding drift: /10.0 of small ints is exact in f32).
+    #[test]
+    fn the_contrast_scale_spans_the_docs_domain_exactly() {
+        assert_eq!(f32::from(-10i8) / 10.0, -1.0);
+        assert_eq!(f32::from(10i8) / 10.0, 1.0);
+        assert_eq!(f32::from(0i8) / 10.0, 0.0);
+        let stepped: Vec<f32> = (-10..=10i8).map(|v| f32::from(v) / 10.0).collect();
+        for (i, w) in stepped.windows(2).enumerate() {
+            let (a, b) = (w[0], w[1]);
+            assert!(b > a, "step {i} does not advance ({a} -> {b})");
+        }
     }
 
     /// #191: the config's −10..=10 integer scale maps onto the docs

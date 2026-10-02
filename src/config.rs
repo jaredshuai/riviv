@@ -174,6 +174,16 @@ pub(crate) struct Config {
     /// every other int key; the consumption point —
     /// [`crate::transform_stage::EffectChain::from_config`] — clamps).
     pub(crate) white_balance: i32,
+    /// riviv-authored key (#193, the chain's third knife — viv.c:76's
+    /// "color correction" realized as the tonal axis; upstream has no
+    /// setting): the user display-effect chain's contrast level, the
+    /// docs enum page's −1.0..1.0 CONTRAST domain as an integer
+    /// −10..=10 scale, off = 0. Display-only (non-destructive, O1=A):
+    /// the master bytes, the read side, and saves never see it. The ini
+    /// keeps the RAW int (out-of-domain values persist untouched like
+    /// every other int key; the consumption point —
+    /// [`crate::transform_stage::EffectChain::from_config`] — clamps).
+    pub(crate) contrast: i32,
     /// riviv-authored key (#80; upstream has no such setting): which paint
     /// backend the viewport uses — `auto | d2d | warp` (a STRING key;
     /// missing or unrecognized falls back to the `auto` default; a legacy
@@ -254,6 +264,7 @@ impl Default for Config {
             keep_zoom: 0,
             sharpen: 0,
             white_balance: 0,
+            contrast: 0,
             renderer: RendererKind::Auto,
             keys: KeyMap::default(),
         }
@@ -433,6 +444,7 @@ impl Config {
         apply_byte!(keep_zoom = "keep_zoom");
         apply_int!(sharpen = "sharpen");
         apply_int!(white_balance = "white_balance");
+        apply_int!(contrast = "contrast");
         // The renderer is a STRING key (riviv-authored, #80): an
         // unrecognized value is a user typo — it falls to the safe `auto`
         // baseline (design §2, the #81 default) in BOTH overlay passes,
@@ -483,7 +495,7 @@ impl Config {
         if root && self.appdata != 0 {
             return vec![("appdata".to_string(), i(self.appdata))];
         }
-        let int_pairs: [(&str, String); 64] = [
+        let int_pairs: [(&str, String); 65] = [
             ("x", i(self.x)),
             ("y", i(self.y)),
             ("wide", i(self.wide)),
@@ -569,10 +581,11 @@ impl Config {
             // upstream block above keeps its exact key-for-key order.
             ("keep_zoom", i(self.keep_zoom)),
             // #185 appends the sharpen int key after keep_zoom; #191
-            // appends white_balance after sharpen (#80's renderer STRING
-            // key stays last).
+            // appends white_balance after sharpen; #193 appends contrast
+            // after white_balance (#80's renderer STRING key stays last).
             ("sharpen", i(self.sharpen)),
             ("white_balance", i(self.white_balance)),
+            ("contrast", i(self.contrast)),
             // #80 appends the renderer STRING key after keep_zoom.
             ("renderer", self.renderer.to_ini().to_string()),
         ];
@@ -702,6 +715,7 @@ mod tests {
             keep_zoom: 1,
             sharpen: 7,
             white_balance: -7,
+            contrast: -4,
             renderer: RendererKind::Warp,
             ..Config::default()
         };
@@ -709,18 +723,18 @@ mod tests {
         let back = parse_apply(&text, true);
         assert_eq!(back, c, "every save key must be a load key");
         // 61 int keys + the riviv-authored keep_zoom (#68) + sharpen
-        // (#185) + white_balance (#191) + the renderer string key (#80)
-        // + one *_keys line per command in Cmd::ALL order (124 rows now
-        // — #191's tail append added its own) — bound rows and empty
-        // rows alike (#42's shell septet, #43's file-management octet,
-        // #178's/#185's/#191's tail-appended rows among them; no
-        // bound-row count is pinned here — the DEFAULT_KEYS table is its
-        // own source of truth and a hand-counted number would only
-        // drift).
+        // (#185) + white_balance (#191) + contrast (#193) + the renderer
+        // string key (#80) + one *_keys line per command in Cmd::ALL
+        // order (125 rows now — #193's tail append added its own) —
+        // bound rows and empty rows alike (#42's shell septet, #43's
+        // file-management octet, #178's/#185's/#191's/#193's
+        // tail-appended rows among them; no bound-row count is pinned
+        // here — the DEFAULT_KEYS table is its own source of truth and a
+        // hand-counted number would only drift).
         assert_eq!(
             c.to_pairs(false).len(),
-            188,
-            "the save table + keep_zoom + sharpen + white_balance + renderer"
+            190,
+            "the save table + keep_zoom + sharpen + white_balance + contrast + renderer"
         );
     }
 
@@ -771,7 +785,7 @@ mod tests {
         let c = Config::default();
         assert_eq!(
             c.to_pairs(true).len(),
-            188,
+            190,
             "active store writes the full table"
         );
         let c = Config {

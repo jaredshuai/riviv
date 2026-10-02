@@ -560,12 +560,45 @@ pub(crate) enum Id {
     OptionsWhiteBalance8,
     OptionsWhiteBalance9,
     OptionsWhiteBalance10,
+    /// ---- #193: contrast display effect ----
+    /// View → "Contrast" (#193, riviv-authored — the chain's third and
+    /// closing knife, viv.c:76's "color correction" realized as the
+    /// tonal axis). No mnemonic: the View dropdown's C already belongs
+    /// to "&Controls" (the no-mnemonic precedent: MenuSharpen).
+    MenuContrast,
+    /// Options View page: the contrast combo's static label (#193).
+    OptionsContrast,
+    /// The contrast combo's off row — the docs domain's 0 (#193).
+    OptionsContrastOff,
+    /// The contrast combo's softening rows −10..=−1 and punchy rows
+    /// 1..=10 (#193; signed numerals are their own localization in both
+    /// tables, like the two scales above).
+    OptionsContrastMinus10,
+    OptionsContrastMinus9,
+    OptionsContrastMinus8,
+    OptionsContrastMinus7,
+    OptionsContrastMinus6,
+    OptionsContrastMinus5,
+    OptionsContrastMinus4,
+    OptionsContrastMinus3,
+    OptionsContrastMinus2,
+    OptionsContrastMinus1,
+    OptionsContrast1,
+    OptionsContrast2,
+    OptionsContrast3,
+    OptionsContrast4,
+    OptionsContrast5,
+    OptionsContrast6,
+    OptionsContrast7,
+    OptionsContrast8,
+    OptionsContrast9,
+    OptionsContrast10,
 }
 
 impl Id {
     /// Variant count; array-typing both tables against this keeps them
     /// length-locked to the enum by construction.
-    pub(crate) const COUNT: usize = Self::OptionsWhiteBalance10 as usize + 1;
+    pub(crate) const COUNT: usize = Self::OptionsContrast10 as usize + 1;
 }
 
 /// Table choice (upstream `LOCALIZATION_LANGUAGE_*`, localization.h:30-32).
@@ -889,6 +922,29 @@ const EN_US: [&str; Id::COUNT] = [
     "8",                                          // OptionsWhiteBalance8 (#191, riviv)
     "9",                                          // OptionsWhiteBalance9 (#191, riviv)
     "10",                                         // OptionsWhiteBalance10 (#191, riviv)
+    "Contrast",                                   // MenuContrast (#193, riviv)
+    "Contrast:",                                  // OptionsContrast (#193, riviv)
+    "Off",                                        // OptionsContrastOff (#193, riviv)
+    "-10",                                        // OptionsContrastMinus10 (#193, riviv)
+    "-9",                                         // OptionsContrastMinus9 (#193, riviv)
+    "-8",                                         // OptionsContrastMinus8 (#193, riviv)
+    "-7",                                         // OptionsContrastMinus7 (#193, riviv)
+    "-6",                                         // OptionsContrastMinus6 (#193, riviv)
+    "-5",                                         // OptionsContrastMinus5 (#193, riviv)
+    "-4",                                         // OptionsContrastMinus4 (#193, riviv)
+    "-3",                                         // OptionsContrastMinus3 (#193, riviv)
+    "-2",                                         // OptionsContrastMinus2 (#193, riviv)
+    "-1",                                         // OptionsContrastMinus1 (#193, riviv)
+    "1",                                          // OptionsContrast1 (#193, riviv)
+    "2",                                          // OptionsContrast2 (#193, riviv)
+    "3",                                          // OptionsContrast3 (#193, riviv)
+    "4",                                          // OptionsContrast4 (#193, riviv)
+    "5",                                          // OptionsContrast5 (#193, riviv)
+    "6",                                          // OptionsContrast6 (#193, riviv)
+    "7",                                          // OptionsContrast7 (#193, riviv)
+    "8",                                          // OptionsContrast8 (#193, riviv)
+    "9",                                          // OptionsContrast9 (#193, riviv)
+    "10",                                         // OptionsContrast10 (#193, riviv)
 ];
 
 /// zh-CN table — upstream localization_zh_cn.h:31/197-199/261-263.
@@ -1203,6 +1259,29 @@ const ZH_CN: [&str; Id::COUNT] = [
     "8",                        // OptionsWhiteBalance8 (#191, riviv)
     "9",                        // OptionsWhiteBalance9 (#191, riviv)
     "10",                       // OptionsWhiteBalance10 (#191, riviv)
+    "对比度",                   // MenuContrast (#193, riviv)
+    "对比度:",                  // OptionsContrast (#193, riviv)
+    "关",                       // OptionsContrastOff (#193, riviv)
+    "-10",                      // OptionsContrastMinus10 (#193, riviv)
+    "-9",                       // OptionsContrastMinus9 (#193, riviv)
+    "-8",                       // OptionsContrastMinus8 (#193, riviv)
+    "-7",                       // OptionsContrastMinus7 (#193, riviv)
+    "-6",                       // OptionsContrastMinus6 (#193, riviv)
+    "-5",                       // OptionsContrastMinus5 (#193, riviv)
+    "-4",                       // OptionsContrastMinus4 (#193, riviv)
+    "-3",                       // OptionsContrastMinus3 (#193, riviv)
+    "-2",                       // OptionsContrastMinus2 (#193, riviv)
+    "-1",                       // OptionsContrastMinus1 (#193, riviv)
+    "1",                        // OptionsContrast1 (#193, riviv)
+    "2",                        // OptionsContrast2 (#193, riviv)
+    "3",                        // OptionsContrast3 (#193, riviv)
+    "4",                        // OptionsContrast4 (#193, riviv)
+    "5",                        // OptionsContrast5 (#193, riviv)
+    "6",                        // OptionsContrast6 (#193, riviv)
+    "7",                        // OptionsContrast7 (#193, riviv)
+    "8",                        // OptionsContrast8 (#193, riviv)
+    "9",                        // OptionsContrast9 (#193, riviv)
+    "10",                       // OptionsContrast10 (#193, riviv)
 ];
 
 /// Map a `GetUserDefaultUILanguage` LANGID onto the table choice

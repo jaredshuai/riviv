@@ -372,16 +372,28 @@ pub(crate) enum Cmd {
     /// white-balance (temperature) stage's own quick toggle — per-stage
     /// independent of Sharpen's (each row flips its own stage; the
     /// other rides along). The checkmark reads the gpu side's LIVE
-    /// chain's white-balance stage, never the config key (D9). LAST row
-    /// of the View menu, right after Sharpen behind the same separator;
-    /// tail-appended for the same id-pinning reason as #178/#185.
+    /// chain's white-balance stage, never the config key (D9). Right
+    /// after Sharpen behind the same separator, with #193's Contrast
+    /// row after it; tail-appended for the same id-pinning reason as
+    /// #178/#185.
     ViewWhiteBalance,
+    /// View → Contrast (#193 — riviv-authored; the chain's third and
+    /// closing knife out of the same viv.c:76 wishlist note, its
+    /// "color correction" word realized as the tonal axis). Ctrl+L.
+    /// The contrast stage's own quick toggle — per-stage independent of
+    /// Sharpen's and White Balance's (each row flips its own stage; the
+    /// others ride along). The checkmark reads the gpu side's LIVE
+    /// chain's contrast stage, never the config key (D9). LAST row of
+    /// the View menu, right after White Balance behind the same
+    /// separator; tail-appended for the same id-pinning reason as
+    /// #178/#185/#191.
+    ViewContrast,
 }
 
 impl Cmd {
     /// Variant count; also the id space size (ids are 1-based — 0 is the
     /// separator/no-command id in Win32 menus and must stay unassigned).
-    pub(crate) const COUNT: usize = Self::ViewWhiteBalance as usize + 1;
+    pub(crate) const COUNT: usize = Self::ViewContrast as usize + 1;
 
     /// The WM_COMMAND command id (upstream uses the `VIV_ID_*` enum values;
     /// riviv's ids are app-internal — nothing interoperates — so they run
@@ -582,9 +594,10 @@ impl Cmd {
         // see the variant's doc).
         Self::EditUndoDelete,
         // #185's tail append (id 123, same id-pinning reason); #191's
-        // (id 124).
+        // (id 124); #193's (id 125).
         Self::ViewSharpen,
         Self::ViewWhiteBalance,
+        Self::ViewContrast,
     ];
 }
 
@@ -1148,7 +1161,7 @@ pub(crate) const ENTRIES: &[Entry] = &[
     // the riviv-authored effect rows close the View menu behind a
     // separator, so the upstream block above keeps its exact shape.
     // #191 appends White Balance right after Sharpen — same block, the
-    // chain's rows sit together.
+    // chain's rows sit together. #193 appends Contrast after that.
     Entry::Separator { parent: Slot::View },
     Entry::Item {
         loc: loc::Id::MenuSharpen,
@@ -1159,6 +1172,11 @@ pub(crate) const ENTRIES: &[Entry] = &[
         loc: loc::Id::MenuWhiteBalance,
         parent: Slot::View,
         cmd: Cmd::ViewWhiteBalance,
+    },
+    Entry::Item {
+        loc: loc::Id::MenuContrast,
+        parent: Slot::View,
+        cmd: Cmd::ViewContrast,
     },
     // Slideshow (#37; upstream viv.c:892-918 — a root menu between View
     // and Navigate, its Rate submenu after Play/Pause and a separator).
@@ -1742,6 +1760,10 @@ pub(crate) struct MenuState {
     /// white-balance stage, independent of the sharpen stage above —
     /// the two rows are two switches, not one "chain on" flag.
     pub(crate) effect_white_balance_on: bool,
+    /// View → Contrast's checkmark (#193): the LIVE chain's contrast
+    /// stage, independent of the two stages above — three rows, three
+    /// switches.
+    pub(crate) effect_contrast_on: bool,
     /// View → Fullscreen's checkmark: `_viv_is_fullscreen` (viv.c:7132).
     pub(crate) fullscreen: bool,
     /// View → 1:1's checkmark: render size == image size (viv.c:7131).
@@ -1804,10 +1826,11 @@ pub(crate) fn checked(cmd: Cmd, state: &MenuState) -> bool {
         Cmd::ViewMenu => state.show_menu,
         Cmd::ViewStatus => state.show_status,
         Cmd::ViewControls => state.show_controls,
-        // #185/#191: the live gpu chain's own stage, not the config key
-        // (D9) — per-stage, each row its own switch.
+        // #185/#191/#193: the live gpu chain's own stage, not the config
+        // key (D9) — per-stage, each row its own switch.
         Cmd::ViewSharpen => state.effect_sharpen_on,
         Cmd::ViewWhiteBalance => state.effect_white_balance_on,
+        Cmd::ViewContrast => state.effect_contrast_on,
         Cmd::ViewFullscreen => state.fullscreen,
         Cmd::ViewOneToOne => state.one_to_one,
         Cmd::ViewSlideshow | Cmd::SlideshowPause => state.slideshow,
@@ -2162,6 +2185,7 @@ mod tests {
             show_controls: true,
             effect_sharpen_on: true,
             effect_white_balance_on: true,
+            effect_contrast_on: true,
             fullscreen: true,
             one_to_one: true,
             slideshow: true,
@@ -2184,6 +2208,7 @@ mod tests {
             show_controls: false,
             effect_sharpen_on: false,
             effect_white_balance_on: false,
+            effect_contrast_on: false,
             fullscreen: false,
             one_to_one: false,
             slideshow: false,
@@ -2221,6 +2246,7 @@ mod tests {
                     | Cmd::ViewOntopAlways
                     | Cmd::ViewSharpen
                     | Cmd::ViewWhiteBalance
+                    | Cmd::ViewContrast
             );
             assert_eq!(checked(cmd, &on), expected_on, "{cmd:?} with everything on");
             let expected_off = matches!(
@@ -2389,6 +2415,7 @@ mod tests {
             show_controls: false,
             effect_sharpen_on: false,
             effect_white_balance_on: false,
+            effect_contrast_on: false,
             fullscreen: false,
             one_to_one: false,
             slideshow: false,
@@ -2568,7 +2595,8 @@ mod tests {
         assert_eq!(Cmd::EditUndoDelete.id(), 122);
         assert_eq!(Cmd::ViewSharpen.id(), 123);
         assert_eq!(Cmd::ViewWhiteBalance.id(), 124);
-        assert_eq!(Cmd::COUNT, 124);
+        assert_eq!(Cmd::ViewContrast.id(), 125);
+        assert_eq!(Cmd::COUNT, 125);
     }
 
     #[test]
