@@ -2678,14 +2678,21 @@ mod tests {
         );
         for (idx, fp) in c_fps.iter().enumerate() {
             // contrast = 0 there is the default chain — skip that one cell.
+            // The message's level is signed (idx as i32 - 10): a plain
+            // `idx - 10` would underflow the usize on the negative half.
             if idx != 10 {
                 assert_ne!(
                     *fp,
                     sharpen_only,
                     "sharpen 3 collides with contrast {}",
-                    idx - 10
+                    idx as i32 - 10
                 );
-                assert_ne!(*fp, wb_only, "wb 3 collides with contrast {}", idx - 10);
+                assert_ne!(
+                    *fp,
+                    wb_only,
+                    "wb 3 collides with contrast {}",
+                    idx as i32 - 10
+                );
             }
         }
     }

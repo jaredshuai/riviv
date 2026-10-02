@@ -372,9 +372,10 @@ pub(crate) enum Cmd {
     /// white-balance (temperature) stage's own quick toggle — per-stage
     /// independent of Sharpen's (each row flips its own stage; the
     /// other rides along). The checkmark reads the gpu side's LIVE
-    /// chain's white-balance stage, never the config key (D9). LAST row
-    /// of the View menu, right after Sharpen behind the same separator;
-    /// tail-appended for the same id-pinning reason as #178/#185.
+    /// chain's white-balance stage, never the config key (D9). Right
+    /// after Sharpen behind the same separator, with #193's Contrast
+    /// row after it; tail-appended for the same id-pinning reason as
+    /// #178/#185.
     ViewWhiteBalance,
     /// View → Contrast (#193 — riviv-authored; the chain's third and
     /// closing knife out of the same viv.c:76 wishlist note, its

@@ -283,7 +283,7 @@ const DEFAULT_KEYS: &[(Cmd, &[KeyDef])] = &[
     // Ctrl+L: Levels, the photo-tool muscle memory for a tonal
     // adjustment — free across upstream's whole table (viv.c:972-1039
     // has no L row; Ctrl+C is Edit Copy, Ctrl+D carries the wallpaper
-    // debt) and riviv's (A/B/C/E/J/K/O/P/Q/R/S/T/V/W/X/Z taken).
+    // debt) and riviv's (B/C/E/J/K/O/P/Q/R/S/T/V/W/X/Z taken).
     (Cmd::ViewContrast, &[key(true, false, false, b'L' as u16)]),
     // The slideshow trio lands right after the Refresh row in upstream's
     // table (viv.c:1027-1029, between Refresh and the animation rows).
