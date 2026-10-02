@@ -12,7 +12,7 @@
 
 ## 主要部分
 
-riviv 是 Windows 上的单 exe 看图程序，[voidImageViewer](https://github.com/voidtools/voidImageViewer) 的非官方 Rust 重写。行为有疑问时可以读 `c-original/` 对照，那份目录只读，实现在根目录 `src/`（AGENTS「技术栈约定」）。产物是静态链接的单 exe：当前 release 体积基线 6,842,368 B（v0.3.0 发布版实测；历史基线:v0.2.0 6,801,920 B、#163 重栅接线 6,800,896 B、#152 SVG 落地 6,770,688 B；口径见 AGENTS「依赖原则」）。
+riviv 是 Windows 上的单 exe 看图程序，[voidImageViewer](https://github.com/voidtools/voidImageViewer) 的非官方 Rust 重写。行为有疑问时可以读 `c-original/` 对照，那份目录只读，实现在根目录 `src/`（AGENTS「技术栈约定」）。产物是静态链接的单 exe：当前 release 体积基线 6,859,776 B（v0.4.0 发布版实测；历史基线:v0.3.0 6,842,368 B、v0.2.0 6,801,920 B、#163 重栅接线 6,800,896 B、#152 SVG 落地 6,770,688 B；口径见 AGENTS「依赖原则」）。
 
 下面只写职责和它们之间的关系。里程碑勾选以 README Roadmap 为准。
 
