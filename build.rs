@@ -6,6 +6,7 @@
 fn main() {
     println!("cargo:rerun-if-changed=res/riviv.ico");
     println!("cargo:rerun-if-changed=res/riviv.manifest");
+    println!("cargo:rerun-if-changed=Cargo.toml");
     let mut res = winresource::WindowsResource::new();
     res.set_icon("res/riviv.ico");
     // PerMonitorV2 (#79): the loader applies this before any user code,
@@ -18,8 +19,13 @@ fn main() {
     // viv.c:5346-5350 loads its rc icon the same way).
     res.set("FileDescription", "riviv — image viewer");
     res.set("ProductName", "riviv");
-    res.set("ProductVersion", "0.1.0");
-    res.set("FileVersion", "0.1.0.0");
+    // Derive from the package version so the exe's file properties can
+    // never drift from it (they were stuck at 0.1.0 through v0.2.0).
+    // FileVersion requires four components; CARGO_PKG_VERSION has three.
+    let pkg_version = std::env::var("CARGO_PKG_VERSION")
+        .expect("cargo always sets CARGO_PKG_VERSION for build scripts");
+    res.set("ProductVersion", &pkg_version);
+    res.set("FileVersion", &format!("{pkg_version}.0"));
     res.set(
         "LegalCopyright",
         "MIT License — original C implementation © voidtools / David Carpenter",
