@@ -361,18 +361,27 @@ pub(crate) enum Cmd {
     EditUndoDelete,
     /// View → Sharpen (#185 — riviv-authored; upstream has no row, only
     /// the viv.c:76 wishlist note naming sharpening). Ctrl+S. The user
-    /// display-effect chain's quick toggle (ADR 0006): the checkmark
-    /// reads the gpu side's LIVE chain, never the config key (D9 — a
-    /// build-failure drop unchecks the row honestly). LAST row of the
-    /// View menu, past Options behind a separator. Tail-appended for the
-    /// same id-pinning reason as #178.
+    /// display-effect chain's sharpen stage's quick toggle (ADR 0006):
+    /// the checkmark reads the gpu side's LIVE chain, never the config
+    /// key (D9 — a build-failure drop unchecks the row honestly). Tail-
+    /// appended so every existing command id stays pinned for the smoke
+    /// scripts (the id test's own rule).
     ViewSharpen,
+    /// View → White Balance (#191 — riviv-authored; the chain's second
+    /// knife out of the same viv.c:76 wishlist note). Ctrl+K. The
+    /// white-balance (temperature) stage's own quick toggle — per-stage
+    /// independent of Sharpen's (each row flips its own stage; the
+    /// other rides along). The checkmark reads the gpu side's LIVE
+    /// chain's white-balance stage, never the config key (D9). LAST row
+    /// of the View menu, right after Sharpen behind the same separator;
+    /// tail-appended for the same id-pinning reason as #178/#185.
+    ViewWhiteBalance,
 }
 
 impl Cmd {
     /// Variant count; also the id space size (ids are 1-based — 0 is the
     /// separator/no-command id in Win32 menus and must stay unassigned).
-    pub(crate) const COUNT: usize = Self::ViewSharpen as usize + 1;
+    pub(crate) const COUNT: usize = Self::ViewWhiteBalance as usize + 1;
 
     /// The WM_COMMAND command id (upstream uses the `VIV_ID_*` enum values;
     /// riviv's ids are app-internal — nothing interoperates — so they run
@@ -572,8 +581,10 @@ impl Cmd {
         // #178's tail append (id 122 — after every upstream-aligned id;
         // see the variant's doc).
         Self::EditUndoDelete,
-        // #185's tail append (id 123, same id-pinning reason).
+        // #185's tail append (id 123, same id-pinning reason); #191's
+        // (id 124).
         Self::ViewSharpen,
+        Self::ViewWhiteBalance,
     ];
 }
 
@@ -1134,13 +1145,20 @@ pub(crate) const ENTRIES: &[Entry] = &[
         cmd: Cmd::ViewOptions,
     },
     // #185 (beyond upstream — viv.c:76's wishlist note, no upstream row):
-    // the riviv-authored Sharpen toggle closes the View menu behind a
+    // the riviv-authored effect rows close the View menu behind a
     // separator, so the upstream block above keeps its exact shape.
+    // #191 appends White Balance right after Sharpen — same block, the
+    // chain's rows sit together.
     Entry::Separator { parent: Slot::View },
     Entry::Item {
         loc: loc::Id::MenuSharpen,
         parent: Slot::View,
         cmd: Cmd::ViewSharpen,
+    },
+    Entry::Item {
+        loc: loc::Id::MenuWhiteBalance,
+        parent: Slot::View,
+        cmd: Cmd::ViewWhiteBalance,
     },
     // Slideshow (#37; upstream viv.c:892-918 — a root menu between View
     // and Navigate, its Rate submenu after Play/Pause and a separator).
@@ -1716,10 +1734,14 @@ pub(crate) struct MenuState {
     /// (viv.c:7126).
     pub(crate) show_controls: bool,
     /// View → Sharpen's checkmark (#185, riviv-authored): the gpu side's
-    /// LIVE chain, non-empty = checked (ADR 0006 D9 — the config key is
-    /// persistence only; a build-failure drop must uncheck the row, and
-    /// reading the key would lie).
-    pub(crate) effect_chain_on: bool,
+    /// LIVE chain, sharpen stage non-zero = checked (ADR 0006 D9 — the
+    /// config key is persistence only; a build-failure drop must uncheck
+    /// the row, and reading the key would lie).
+    pub(crate) effect_sharpen_on: bool,
+    /// View → White Balance's checkmark (#191): the LIVE chain's
+    /// white-balance stage, independent of the sharpen stage above —
+    /// the two rows are two switches, not one "chain on" flag.
+    pub(crate) effect_white_balance_on: bool,
     /// View → Fullscreen's checkmark: `_viv_is_fullscreen` (viv.c:7132).
     pub(crate) fullscreen: bool,
     /// View → 1:1's checkmark: render size == image size (viv.c:7131).
@@ -1782,8 +1804,10 @@ pub(crate) fn checked(cmd: Cmd, state: &MenuState) -> bool {
         Cmd::ViewMenu => state.show_menu,
         Cmd::ViewStatus => state.show_status,
         Cmd::ViewControls => state.show_controls,
-        // #185: the live gpu chain, not the config key (D9).
-        Cmd::ViewSharpen => state.effect_chain_on,
+        // #185/#191: the live gpu chain's own stage, not the config key
+        // (D9) — per-stage, each row its own switch.
+        Cmd::ViewSharpen => state.effect_sharpen_on,
+        Cmd::ViewWhiteBalance => state.effect_white_balance_on,
         Cmd::ViewFullscreen => state.fullscreen,
         Cmd::ViewOneToOne => state.one_to_one,
         Cmd::ViewSlideshow | Cmd::SlideshowPause => state.slideshow,
@@ -2136,7 +2160,8 @@ mod tests {
             show_menu: true,
             show_status: true,
             show_controls: true,
-            effect_chain_on: true,
+            effect_sharpen_on: true,
+            effect_white_balance_on: true,
             fullscreen: true,
             one_to_one: true,
             slideshow: true,
@@ -2157,7 +2182,8 @@ mod tests {
             show_menu: false,
             show_status: false,
             show_controls: false,
-            effect_chain_on: false,
+            effect_sharpen_on: false,
+            effect_white_balance_on: false,
             fullscreen: false,
             one_to_one: false,
             slideshow: false,
@@ -2194,6 +2220,7 @@ mod tests {
                     | Cmd::ViewFillWindow
                     | Cmd::ViewOntopAlways
                     | Cmd::ViewSharpen
+                    | Cmd::ViewWhiteBalance
             );
             assert_eq!(checked(cmd, &on), expected_on, "{cmd:?} with everything on");
             let expected_off = matches!(
@@ -2360,7 +2387,8 @@ mod tests {
             show_menu: false,
             show_status: false,
             show_controls: false,
-            effect_chain_on: false,
+            effect_sharpen_on: false,
+            effect_white_balance_on: false,
             fullscreen: false,
             one_to_one: false,
             slideshow: false,
@@ -2539,7 +2567,8 @@ mod tests {
         // whole table — every upstream id above stands unshifted.
         assert_eq!(Cmd::EditUndoDelete.id(), 122);
         assert_eq!(Cmd::ViewSharpen.id(), 123);
-        assert_eq!(Cmd::COUNT, 123);
+        assert_eq!(Cmd::ViewWhiteBalance.id(), 124);
+        assert_eq!(Cmd::COUNT, 124);
     }
 
     #[test]

@@ -1379,7 +1379,10 @@ fn desired_output_face(state: &WindowState) -> crate::transform_stage::OutputSur
 /// verdict is about one device's context, not the user's wish) — a
 /// failing fresh device drops it again with the same breadcrumb.
 fn seed_effect_chain(state: &WindowState) -> crate::transform_stage::EffectChain {
-    crate::transform_stage::EffectChain::from_config(state.config.sharpen)
+    crate::transform_stage::EffectChain::from_config(
+        state.config.sharpen,
+        state.config.white_balance,
+    )
 }
 
 /// One `create` call with the D6 AC-face fallback (#156), shared by every
@@ -7275,13 +7278,17 @@ fn refresh_menu_state(hwnd: HWND, target: HMENU) {
             show_menu: state.config.show_menu != 0,
             show_status: state.config.show_status != 0,
             show_controls: state.config.show_controls != 0,
-            // #185 (ADR 0006 D9): the LIVE gpu chain, not the config key —
-            // a build-failure drop unchecks the row honestly. A stackless
-            // (dying) session reads as off.
-            effect_chain_on: state
+            // #185/#191 (ADR 0006 D9): the LIVE gpu chain's own stage, not
+            // the config key — a build-failure drop unchecks the row
+            // honestly. A stackless (dying) session reads as off.
+            effect_sharpen_on: state
                 .gpu
                 .as_ref()
-                .is_some_and(|gpu| !gpu.effect_chain().is_empty()),
+                .is_some_and(|gpu| gpu.effect_chain().sharpen != 0),
+            effect_white_balance_on: state
+                .gpu
+                .as_ref()
+                .is_some_and(|gpu| gpu.effect_chain().white_balance != 0),
             fullscreen: state.fullscreen,
             one_to_one,
             slideshow: state.slideshow,
@@ -7602,8 +7609,10 @@ fn on_command(hwnd: HWND, cmd: menu::Cmd) {
         menu::Cmd::ViewMenu => toggle_menu(hwnd),
         menu::Cmd::ViewStatus => toggle_status(hwnd),
         menu::Cmd::ViewControls => toggle_controls(hwnd),
-        // The sharpen toggle (#185, riviv-authored; ADR 0006).
+        // The effect-row toggles (#185/#191, riviv-authored; ADR 0006) —
+        // per-stage: each row flips its own stage, the other rides along.
         menu::Cmd::ViewSharpen => toggle_sharpen(hwnd),
+        menu::Cmd::ViewWhiteBalance => toggle_white_balance(hwnd),
         // The Preset trio (#46; viv.c:1990-2013 — assign all five configs,
         // one frame rebuild).
         menu::Cmd::ViewPreset1 => apply_preset(hwnd, crate::frame::Preset::Minimal),
@@ -8220,28 +8229,59 @@ fn toggle_controls(hwnd: HWND) {
     update_frame(hwnd);
 }
 
-/// View → Sharpen (#185, riviv-authored; ADR 0006): the user display
-/// effect chain's quick toggle. The toggle's direction reads the LIVE
-/// gpu chain (D9) — an unchecked row after a build-failure drop toggles
-/// ON, re-arming the persisted level (a same-device retry; a fresh
-/// failure drops again with the same breadcrumb). The config key is the
-/// persistence and the re-arm source, never the display state. The
-/// gated re-identity mints the `output_gen` exactly when the
-/// fingerprint really moved — it does not on WARP, where the D5
-/// exclusion normalizes the chain term (the toggle still flips the key
-/// and the chain; the output was and stays chain-free there).
+/// View → Sharpen (#185, riviv-authored; ADR 0006): the display-effect
+/// chain's sharpen-stage quick toggle — see [`toggle_effect_stage`] for
+/// the shared contract.
 fn toggle_sharpen(hwnd: HWND) {
+    toggle_effect_stage(hwnd, EffectStage::Sharpen);
+}
+
+/// The White Balance row's arm (#191): the sharpen toggle's mirror —
+/// same live-chain read, same gated re-identity, its own stage and its
+/// own config key.
+fn toggle_white_balance(hwnd: HWND) {
+    toggle_effect_stage(hwnd, EffectStage::WhiteBalance);
+}
+
+/// The effect rows' shared arm (#185/#191): which stage a View row owns.
+enum EffectStage {
+    Sharpen,
+    WhiteBalance,
+}
+
+/// The per-stage toggle core behind both View rows (#185 sharpen,
+/// #191 white balance — the two-knife generalization of #185's single
+/// toggle): the LIVE gpu chain decides on/off (D9) — an unchecked row
+/// after a build-failure drop toggles ON, re-arming the persisted level
+/// (a same-device retry; a fresh failure drops again with the same
+/// breadcrumb). The config keys are persistence and the re-arm source,
+/// never the display state. Only the TOGGLED stage's key is written:
+/// the other stage's raw ini value (a hand-edited out-of-domain int)
+/// stays untouched for its own round trip. The gated re-identity mints
+/// the `output_gen` exactly when the fingerprint really moved — it does
+/// not on WARP, where the D5 exclusion normalizes the chain term (the
+/// toggle still flips the key and the chain; the output was and stays
+/// chain-free there).
+fn toggle_effect_stage(hwnd: HWND, stage: EffectStage) {
     // SAFETY: the borrow spans the chain read, the config write, the
     // chain set and the gated re-identity — nothing pumps.
     if let Some(state) = unsafe { state_of(hwnd) } {
-        let target = state
+        let live = state
             .gpu
             .as_ref()
             .map_or_else(crate::transform_stage::EffectChain::default, |gpu| {
                 gpu.effect_chain()
-            })
-            .toggle_target(state.config.sharpen);
-        state.config.sharpen = i32::from(target.sharpen);
+            });
+        let target = match stage {
+            EffectStage::Sharpen => live.toggle_sharpen(state.config.sharpen),
+            EffectStage::WhiteBalance => live.toggle_white_balance(state.config.white_balance),
+        };
+        match stage {
+            EffectStage::Sharpen => state.config.sharpen = i32::from(target.sharpen),
+            EffectStage::WhiteBalance => {
+                state.config.white_balance = i32::from(target.white_balance);
+            }
+        }
         if let Some(gpu) = state.gpu.as_mut() {
             gpu.set_effect_chain(target);
         }
@@ -8250,13 +8290,16 @@ fn toggle_sharpen(hwnd: HWND) {
     repaint(hwnd);
 }
 
-/// The Options-OK arm (#185): the freshly committed config key IS the
-/// user's edited truth — replay it onto the live chain and re-identify
-/// through the same gate as the toggle (silent when the level did not
-/// move). Idempotent by construction: an unchanged key is a set no-op
-/// and a gate that stays closed.
+/// The Options-OK arm (#185, #191): the freshly committed config keys ARE
+/// the user's edited truth — replay them onto the live chain and
+/// re-identify through the same gate as the toggles (silent when no
+/// level moved). Idempotent by construction: an unchanged key is a set
+/// no-op and a gate that stays closed.
 pub(crate) fn apply_config_effect_chain(state: &mut WindowState) {
-    let chain = crate::transform_stage::EffectChain::from_config(state.config.sharpen);
+    let chain = crate::transform_stage::EffectChain::from_config(
+        state.config.sharpen,
+        state.config.white_balance,
+    );
     if let Some(gpu) = state.gpu.as_mut() {
         gpu.set_effect_chain(chain);
     }

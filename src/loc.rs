@@ -527,12 +527,45 @@ pub(crate) enum Id {
     OptionsSharpen8,
     OptionsSharpen9,
     OptionsSharpen10,
+    /// ---- #191: white-balance display effect ----
+    /// View → "White Balance" (#191, riviv-authored — the chain's second
+    /// knife out of the same viv.c:76 wishlist note). No mnemonic: the
+    /// View dropdown's W already belongs to "&Window Size" (the
+    /// no-mnemonic precedent: MenuSharpen).
+    MenuWhiteBalance,
+    /// Options View page: the white-balance combo's static label (#191).
+    OptionsWhiteBalance,
+    /// The white-balance combo's off row — the docs domain's 0 (#191).
+    OptionsWhiteBalanceOff,
+    /// The white-balance combo's cooling rows −10..=−1 and warming rows
+    /// 1..=10 (#191; signed numerals are their own localization in both
+    /// tables, like the sharpen scale's).
+    OptionsWhiteBalanceMinus10,
+    OptionsWhiteBalanceMinus9,
+    OptionsWhiteBalanceMinus8,
+    OptionsWhiteBalanceMinus7,
+    OptionsWhiteBalanceMinus6,
+    OptionsWhiteBalanceMinus5,
+    OptionsWhiteBalanceMinus4,
+    OptionsWhiteBalanceMinus3,
+    OptionsWhiteBalanceMinus2,
+    OptionsWhiteBalanceMinus1,
+    OptionsWhiteBalance1,
+    OptionsWhiteBalance2,
+    OptionsWhiteBalance3,
+    OptionsWhiteBalance4,
+    OptionsWhiteBalance5,
+    OptionsWhiteBalance6,
+    OptionsWhiteBalance7,
+    OptionsWhiteBalance8,
+    OptionsWhiteBalance9,
+    OptionsWhiteBalance10,
 }
 
 impl Id {
     /// Variant count; array-typing both tables against this keeps them
     /// length-locked to the enum by construction.
-    pub(crate) const COUNT: usize = Self::OptionsSharpen10 as usize + 1;
+    pub(crate) const COUNT: usize = Self::OptionsWhiteBalance10 as usize + 1;
 }
 
 /// Table choice (upstream `LOCALIZATION_LANGUAGE_*`, localization.h:30-32).
@@ -833,6 +866,29 @@ const EN_US: [&str; Id::COUNT] = [
     "8",                                          // OptionsSharpen8 (#185, riviv)
     "9",                                          // OptionsSharpen9 (#185, riviv)
     "10",                                         // OptionsSharpen10 (#185, riviv)
+    "White Balance",                              // MenuWhiteBalance (#191, riviv)
+    "White balance:",                             // OptionsWhiteBalance (#191, riviv)
+    "Off",                                        // OptionsWhiteBalanceOff (#191, riviv)
+    "-10",                                        // OptionsWhiteBalanceMinus10 (#191, riviv)
+    "-9",                                         // OptionsWhiteBalanceMinus9 (#191, riviv)
+    "-8",                                         // OptionsWhiteBalanceMinus8 (#191, riviv)
+    "-7",                                         // OptionsWhiteBalanceMinus7 (#191, riviv)
+    "-6",                                         // OptionsWhiteBalanceMinus6 (#191, riviv)
+    "-5",                                         // OptionsWhiteBalanceMinus5 (#191, riviv)
+    "-4",                                         // OptionsWhiteBalanceMinus4 (#191, riviv)
+    "-3",                                         // OptionsWhiteBalanceMinus3 (#191, riviv)
+    "-2",                                         // OptionsWhiteBalanceMinus2 (#191, riviv)
+    "-1",                                         // OptionsWhiteBalanceMinus1 (#191, riviv)
+    "1",                                          // OptionsWhiteBalance1 (#191, riviv)
+    "2",                                          // OptionsWhiteBalance2 (#191, riviv)
+    "3",                                          // OptionsWhiteBalance3 (#191, riviv)
+    "4",                                          // OptionsWhiteBalance4 (#191, riviv)
+    "5",                                          // OptionsWhiteBalance5 (#191, riviv)
+    "6",                                          // OptionsWhiteBalance6 (#191, riviv)
+    "7",                                          // OptionsWhiteBalance7 (#191, riviv)
+    "8",                                          // OptionsWhiteBalance8 (#191, riviv)
+    "9",                                          // OptionsWhiteBalance9 (#191, riviv)
+    "10",                                         // OptionsWhiteBalance10 (#191, riviv)
 ];
 
 /// zh-CN table — upstream localization_zh_cn.h:31/197-199/261-263.
@@ -1124,6 +1180,29 @@ const ZH_CN: [&str; Id::COUNT] = [
     "8",                        // OptionsSharpen8 (#185, riviv)
     "9",                        // OptionsSharpen9 (#185, riviv)
     "10",                       // OptionsSharpen10 (#185, riviv)
+    "白平衡",                   // MenuWhiteBalance (#191, riviv)
+    "白平衡:",                  // OptionsWhiteBalance (#191, riviv)
+    "关",                       // OptionsWhiteBalanceOff (#191, riviv)
+    "-10",                      // OptionsWhiteBalanceMinus10 (#191, riviv)
+    "-9",                       // OptionsWhiteBalanceMinus9 (#191, riviv)
+    "-8",                       // OptionsWhiteBalanceMinus8 (#191, riviv)
+    "-7",                       // OptionsWhiteBalanceMinus7 (#191, riviv)
+    "-6",                       // OptionsWhiteBalanceMinus6 (#191, riviv)
+    "-5",                       // OptionsWhiteBalanceMinus5 (#191, riviv)
+    "-4",                       // OptionsWhiteBalanceMinus4 (#191, riviv)
+    "-3",                       // OptionsWhiteBalanceMinus3 (#191, riviv)
+    "-2",                       // OptionsWhiteBalanceMinus2 (#191, riviv)
+    "-1",                       // OptionsWhiteBalanceMinus1 (#191, riviv)
+    "1",                        // OptionsWhiteBalance1 (#191, riviv)
+    "2",                        // OptionsWhiteBalance2 (#191, riviv)
+    "3",                        // OptionsWhiteBalance3 (#191, riviv)
+    "4",                        // OptionsWhiteBalance4 (#191, riviv)
+    "5",                        // OptionsWhiteBalance5 (#191, riviv)
+    "6",                        // OptionsWhiteBalance6 (#191, riviv)
+    "7",                        // OptionsWhiteBalance7 (#191, riviv)
+    "8",                        // OptionsWhiteBalance8 (#191, riviv)
+    "9",                        // OptionsWhiteBalance9 (#191, riviv)
+    "10",                       // OptionsWhiteBalance10 (#191, riviv)
 ];
 
 /// Map a `GetUserDefaultUILanguage` LANGID onto the table choice

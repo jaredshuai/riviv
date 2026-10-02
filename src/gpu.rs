@@ -63,7 +63,7 @@ use windows::Win32::Graphics::Dxgi::{
 use windows::Win32::Graphics::Gdi::ValidateRect;
 use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, PAINTSTRUCT};
 use windows::Win32::UI::WindowsAndMessaging::{GetClientRect, GetParent, IsIconic};
-use windows::core::Interface;
+use windows::core::{GUID, Interface};
 
 use crate::config::RendererKind;
 use crate::paint::scene_rect;
@@ -560,6 +560,30 @@ const D2D1_SHARPEN_PROP_SHARPNESS: u32 = 0;
 /// an internal constant (O6=A — no second knob until a real use case
 /// asks for one).
 const D2D1_SHARPEN_PROP_THRESHOLD: u32 = 1;
+
+/// `CLSID_D2D1TemperatureTint` — transcribed from d2d1effects_2.h:38
+/// (`89176087-8af9-4a08-aeb1-895f38db1766`, the #130 transcribe-from-
+/// the-header precedent): windows 0.62.2 binds the sharpen CLSID but
+/// NOT this one, while the same header's PROPERTY enum below it IS
+/// bound — so only the GUID is hand-carried, pinned against the crate's
+/// own export by test (#191). The effect is a Win10 built-in (docs
+/// Requirements: min client Windows 10) — no redist, no size-budget
+/// question (ADR 0006's dependency reasoning carries over verbatim).
+const CLSID_D2D1_TEMPERATURE_TINT: GUID = GUID::from_u128(0x89176087_8af9_4a08_aeb1_895f38db1766);
+
+/// `D2D1_TEMPERATUREANDTINT_PROP_TEMPERATURE = 0` (d2d1effects_2.h:334-
+/// 352, the same enum block the crate binds natively — pinned to that
+/// export by test). The value domain is TEMPERATURE −1.0..1.0 default
+/// 0.0 (the docs ENUM page's Constants table — the effect page is a
+/// stub, the same D6 shape as sharpen); the config scale is that float
+/// domain as the integer −10..=10, off = 0 (#191).
+const D2D1_TEMPERATUREANDTINT_PROP_TEMPERATURE: u32 = 0;
+/// `D2D1_TEMPERATUREANDTINT_PROP_TINT = 1` (same header, pinned by
+/// test). The domain is −1.0..1.0 default 0.0; the value is PINNED to
+/// the default as an internal constant (O6's no-second-knob ruling,
+/// sharpen's THRESHOLD precedent — tint stays unexposed until a real
+/// use case asks).
+const D2D1_TEMPERATUREANDTINT_PROP_TINT: u32 = 1;
 
 /// The built effect graph: the intermediate the scene composites into,
 /// the chain wired `intermediate → [user effects] → ColorManagement →
@@ -1698,50 +1722,115 @@ impl GpuStack {
         let mut effects: Vec<ID2D1Effect> = Vec::new();
         let mut chain_tail: Option<ID2D1Image> = None;
         if chained {
-            // SAFETY: the context is live; the CLSID is a static constant.
-            let sharpen = unsafe { self.context.CreateEffect(&CLSID_D2D1Sharpen) }
-                .map_err(|e| format!("CreateEffect(Sharpen) failed: {e}"))?;
-            // #187's fault seam (ADR 0006 D9): a consumed count refuses
-            // the build AFTER the create genuinely succeeded — the Err
-            // arm of `ensure_effect_graph` drops the chain for the
-            // session, and the next paint collapses onto the chain-less
-            // shape. The smoke pin drives exactly that hand-off. Inert
-            // unless RIVIV_FAULT armed a count.
-            if crate::fault::consume_chain_build() {
-                return Err(
-                    "fault-injected effect chain build failure (RIVIV_FAULT seam)".to_string(),
-                );
-            }
-            // SAFETY: property writes on the live effect; FLOAT properties
-            // take 4 bytes; sharpness ≤ 10.0 and threshold 0.0 sit inside
-            // the docs enum page's domains (ADR 0006 D6).
-            unsafe {
-                let sharpness = f32::from(chain.sharpen);
-                sharpen
-                    .SetValue(
-                        D2D1_SHARPEN_PROP_SHARPNESS,
-                        D2D1_PROPERTY_TYPE_FLOAT,
-                        &sharpness.to_ne_bytes(),
-                    )
-                    .map_err(|e| format!("SetValue(sharpness) failed: {e}"))?;
-                let threshold = 0.0f32;
-                sharpen
-                    .SetValue(
-                        D2D1_SHARPEN_PROP_THRESHOLD,
-                        D2D1_PROPERTY_TYPE_FLOAT,
-                        &threshold.to_ne_bytes(),
-                    )
-                    .map_err(|e| format!("SetValue(threshold) failed: {e}"))?;
-                // Input 0 = the intermediate (the chain's head); the effect
-                // holds its own reference.
-                sharpen.SetInput(0, Some(&intermediate_img), false);
-            }
-            chain_tail = Some(
-                sharpen
+            // The chain's fixed stage order: sharpen → white balance →
+            // [ColorManagement] (#185/#191). A stage at 0 is ABSENT, not
+            // present-at-zero — the zero-perturbation contract keeps off
+            // bit-identical to the effect's absence per stage. The stages
+            // commute visually (a convolution vs a channel mix); the fixed
+            // order makes the graph's identity deterministic.
+            let sharpen_img: Option<ID2D1Image> = if chain.sharpen != 0 {
+                // SAFETY: the context is live; the CLSID is a static constant.
+                let sharpen = unsafe { self.context.CreateEffect(&CLSID_D2D1Sharpen) }
+                    .map_err(|e| format!("CreateEffect(Sharpen) failed: {e}"))?;
+                // #187's fault seam (ADR 0006 D9): a consumed count refuses
+                // the build AFTER the create genuinely succeeded — the Err
+                // arm of `ensure_effect_graph` drops the chain for the
+                // session, and the next paint collapses onto the chain-less
+                // shape. The smoke pin drives exactly that hand-off. Inert
+                // unless RIVIV_FAULT armed a count. With both stages on this
+                // is the block's first create; a wb-only chain meets the
+                // same seam at its own create below (#191).
+                if crate::fault::consume_chain_build() {
+                    return Err(
+                        "fault-injected effect chain build failure (RIVIV_FAULT seam)".to_string(),
+                    );
+                }
+                // SAFETY: property writes on the live effect; FLOAT
+                // properties take 4 bytes; sharpness ≤ 10.0 and threshold
+                // 0.0 sit inside the docs enum page's domains (ADR 0006
+                // D6).
+                unsafe {
+                    let sharpness = f32::from(chain.sharpen);
+                    sharpen
+                        .SetValue(
+                            D2D1_SHARPEN_PROP_SHARPNESS,
+                            D2D1_PROPERTY_TYPE_FLOAT,
+                            &sharpness.to_ne_bytes(),
+                        )
+                        .map_err(|e| format!("SetValue(sharpness) failed: {e}"))?;
+                    let threshold = 0.0f32;
+                    sharpen
+                        .SetValue(
+                            D2D1_SHARPEN_PROP_THRESHOLD,
+                            D2D1_PROPERTY_TYPE_FLOAT,
+                            &threshold.to_ne_bytes(),
+                        )
+                        .map_err(|e| format!("SetValue(threshold) failed: {e}"))?;
+                    // Input 0 = the intermediate (the chain's head); the
+                    // effect holds its own reference.
+                    sharpen.SetInput(0, Some(&intermediate_img), false);
+                }
+                let img: ID2D1Image = sharpen
                     .cast()
-                    .map_err(|e| format!("cast sharpen to ID2D1Image failed: {e}"))?,
-            );
-            effects.push(sharpen);
+                    .map_err(|e| format!("cast sharpen to ID2D1Image failed: {e}"))?;
+                effects.push(sharpen);
+                Some(img)
+            } else {
+                None
+            };
+            let white_balance_img: Option<ID2D1Image> = if chain.white_balance != 0 {
+                // SAFETY: the context is live; the GUID is the transcribed
+                // header constant above (a Win10 built-in effect).
+                let white_balance =
+                    unsafe { self.context.CreateEffect(&CLSID_D2D1_TEMPERATURE_TINT) }
+                        .map_err(|e| format!("CreateEffect(TemperatureTint) failed: {e}"))?;
+                if sharpen_img.is_none() {
+                    // #187's seam for the wb-only chain: this create is the
+                    // block's first — the identical after-create refusal
+                    // contract as the sharpen arm above.
+                    if crate::fault::consume_chain_build() {
+                        return Err(
+                            "fault-injected effect chain build failure (RIVIV_FAULT seam)"
+                                .to_string(),
+                        );
+                    }
+                }
+                // SAFETY: property writes on the live effect; FLOAT
+                // properties take 4 bytes; temperature ∈ −1.0..1.0 (the int
+                // scale over ten) and tint 0.0 sit inside the docs enum
+                // page's domains (#191, the D6 source-of-truth shape).
+                unsafe {
+                    let temperature = f32::from(chain.white_balance) / 10.0;
+                    white_balance
+                        .SetValue(
+                            D2D1_TEMPERATUREANDTINT_PROP_TEMPERATURE,
+                            D2D1_PROPERTY_TYPE_FLOAT,
+                            &temperature.to_ne_bytes(),
+                        )
+                        .map_err(|e| format!("SetValue(temperature) failed: {e}"))?;
+                    let tint = 0.0f32;
+                    white_balance
+                        .SetValue(
+                            D2D1_TEMPERATUREANDTINT_PROP_TINT,
+                            D2D1_PROPERTY_TYPE_FLOAT,
+                            &tint.to_ne_bytes(),
+                        )
+                        .map_err(|e| format!("SetValue(tint) failed: {e}"))?;
+                    // Input 0 = the chain's running tail — the sharpen
+                    // output when that stage runs, else the intermediate
+                    // head; the effect holds its own reference.
+                    let head: &ID2D1Image = sharpen_img.as_ref().unwrap_or(&intermediate_img);
+                    white_balance.SetInput(0, Some(head), false);
+                }
+                let img: ID2D1Image = white_balance
+                    .cast()
+                    .map_err(|e| format!("cast white balance to ID2D1Image failed: {e}"))?;
+                effects.push(white_balance);
+                Some(img)
+            } else {
+                None
+            };
+            chain_tail = white_balance_img.or(sharpen_img);
         }
         // The CM-less form's early exit (#183): a Direct arm reaches here
         // only WITH a chain (the gate above), and its tail is the graph's
@@ -3198,6 +3287,48 @@ mod tests {
         assert_eq!(D2D1_SHARPEN_PROP_SHARPNESS, 0);
         assert_eq!(D2D1_SHARPEN_PROP_THRESHOLD, 1);
         assert_ne!(D2D1_SHARPEN_PROP_SHARPNESS, D2D1_SHARPEN_PROP_THRESHOLD);
+    }
+
+    /// #191's property indices carry a STRONGER pin than sharpen's: the
+    /// windows 0.62.2 crate binds this enum natively, so the transcribed
+    /// constants are checked against the crate's own export — two
+    /// independent sources (the header transcription and the crate's
+    /// metadata) must agree.
+    #[test]
+    fn the_white_balance_property_indices_match_the_crate_export() {
+        use windows::Win32::Graphics::Direct2D as d2d;
+        assert_eq!(
+            D2D1_TEMPERATUREANDTINT_PROP_TEMPERATURE,
+            d2d::D2D1_TEMPERATUREANDTINT_PROP_TEMPERATURE.0 as u32
+        );
+        assert_eq!(
+            D2D1_TEMPERATUREANDTINT_PROP_TINT,
+            d2d::D2D1_TEMPERATUREANDTINT_PROP_TINT.0 as u32
+        );
+        assert_ne!(
+            D2D1_TEMPERATUREANDTINT_PROP_TEMPERATURE,
+            D2D1_TEMPERATUREANDTINT_PROP_TINT
+        );
+    }
+
+    /// #191: the config's −10..=10 integer scale maps onto the docs
+    /// enum page's −1.0..1.0 TEMPERATURE domain exactly — both edges,
+    /// zero, and a signed middle step (0.1 per step, no rounding drift:
+    /// /10.0 of small ints is exact in f32).
+    #[test]
+    fn the_white_balance_scale_spans_the_docs_domain_exactly() {
+        assert_eq!(f32::from(-10i8) / 10.0, -1.0);
+        assert_eq!(f32::from(10i8) / 10.0, 1.0);
+        assert_eq!(f32::from(0i8) / 10.0, 0.0);
+        assert_eq!(f32::from(-7i8) / 10.0, -0.7);
+        assert_eq!(f32::from(3i8) / 10.0, 0.3);
+        // every int step is representable — the whole combo walks the
+        // domain without a single colliding float.
+        let stepped: Vec<f32> = (-10..=10i8).map(|v| f32::from(v) / 10.0).collect();
+        for (i, w) in stepped.windows(2).enumerate() {
+            let (a, b) = (w[0], w[1]);
+            assert!(b > a, "step {i} does not advance ({a} -> {b})");
+        }
     }
 
     #[test]

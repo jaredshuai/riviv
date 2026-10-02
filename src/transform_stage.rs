@@ -305,15 +305,21 @@ pub(crate) enum DisplayArm {
 /// The user display-effect chain (#183, ADR 0006): a DISPLAY-ONLY,
 /// non-destructive effect stack (O1=A — the master bytes, the read side
 /// (status-bar RGB / clipboard / copy) and the save path never see it;
-/// only the viewport and the dump do, per #156's contract). The first
-/// knife carries a single sharpen stage (O2=A); `sharpen` is the docs
-/// enum page's 0.0–10.0 SHARPNESS domain as an integer 0..=10 scale
-/// (O4=A — the int-key config family, `off = 0`). `Eq`/`Hash` make the
-/// chain a graph-identity term (`built_for`) and later a fingerprint
-/// policy term — an f32 could never key either.
+/// only the viewport and the dump do, per #156's contract). Each stage
+/// is one knife over one docs enum-page domain as an int-key scale
+/// (O4=A/O6=A): sharpen (#185) = 0.0–10.0 SHARPNESS as 0..=10, white
+/// balance (#191) = −1.0..1.0 TEMPERATURE as −10..=10, off = 0 per
+/// stage. `Eq`/`Hash` make the chain a graph-identity term (`built_for`)
+/// and later a fingerprint policy term — an f32 could never key either.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub(crate) struct EffectChain {
     pub(crate) sharpen: u8,
+    /// The white-balance stage (#191, the chain's second knife): the
+    /// docs enum page's −1.0..1.0 TEMPERATURE domain as an integer
+    /// −10..=10 scale (0.1 per step, off = 0). SIGNED on purpose —
+    /// cooling is half the knob — and `i8` covers the domain with room
+    /// for the clamp's edges.
+    pub(crate) white_balance: i8,
 }
 
 /// The level a fresh toggle-ON lands on when the config key carries no
@@ -322,44 +328,68 @@ pub(crate) struct EffectChain {
 /// of the docs domain. The Options combo stays the level editor; the
 /// toggle is the quick switch.
 pub(crate) const SHARPEN_TOGGLE_ON: u8 = 3;
+/// #191's mirror of [`SHARPEN_TOGGLE_ON`]: a gentle third of the
+/// temperature domain, on the WARM side of zero (the positive sign).
+pub(crate) const WHITE_BALANCE_TOGGLE_ON: i8 = 3;
 
 impl EffectChain {
     /// The chain's own off state — and the zero-perturbation contract's
     /// structural term: an empty chain must collapse every (backend, arm)
-    /// cell onto the pre-#183 dispatch shape (see [`pass_shape`]).
+    /// cell onto the pre-#183 dispatch shape (see [`pass_shape`]). A
+    /// single stage off is NOT an empty chain — the other stage still
+    /// forces the two-stage shape (#191).
     pub(crate) fn is_empty(&self) -> bool {
-        self.sharpen == 0
+        self.sharpen == 0 && self.white_balance == 0
     }
 
-    /// The toggle's target chain (#185): on flips off, off flips on. The
-    /// ON level re-arms from the config key when it carries one (a
-    /// dropped-then-retoggled chain retries the persisted level — D9's
-    /// drop is session-scoped, the user's standing wish is not), else
-    /// falls to [`SHARPEN_TOGGLE_ON`]. A hand-edited out-of-domain key
-    /// clamps here, never at parse (the raw int stays in the ini like
-    /// every other int key).
-    pub(crate) fn toggle_target(&self, config_sharpen: i32) -> EffectChain {
-        if !self.is_empty() {
-            EffectChain { sharpen: 0 }
+    /// The Sharpen toggle's target chain (#185/#191): flips the sharpen
+    /// STAGE only, the white-balance stage rides along untouched — each
+    /// View row owns its own stage. The ON level re-arms from the config
+    /// key when it carries one (a dropped-then-retoggled chain retries
+    /// the persisted level — D9's drop is session-scoped, the user's
+    /// standing wish is not), else falls to [`SHARPEN_TOGGLE_ON`]. A
+    /// hand-edited out-of-domain key clamps here, never at parse (the
+    /// raw int stays in the ini like every other int key).
+    pub(crate) fn toggle_sharpen(&self, config_sharpen: i32) -> EffectChain {
+        let mut target = *self;
+        target.sharpen = if self.sharpen != 0 {
+            0
         } else if config_sharpen <= 0 {
-            EffectChain {
-                sharpen: SHARPEN_TOGGLE_ON,
-            }
+            SHARPEN_TOGGLE_ON
         } else {
-            EffectChain::from_config(config_sharpen)
-        }
+            EffectChain::from_config(config_sharpen, i32::from(self.white_balance)).sharpen
+        };
+        target
     }
 
-    /// The chain a config key implies — the SEED every stack
-    /// (re)installation replays (#185): `0..=10` clamped, off = 0. The
+    /// The White Balance toggle's target chain (#191): the same shape as
+    /// [`toggle_sharpen`] with the stages swapped. "No persisted level"
+    /// is `config == 0` exactly — a NEGATIVE key is a real standing
+    /// level (cooling), not an absence.
+    pub(crate) fn toggle_white_balance(&self, config_white_balance: i32) -> EffectChain {
+        let mut target = *self;
+        target.white_balance = if self.white_balance != 0 {
+            0
+        } else if config_white_balance == 0 {
+            WHITE_BALANCE_TOGGLE_ON
+        } else {
+            EffectChain::from_config(i32::from(self.sharpen), config_white_balance).white_balance
+        };
+        target
+    }
+
+    /// The chain a config pair implies — the SEED every stack
+    /// (re)installation replays (#185, #191 for the second key): each
+    /// stage clamped into its own docs domain, off = 0/0. The
     /// seed runs at stack creation AND every rebuild, so a device-loss
     /// rebuild re-arms a chain the old device's build failure had
     /// dropped (D9's drop is a verdict about one device's context, not
     /// the user's wish — a fresh device gets a fresh try, its failure
     /// would drop again with the same breadcrumb).
-    pub(crate) fn from_config(config_sharpen: i32) -> EffectChain {
+    pub(crate) fn from_config(config_sharpen: i32, config_white_balance: i32) -> EffectChain {
         EffectChain {
             sharpen: config_sharpen.clamp(0, 10) as u8,
+            white_balance: config_white_balance.clamp(-10, 10) as i8,
         }
     }
 }
@@ -2311,7 +2341,7 @@ mod tests {
                     _ => PassShape::TwoStage,
                 };
                 assert_eq!(
-                    pass_shape(backend, arm, EffectChain { sharpen: 0 }),
+                    pass_shape(backend, arm, EffectChain::default()),
                     expected,
                     "{backend:?}/{arm:?}"
                 );
@@ -2321,7 +2351,9 @@ mod tests {
 
     /// The one NEW shape: a user chain on the hardware Direct arm forces
     /// the two-stage form (scene → intermediate → chain → target, no
-    /// ColorManagement — ADR 0006's CM-less graph form).
+    /// ColorManagement — ADR 0006's CM-less graph form). Either stage
+    /// alone suffices (#191): a wb-only chain is as much a chain as a
+    /// sharpen-only one.
     #[test]
     fn chain_forces_two_stage_on_the_hardware_direct_arm() {
         for sharpen in 1..=10u8 {
@@ -2329,10 +2361,30 @@ mod tests {
                 pass_shape(
                     Backend::Hardware,
                     DisplayArm::Direct,
-                    EffectChain { sharpen }
+                    EffectChain {
+                        sharpen,
+                        ..EffectChain::default()
+                    }
                 ),
                 PassShape::TwoStage,
                 "sharpen={sharpen}"
+            );
+        }
+        for white_balance in -10..=10i8 {
+            if white_balance == 0 {
+                continue;
+            }
+            assert_eq!(
+                pass_shape(
+                    Backend::Hardware,
+                    DisplayArm::Direct,
+                    EffectChain {
+                        white_balance,
+                        ..EffectChain::default()
+                    }
+                ),
+                PassShape::TwoStage,
+                "white_balance={white_balance}"
             );
         }
     }
@@ -2347,7 +2399,10 @@ mod tests {
             pass_shape(
                 Backend::Warp,
                 DisplayArm::Direct,
-                EffectChain { sharpen: 10 }
+                EffectChain {
+                    sharpen: 10,
+                    ..EffectChain::default()
+                }
             ),
             PassShape::Direct
         );
@@ -2367,7 +2422,14 @@ mod tests {
                     DisplayArm::P3ToScRgb,
                 ] {
                     assert_eq!(
-                        pass_shape(backend, arm, EffectChain { sharpen }),
+                        pass_shape(
+                            backend,
+                            arm,
+                            EffectChain {
+                                sharpen,
+                                ..EffectChain::default()
+                            }
+                        ),
                         PassShape::TwoStage,
                         "{backend:?}/{arm:?}/sharpen={sharpen}"
                     );
@@ -2383,7 +2445,14 @@ mod tests {
     fn wide_blank_stays_direct_whatever_the_chain() {
         for backend in both_backends() {
             assert_eq!(
-                pass_shape(backend, DisplayArm::WideBlank, EffectChain { sharpen: 10 }),
+                pass_shape(
+                    backend,
+                    DisplayArm::WideBlank,
+                    EffectChain {
+                        sharpen: 10,
+                        ..EffectChain::default()
+                    }
+                ),
                 PassShape::Direct
             );
         }
@@ -2412,7 +2481,13 @@ mod tests {
     #[test]
     fn a_chain_change_is_a_fingerprint_transition_the_tracker_mints() {
         let off = chain_term_fp(Backend::Hardware, EffectChain::default());
-        let on = chain_term_fp(Backend::Hardware, EffectChain { sharpen: 3 });
+        let on = chain_term_fp(
+            Backend::Hardware,
+            EffectChain {
+                sharpen: 3,
+                ..EffectChain::default()
+            },
+        );
         assert_ne!(off, on, "the chain term must ride the policy");
         // A->B->A walks gens 1, 2, 3 — the round trip is a change signal
         // too (OutputTracker's own contract, restated for the chain arm).
@@ -2429,7 +2504,13 @@ mod tests {
     #[test]
     fn warp_normalizes_the_chain_term_the_exclusion_is_a_table_row() {
         let off = chain_term_fp(Backend::Warp, EffectChain::default());
-        let on = chain_term_fp(Backend::Warp, EffectChain { sharpen: 10 });
+        let on = chain_term_fp(
+            Backend::Warp,
+            EffectChain {
+                sharpen: 10,
+                ..EffectChain::default()
+            },
+        );
         assert_eq!(
             off, on,
             "a WARP session's chain cannot change the output, the fingerprints must agree"
@@ -2442,7 +2523,15 @@ mod tests {
     #[test]
     fn every_sharpen_level_fingerprints_apart_on_hardware() {
         let fps: Vec<_> = (0..=10u8)
-            .map(|s| chain_term_fp(Backend::Hardware, EffectChain { sharpen: s }))
+            .map(|s| {
+                chain_term_fp(
+                    Backend::Hardware,
+                    EffectChain {
+                        sharpen: s,
+                        ..EffectChain::default()
+                    },
+                )
+            })
             .collect();
         for i in 0..fps.len() {
             for j in i + 1..fps.len() {
@@ -2451,37 +2540,147 @@ mod tests {
         }
     }
 
-    // ---- the toggle and the seed (#185) ----
-
-    /// The toggle's pure core: on flips off, off re-arms from the config
-    /// key, a zero config falls to SHARPEN_TOGGLE_ON, and a hand-edited
-    /// out-of-domain key clamps at the edge (the raw int stays in the
-    /// ini like every other int key).
+    /// #191's mirror: the wb combo's 21 values are 21 identities, and a
+    /// wb move never collides with a sharpen move (the two stages are
+    /// separate terms, not one packed number).
     #[test]
-    fn toggle_target_flips_off_rearms_from_config_and_clamps() {
-        let off = EffectChain::default();
-        let on3 = EffectChain { sharpen: 3 };
-        // On -> off, whatever the config says.
-        assert_eq!(on3.toggle_target(7).sharpen, 0);
-        assert_eq!(EffectChain { sharpen: 10 }.toggle_target(10).sharpen, 0);
-        // Off -> the config's standing level.
-        assert_eq!(off.toggle_target(7).sharpen, 7);
-        assert_eq!(off.toggle_target(1).sharpen, 1);
-        // Off with no standing level -> the documented default.
-        assert_eq!(off.toggle_target(0).sharpen, SHARPEN_TOGGLE_ON);
-        assert_eq!(off.toggle_target(-4).sharpen, SHARPEN_TOGGLE_ON);
-        // Out-of-domain configs clamp at 10.
-        assert_eq!(off.toggle_target(999).sharpen, 10);
+    fn every_white_balance_level_fingerprints_apart_on_hardware() {
+        let wb_fps: Vec<_> = (-10..=10i8)
+            .map(|w| {
+                chain_term_fp(
+                    Backend::Hardware,
+                    EffectChain {
+                        white_balance: w,
+                        ..EffectChain::default()
+                    },
+                )
+            })
+            .collect();
+        for i in 0..wb_fps.len() {
+            for j in i + 1..wb_fps.len() {
+                assert_ne!(wb_fps[i], wb_fps[j], "wb {i} collides with wb {j}");
+            }
+        }
+        let sharpen_only = chain_term_fp(
+            Backend::Hardware,
+            EffectChain {
+                sharpen: 3,
+                ..EffectChain::default()
+            },
+        );
+        for (idx, fp) in wb_fps.iter().enumerate() {
+            // wb = 0 there is the default chain — skip that one cell.
+            if idx != 10 {
+                assert_ne!(*fp, sharpen_only, "sharpen 3 collides with wb {}", idx - 10);
+            }
+        }
     }
 
-    /// The stack-seed clamp: the config key is the ini's raw int, the
-    /// chain's domain is the docs enum page's 0..=10.
+    // ---- the toggles and the seed (#185, #191) ----
+
+    /// The Sharpen toggle's pure core: on flips off, off re-arms from the
+    /// config key, a zero config falls to SHARPEN_TOGGLE_ON, and a
+    /// hand-edited out-of-domain key clamps at the edge (the raw int
+    /// stays in the ini like every other int key).
+    #[test]
+    fn toggle_sharpen_flips_off_rearms_from_config_and_clamps() {
+        let off = EffectChain::default();
+        let on3 = EffectChain {
+            sharpen: 3,
+            ..EffectChain::default()
+        };
+        // On -> off, whatever the config says.
+        assert_eq!(on3.toggle_sharpen(7).sharpen, 0);
+        assert_eq!(
+            EffectChain {
+                sharpen: 10,
+                ..EffectChain::default()
+            }
+            .toggle_sharpen(10)
+            .sharpen,
+            0
+        );
+        // Off -> the config's standing level.
+        assert_eq!(off.toggle_sharpen(7).sharpen, 7);
+        assert_eq!(off.toggle_sharpen(1).sharpen, 1);
+        // Off with no standing level -> the documented default.
+        assert_eq!(off.toggle_sharpen(0).sharpen, SHARPEN_TOGGLE_ON);
+        assert_eq!(off.toggle_sharpen(-4).sharpen, SHARPEN_TOGGLE_ON);
+        // Out-of-domain configs clamp at 10.
+        assert_eq!(off.toggle_sharpen(999).sharpen, 10);
+    }
+
+    /// #191: the White Balance toggle mirrors the sharpen core with the
+    /// one SIGNED-domain difference — a negative config is a real
+    /// standing level (cooling) and re-arms as-is; only exactly 0 falls
+    /// to WHITE_BALANCE_TOGGLE_ON.
+    #[test]
+    fn toggle_white_balance_flips_rearms_negatives_and_clamps() {
+        let off = EffectChain::default();
+        let warm = EffectChain {
+            white_balance: 3,
+            ..EffectChain::default()
+        };
+        let cool = EffectChain {
+            white_balance: -7,
+            ..EffectChain::default()
+        };
+        // On -> off, whatever the config says.
+        assert_eq!(warm.toggle_white_balance(5).white_balance, 0);
+        assert_eq!(cool.toggle_white_balance(-7).white_balance, 0);
+        // Off -> the config's standing level, negative included.
+        assert_eq!(off.toggle_white_balance(5).white_balance, 5);
+        assert_eq!(off.toggle_white_balance(-7).white_balance, -7);
+        // Off with no standing level -> the documented warm-side default.
+        assert_eq!(
+            off.toggle_white_balance(0).white_balance,
+            WHITE_BALANCE_TOGGLE_ON
+        );
+        // Out-of-domain configs clamp at the edges.
+        assert_eq!(off.toggle_white_balance(999).white_balance, 10);
+        assert_eq!(off.toggle_white_balance(-999).white_balance, -10);
+    }
+
+    /// #191's per-stage ownership: each toggle flips ITS stage and leaves
+    /// the other one exactly where it stood — the two View rows are
+    /// independent switches, and a stage-off chain with the other stage
+    /// running is not empty.
+    #[test]
+    fn each_toggle_flips_only_its_own_stage() {
+        let both = EffectChain {
+            sharpen: 6,
+            white_balance: -4,
+        };
+        let sharpen_off = both.toggle_sharpen(6);
+        assert_eq!(sharpen_off.sharpen, 0);
+        assert_eq!(
+            sharpen_off.white_balance, -4,
+            "wb survives the sharpen toggle"
+        );
+        assert!(!sharpen_off.is_empty(), "a wb-only chain still runs");
+        let wb_off = both.toggle_white_balance(-4);
+        assert_eq!(wb_off.white_balance, 0);
+        assert_eq!(wb_off.sharpen, 6, "sharpen survives the wb toggle");
+        assert!(!wb_off.is_empty(), "a sharpen-only chain still runs");
+        assert!(sharpen_off.toggle_white_balance(-4).is_empty());
+    }
+
+    /// The stack-seed clamp: the config keys are the ini's raw ints, the
+    /// chain's domains are the docs enum pages (sharpen 0..=10, white
+    /// balance −10..=10 with both signed edges).
     #[test]
     fn from_config_clamps_into_the_docs_domain() {
-        assert_eq!(EffectChain::from_config(0).sharpen, 0);
-        assert_eq!(EffectChain::from_config(5).sharpen, 5);
-        assert_eq!(EffectChain::from_config(10).sharpen, 10);
-        assert_eq!(EffectChain::from_config(300).sharpen, 10);
-        assert_eq!(EffectChain::from_config(-1).sharpen, 0);
+        assert_eq!(EffectChain::from_config(0, 0).sharpen, 0);
+        assert_eq!(EffectChain::from_config(5, 0).sharpen, 5);
+        assert_eq!(EffectChain::from_config(10, 0).sharpen, 10);
+        assert_eq!(EffectChain::from_config(300, 0).sharpen, 10);
+        assert_eq!(EffectChain::from_config(-1, 0).sharpen, 0);
+        assert_eq!(EffectChain::from_config(0, 0).white_balance, 0);
+        assert_eq!(EffectChain::from_config(0, 7).white_balance, 7);
+        assert_eq!(EffectChain::from_config(0, -7).white_balance, -7);
+        assert_eq!(EffectChain::from_config(0, 10).white_balance, 10);
+        assert_eq!(EffectChain::from_config(0, -10).white_balance, -10);
+        assert_eq!(EffectChain::from_config(0, 300).white_balance, 10);
+        assert_eq!(EffectChain::from_config(0, -300).white_balance, -10);
     }
 }
