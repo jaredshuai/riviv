@@ -43,6 +43,6 @@
 
 ### 发布命令（对外发布链已四度验证：v0.1.0 网页、v0.2.0/v0.3.0/v0.4.0 CLI）
 
-- **发版**（v0.2.0 实走 2026-09-30;v0.3.0 复走同链 2026-10-02 零改动零意外;v0.4.0 复走同链 2026-10-02,唯一新知=在仓库目录外(资产暂存目录)跑 `gh release create` 须带 `-R jaredshuai/riviv`,否则 `no git remotes found`):`git push origin vX.Y.Z` 推 annotated tag → `gh release create vX.Y.Z --title "…" --notes-file <说明稿> --latest <portable.exe> <zh-CN-Setup.exe> <en-US-Setup.exe>`——三资产一次上传,Latest 标记即时生效;portable 资产=release exe 改名复制。
+- **发版**（v0.2.0 实走 2026-09-30;v0.3.0 复走同链 2026-10-02 零改动零意外;v0.4.0 复走同链 2026-10-02,唯一新知=在仓库目录外(资产暂存目录)跑 `gh release create` 须带 `-R jaredshuai/riviv`,否则 `no git remotes found`):`git push origin vX.Y.Z` 推 annotated tag → `gh release create vX.Y.Z -R jaredshuai/riviv --title "…" --notes-file <说明稿> --latest <portable.exe> <zh-CN-Setup.exe> <en-US-Setup.exe>`——三资产一次上传,Latest 标记即时生效;portable 资产=release exe 改名复制。
 - v0.1.0 为网页手建(无命令留档,历史形态)。
 - **未验证**的仅剩:安装包对外发布命令自动化(以上 CLI 为单机手工链;无 CI 发版流水线,CI 仅跑门禁 #93)。本机试打（`installer/build-installer.ps1`）不等于发版。
