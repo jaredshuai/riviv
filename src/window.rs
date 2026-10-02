@@ -1382,6 +1382,7 @@ fn seed_effect_chain(state: &WindowState) -> crate::transform_stage::EffectChain
     crate::transform_stage::EffectChain::from_config(
         state.config.sharpen,
         state.config.white_balance,
+        state.config.contrast,
     )
 }
 
@@ -7278,9 +7279,9 @@ fn refresh_menu_state(hwnd: HWND, target: HMENU) {
             show_menu: state.config.show_menu != 0,
             show_status: state.config.show_status != 0,
             show_controls: state.config.show_controls != 0,
-            // #185/#191 (ADR 0006 D9): the LIVE gpu chain's own stage, not
-            // the config key — a build-failure drop unchecks the row
-            // honestly. A stackless (dying) session reads as off.
+            // #185/#191/#193 (ADR 0006 D9): the LIVE gpu chain's own
+            // stage, not the config key — a build-failure drop unchecks
+            // the row honestly. A stackless (dying) session reads as off.
             effect_sharpen_on: state
                 .gpu
                 .as_ref()
@@ -7289,6 +7290,10 @@ fn refresh_menu_state(hwnd: HWND, target: HMENU) {
                 .gpu
                 .as_ref()
                 .is_some_and(|gpu| gpu.effect_chain().white_balance != 0),
+            effect_contrast_on: state
+                .gpu
+                .as_ref()
+                .is_some_and(|gpu| gpu.effect_chain().contrast != 0),
             fullscreen: state.fullscreen,
             one_to_one,
             slideshow: state.slideshow,
@@ -7613,6 +7618,7 @@ fn on_command(hwnd: HWND, cmd: menu::Cmd) {
         // per-stage: each row flips its own stage, the other rides along.
         menu::Cmd::ViewSharpen => toggle_sharpen(hwnd),
         menu::Cmd::ViewWhiteBalance => toggle_white_balance(hwnd),
+        menu::Cmd::ViewContrast => toggle_contrast(hwnd),
         // The Preset trio (#46; viv.c:1990-2013 — assign all five configs,
         // one frame rebuild).
         menu::Cmd::ViewPreset1 => apply_preset(hwnd, crate::frame::Preset::Minimal),
@@ -8243,25 +8249,34 @@ fn toggle_white_balance(hwnd: HWND) {
     toggle_effect_stage(hwnd, EffectStage::WhiteBalance);
 }
 
-/// The effect rows' shared arm (#185/#191): which stage a View row owns.
+/// The Contrast row's arm (#193): the two toggles above it mirrored —
+/// same live-chain read, same gated re-identity, its own stage and its
+/// own config key.
+fn toggle_contrast(hwnd: HWND) {
+    toggle_effect_stage(hwnd, EffectStage::Contrast);
+}
+
+/// The effect rows' shared arm (#185/#191/#193): which stage a View row
+/// owns.
 enum EffectStage {
     Sharpen,
     WhiteBalance,
+    Contrast,
 }
 
-/// The per-stage toggle core behind both View rows (#185 sharpen,
-/// #191 white balance — the two-knife generalization of #185's single
-/// toggle): the LIVE gpu chain decides on/off (D9) — an unchecked row
-/// after a build-failure drop toggles ON, re-arming the persisted level
-/// (a same-device retry; a fresh failure drops again with the same
-/// breadcrumb). The config keys are persistence and the re-arm source,
-/// never the display state. Only the TOGGLED stage's key is written:
-/// the other stage's raw ini value (a hand-edited out-of-domain int)
-/// stays untouched for its own round trip. The gated re-identity mints
-/// the `output_gen` exactly when the fingerprint really moved — it does
-/// not on WARP, where the D5 exclusion normalizes the chain term (the
-/// toggle still flips the key and the chain; the output was and stays
-/// chain-free there).
+/// The per-stage toggle core behind the three View rows (#185 sharpen,
+/// #191 white balance, #193 contrast — the three-knife generalization
+/// of #185's single toggle): the LIVE gpu chain decides on/off (D9) —
+/// an unchecked row after a build-failure drop toggles ON, re-arming
+/// the persisted level (a same-device retry; a fresh failure drops
+/// again with the same breadcrumb). The config keys are persistence and
+/// the re-arm source, never the display state. Only the TOGGLED stage's
+/// key is written: the other stages' raw ini values (hand-edited
+/// out-of-domain ints) stay untouched for their own round trip. The
+/// gated re-identity mints the `output_gen` exactly when the
+/// fingerprint really moved — it does not on WARP, where the D5
+/// exclusion normalizes the chain term (the toggle still flips the key
+/// and the chain; the output was and stays chain-free there).
 fn toggle_effect_stage(hwnd: HWND, stage: EffectStage) {
     // SAFETY: the borrow spans the chain read, the config write, the
     // chain set and the gated re-identity — nothing pumps.
@@ -8275,12 +8290,14 @@ fn toggle_effect_stage(hwnd: HWND, stage: EffectStage) {
         let target = match stage {
             EffectStage::Sharpen => live.toggle_sharpen(state.config.sharpen),
             EffectStage::WhiteBalance => live.toggle_white_balance(state.config.white_balance),
+            EffectStage::Contrast => live.toggle_contrast(state.config.contrast),
         };
         match stage {
             EffectStage::Sharpen => state.config.sharpen = i32::from(target.sharpen),
             EffectStage::WhiteBalance => {
                 state.config.white_balance = i32::from(target.white_balance);
             }
+            EffectStage::Contrast => state.config.contrast = i32::from(target.contrast),
         }
         if let Some(gpu) = state.gpu.as_mut() {
             gpu.set_effect_chain(target);
@@ -8290,15 +8307,16 @@ fn toggle_effect_stage(hwnd: HWND, stage: EffectStage) {
     repaint(hwnd);
 }
 
-/// The Options-OK arm (#185, #191): the freshly committed config keys ARE
-/// the user's edited truth — replay them onto the live chain and
-/// re-identify through the same gate as the toggles (silent when no
+/// The Options-OK arm (#185, #191, #193): the freshly committed config
+/// keys ARE the user's edited truth — replay them onto the live chain
+/// and re-identify through the same gate as the toggles (silent when no
 /// level moved). Idempotent by construction: an unchanged key is a set
 /// no-op and a gate that stays closed.
 pub(crate) fn apply_config_effect_chain(state: &mut WindowState) {
     let chain = crate::transform_stage::EffectChain::from_config(
         state.config.sharpen,
         state.config.white_balance,
+        state.config.contrast,
     );
     if let Some(gpu) = state.gpu.as_mut() {
         gpu.set_effect_chain(chain);

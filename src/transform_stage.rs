@@ -308,8 +308,9 @@ pub(crate) enum DisplayArm {
 /// only the viewport and the dump do, per #156's contract). Each stage
 /// is one knife over one docs enum-page domain as an int-key scale
 /// (O4=A/O6=A): sharpen (#185) = 0.0–10.0 SHARPNESS as 0..=10, white
-/// balance (#191) = −1.0..1.0 TEMPERATURE as −10..=10, off = 0 per
-/// stage. `Eq`/`Hash` make the chain a graph-identity term (`built_for`)
+/// balance (#191) = −1.0..1.0 TEMPERATURE as −10..=10, contrast (#193,
+/// the chain's closing knife) = −1.0..1.0 CONTRAST as −10..=10, off = 0
+/// per stage. `Eq`/`Hash` make the chain a graph-identity term (`built_for`)
 /// and later a fingerprint policy term — an f32 could never key either.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub(crate) struct EffectChain {
@@ -320,6 +321,13 @@ pub(crate) struct EffectChain {
     /// cooling is half the knob — and `i8` covers the domain with room
     /// for the clamp's edges.
     pub(crate) white_balance: i8,
+    /// The contrast stage (#193, the chain's third knife — viv.c:76's
+    /// "color correction" realized as the tonal axis): the docs enum
+    /// page's −1.0..1.0 CONTRAST domain as an integer −10..=10 scale
+    /// (0.1 per step, off = 0 — the docs default 0.0f IS the identity,
+    /// the exact white_balance shape). SIGNED on purpose — softening is
+    /// half the knob.
+    pub(crate) contrast: i8,
 }
 
 /// The level a fresh toggle-ON lands on when the config key carries no
@@ -331,19 +339,22 @@ pub(crate) const SHARPEN_TOGGLE_ON: u8 = 3;
 /// #191's mirror of [`SHARPEN_TOGGLE_ON`]: a gentle third of the
 /// temperature domain, on the WARM side of zero (the positive sign).
 pub(crate) const WHITE_BALANCE_TOGGLE_ON: i8 = 3;
+/// #193's mirror of [`WHITE_BALANCE_TOGGLE_ON`]: a gentle third of the
+/// contrast domain, on the punchy side of zero (the positive sign).
+pub(crate) const CONTRAST_TOGGLE_ON: i8 = 3;
 
 impl EffectChain {
     /// The chain's own off state — and the zero-perturbation contract's
     /// structural term: an empty chain must collapse every (backend, arm)
     /// cell onto the pre-#183 dispatch shape (see [`pass_shape`]). A
-    /// single stage off is NOT an empty chain — the other stage still
-    /// forces the two-stage shape (#191).
+    /// single stage off is NOT an empty chain — the other stages still
+    /// force the two-stage shape (#191, #193).
     pub(crate) fn is_empty(&self) -> bool {
-        self.sharpen == 0 && self.white_balance == 0
+        self.sharpen == 0 && self.white_balance == 0 && self.contrast == 0
     }
 
-    /// The Sharpen toggle's target chain (#185/#191): flips the sharpen
-    /// STAGE only, the white-balance stage rides along untouched — each
+    /// The Sharpen toggle's target chain (#185/#191/#193): flips the
+    /// sharpen STAGE only, the other stages ride along untouched — each
     /// View row owns its own stage. The ON level re-arms from the config
     /// key when it carries one (a dropped-then-retoggled chain retries
     /// the persisted level — D9's drop is session-scoped, the user's
@@ -357,7 +368,12 @@ impl EffectChain {
         } else if config_sharpen <= 0 {
             SHARPEN_TOGGLE_ON
         } else {
-            EffectChain::from_config(config_sharpen, i32::from(self.white_balance)).sharpen
+            EffectChain::from_config(
+                config_sharpen,
+                i32::from(self.white_balance),
+                i32::from(self.contrast),
+            )
+            .sharpen
         };
         target
     }
@@ -373,23 +389,53 @@ impl EffectChain {
         } else if config_white_balance == 0 {
             WHITE_BALANCE_TOGGLE_ON
         } else {
-            EffectChain::from_config(i32::from(self.sharpen), config_white_balance).white_balance
+            EffectChain::from_config(
+                i32::from(self.sharpen),
+                config_white_balance,
+                i32::from(self.contrast),
+            )
+            .white_balance
         };
         target
     }
 
-    /// The chain a config pair implies — the SEED every stack
-    /// (re)installation replays (#185, #191 for the second key): each
-    /// stage clamped into its own docs domain, off = 0/0. The
+    /// The Contrast toggle's target chain (#193): [`toggle_white_balance`]'s
+    /// exact mirror — "no persisted level" is `config == 0` (a NEGATIVE
+    /// key is a real standing level, softening).
+    pub(crate) fn toggle_contrast(&self, config_contrast: i32) -> EffectChain {
+        let mut target = *self;
+        target.contrast = if self.contrast != 0 {
+            0
+        } else if config_contrast == 0 {
+            CONTRAST_TOGGLE_ON
+        } else {
+            EffectChain::from_config(
+                i32::from(self.sharpen),
+                i32::from(self.white_balance),
+                config_contrast,
+            )
+            .contrast
+        };
+        target
+    }
+
+    /// The chain a config triple implies — the SEED every stack
+    /// (re)installation replays (#185, #191/#193 for the later keys):
+    /// each stage clamped into its own docs domain, off = 0/0/0. The
     /// seed runs at stack creation AND every rebuild, so a device-loss
     /// rebuild re-arms a chain the old device's build failure had
     /// dropped (D9's drop is a verdict about one device's context, not
     /// the user's wish — a fresh device gets a fresh try, its failure
     /// would drop again with the same breadcrumb).
-    pub(crate) fn from_config(config_sharpen: i32, config_white_balance: i32) -> EffectChain {
+    pub(crate) fn from_config(
+        config_sharpen: i32,
+        config_white_balance: i32,
+        config_contrast: i32,
+    ) -> EffectChain {
         EffectChain {
             sharpen: config_sharpen.clamp(0, 10) as u8,
             white_balance: config_white_balance.clamp(-10, 10) as i8,
+            contrast: config_contrast.clamp(-10, 10) as i8,
         }
     }
 }
@@ -2387,6 +2433,23 @@ mod tests {
                 "white_balance={white_balance}"
             );
         }
+        for contrast in -10..=10i8 {
+            if contrast == 0 {
+                continue;
+            }
+            assert_eq!(
+                pass_shape(
+                    Backend::Hardware,
+                    DisplayArm::Direct,
+                    EffectChain {
+                        contrast,
+                        ..EffectChain::default()
+                    }
+                ),
+                PassShape::TwoStage,
+                "contrast={contrast}"
+            );
+        }
     }
 
     /// O3=B's executable cell: WARP never runs the chain — #127's hard
@@ -2576,6 +2639,57 @@ mod tests {
         }
     }
 
+    /// #193's mirror: the contrast combo's 21 values are 21 identities,
+    /// and a contrast move never collides with a sharpen or wb move.
+    #[test]
+    fn every_contrast_level_fingerprints_apart_on_hardware() {
+        let c_fps: Vec<_> = (-10..=10i8)
+            .map(|c| {
+                chain_term_fp(
+                    Backend::Hardware,
+                    EffectChain {
+                        contrast: c,
+                        ..EffectChain::default()
+                    },
+                )
+            })
+            .collect();
+        for i in 0..c_fps.len() {
+            for j in i + 1..c_fps.len() {
+                assert_ne!(
+                    c_fps[i], c_fps[j],
+                    "contrast {i} collides with contrast {j}"
+                );
+            }
+        }
+        let sharpen_only = chain_term_fp(
+            Backend::Hardware,
+            EffectChain {
+                sharpen: 3,
+                ..EffectChain::default()
+            },
+        );
+        let wb_only = chain_term_fp(
+            Backend::Hardware,
+            EffectChain {
+                white_balance: 3,
+                ..EffectChain::default()
+            },
+        );
+        for (idx, fp) in c_fps.iter().enumerate() {
+            // contrast = 0 there is the default chain — skip that one cell.
+            if idx != 10 {
+                assert_ne!(
+                    *fp,
+                    sharpen_only,
+                    "sharpen 3 collides with contrast {}",
+                    idx - 10
+                );
+                assert_ne!(*fp, wb_only, "wb 3 collides with contrast {}", idx - 10);
+            }
+        }
+    }
+
     // ---- the toggles and the seed (#185, #191) ----
 
     /// The Sharpen toggle's pure core: on flips off, off re-arms from the
@@ -2641,46 +2755,99 @@ mod tests {
         assert_eq!(off.toggle_white_balance(-999).white_balance, -10);
     }
 
-    /// #191's per-stage ownership: each toggle flips ITS stage and leaves
-    /// the other one exactly where it stood — the two View rows are
-    /// independent switches, and a stage-off chain with the other stage
-    /// running is not empty.
+    /// #193: the Contrast toggle mirrors the wb core verbatim — a
+    /// negative config is a real standing level (softening) and re-arms
+    /// as-is; only exactly 0 falls to CONTRAST_TOGGLE_ON.
+    #[test]
+    fn toggle_contrast_flips_rearms_negatives_and_clamps() {
+        let off = EffectChain::default();
+        let punchy = EffectChain {
+            contrast: 3,
+            ..EffectChain::default()
+        };
+        let soft = EffectChain {
+            contrast: -7,
+            ..EffectChain::default()
+        };
+        // On -> off, whatever the config says.
+        assert_eq!(punchy.toggle_contrast(5).contrast, 0);
+        assert_eq!(soft.toggle_contrast(-7).contrast, 0);
+        // Off -> the config's standing level, negative included.
+        assert_eq!(off.toggle_contrast(5).contrast, 5);
+        assert_eq!(off.toggle_contrast(-7).contrast, -7);
+        // Off with no standing level -> the documented punchy-side default.
+        assert_eq!(off.toggle_contrast(0).contrast, CONTRAST_TOGGLE_ON);
+        // Out-of-domain configs clamp at the edges.
+        assert_eq!(off.toggle_contrast(999).contrast, 10);
+        assert_eq!(off.toggle_contrast(-999).contrast, -10);
+    }
+
+    /// #191/#193's per-stage ownership: each toggle flips ITS stage and
+    /// leaves the others exactly where they stood — the three View rows
+    /// are independent switches, and a stage-off chain with either other
+    /// stage running is not empty.
     #[test]
     fn each_toggle_flips_only_its_own_stage() {
-        let both = EffectChain {
+        let all = EffectChain {
             sharpen: 6,
             white_balance: -4,
+            contrast: 5,
         };
-        let sharpen_off = both.toggle_sharpen(6);
+        let sharpen_off = all.toggle_sharpen(6);
         assert_eq!(sharpen_off.sharpen, 0);
         assert_eq!(
             sharpen_off.white_balance, -4,
             "wb survives the sharpen toggle"
         );
-        assert!(!sharpen_off.is_empty(), "a wb-only chain still runs");
-        let wb_off = both.toggle_white_balance(-4);
+        assert_eq!(
+            sharpen_off.contrast, 5,
+            "contrast survives the sharpen toggle"
+        );
+        assert!(!sharpen_off.is_empty(), "a wb+contrast chain still runs");
+        let wb_off = all.toggle_white_balance(-4);
         assert_eq!(wb_off.white_balance, 0);
         assert_eq!(wb_off.sharpen, 6, "sharpen survives the wb toggle");
-        assert!(!wb_off.is_empty(), "a sharpen-only chain still runs");
-        assert!(sharpen_off.toggle_white_balance(-4).is_empty());
+        assert_eq!(wb_off.contrast, 5, "contrast survives the wb toggle");
+        assert!(!wb_off.is_empty(), "a sharpen+contrast chain still runs");
+        let contrast_off = all.toggle_contrast(5);
+        assert_eq!(contrast_off.contrast, 0);
+        assert_eq!(
+            contrast_off.sharpen, 6,
+            "sharpen survives the contrast toggle"
+        );
+        assert_eq!(
+            contrast_off.white_balance, -4,
+            "wb survives the contrast toggle"
+        );
+        assert!(!contrast_off.is_empty(), "a sharpen+wb chain still runs");
+        let two_off = contrast_off.toggle_white_balance(-4);
+        assert!(!two_off.is_empty(), "the last standing stage still runs");
+        assert!(two_off.toggle_sharpen(6).is_empty());
     }
 
     /// The stack-seed clamp: the config keys are the ini's raw ints, the
     /// chain's domains are the docs enum pages (sharpen 0..=10, white
-    /// balance −10..=10 with both signed edges).
+    /// balance and contrast −10..=10 with both signed edges).
     #[test]
     fn from_config_clamps_into_the_docs_domain() {
-        assert_eq!(EffectChain::from_config(0, 0).sharpen, 0);
-        assert_eq!(EffectChain::from_config(5, 0).sharpen, 5);
-        assert_eq!(EffectChain::from_config(10, 0).sharpen, 10);
-        assert_eq!(EffectChain::from_config(300, 0).sharpen, 10);
-        assert_eq!(EffectChain::from_config(-1, 0).sharpen, 0);
-        assert_eq!(EffectChain::from_config(0, 0).white_balance, 0);
-        assert_eq!(EffectChain::from_config(0, 7).white_balance, 7);
-        assert_eq!(EffectChain::from_config(0, -7).white_balance, -7);
-        assert_eq!(EffectChain::from_config(0, 10).white_balance, 10);
-        assert_eq!(EffectChain::from_config(0, -10).white_balance, -10);
-        assert_eq!(EffectChain::from_config(0, 300).white_balance, 10);
-        assert_eq!(EffectChain::from_config(0, -300).white_balance, -10);
+        assert_eq!(EffectChain::from_config(0, 0, 0).sharpen, 0);
+        assert_eq!(EffectChain::from_config(5, 0, 0).sharpen, 5);
+        assert_eq!(EffectChain::from_config(10, 0, 0).sharpen, 10);
+        assert_eq!(EffectChain::from_config(300, 0, 0).sharpen, 10);
+        assert_eq!(EffectChain::from_config(-1, 0, 0).sharpen, 0);
+        assert_eq!(EffectChain::from_config(0, 0, 0).white_balance, 0);
+        assert_eq!(EffectChain::from_config(0, 7, 0).white_balance, 7);
+        assert_eq!(EffectChain::from_config(0, -7, 0).white_balance, -7);
+        assert_eq!(EffectChain::from_config(0, 10, 0).white_balance, 10);
+        assert_eq!(EffectChain::from_config(0, -10, 0).white_balance, -10);
+        assert_eq!(EffectChain::from_config(0, 300, 0).white_balance, 10);
+        assert_eq!(EffectChain::from_config(0, -300, 0).white_balance, -10);
+        assert_eq!(EffectChain::from_config(0, 0, 0).contrast, 0);
+        assert_eq!(EffectChain::from_config(0, 0, 7).contrast, 7);
+        assert_eq!(EffectChain::from_config(0, 0, -7).contrast, -7);
+        assert_eq!(EffectChain::from_config(0, 0, 10).contrast, 10);
+        assert_eq!(EffectChain::from_config(0, 0, -10).contrast, -10);
+        assert_eq!(EffectChain::from_config(0, 0, 300).contrast, 10);
+        assert_eq!(EffectChain::from_config(0, 0, -300).contrast, -10);
     }
 }
