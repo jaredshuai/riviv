@@ -5,6 +5,23 @@ history by git-cliff (cliff.toml is the policy; do not hand-edit the output).
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+## [0.3.0] - 2026-10-02
+### Added
+
+- Feat(fault): #172 RIVIV_FAULT 故障注入 seam——五条运行时容错路径接线面活体验证 (a5901f9)
+- Feat(filemgmt): #178 undo-delete——Ctrl+Z 从回收站撤销删除并原位回插 playlist (4a2be86)
+- Feat(gpu): #183 实现票①——D2D 效果链地基:pass_shape 决策表 + EffectGraph 链推广 + ADR 0006 (6bcf565)
+- Feat(ui): #185 实现票②——sharpen 表面:config 键 + Cmd 123 + View 行/热键/Options 一行 + fingerprint 链身份 (0aa3c3a)
+- Feat(smoke): #187 效果链冒烟矩阵——D9 chain 注入 seam + A4 负控钉测 + smoke187 矩阵 (e2d05ac)
+### Fixed
+
+- Fix(gpu): #173 frame_space 创建期以会话内容类种子化——AC 面新鲜栈首次 prepare 失败不再被空白路径改道 (39c68ab)
+- Fix(fault): 外部评审#1 处置——prepare 注点移至 stamp 后(保真度)+5 项文档/面包屑修正 (4fe8f9a)
+- Fix(gpu): 外部评审#2 P1——空帧改喂臂隐含空间,Legacy 面生产路径陈旧 stamp 错配根治 (6022054)
+- Fix(filemgmt): #179 预审采纳——P2 原子防覆盖 + P3×2(斜杠折叠/同节点解析) (73f304d)
+- Fix(filemgmt): #179 bot 评审二轮采纳——pair 身份绑定/ghost 过滤/HRESULT 映射/id+path/next_id (af75908)
+- Fix(gpu): #184 采纳 Codex P1——链 build 失败会话级弃链,阻断 repaint 循环 (8563810)
+
 ## [0.2.0] - 2026-09-30
 ### Added
 
