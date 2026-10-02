@@ -271,6 +271,14 @@ const DEFAULT_KEYS: &[(Cmd, &[KeyDef])] = &[
     // command (its only file-output rows are the shell Copy To verb's
     // dialog, Ctrl-less), so the chord carries no muscle-memory debt.
     (Cmd::ViewSharpen, &[key(true, false, false, b'S' as u16)]),
+    // The white-balance toggle (#191, riviv-authored — no upstream
+    // binding). Ctrl+K: Kelvin, the color-temperature unit the knob
+    // turns — free across upstream's whole table and riviv's (Ctrl+W,
+    // Ctrl+B, Ctrl+T are all taken: Close, Open Folder, On-top Always).
+    (
+        Cmd::ViewWhiteBalance,
+        &[key(true, false, false, b'K' as u16)],
+    ),
     // The slideshow trio lands right after the Refresh row in upstream's
     // table (viv.c:1027-1029, between Refresh and the animation rows).
     (Cmd::SlideshowPause, &[key(false, false, false, VK_SPACE)]),

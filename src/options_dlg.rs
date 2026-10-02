@@ -116,11 +116,15 @@ const EDIT_KEY_CLASS: PCWSTR = w!("riviv_edit_key");
 /// units: client 310x271, tree (6,6) 84x240, page host at (106,26)
 /// 194x216 (the largest page template — the rc's 186x214 placeholder is
 /// where upstream parks its page dialogs; riviv sizes the host to the
-/// page so nothing clips), buttons bottom-right.
+/// page so nothing clips), buttons bottom-right. #191 grew the height
+/// by 14 du (client 271→285, tree 240→254, host 233→247): the View
+/// page's effect block gained the white-balance row and the page was
+/// already full at 233 — a riviv deviation from the rc's frame size,
+/// noted in README Differences alongside the page-content ones.
 const DLG_WIDE: i32 = 310;
-const DLG_HIGH: i32 = 288;
-const TREE: (i32, i32, i32, i32) = (6, 6, 84, 240);
-const PAGE: (i32, i32, i32, i32) = (106, 26, 194, 233);
+const DLG_HIGH: i32 = 302;
+const TREE: (i32, i32, i32, i32) = (6, 6, 84, 254);
+const PAGE: (i32, i32, i32, i32) = (106, 26, 194, 247);
 const BTN_W: i32 = 50;
 const BTN_H: i32 = 14;
 

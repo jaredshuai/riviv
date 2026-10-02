@@ -195,6 +195,99 @@ pub(crate) const SHARPEN_LEVELS: &[ComboEntry] = &[
     },
 ];
 
+/// The white-balance combo (#191, the chain's second knife; the sharpen
+/// row's mirror): the docs enum page's −1.0..1.0 TEMPERATURE domain as
+/// the integer −10..=10 scale, in ascending order — the "Off" row (the
+/// docs 0.0) sits mid-list between cooling and warming. An
+/// out-of-domain ini key shows blank and OK preserves it, like every
+/// other combo.
+pub(crate) const WHITE_BALANCE_LEVELS: &[ComboEntry] = &[
+    ComboEntry {
+        label: loc::Id::OptionsWhiteBalanceMinus10,
+        value: -10,
+    },
+    ComboEntry {
+        label: loc::Id::OptionsWhiteBalanceMinus9,
+        value: -9,
+    },
+    ComboEntry {
+        label: loc::Id::OptionsWhiteBalanceMinus8,
+        value: -8,
+    },
+    ComboEntry {
+        label: loc::Id::OptionsWhiteBalanceMinus7,
+        value: -7,
+    },
+    ComboEntry {
+        label: loc::Id::OptionsWhiteBalanceMinus6,
+        value: -6,
+    },
+    ComboEntry {
+        label: loc::Id::OptionsWhiteBalanceMinus5,
+        value: -5,
+    },
+    ComboEntry {
+        label: loc::Id::OptionsWhiteBalanceMinus4,
+        value: -4,
+    },
+    ComboEntry {
+        label: loc::Id::OptionsWhiteBalanceMinus3,
+        value: -3,
+    },
+    ComboEntry {
+        label: loc::Id::OptionsWhiteBalanceMinus2,
+        value: -2,
+    },
+    ComboEntry {
+        label: loc::Id::OptionsWhiteBalanceMinus1,
+        value: -1,
+    },
+    ComboEntry {
+        label: loc::Id::OptionsWhiteBalanceOff,
+        value: 0,
+    },
+    ComboEntry {
+        label: loc::Id::OptionsWhiteBalance1,
+        value: 1,
+    },
+    ComboEntry {
+        label: loc::Id::OptionsWhiteBalance2,
+        value: 2,
+    },
+    ComboEntry {
+        label: loc::Id::OptionsWhiteBalance3,
+        value: 3,
+    },
+    ComboEntry {
+        label: loc::Id::OptionsWhiteBalance4,
+        value: 4,
+    },
+    ComboEntry {
+        label: loc::Id::OptionsWhiteBalance5,
+        value: 5,
+    },
+    ComboEntry {
+        label: loc::Id::OptionsWhiteBalance6,
+        value: 6,
+    },
+    ComboEntry {
+        label: loc::Id::OptionsWhiteBalance7,
+        value: 7,
+    },
+    ComboEntry {
+        label: loc::Id::OptionsWhiteBalance8,
+        value: 8,
+    },
+    ComboEntry {
+        label: loc::Id::OptionsWhiteBalance9,
+        value: 9,
+    },
+    ComboEntry {
+        label: loc::Id::OptionsWhiteBalance10,
+        value: 10,
+    },
+];
+
 /// The title-bar-format combo (#47; upstream
 /// IDC_TITLE_BAR_FORMAT on the View page, viv.c:8372-8376 — the index IS
 /// the config value: 0 full path / 1 filename / 2 none).
@@ -257,6 +350,11 @@ pub(crate) enum Field {
     /// level; the OK arm replays it onto the live chain (the toggle's
     /// display state reads the chain, not this key — ADR 0006 D9).
     Sharpen,
+    /// The white-balance combo (#191; the sharpen row's mirror — the
+    /// same wishlist note, the chain's second knife). Same contract:
+    /// edits the persistent level, the OK arm replays it onto the live
+    /// chain's white-balance stage.
+    WhiteBalance,
     WindowedBg,
     FullscreenBg,
     LeftClickAction,
@@ -416,10 +514,11 @@ pub(crate) const VIEW: &[Ctrl] = &[
     },
     // Loop animations once (upstream IDD_VIEW's own order right after the
     // auto-size pair; #38). The tail rows below the auto-size pair run a
-    // 14-du pitch (#185 squeezed #68's 16-du tail once more — three more
-    // rows landed since the rc: keep-zoom, the color pair's move-down,
-    // and sharpen — so all eight tail rows + the last control's extent
-    // stay inside the page host's 233-du height).
+    // 14-du pitch (#185 squeezed #68's 16-du tail once more — the rows
+    // that landed since the rc: keep-zoom, the color pair's move-down,
+    // sharpen, and #191's white balance — so all nine tail rows + the
+    // last control's extent stay inside the page host, which #191 grew
+    // from 233 to 247 du for exactly this row; see options_dlg's PAGE).
     Ctrl {
         kind: Kind::Checkbox,
         label: loc::Id::OptionsLoopAnimationsOnce,
@@ -480,7 +579,7 @@ pub(crate) const VIEW: &[Ctrl] = &[
         field: Field::WindowedBg,
         label_w: 96,
         x: 0,
-        y: 204,
+        y: 218,
         w: 50,
         h: 14,
     },
@@ -490,14 +589,14 @@ pub(crate) const VIEW: &[Ctrl] = &[
         field: Field::FullscreenBg,
         label_w: 96,
         x: 0,
-        y: 218,
+        y: 232,
         w: 50,
         h: 14,
     },
     // Sharpen (#185; a riviv-authored row — upstream has no Options UI
     // for its viv.c:76 wishlist note). GEOMETRICALLY it sits between the
-    // keep-zoom row and the color pair (y=190); TABLE-wise it is the
-    // page's LAST control on purpose — `ctrl_id` derives from the table
+    // keep-zoom row and the white-balance row (y=190); TABLE-wise it
+    // stays where #185 parked it — `ctrl_id` derives from the table
     // index, and appending keeps every existing control id stable for
     // the smoke scripts that address them numerically.
     Ctrl {
@@ -507,6 +606,20 @@ pub(crate) const VIEW: &[Ctrl] = &[
         label_w: 74,
         x: 0,
         y: 190,
+        w: 119,
+        h: 30,
+    },
+    // White balance (#191; the sharpen row's mirror at y=204, under it
+    // in the same effect block). The table's LAST control — the same
+    // append-only rule as sharpen above keeps every prior ctrl_id
+    // stable.
+    Ctrl {
+        kind: Kind::Combo(WHITE_BALANCE_LEVELS),
+        label: loc::Id::OptionsWhiteBalance,
+        field: Field::WhiteBalance,
+        label_w: 74,
+        x: 0,
+        y: 204,
         w: 119,
         h: 30,
     },
@@ -598,6 +711,7 @@ pub(crate) struct OptionsModel {
     pub(crate) cache_last: bool,
     pub(crate) keep_zoom: bool,
     pub(crate) sharpen: Option<i32>,
+    pub(crate) white_balance: Option<i32>,
     pub(crate) windowed_bg: [u8; 3],
     pub(crate) fullscreen_bg: [u8; 3],
     pub(crate) left_click_action: Option<i32>,
@@ -654,6 +768,7 @@ impl OptionsModel {
             Field::TitleBarFormat => self.title_bar_format,
             Field::AutoZoomType => self.auto_zoom_type,
             Field::Sharpen => self.sharpen,
+            Field::WhiteBalance => self.white_balance,
             Field::LeftClickAction => self.left_click_action,
             Field::RightClickAction => self.right_click_action,
             Field::MouseWheelAction => self.mouse_wheel_action,
@@ -669,6 +784,7 @@ impl OptionsModel {
             Field::TitleBarFormat => self.title_bar_format = Some(value),
             Field::AutoZoomType => self.auto_zoom_type = Some(value),
             Field::Sharpen => self.sharpen = Some(value),
+            Field::WhiteBalance => self.white_balance = Some(value),
             Field::LeftClickAction => self.left_click_action = Some(value),
             Field::RightClickAction => self.right_click_action = Some(value),
             Field::MouseWheelAction => self.mouse_wheel_action = Some(value),
@@ -715,6 +831,7 @@ impl OptionsModel {
             cache_last: to_bool(config.cache_last),
             keep_zoom: to_bool(config.keep_zoom),
             sharpen: Some(config.sharpen),
+            white_balance: Some(config.white_balance),
             windowed_bg: config.windowed_bg(),
             fullscreen_bg: config.fullscreen_bg(),
             left_click_action: Some(config.left_click_action),
@@ -736,7 +853,10 @@ impl OptionsModel {
         // Both verdicts compare against the config as it stands NOW —
         // before this method writes anything.
         let repaint = repaint_filters_colors(config, self)
-            || self.sharpen.is_some_and(|v| v != config.sharpen);
+            || self.sharpen.is_some_and(|v| v != config.sharpen)
+            || self
+                .white_balance
+                .is_some_and(|v| v != config.white_balance);
         let refit = fit_inputs_changed(config, self);
         if let Some(v) = self.shrink_blit_mode {
             config.shrink_blit_mode = v;
@@ -753,9 +873,13 @@ impl OptionsModel {
         // #185: a moved sharpen level re-keys the display chain — the OK
         // arm replays the key onto the live chain after this commit; the
         // repaint flag rides the same filter/color family (the viewport
-        // must redraw through the re-keyed graph).
+        // must redraw through the re-keyed graph). #191's white_balance
+        // joins the same family and the same OK-arm replay.
         if let Some(v) = self.sharpen {
             config.sharpen = v;
+        }
+        if let Some(v) = self.white_balance {
+            config.white_balance = v;
         }
         if let Some(v) = self.left_click_action {
             config.left_click_action = v;
@@ -863,7 +987,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!((bools, values, colors), (11, 9, 2));
+        assert_eq!((bools, values, colors), (11, 10, 2));
     }
 
     #[test]
@@ -881,8 +1005,11 @@ mod tests {
         assert_eq!(values(AUTO_ZOOM_TYPES), vec![0, 1, 2, 3]);
         assert_eq!(values(BLIT_MODES), vec![0, 1]);
         // #185: the sharpen scale is the docs domain 0..=10 verbatim, off
-        // first (the combo's own order).
+        // first (the combo's own order). #191: the white-balance scale is
+        // its enum page's −1.0..1.0 over −10..=10, ascending — the Off
+        // row (0) mid-list between cooling and warming.
         assert_eq!(values(SHARPEN_LEVELS), (0..=10).collect::<Vec<_>>());
+        assert_eq!(values(WHITE_BALANCE_LEVELS), (-10..=10).collect::<Vec<_>>());
     }
 
     #[test]
@@ -900,6 +1027,12 @@ mod tests {
         // shows blank and OK preserves it.
         assert_eq!(combo_index(SHARPEN_LEVELS, 11), None);
         assert_eq!(combo_index(SHARPEN_LEVELS, 300), None);
+        // #191: the signed domain ends at both edges — an out-of-domain
+        // key shows blank and OK preserves it, whichever side it left.
+        assert_eq!(combo_index(WHITE_BALANCE_LEVELS, 11), None);
+        assert_eq!(combo_index(WHITE_BALANCE_LEVELS, -11), None);
+        assert_eq!(combo_index(WHITE_BALANCE_LEVELS, 300), None);
+        assert_eq!(combo_index(WHITE_BALANCE_LEVELS, -300), None);
     }
 
     #[test]
@@ -918,7 +1051,7 @@ mod tests {
                 );
             }
         }
-        assert_eq!(seen.len(), 22);
+        assert_eq!(seen.len(), 23);
     }
 
     #[test]
@@ -953,8 +1086,9 @@ mod tests {
     fn every_row_sits_on_its_own_line_in_dialog_units() {
         // The shell stacks controls straight from these y values: no two
         // rows share a line, and nothing exceeds the page container's
-        // 233-du height (options_dlg's PAGE host — wider than upstream's
-        // 214-du rc page because riviv's View page carries more rows, #68).
+        // 247-du height (options_dlg's PAGE host — wider than upstream's
+        // 214-du rc page because riviv's View page carries more rows,
+        // #68, and taller since #191 added the white-balance row).
         // A combo's `h` is its OPEN dropdown extent (like the rc's 30/100),
         // not its row height, so only `y` participates here.
         for page in &PAGES {
@@ -962,7 +1096,7 @@ mod tests {
             ys.sort_unstable();
             ys.dedup();
             assert_eq!(ys.len(), page.controls.len(), "two rows share a y");
-            assert!(*ys.last().unwrap() < 233, "row below the page area");
+            assert!(*ys.last().unwrap() < 247, "row below the page area");
         }
     }
 
@@ -986,6 +1120,7 @@ mod tests {
             cache_last: true,
             keep_zoom: true,
             sharpen: Some(6),
+            white_balance: Some(-5),
             windowed_bg: [10, 20, 30],
             fullscreen_bg: [1, 2, 3],
             left_click_action: Some(3),
@@ -1011,6 +1146,7 @@ mod tests {
         assert_eq!(config.cache_last, 1);
         assert_eq!(config.keep_zoom, 1);
         assert_eq!(config.sharpen, 6);
+        assert_eq!(config.white_balance, -5);
         assert_eq!(config.windowed_background_color_r, 10);
         assert_eq!(config.fullscreen_background_color_b, 3);
         assert_eq!(config.left_click_action, 3);
@@ -1039,6 +1175,7 @@ mod tests {
             auto_zoom_type: 7,
             shrink_blit_mode: 9,
             sharpen: 300,
+            white_balance: -300,
             ..Config::default()
         };
         let model = OptionsModel {
@@ -1046,6 +1183,7 @@ mod tests {
             auto_zoom_type: None,
             shrink_blit_mode: None,
             sharpen: Some(300),
+            white_balance: Some(-300),
             ..OptionsModel::from_config(&config)
         };
         let effects = model.commit(&mut config);
@@ -1054,5 +1192,9 @@ mod tests {
         assert_eq!(config.auto_zoom_type, 7);
         assert_eq!(config.shrink_blit_mode, 9);
         assert_eq!(config.sharpen, 300, "out-of-domain sharpen preserves");
+        assert_eq!(
+            config.white_balance, -300,
+            "out-of-domain white_balance preserves, either side"
+        );
     }
 }
