@@ -32,7 +32,7 @@ playlist pane 是 viv.c:36 的一句愿望(`[HIGH] playlist pane or tool window`
 3. **菜单面有预留**:`src/menu.rs:699` 注明 File/View/Navigate/Help 内死行等特性——View 行有位;命令表 ENTRIES 按 upstream 序尾追加(#178 手法,冒烟按数字 id 直发 WM_COMMAND 零扰动)。
 4. **布局数学可测先例**:toolbar.rs 模块头「Everything decidable is pure: heights, layout rects」——面板条宽/边侧/最小宽同法下沉纯函数纳入测试网。
 5. **本地化机制现成**:loc.rs 双语 Id(en/zh-CN)。
-6. **右键命令族现成**:面板上下文候选(Delete/Rename/Copy Filename/Copy/属性)全部已是实现过的命令,纯接线。
+6. **右键命令族现成,但目标是当前图**:`state.nav_current`(window.rs:232)是唯一行动目标——Delete/Rename/Copy Filename 族全部作用于**当前显示图**,不支持任意选中行。对非当前行执行 = 先跳转(选中行→跳转→命令)或新增 entry 目标化路径,非纯接线(O4 的成本项)。
 
 ## 侵入面与风险(实现票主战场)
 
@@ -51,7 +51,7 @@ playlist pane 是 viv.c:36 的一句愿望(`[HIGH] playlist pane or tool window`
 
 ## 语义与边界(设计要点,待咨询/拍板确认)
 
-- **只显示与跳转,不改播放列表语义**(边界钉死,见「边界划清」)。
+- **只显示与跳转,不改播放列表的构建语义**(边界钉死,见「边界划清」;O4 若裁 B,右键命令是调用既有命令,非新增列表语义)。
 - **呈现序是显式决策(O2b),不是推导**:`nav_compare`(playlist.rs:512)是 Jump To 的固定序——文件名 collation + 插入 id 决胜,**恒名序、与 config sort 无关**(上游 `_viv_nav_compare` 本义 = `_viv_fd_compare_name`,viv.c:13324);Next/Prev 走的则是 `fd_compare`(config sort 参数化,默认 mtime 降序)或 shuffle 序——两者今日就不同,面板选哪边见 O2b。
 - 同步策略:导航换图→高亮跟随 + 滚动到可见;播放列表变更(拖放扫描 / CLI 解析 / 单实例转发 / 删除 / 重命名 / undo-delete 重接)→列表刷新。快照式(每次重建,jumpto 同法)vs 差分更新,大列表下差分才有意义(O2a)。
 
@@ -67,13 +67,13 @@ playlist pane 是 viv.c:36 的一句愿望(`[HIGH] playlist pane or tool window`
 - **O1 形态**:A(推荐)停靠 pane(client 区竖条;三侵入面全吃,与主窗一体感强)vs B 浮动 tool window(owned 窗;零主布局侵入,多一个窗口管理面:z 序/最小化随主窗)。愿望原文两者皆可,首刀裁一。
 - **O2 同步与呈现序**:(a) 刷新策略——A(推荐)快照式重建(jumpto 同法;简单,变更点全走单一重建入口)vs B 差分更新(须 playlist 变更埋点 + 行稳定性论证,复杂;仅巨列表下有收益);(b) 呈现序——A(推荐)沿 Jump To 先例固定名序(`nav_compare`;稳定可寻、与 Jump To 行为一致)vs B 跟随导航序(`fd_compare` 随 config sort/shuffle——「面板=导航地图」直观,但序随设置翻动、shuffle 下=会话态)。
 - **O3 大列表**:A(推荐)v1 即 ListView owner-data 虚拟模式(上游 playlist 无上限,拖放整棵树即巨列表)vs B 先全量控件、巨列表后补(两段路)。
-- **O4 交互面**:A(推荐)v1 = 单击选中 / 双击或 Enter 跳转 vs B v1 即附带右键命令族(命令全现成,纯接线,但表面积×冒烟面增大)。
+- **O4 交互面**:A(推荐)v1 = 单击选中 / 双击或 Enter 跳转 vs B v1 即附带右键命令族(命令语义现成但目标=当前图:对非当前行须先跳转再作用,或新增 entry 目标化路径 + 状态;表面积×冒烟面同步增大)。
 - **O5 持久化**:A(推荐)开关 + 宽度两键 vs B 只开关(宽度固定)vs C 边侧也可配。
 - **O6 热键**:A(推荐)默认无键、Controls 页可绑(参照上游键表 viv.c:972-1039 无 toolbar toggle 键的惯例,View 类开关轻表面)vs B 默认键(候选 = 双侧全空的 Ctrl+D/H/Y 等)。
 
 ## 边界划清(不进本票)
 
-相邻上游愿望各自成票:`/add` 与 500ms 重启追加(viv.c:33/35)、playlist 文件格式 / album(viv.c:78)、m3u/efu 载入(viv.c:102)、Play All Instances(viv.c:88)、Everything randomize 键(viv.c:89)。本票(及其实现票)只做**显示与跳转**,不改播放列表语义。
+相邻上游愿望各自成票:`/add` 与 500ms 重启追加(viv.c:33/35)、playlist 文件格式 / album(viv.c:78)、m3u/efu 载入(viv.c:102)、Play All Instances(viv.c:88)、Everything randomize 键(viv.c:89)。本票(及其实现票)只做**显示与跳转**,不改播放列表的**构建语义**(add/clear/排序如何形成列表——那是上述相邻愿望的事);O4 若裁 B,右键命令只是**调用既有命令**(删除/重命名语义与主界面同一),不是本特性新增的播放列表变更,但同步/undo/错误面须随实现票明写。
 
 ## 决策影响
 
