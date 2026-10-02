@@ -5,6 +5,12 @@ history by git-cliff (cliff.toml is the policy; do not hand-edit the output).
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+## [0.4.0] - 2026-10-02
+### Added
+
+- Feat(effect): #191 white balance - the display-effect chain's second knife (TemperatureTint) (d997b56)
+- Feat(effect): #193 contrast - the display-effect chain's closing knife (D2D1Contrast) (041ca87)
+
 ## [0.3.0] - 2026-10-02
 ### Added
 
