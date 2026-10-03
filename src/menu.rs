@@ -388,12 +388,21 @@ pub(crate) enum Cmd {
     /// separator; tail-appended for the same id-pinning reason as
     /// #178/#185/#191.
     ViewContrast,
+    /// View → Playlist Pane (#199 — riviv-authored; upstream's viv.c:36
+    /// wishlist note was never implemented, so there is no upstream id).
+    /// The fourth chrome toggle (Menu/Status Bar/Controls family): the
+    /// row sits after Controls, the checkmark reads the config key like
+    /// its siblings (the pane holds no live state the config could lie
+    /// about — unlike the effect rows). No default key (the family is
+    /// keyless upstream; Controls-page bindable). Tail-appended so every
+    /// existing command id stays pinned for the smoke scripts.
+    ViewPlaylistPane,
 }
 
 impl Cmd {
     /// Variant count; also the id space size (ids are 1-based — 0 is the
     /// separator/no-command id in Win32 menus and must stay unassigned).
-    pub(crate) const COUNT: usize = Self::ViewContrast as usize + 1;
+    pub(crate) const COUNT: usize = Self::ViewPlaylistPane as usize + 1;
 
     /// The WM_COMMAND command id (upstream uses the `VIV_ID_*` enum values;
     /// riviv's ids are app-internal — nothing interoperates — so they run
@@ -594,10 +603,11 @@ impl Cmd {
         // see the variant's doc).
         Self::EditUndoDelete,
         // #185's tail append (id 123, same id-pinning reason); #191's
-        // (id 124); #193's (id 125).
+        // (id 124); #193's (id 125); #199's (id 126).
         Self::ViewSharpen,
         Self::ViewWhiteBalance,
         Self::ViewContrast,
+        Self::ViewPlaylistPane,
     ];
 }
 
@@ -878,11 +888,14 @@ pub(crate) const ENTRIES: &[Entry] = &[
         parent: Slot::Edit,
         cmd: Cmd::EditMoveTo,
     },
-    // View (viv.c:839-935): the five chrome toggles (Caption/Frame
-    // MF_OWNERDRAW = menu-hidden upstream), the Preset popup, fullscreen/
+    // View (viv.c:839-935): the chrome toggles (Caption/Frame
+    // MF_OWNERDRAW = menu-hidden upstream; Menu/Status Bar/Controls —
+    // plus #199's riviv-authored Playlist Pane after Controls), the
+    // Preset popup, fullscreen/
     // slideshow, the Window Size popup, Refresh, the three fit rows,
     // 1:1 / Best Fit, the Pan/Scan and Zoom popups, the On Top popup and
-    // Options last — upstream's full order.
+    // Options last — upstream's full order (#199's row the one
+    // addition).
     Entry::Popup {
         loc: loc::Id::MenuView,
         parent: Slot::Root,
@@ -916,6 +929,15 @@ pub(crate) const ENTRIES: &[Entry] = &[
         loc: loc::Id::MenuControls,
         parent: Slot::View,
         cmd: Cmd::ViewControls,
+    },
+    // View → Playlist Pane (#199, riviv-authored): the chrome-toggle
+    // family's fourth row, right after Controls (upstream has no row —
+    // the viv.c:36 pane was never built; the id is tail-appended, only
+    // the ROW position follows the family).
+    Entry::Item {
+        loc: loc::Id::MenuPlaylistPane,
+        parent: Slot::View,
+        cmd: Cmd::ViewPlaylistPane,
     },
     // View → Preset (#46; viv.c:848-851): Minimal/Compact/Normal.
     Entry::Popup {
@@ -1751,6 +1773,11 @@ pub(crate) struct MenuState {
     /// View → Controls' checkmark (#45): `config_show_controls`
     /// (viv.c:7126).
     pub(crate) show_controls: bool,
+    /// View → Playlist Pane's checkmark (#199, riviv-authored):
+    /// `show_playlist_pane` — read from the config like its siblings
+    /// (the pane is dumb chrome; nothing can drop it the way a build
+    /// failure unchecks an effect row).
+    pub(crate) show_playlist_pane: bool,
     /// View → Sharpen's checkmark (#185, riviv-authored): the gpu side's
     /// LIVE chain, sharpen stage non-zero = checked (ADR 0006 D9 — the
     /// config key is persistence only; a build-failure drop must uncheck
@@ -1826,6 +1853,7 @@ pub(crate) fn checked(cmd: Cmd, state: &MenuState) -> bool {
         Cmd::ViewMenu => state.show_menu,
         Cmd::ViewStatus => state.show_status,
         Cmd::ViewControls => state.show_controls,
+        Cmd::ViewPlaylistPane => state.show_playlist_pane,
         // #185/#191/#193: the live gpu chain's own stage, not the config
         // key (D9) — per-stage, each row its own switch.
         Cmd::ViewSharpen => state.effect_sharpen_on,
@@ -2183,6 +2211,7 @@ mod tests {
             show_menu: true,
             show_status: true,
             show_controls: true,
+            show_playlist_pane: true,
             effect_sharpen_on: true,
             effect_white_balance_on: true,
             effect_contrast_on: true,
@@ -2206,6 +2235,7 @@ mod tests {
             show_menu: false,
             show_status: false,
             show_controls: false,
+            show_playlist_pane: false,
             effect_sharpen_on: false,
             effect_white_balance_on: false,
             effect_contrast_on: false,
@@ -2247,6 +2277,7 @@ mod tests {
                     | Cmd::ViewSharpen
                     | Cmd::ViewWhiteBalance
                     | Cmd::ViewContrast
+                    | Cmd::ViewPlaylistPane
             );
             assert_eq!(checked(cmd, &on), expected_on, "{cmd:?} with everything on");
             let expected_off = matches!(
@@ -2413,6 +2444,7 @@ mod tests {
             show_menu: false,
             show_status: false,
             show_controls: false,
+            show_playlist_pane: false,
             effect_sharpen_on: false,
             effect_white_balance_on: false,
             effect_contrast_on: false,
@@ -2596,7 +2628,9 @@ mod tests {
         assert_eq!(Cmd::ViewSharpen.id(), 123);
         assert_eq!(Cmd::ViewWhiteBalance.id(), 124);
         assert_eq!(Cmd::ViewContrast.id(), 125);
-        assert_eq!(Cmd::COUNT, 125);
+        // #199's tail append: the pane toggle rides the tail.
+        assert_eq!(Cmd::ViewPlaylistPane.id(), 126);
+        assert_eq!(Cmd::COUNT, 126);
     }
 
     #[test]

@@ -400,6 +400,10 @@ pub(crate) enum Id {
     /// ---- #45: toolbar ----
     /// View → "Controls" toggle (en_us.h:72 / zh_cn.h:72).
     MenuControls,
+    /// View → "Playlist Pane" toggle (#199, riviv-authored — upstream
+    /// never built the viv.c:36 pane, so there is no upstream string;
+    /// the label follows the chrome-toggle family's noun style).
+    MenuPlaylistPane,
     /// Toolbar button labels (en_us.h:188-193 / zh_cn.h:188-193).
     ToolbarPreviousImage,
     ToolbarNextImage,
@@ -836,12 +840,13 @@ const EN_US: [&str; Id::COUNT] = [
      /install-options <...> Run with the specified options after installation.\n\
      /uninstall <path>\tUninstall from the specified path.",
     "&Controls",       // MenuControls (en_us.h:72)
-    "Previous Image",  // ToolbarPreviousImage (en_us.h:188)
-    "Next Image",      // ToolbarNextImage (en_us.h:189)
-    "Play Slideshow",  // ToolbarPlaySlideshow (en_us.h:190)
+    "Play&list Pane", // MenuPlaylistPane (#199, riviv-authored; L — the View level's P belongs to Preset)
+    "Previous Image", // ToolbarPreviousImage (en_us.h:188)
+    "Next Image",     // ToolbarNextImage (en_us.h:189)
+    "Play Slideshow", // ToolbarPlaySlideshow (en_us.h:190)
     "Pause Slideshow", // ToolbarPauseSlideshow (en_us.h:191)
-    "Best Fit",        // ToolbarBestFit (en_us.h:192)
-    "Actual Size",     // ToolbarActualSize (en_us.h:193)
+    "Best Fit",       // ToolbarBestFit (en_us.h:192)
+    "Actual Size",    // ToolbarActualSize (en_us.h:193)
     // #46 block (en_us.h:68-87/111-114).
     "Caption",                               // MenuCaption (en_us.h:68)
     "Frame",                                 // MenuThickFrame (en_us.h:69)
@@ -1172,13 +1177,14 @@ const ZH_CN: [&str; Id::COUNT] = [
      /install <路径>\t安装到指定路径。\n\
      /install-options <...> 安装后以指定选项运行。\n\
      /uninstall <路径>\t从指定路径卸载。",
-    "控件(&C)", // MenuControls (zh_cn.h:72)
-    "上一个",   // ToolbarPreviousImage (zh_cn.h:188)
-    "下一个",   // ToolbarNextImage (zh_cn.h:189)
-    "播放",     // ToolbarPlaySlideshow (zh_cn.h:190)
-    "暂停",     // ToolbarPauseSlideshow (zh_cn.h:191)
-    "最佳适应", // ToolbarBestFit (zh_cn.h:192)
-    "实际大小", // ToolbarActualSize (zh_cn.h:193)
+    "控件(&C)",         // MenuControls (zh_cn.h:72)
+    "播放列表面板(&L)", // MenuPlaylistPane (#199, riviv-authored; L — the View level's P belongs to Preset)
+    "上一个",           // ToolbarPreviousImage (zh_cn.h:188)
+    "下一个",           // ToolbarNextImage (zh_cn.h:189)
+    "播放",             // ToolbarPlaySlideshow (zh_cn.h:190)
+    "暂停",             // ToolbarPauseSlideshow (zh_cn.h:191)
+    "最佳适应",         // ToolbarBestFit (zh_cn.h:192)
+    "实际大小",         // ToolbarActualSize (zh_cn.h:193)
     // #46 block (zh_cn.h:68-87/111-114).
     "标题栏",                 // MenuCaption (zh_cn.h:68)
     "边框",                   // MenuThickFrame (zh_cn.h:69)
