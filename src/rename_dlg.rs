@@ -334,17 +334,24 @@ fn apply_rename(owner: HWND, old: &[u16], new_full: &[u16]) {
             {
                 session.set_path(new_os.clone());
             }
-            // The last-cache's snapshot keeps the OLD path on purpose —
-            // upstream renames only `current_fd`, never the cached copy.
-            state
-                .playlist
-                .rename_path(old_os.as_os_str(), new_os.as_os_str());
         }
+        // The PLAYLIST entry renames by exact old-path match regardless of
+        // whether the renamed file is still the current (a slideshow may
+        // have advanced while the dialog was open — cubic P2 on PR #200):
+        // the shell renamed exactly one path, and a stale playlist row
+        // would fail the next navigation's not-found check. The
+        // last-cache's snapshot keeps the OLD path on purpose — upstream
+        // renames only `current_fd`, never the cached copy.
+        state
+            .playlist
+            .rename_path(old_os.as_os_str(), new_os.as_os_str());
     }
+    // #199: the renamed row's path changed in the playlist — the pane's
+    // snapshot holds the old one; rebuild before the retitle's selection
+    // sync runs (unconditionally: the row matters even when the display
+    // moved on).
+    crate::window::pane_refresh(owner);
     if applied {
-        // #199: the renamed row's path changed — the pane's snapshot holds
-        // the old one; rebuild before the retitle's selection sync runs.
-        crate::window::pane_refresh(owner);
         refresh_title(owner);
     }
 }

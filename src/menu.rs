@@ -888,11 +888,14 @@ pub(crate) const ENTRIES: &[Entry] = &[
         parent: Slot::Edit,
         cmd: Cmd::EditMoveTo,
     },
-    // View (viv.c:839-935): the five chrome toggles (Caption/Frame
-    // MF_OWNERDRAW = menu-hidden upstream), the Preset popup, fullscreen/
+    // View (viv.c:839-935): the chrome toggles (Caption/Frame
+    // MF_OWNERDRAW = menu-hidden upstream; Menu/Status Bar/Controls —
+    // plus #199's riviv-authored Playlist Pane after Controls), the
+    // Preset popup, fullscreen/
     // slideshow, the Window Size popup, Refresh, the three fit rows,
     // 1:1 / Best Fit, the Pan/Scan and Zoom popups, the On Top popup and
-    // Options last — upstream's full order.
+    // Options last — upstream's full order (#199's row the one
+    // addition).
     Entry::Popup {
         loc: loc::Id::MenuView,
         parent: Slot::Root,

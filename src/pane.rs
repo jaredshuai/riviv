@@ -26,10 +26,11 @@ use std::path::{Path, PathBuf};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{DEFAULT_GUI_FONT, GetStockObject};
 use windows::Win32::UI::Controls::{
-    LVCF_FMT, LVCF_WIDTH, LVCFMT_LEFT, LVCOLUMNW, LVIF_TEXT, LVIS_SELECTED, LVITEMW,
-    LVM_ENSUREVISIBLE, LVM_INSERTCOLUMNW, LVM_SETCOLUMNWIDTH, LVM_SETEXTENDEDLISTVIEWSTYLE,
-    LVM_SETITEMCOUNT, LVM_SETITEMSTATE, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT,
-    LVS_NOCOLUMNHEADER, LVS_OWNERDATA, LVS_REPORT, LVS_SHOWSELALWAYS, LVS_SINGLESEL, NMLVDISPINFOW,
+    LIST_VIEW_ITEM_STATE_FLAGS, LVCF_FMT, LVCF_WIDTH, LVCFMT_LEFT, LVCOLUMNW, LVIF_TEXT,
+    LVIS_SELECTED, LVITEMW, LVM_ENSUREVISIBLE, LVM_INSERTCOLUMNW, LVM_SETCOLUMNWIDTH,
+    LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMCOUNT, LVM_SETITEMSTATE, LVS_EX_DOUBLEBUFFER,
+    LVS_EX_FULLROWSELECT, LVS_NOCOLUMNHEADER, LVS_OWNERDATA, LVS_REPORT, LVS_SHOWSELALWAYS,
+    LVS_SINGLESEL, NMLVDISPINFOW,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::VK_RETURN;
 use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
@@ -344,8 +345,31 @@ pub(crate) fn publish(pane_hwnd: HWND, count: usize, current: Option<usize>) {
 
 /// Move the selection/highlight onto an index and scroll it into view
 /// (send-only, same re-entrancy contract as [`publish`]) — the
-/// display-change hook, cheap: two state sends, no rebuild.
+/// display-change hook, cheap: state sends, no rebuild. Every standing
+/// selection is CLEARED first (cubic P2 + Codex P2 on PR #200):
+/// programmatic LVM_SETITEMSTATE does not auto-clear the previous row
+/// even under LVS_SINGLESEL, and a stale second selection would send
+/// Enter (GETNEXTITEM walks index order) to the wrong row; a None index
+/// (the current image left the snapshot) clears outright so the pane
+/// never highlights a file that is not the current one.
 pub(crate) fn select(pane_hwnd: HWND, index: Option<usize>) {
+    let mut clear = LVITEMW {
+        mask: Default::default(),
+        stateMask: LVIS_SELECTED,
+        state: LIST_VIEW_ITEM_STATE_FLAGS(0),
+        iItem: -1,
+        ..Default::default()
+    };
+    // SAFETY: the live pane child; iItem -1 addresses EVERY item
+    // (the documented all-items form), and the send may repaint.
+    unsafe {
+        SendMessageW(
+            pane_hwnd,
+            LVM_SETITEMSTATE,
+            Some(WPARAM(-1isize as usize)),
+            Some(LPARAM(&mut clear as *mut _ as isize)),
+        );
+    }
     let Some(index) = index else {
         return;
     };

@@ -840,13 +840,13 @@ const EN_US: [&str; Id::COUNT] = [
      /install-options <...> Run with the specified options after installation.\n\
      /uninstall <path>\tUninstall from the specified path.",
     "&Controls",       // MenuControls (en_us.h:72)
-    "&Playlist Pane",  // MenuPlaylistPane (#199, riviv-authored)
-    "Previous Image",  // ToolbarPreviousImage (en_us.h:188)
-    "Next Image",      // ToolbarNextImage (en_us.h:189)
-    "Play Slideshow",  // ToolbarPlaySlideshow (en_us.h:190)
+    "Play&list Pane", // MenuPlaylistPane (#199, riviv-authored; L — the View level's P belongs to Preset)
+    "Previous Image", // ToolbarPreviousImage (en_us.h:188)
+    "Next Image",     // ToolbarNextImage (en_us.h:189)
+    "Play Slideshow", // ToolbarPlaySlideshow (en_us.h:190)
     "Pause Slideshow", // ToolbarPauseSlideshow (en_us.h:191)
-    "Best Fit",        // ToolbarBestFit (en_us.h:192)
-    "Actual Size",     // ToolbarActualSize (en_us.h:193)
+    "Best Fit",       // ToolbarBestFit (en_us.h:192)
+    "Actual Size",    // ToolbarActualSize (en_us.h:193)
     // #46 block (en_us.h:68-87/111-114).
     "Caption",                               // MenuCaption (en_us.h:68)
     "Frame",                                 // MenuThickFrame (en_us.h:69)
@@ -1178,7 +1178,7 @@ const ZH_CN: [&str; Id::COUNT] = [
      /install-options <...> 安装后以指定选项运行。\n\
      /uninstall <路径>\t从指定路径卸载。",
     "控件(&C)",         // MenuControls (zh_cn.h:72)
-    "播放列表面板(&P)", // MenuPlaylistPane (#199, riviv-authored)
+    "播放列表面板(&L)", // MenuPlaylistPane (#199, riviv-authored; L — the View level's P belongs to Preset)
     "上一个",           // ToolbarPreviousImage (zh_cn.h:188)
     "下一个",           // ToolbarNextImage (zh_cn.h:189)
     "播放",             // ToolbarPlaySlideshow (zh_cn.h:190)

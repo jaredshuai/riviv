@@ -2646,10 +2646,14 @@ fn toggle_fullscreen(hwnd: HWND) {
             controls_show(hwnd, true);
         }
         // The pane comes back with the chrome (#199) — per config, like
-        // the strip above it.
+        // the strip above it, and catches up its selection: the display
+        // may have navigated while fullscreen (the hook skips itself
+        // there, cubic P2 on PR #200), so sync once the pane is visible
+        // again.
         // SAFETY: read-only config read; the show runs outside.
         if (unsafe { state_of(hwnd) }).is_some_and(|state| state.config.show_playlist_pane != 0) {
             pane_show(hwnd, true);
+            pane_display_changed(hwnd);
         }
         // SAFETY: read-modify-write of the style on the owning thread.
         let style = unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) } as u32;
@@ -3313,11 +3317,11 @@ fn window_size_to_image(hwnd: HWND, kind: i32) {
             state.controls.height(),
             // #199: a visible pane widens the window around the SAME
             // image area (auto-fit 计入面板宽 — the window grows, the
-            // image never shrinks behind the pane).
-            if !state.pane.hwnd.is_invalid()
-                // SAFETY: read-only visibility query on our live child.
-                && unsafe { IsWindowVisible(state.pane.hwnd) }.as_bool()
-            {
+            // image never shrinks behind the pane). Read from the CONFIG,
+            // not the live visibility: this function exits fullscreen
+            // first (below), and a fullscreen-hidden pane comes back per
+            // config before the sizing lands (cubic P2 on PR #200).
+            if state.config.show_playlist_pane != 0 {
                 crate::pane::clamp_width(state.config.playlist_pane_width)
             } else {
                 0
