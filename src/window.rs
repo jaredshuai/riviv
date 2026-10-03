@@ -63,7 +63,8 @@ use windows::Win32::UI::Controls::Dialogs::{
 };
 use windows::Win32::UI::Controls::{
     ICC_BAR_CLASSES, ICC_STANDARD_CLASSES, ICC_WIN95_CLASSES, INITCOMMONCONTROLSEX,
-    InitCommonControlsEx, NM_CLICK, NMHDR, NMMOUSE, SB_GETPARTS, WM_MOUSELEAVE,
+    InitCommonControlsEx, LVM_GETNEXTITEM, LVN_GETDISPINFO, LVNI_SELECTED, NM_CLICK, NM_DBLCLK,
+    NMHDR, NMLVDISPINFOW, NMMOUSE, SB_GETPARTS, WM_MOUSELEAVE,
 };
 use windows::Win32::UI::HiDpi::{
     GetProcessDpiAwareness, PROCESS_DPI_UNAWARE, PROCESS_PER_MONITOR_DPI_AWARE,
@@ -85,25 +86,25 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GWL_EXSTYLE, GWL_STYLE, GWLP_USERDATA, GetClientRect, GetCursorPos, GetForegroundWindow,
     GetMenu, GetMessageW, GetParent, GetSystemMetrics, GetWindowLongPtrW, GetWindowRect, HICON,
     HMENU, HTCAPTION, HTMENU, HWND_BOTTOM, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST, IDC_ARROW,
-    IMAGE_ICON, IsIconic, IsZoomed, KillTimer, LR_DEFAULTCOLOR, LoadCursorW, LoadImageW,
-    MB_ICONERROR, MB_ICONQUESTION, MB_OK, MENU_ITEM_FLAGS, MF_BYCOMMAND, MF_CHECKED, MF_ENABLED,
-    MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MFT_RADIOCHECK, MINMAXINFO, MSG,
-    MenuItemFromPoint, MessageBoxW, PostMessageW, PostQuitMessage, RegisterClassExW,
-    SC_MONITORPOWER, SHOW_WINDOW_CMD, SM_CXICON, SM_CXSMICON, SM_CYICON, SM_CYSMICON, SW_MAXIMIZE,
-    SW_RESTORE, SW_SHOW, SW_SHOWNORMAL, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOCOPYBITS,
-    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SYSTEM_METRICS_INDEX, SendMessageW, SetCursorPos,
-    SetForegroundWindow, SetMenu, SetTimer, SetWindowLongPtrW, SetWindowPos, SetWindowTextW,
-    ShowCursor, ShowWindow, TPM_CENTERALIGN, TPM_LEFTBUTTON, TPM_VCENTERALIGN, TrackPopupMenu,
-    TranslateMessage, USER_TIMER_MINIMUM, WINDOW_EX_STYLE, WINDOW_STYLE, WM_ACTIVATE, WM_CLOSE,
-    WM_COMMAND, WM_CONTEXTMENU, WM_COPYDATA, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED,
-    WM_DROPFILES, WM_ENDSESSION, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_INITMENU, WM_KEYDOWN,
-    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE,
-    WM_MOUSEWHEEL, WM_MOVE, WM_NCCREATE, WM_NCDESTROY, WM_NCLBUTTONDOWN, WM_NCXBUTTONDBLCLK,
-    WM_NCXBUTTONDOWN, WM_NOTIFY, WM_NULL, WM_PAINT, WM_PASTE, WM_QUERYENDSESSION, WM_RBUTTONDBLCLK,
-    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SIZE, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_TIMER,
-    WM_XBUTTONDBLCLK, WM_XBUTTONDOWN, WNDCLASSEXW, WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN,
-    WS_EX_ACCEPTFILES, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_SYSMENU, WS_THICKFRAME, WS_VISIBLE,
-    WindowFromPoint,
+    IMAGE_ICON, IsIconic, IsWindowVisible, IsZoomed, KillTimer, LR_DEFAULTCOLOR, LoadCursorW,
+    LoadImageW, MB_ICONERROR, MB_ICONQUESTION, MB_OK, MENU_ITEM_FLAGS, MF_BYCOMMAND, MF_CHECKED,
+    MF_ENABLED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MFT_RADIOCHECK,
+    MINMAXINFO, MSG, MenuItemFromPoint, MessageBoxW, PostMessageW, PostQuitMessage,
+    RegisterClassExW, SC_MONITORPOWER, SHOW_WINDOW_CMD, SM_CXICON, SM_CXSMICON, SM_CYICON,
+    SM_CYSMICON, SW_HIDE, SW_MAXIMIZE, SW_RESTORE, SW_SHOW, SW_SHOWNORMAL, SWP_FRAMECHANGED,
+    SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SYSTEM_METRICS_INDEX,
+    SendMessageW, SetCursorPos, SetForegroundWindow, SetMenu, SetTimer, SetWindowLongPtrW,
+    SetWindowPos, SetWindowTextW, ShowCursor, ShowWindow, TPM_CENTERALIGN, TPM_LEFTBUTTON,
+    TPM_VCENTERALIGN, TrackPopupMenu, TranslateMessage, USER_TIMER_MINIMUM, WINDOW_EX_STYLE,
+    WINDOW_STYLE, WM_ACTIVATE, WM_CLOSE, WM_COMMAND, WM_CONTEXTMENU, WM_COPYDATA, WM_DESTROY,
+    WM_DISPLAYCHANGE, WM_DPICHANGED, WM_DROPFILES, WM_ENDSESSION, WM_ERASEBKGND, WM_GETMINMAXINFO,
+    WM_INITMENU, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
+    WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_MOVE, WM_NCCREATE, WM_NCDESTROY,
+    WM_NCLBUTTONDOWN, WM_NCXBUTTONDBLCLK, WM_NCXBUTTONDOWN, WM_NOTIFY, WM_NULL, WM_PAINT, WM_PASTE,
+    WM_QUERYENDSESSION, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SIZE, WM_SYSCOMMAND,
+    WM_SYSKEYDOWN, WM_TIMER, WM_XBUTTONDBLCLK, WM_XBUTTONDOWN, WNDCLASSEXW, WS_CAPTION, WS_CHILD,
+    WS_CLIPCHILDREN, WS_EX_ACCEPTFILES, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_SYSMENU, WS_THICKFRAME,
+    WS_VISIBLE, WindowFromPoint,
 };
 use windows::core::{HSTRING, PCSTR, PCWSTR, PWSTR, w};
 
@@ -198,6 +199,14 @@ pub(crate) struct WindowState {
     /// 6681). Default = absent (creation failed / hidden) — every
     /// consumer guards on it.
     pub(crate) controls: crate::toolbar::ControlsSet,
+    /// The playlist pane child (#199, riviv-authored — upstream's viv.c:36
+    /// wish, never built there): a right-edge docked owner-data ListView.
+    /// Created once in `run()` next to the viewport; visibility follows
+    /// `show_playlist_pane` (hidden with the chrome in fullscreen — hide,
+    /// not destroy: the pane owns no config-dependent resources). The
+    /// item snapshot is the state's own, read by the GETDISPINFO handler
+    /// during the control's paint.
+    pub(crate) pane: crate::pane::Pane,
     /// The menu bar (#23; upstream `_viv_hmenu`, viv.c:718/5352) — built
     /// once in `run` before the window exists, attached at creation when
     /// `config_show_menu` is set, and re-attached/detached by the
@@ -640,6 +649,10 @@ pub(crate) fn refresh_title(hwnd: HWND) {
         // SetWindowTextW return too).
         let _ = unsafe { SetWindowTextW(hwnd, &title) };
     }
+    // #199: the pane's selection follows the display change (the title
+    // refresh runs on every path change; the hook is cheap and skips
+    // itself while the pane is off).
+    pane_display_changed(hwnd);
 }
 
 /// Sample the source pixel under the cursor (#47; upstream
@@ -2632,6 +2645,12 @@ fn toggle_fullscreen(hwnd: HWND) {
         if (unsafe { state_of(hwnd) }).is_some_and(|state| state.config.show_controls != 0) {
             controls_show(hwnd, true);
         }
+        // The pane comes back with the chrome (#199) — per config, like
+        // the strip above it.
+        // SAFETY: read-only config read; the show runs outside.
+        if (unsafe { state_of(hwnd) }).is_some_and(|state| state.config.show_playlist_pane != 0) {
+            pane_show(hwnd, true);
+        }
         // SAFETY: read-modify-write of the style on the owning thread.
         let style = unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) } as u32;
         // The caption/frame bits come back per config (#46; upstream
@@ -2753,6 +2772,18 @@ fn toggle_fullscreen(hwnd: HWND) {
             let set = (unsafe { state_of(hwnd) }).map(|state| std::mem::take(&mut state.controls));
             if let Some(mut set) = set {
                 crate::toolbar::destroy(&mut set);
+            }
+        }
+        // The pane hides with the chrome (#199 — hide, not destroy: the
+        // monitor goes to the image; the exit path re-shows it per config
+        // and the snapshot survives underneath). The handle copy runs
+        // inside the borrow, the show call outside it.
+        {
+            // SAFETY: read-only handle copy.
+            let pane = (unsafe { state_of(hwnd) }).map(|s| s.pane.hwnd);
+            if let Some(pane) = pane.filter(|p| !p.is_invalid()) {
+                // SAFETY: our live child window.
+                let _ = unsafe { ShowWindow(pane, SW_HIDE) };
             }
         }
         // SAFETY: hwnd is live; covers the monitor, reentering wnd_proc
@@ -3280,9 +3311,21 @@ fn window_size_to_image(hwnd: HWND, kind: i32) {
             state.config.show_menu != 0 && !state.menu.is_invalid(),
             crate::status::height(state.status),
             state.controls.height(),
+            // #199: a visible pane widens the window around the SAME
+            // image area (auto-fit 计入面板宽 — the window grows, the
+            // image never shrinks behind the pane).
+            if !state.pane.hwnd.is_invalid()
+                // SAFETY: read-only visibility query on our live child.
+                && unsafe { IsWindowVisible(state.pane.hwnd) }.as_bool()
+            {
+                crate::pane::clamp_width(state.config.playlist_pane_width)
+            } else {
+                0
+            },
         )
     });
-    let Some((fullscreen, image, auto_fit, has_menu, status_h, controls_h)) = gathered else {
+    let Some((fullscreen, image, auto_fit, has_menu, status_h, controls_h, pane_w)) = gathered
+    else {
         return;
     };
     // Get out of fullscreen first (upstream viv.c:2081-2085).
@@ -3331,7 +3374,9 @@ fn window_size_to_image(hwnd: HWND, kind: i32) {
     let mut outer = RECT {
         left: 0,
         top: 0,
-        right: client.0,
+        // #199: the pane rides the right edge of the same compensation
+        // the bottom chrome rides on the bottom.
+        right: client.0 + pane_w,
         bottom: client.1 + status_h + controls_h,
     };
     // SAFETY: live style read; the rect is a valid in/out.
@@ -4326,6 +4371,11 @@ fn adopt_display_tail(hwnd: HWND, title: Option<HSTRING>, invalidate: bool) {
         // like every other title update (upstream viv.c:1249 ignores the
         // SetWindowTextW return too).
         let _ = unsafe { SetWindowTextW(hwnd, title) };
+        // #199: the pane's selection follows the DISPLAYED image — the
+        // adoption tail is where the on-screen file changes (the
+        // request-time hook in request_open covers the pre-decode title
+        // move).
+        pane_display_changed(hwnd);
     }
     if invalidate {
         repaint(hwnd);
@@ -4587,6 +4637,11 @@ pub(crate) fn request_open(hwnd: HWND, path: &OsStr, origin: OpenOrigin<'_>) {
         // SetWindowTextW return too).
         let _ = unsafe { SetWindowTextW(hwnd, &title) };
     }
+    // #199: the pane hooks the request-time title move too (the smoke's
+    // S3/S5 finding — this inline site, not refresh_title, is the one
+    // every load and navigation actually walks), so the selection and the
+    // fallback rescan land as soon as the path is known.
+    pane_display_changed(hwnd);
     refresh_status(hwnd);
 }
 
@@ -4721,6 +4776,8 @@ fn open_from_filename(hwnd: HWND, path: &OsStr) -> bool {
             if let Some(state) = unsafe { state_of(hwnd) } {
                 playlist::add_path(&mut state.playlist, p);
             }
+            // #199: the pane's snapshot tracks the membership.
+            pane_refresh(hwnd);
             home_open(hwnd, false, false);
             true
         }
@@ -4738,6 +4795,8 @@ fn open_from_filename(hwnd: HWND, path: &OsStr) -> bool {
             let found = (unsafe { state_of(hwnd) })
                 .map(|state| playlist::add_expanded(&mut state.playlist, p))
                 .unwrap_or(false);
+            // #199: same hook (found or not, the mutation happened).
+            pane_refresh(hwnd);
             if found {
                 home_open(hwnd, false, false);
             }
@@ -5474,6 +5533,10 @@ fn blank_display(hwnd: HWND) {
         state.src_pixel = (-1, -1);
     }
     refresh_status(hwnd);
+    // #199: the blank cleared the playlist — the pane's snapshot must not
+    // outlive it (no display change follows a blank, so this hook, not
+    // the title seam, owns the rebuild).
+    pane_refresh(hwnd);
     // A blanked display can never hide the cursor — reconcile it (upstream
     // `_viv_blank` → `_viv_start_first_frame` → `_viv_update_show_cursor`,
     // viv.c:7928 + 14338).
@@ -5606,6 +5669,10 @@ fn delete_current(hwnd: HWND, permanently: bool) {
             };
             state.playlist.remove_by_id(current.id);
         }
+        // #199: the pane's snapshot loses the deleted row (the nav below
+        // moves the display; the membership hook keeps the list honest
+        // even when the walk lands on nothing).
+        pane_refresh(hwnd);
         if !nav_next(hwnd, false, true, false, false) {
             blank_display(hwnd);
         }
@@ -5646,6 +5713,10 @@ fn undo_delete_current(hwnd: HWND) {
                     .cloned()
             });
             if let Some(entry) = nav_entry {
+                // #199: the restored row is back in the playlist — refresh
+                // BEFORE the open so the pane lands with the row present
+                // and selected.
+                pane_refresh(hwnd);
                 request_open(hwnd, &entry.path, OpenOrigin::Nav(&entry));
             }
         }
@@ -5890,6 +5961,10 @@ fn process_parsed_cl(hwnd: HWND, parsed: &cli::Parsed) {
             }
         }
     }
+    // #199: the command-line walk's mutations land here — add-mode never
+    // navigates (the appended rows would otherwise wait for the next
+    // display change), and a bare ClearPlaylist changes nothing on screen.
+    pane_refresh(hwnd);
     // Show the first image — never in add-mode (viv.c:5046-5098).
     if !parsed.is_add && parsed.file_count >= 1 {
         let lone_stdin = parsed.file_count == 1
@@ -6164,6 +6239,10 @@ fn on_everything_reply(hwnd: HWND, cds: &COPYDATASTRUCT, add: bool) {
         }
         reply
     });
+    // #199: the reply rebuilt the list (add mode appends with no
+    // navigation to carry the change; the home_open arm refreshes again
+    // through its own display change — idempotent).
+    pane_refresh(hwnd);
     if !add && parsed.is_some() {
         home_open(hwnd, false, false);
     }
@@ -6926,6 +7005,9 @@ fn open_image_via_dialog(hwnd: HWND, add: bool) {
             state.playlist.clear();
         }
     }
+    // #199: the add flavor appends with no navigation to carry the
+    // change; the open flavor's own hook re-refreshes (idempotent).
+    pane_refresh(hwnd);
     if !add {
         let _ = open_from_filename(hwnd, &path);
     }
@@ -7279,6 +7361,7 @@ fn refresh_menu_state(hwnd: HWND, target: HMENU) {
             show_menu: state.config.show_menu != 0,
             show_status: state.config.show_status != 0,
             show_controls: state.config.show_controls != 0,
+            show_playlist_pane: state.config.show_playlist_pane != 0,
             // #185/#191/#193 (ADR 0006 D9): the LIVE gpu chain's own
             // stage, not the config key — a build-failure drop unchecks
             // the row honestly. A stackless (dying) session reads as off.
@@ -7614,6 +7697,7 @@ fn on_command(hwnd: HWND, cmd: menu::Cmd) {
         menu::Cmd::ViewMenu => toggle_menu(hwnd),
         menu::Cmd::ViewStatus => toggle_status(hwnd),
         menu::Cmd::ViewControls => toggle_controls(hwnd),
+        menu::Cmd::ViewPlaylistPane => toggle_playlist_pane(hwnd),
         // The effect-row toggles (#185/#191, riviv-authored; ADR 0006) —
         // per-stage: each row flips its own stage, the other rides along.
         menu::Cmd::ViewSharpen => toggle_sharpen(hwnd),
@@ -7988,29 +8072,64 @@ fn update_frame(hwnd: HWND) {
     let old_style = WINDOW_STYLE(unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) } as u32);
     // SAFETY: read-only menu query on the live window.
     let old_has_menu = !unsafe { GetMenu(hwnd) }.is_invalid();
-    // SAFETY: the borrow spans only the height reads.
-    let (old_status, old_controls) = (unsafe { state_of(hwnd) }).map_or((0, 0), |state| {
-        (crate::status::height(state.status), state.controls.height())
-    });
+    // SAFETY: the borrow spans only the height/pane reads.
+    let (old_status, old_controls, old_pane_w) =
+        (unsafe { state_of(hwnd) }).map_or((0, 0, 0), |state| {
+            let pane_w = if !state.pane.hwnd.is_invalid()
+            // SAFETY: read-only visibility query on our live child.
+            && unsafe { IsWindowVisible(state.pane.hwnd) }.as_bool()
+            {
+                crate::pane::clamp_width(state.config.playlist_pane_width)
+            } else {
+                0
+            };
+            (
+                crate::status::height(state.status),
+                state.controls.height(),
+                pane_w,
+            )
+        });
     let mut old_outer = client;
     // SAFETY: in/out rect valid; failure leaves a zero frame delta like
     // upstream's unchecked AdjustWindowRect.
     let _ = unsafe { AdjustWindowRect(&mut old_outer, old_style, old_has_menu) };
     old_outer.bottom += old_status + old_controls;
+    // #199: the pane's width rides the same compensation so a pane toggle
+    // moves the RIGHT edge only — the image area stays put, the family
+    // contract the bar/strip heights already follow.
+    old_outer.right += old_pane_w;
     // The five target values (the config was already written by the
-    // caller — upstream's case arms, viv.c:1966-2013).
+    // caller — upstream's case arms, viv.c:1966-2013) plus the pane's
+    // (#199).
     // SAFETY: the borrow spans only the config reads and the handle copy.
-    let (show_menu, show_status, show_controls, show_caption, show_thickframe, menu) =
-        (unsafe { state_of(hwnd) }).map_or((true, true, true, true, true, HMENU::default()), |s| {
+    let (
+        show_menu,
+        show_status,
+        show_controls,
+        show_caption,
+        show_thickframe,
+        show_pane,
+        target_pane_w,
+        menu,
+    ) = (unsafe { state_of(hwnd) }).map_or(
+        (true, true, true, true, true, false, 0, HMENU::default()),
+        |s| {
             (
                 s.config.show_menu != 0,
                 s.config.show_status != 0,
                 s.config.show_controls != 0,
                 s.config.show_caption != 0,
                 s.config.show_thickframe != 0,
+                s.config.show_playlist_pane != 0,
+                if s.config.show_playlist_pane != 0 {
+                    crate::pane::clamp_width(s.config.playlist_pane_width)
+                } else {
+                    0
+                },
                 s.menu,
             )
-        });
+        },
+    );
     // The style bits (viv.c:9855-9871): caption and sysmenu travel
     // together, the thick frame alone.
     let mut new_style = old_style;
@@ -8044,6 +8163,9 @@ fn update_frame(hwnd: HWND) {
     // client.
     status_show(hwnd, show_status);
     controls_show(hwnd, show_controls);
+    // #199: the pane's visibility half — hide, never destroy (it owns no
+    // config-dependent resources, unlike the bar/strip pair).
+    pane_show(hwnd, show_pane);
     // The new outer rect over the same client: the NEW style, the TARGET
     // menu attach and the AFTER children heights (viv.c:9894-9903).
     // SAFETY: the borrow spans only the height reads.
@@ -8054,6 +8176,9 @@ fn update_frame(hwnd: HWND) {
     // SAFETY: same call as above with the new style/menu.
     let _ = unsafe { AdjustWindowRect(&mut new_outer, new_style, show_menu && !menu.is_invalid()) };
     new_outer.bottom += new_status + new_controls;
+    // #199: the pane's target width (clamped; the pane_show above has
+    // already flipped the child's visibility, so on_size agrees).
+    new_outer.right += if show_pane { target_pane_w } else { 0 };
     let mut window = RECT::default();
     // SAFETY: read-only outer-rect query, fail-soft like upstream's
     // unchecked GetWindowRect (viv.c:9905).
@@ -8233,6 +8358,142 @@ fn toggle_controls(hwnd: HWND) {
         state.config.show_controls = i32::from(state.config.show_controls == 0);
     }
     update_frame(hwnd);
+}
+
+/// View → Playlist Pane (#199, riviv-authored): the chrome-toggle
+/// family's fourth arm — flip the key, funnel through update_frame (the
+/// width compensation there keeps the IMAGE area put; the rebuild's
+/// on_size re-docks), then seed the content (a toggle-on must not show
+/// a stale snapshot).
+fn toggle_playlist_pane(hwnd: HWND) {
+    // SAFETY: the borrow spans the config flip — nothing pumps.
+    if let Some(state) = unsafe { state_of(hwnd) } {
+        state.config.show_playlist_pane = i32::from(state.config.show_playlist_pane == 0);
+    }
+    update_frame(hwnd);
+    pane_refresh(hwnd);
+}
+
+/// The pane's half of the frame rebuild (#199): show/hide per config —
+/// hide, never destroy (unlike the bar/strip the pane owns no
+/// config-dependent resources). The rebuild's closing SetWindowPos
+/// triggers the on_size that re-docks it.
+fn pane_show(hwnd: HWND, show: bool) {
+    // SAFETY: read-only handle copy; the show call runs outside.
+    let pane = (unsafe { state_of(hwnd) }).map(|s| s.pane.hwnd);
+    if let Some(pane) = pane.filter(|p| !p.is_invalid()) {
+        // SAFETY: our live child window.
+        let _ = unsafe { ShowWindow(pane, if show { SW_SHOW } else { SW_HIDE }) };
+    }
+}
+
+/// Rebuild the pane's item snapshot (#199 O2a: playlist entries, or the
+/// single-file fallback's flat directory scan, in the Jump To fixed
+/// name order) and publish it with the selection moved onto the current
+/// image. The snapshot build runs UNDER the state borrow (read_dir and
+/// metadata never pump messages); every ListView send runs after it
+/// drops — the sends re-enter the wnd_proc, whose GETDISPINFO handler
+/// reads the just-stored items.
+pub(crate) fn pane_refresh(hwnd: HWND) {
+    // SAFETY: the borrow spans the snapshot build, the current-path
+    // clone, and the field stores.
+    let published = (unsafe { state_of(hwnd) }).and_then(|state| {
+        let (items, scanned) = crate::pane::snapshot(
+            &state.playlist,
+            state.nav_current.as_ref().map(|e| e.path.as_os_str()),
+        );
+        let index = crate::pane::current_index(
+            &items,
+            state.nav_current.as_ref().map(|e| e.path.as_os_str()),
+        );
+        let pane_hwnd = state.pane.hwnd;
+        let count = items.len();
+        state.pane.items = items;
+        state.pane.scanned_dir = scanned;
+        (!pane_hwnd.is_invalid()).then_some((pane_hwnd, count, index))
+    });
+    if let Some((pane_hwnd, count, index)) = published {
+        crate::pane::publish(pane_hwnd, count, index);
+    }
+}
+
+/// The pane's display-change hook (#199, on refresh_title): move the
+/// selection onto the current image — cheap, no rebuild — and rebuild
+/// only when the single-file fallback's source directory moved (a
+/// playlist-sourced snapshot's membership is the mutation hooks'
+/// business). Skipped entirely while the pane is off or in fullscreen.
+fn pane_display_changed(hwnd: HWND) {
+    // SAFETY: the borrow spans only the reads and the clones.
+    let gathered = (unsafe { state_of(hwnd) }).and_then(|state| {
+        if state.pane.hwnd.is_invalid() || state.config.show_playlist_pane == 0 || state.fullscreen
+        {
+            return None;
+        }
+        Some((
+            state.pane.hwnd,
+            state.pane.scanned_dir.clone(),
+            state.playlist.is_empty(),
+            state.nav_current.as_ref().map(|e| e.path.clone()),
+        ))
+    });
+    let Some((pane_hwnd, scanned_dir, playlist_empty, current)) = gathered else {
+        return;
+    };
+    let stale = match (&scanned_dir, playlist_empty, current.as_ref()) {
+        // The snapshot's SOURCE must match reality: a dir-sourced snapshot
+        // (Some) while the playlist exists (the shuffle build adopted the
+        // directory mid-navigation), or a playlist-sourced one (None)
+        // while the playlist died (the blank), is stale.
+        (Some(_), false, _) => true,
+        (None, true, _) => true,
+        // The fallback's own trigger: the current file left the scanned
+        // directory (or went away entirely).
+        (Some(dir), true, Some(path)) => Path::new(path).parent() != Some(dir.as_path()),
+        (Some(_), true, None) => true,
+        // A live playlist's snapshot keeps its membership to the mutation
+        // hooks — this hook only moves the selection.
+        (None, false, _) => false,
+    };
+    if stale {
+        pane_refresh(hwnd);
+        return;
+    }
+    // SAFETY: the index math reads the stored snapshot; the selection
+    // sends run after the borrow drops.
+    let index = (unsafe { state_of(hwnd) })
+        .and_then(|state| crate::pane::current_index(&state.pane.items, current.as_deref()));
+    crate::pane::select(pane_hwnd, index);
+}
+
+/// The pane's jump (#199): Enter (the subclassed key) or double-click on
+/// a row — the same request_open(OpenOrigin::Nav) contract Jump To's
+/// IDOK arm uses (jumpto_dlg.rs).
+fn on_pane_jump(hwnd: HWND) {
+    // SAFETY: read-only handle copy; the sends run outside.
+    let pane_hwnd = (unsafe { state_of(hwnd) }).map(|s| s.pane.hwnd);
+    let Some(pane_hwnd) = pane_hwnd.filter(|p| !p.is_invalid()) else {
+        return;
+    };
+    // SAFETY: the live pane child; GETNEXTITEM is a pure selection query
+    // (it walks the control's own state, no dispinfo callback).
+    let index = unsafe {
+        SendMessageW(
+            pane_hwnd,
+            LVM_GETNEXTITEM,
+            Some(WPARAM(-1isize as usize)),
+            Some(LPARAM(LVNI_SELECTED as isize)),
+        )
+        .0
+    };
+    if index < 0 {
+        return;
+    }
+    // SAFETY: read-only snapshot read; request_open pumps, so it runs
+    // outside the borrow.
+    let entry = (unsafe { state_of(hwnd) }).and_then(|s| s.pane.items.get(index as usize).cloned());
+    if let Some(entry) = entry {
+        request_open(hwnd, &entry.path, OpenOrigin::Nav(&entry));
+    }
 }
 
 /// View → Sharpen (#185, riviv-authored; ADR 0006): the display-effect
@@ -8540,6 +8801,11 @@ pub(crate) fn apply_drop_files(hwnd: HWND, hdrop: HDROP) {
                     }
                 }
             }
+            // #199: the shift-append flavor leaves the current image up —
+            // no navigation will carry the membership change, so the pane
+            // refreshes here; the replace flavor's home_open refreshes
+            // through its own display change (idempotent).
+            pane_refresh(hwnd);
             // Only the replace flavor homes (viv.c:3113-3116); a shift-append
             // leaves the current image up.
             if !is_shift {
@@ -8571,8 +8837,8 @@ pub(crate) fn apply_drop_files(hwnd: HWND, hdrop: HDROP) {
 /// Both axes clamp at 0 (a degenerate client must not hand CreateWindowExW
 /// or SetWindowPos a negative size). #79 (PMv2) will rework the chrome
 /// bookkeeping — re-derive from here when it does.
-fn view_target_size(client: (i32, i32), chrome_h: i32) -> (i32, i32) {
-    (client.0.max(0), (client.1 - chrome_h).max(0))
+fn view_target_size(client: (i32, i32), chrome_h: i32, pane_w: i32) -> (i32, i32) {
+    ((client.0 - pane_w).max(0), (client.1 - chrome_h).max(0))
 }
 
 /// The rect a WM_DPICHANGED should resize the window to (#79): the
@@ -8704,6 +8970,50 @@ fn on_size(hwnd: HWND) {
             );
         }
     }
+    // The pane dock (#199), after the bottom chrome and before the
+    // viewport: the first SIDE-docked chrome — a right-edge strip from
+    // the client top down to the bottom chrome. Visibility gates the
+    // width contribution (hidden = 0, so fullscreen and toggle-off both
+    // collapse it), mirroring how the bar's height() reports 0 when
+    // absent.
+    // SAFETY: the borrow spans the reads; the dock sends run after.
+    let pane_dock = (unsafe { state_of(hwnd) }).and_then(|state| {
+        if state.pane.hwnd.is_invalid() {
+            return None;
+        }
+        let mut client = RECT::default();
+        // SAFETY: read-only rect query on the live window.
+        let _ = unsafe { GetClientRect(hwnd, &mut client) };
+        // SAFETY: read-only visibility query on our live child.
+        let visible = unsafe { IsWindowVisible(state.pane.hwnd) }.as_bool();
+        let pane_w = if visible {
+            crate::pane::clamp_width(state.config.playlist_pane_width)
+        } else {
+            0
+        };
+        let chrome_h = crate::status::height(state.status) + state.controls.height();
+        let (rect, _) = crate::pane::layout(
+            (client.right - client.left, client.bottom - client.top),
+            chrome_h,
+            pane_w,
+        );
+        Some((state.pane.hwnd, rect))
+    });
+    if let Some((pane_hwnd, rect)) = pane_dock {
+        // SAFETY: our live child window; fail-soft like the docks above.
+        let _ = unsafe {
+            SetWindowPos(
+                pane_hwnd,
+                None,
+                rect.left,
+                rect.top,
+                rect.right - rect.left,
+                rect.bottom - rect.top,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            )
+        };
+        crate::pane::dock(pane_hwnd, rect);
+    }
     // The viewport child (#78): its client rect IS the render viewport.
     // Resize it AFTER the chrome docks above (the heights are live by then)
     // and BEFORE the re-anchor below (which reads the child's new rect —
@@ -8712,7 +9022,7 @@ fn on_size(hwnd: HWND) {
     // funnels through here, so this one site upholds the ADR 0002 D4
     // invariant: the child resize always trails the chrome heights.
     // SAFETY: the borrow spans only the handle copy, the client read, and
-    // the two height reads.
+    // the height/pane reads.
     let view_target = (unsafe { state_of(hwnd) }).and_then(|state| {
         if state.viewport.is_invalid() {
             return None;
@@ -8720,9 +9030,18 @@ fn on_size(hwnd: HWND) {
         let mut client = RECT::default();
         // SAFETY: read-only rect query on the live window.
         let _ = unsafe { GetClientRect(hwnd, &mut client) };
+        // SAFETY: read-only visibility query on our live child.
+        let pane_w = if !state.pane.hwnd.is_invalid()
+            && unsafe { IsWindowVisible(state.pane.hwnd) }.as_bool()
+        {
+            crate::pane::clamp_width(state.config.playlist_pane_width)
+        } else {
+            0
+        };
         let (wide, high) = view_target_size(
             (client.right - client.left, client.bottom - client.top),
             crate::status::height(state.status) + state.controls.height(),
+            pane_w,
         );
         Some((state.viewport, wide, high))
     });
@@ -9244,6 +9563,34 @@ unsafe extern "system" fn wnd_proc(
                 let nm = unsafe { &*(lparam.0 as *const NMMOUSE) };
                 on_status_nm_click(hwnd, nm);
             }
+            // The pane's notifications (#199): double-click = jump to the
+            // row (Enter rides the subclass's PANE_JUMP_MESSAGE instead);
+            // owner-data text requests fill from the state's snapshot —
+            // pure memory writes under the read borrow, no sends, so the
+            // control's synchronous wait cannot re-enter.
+            if !hdr.is_null()
+                // SAFETY: same two header fields.
+                && unsafe { (*hdr).idFrom } == crate::pane::PANE_ID as usize
+            {
+                // SAFETY: the code field again.
+                match unsafe { (*hdr).code } {
+                    NM_DBLCLK => on_pane_jump(hwnd),
+                    LVN_GETDISPINFO => {
+                        // SAFETY: an LVN_GETDISPINFO carries NMLVDISPINFOW
+                        // in the same notification block.
+                        let di = lparam.0 as *mut NMLVDISPINFOW;
+                        // SAFETY: read-only snapshot borrow; disp_info only
+                        // writes the ListView's own text buffer.
+                        // SAFETY: read-only snapshot borrow; disp_info's
+                        // contract covers the notification pointer.
+                        if let Some(state) = unsafe { state_of(hwnd) } {
+                            // SAFETY: di is the NMLVDISPINFOW validated above.
+                            unsafe { crate::pane::disp_info(&state.pane, di) };
+                        }
+                    }
+                    _ => {}
+                }
+            }
             // SAFETY: upstream breaks out of its switch onto the default
             // return; the frame's own handling for unmatched notifications
             // is the default procedure's.
@@ -9271,6 +9618,12 @@ unsafe extern "system" fn wnd_proc(
                 // the default procedure owns the system command.
                 unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
             }
+        }
+        // The pane's Enter (#199): the subclassed ListView forwards the
+        // key; the jump is the same contract as the double-click arm.
+        crate::pane::PANE_JUMP_MESSAGE => {
+            on_pane_jump(hwnd);
+            LRESULT(0)
         }
         // The background decode's kick: the queue holds the replies, this
         // just wakes the UI thread to drain them (upstream _VIV_WM_REPLY).
@@ -9796,6 +10149,9 @@ pub(crate) fn run() -> Result<(), String> {
         // children and stored here; invalid until then.
         viewport: HWND::default(),
         controls: crate::toolbar::ControlsSet::default(),
+        // The playlist pane (#199) is created in run() next to the
+        // viewport; invalid until then.
+        pane: crate::pane::Pane::default(),
         menu: HMENU::default(),
         status_file_not_found: false,
         status_load_failed: false,
@@ -10040,13 +10396,27 @@ pub(crate) fn run() -> Result<(), String> {
     let mut client = RECT::default();
     // SAFETY: read-only rect query on the live window.
     let _ = unsafe { GetClientRect(hwnd, &mut client) };
-    // SAFETY: the borrow spans only the two height reads.
-    let (status_h, controls_h) = (unsafe { state_of(hwnd) }).map_or((0, 0), |state| {
-        (crate::status::height(state.status), state.controls.height())
+    // SAFETY: the borrow spans only the two height reads and the pane
+    // reads.
+    let (status_h, controls_h, pane_w) = (unsafe { state_of(hwnd) }).map_or((0, 0, 0), |state| {
+        // The pane does not exist yet (created below) — but the config
+        // already knows whether it WILL show; size the first viewport
+        // against that truth so the pane's first dock never overlaps.
+        let pane_w = if state.config.show_playlist_pane != 0 {
+            crate::pane::clamp_width(state.config.playlist_pane_width)
+        } else {
+            0
+        };
+        (
+            crate::status::height(state.status),
+            state.controls.height(),
+            pane_w,
+        )
     });
     let (view_w, view_h) = view_target_size(
         (client.right - client.left, client.bottom - client.top),
         status_h + controls_h,
+        pane_w,
     );
     // SAFETY: all parameters valid; the child dies with its parent (Windows
     // destroys children first — before the owner's WM_NCDESTROY frees the
@@ -10073,6 +10443,28 @@ pub(crate) fn run() -> Result<(), String> {
     if let Some(state) = unsafe { state_of(hwnd) } {
         state.viewport = view_hwnd;
     }
+
+    // The playlist pane (#199), created after the viewport so its z-order
+    // sibling sits above it (the viewport is HWND_BOTTOM-pinned on every
+    // on_size regardless). Per config it shows now or waits hidden for
+    // the toggle — a failed creation degrades silently like the status
+    // bar's (the viewer keeps working, just without the pane).
+    match crate::pane::create(hwnd) {
+        Ok(pane) => {
+            // SAFETY: the borrow spans only the field store.
+            if let Some(state) = unsafe { state_of(hwnd) } {
+                state.pane = pane;
+                if state.config.show_playlist_pane == 0 {
+                    // SAFETY: our live child.
+                    let _ = unsafe { ShowWindow(state.pane.hwnd, SW_HIDE) };
+                }
+            }
+        }
+        Err(msg) => eprintln!("playlist pane unavailable: {msg}"),
+    }
+    // The first snapshot and dock ride the first on_size (the show below
+    // triggers it); seed the content now so the pane is never born empty.
+    pane_refresh(hwnd);
 
     // The startup renderer request (#80 design §3's stack): read before
     // the show, so the first paint already has a stack. Init failure is
@@ -10649,26 +11041,36 @@ mod tests {
 
     #[test]
     fn view_target_size_passes_a_normal_client_through_minus_the_chrome() {
-        // The everyday path: the width is the client width as-is, the
-        // height loses exactly the bottom-docked chrome (status bar +
-        // controls strip).
-        assert_eq!(view_target_size((1920, 1080), 100), (1920, 980));
+        // The everyday path: the width is the client width as-is (pane
+        // off), the height loses exactly the bottom-docked chrome (status
+        // bar + controls strip).
+        assert_eq!(view_target_size((1920, 1080), 100, 0), (1920, 980));
     }
 
     #[test]
     fn view_target_size_never_hands_out_a_negative_dimension() {
         // Chrome taller than the client (a degenerate short window): the
         // negative difference clamps to 0 instead of reaching
-        // CreateWindowExW/SetWindowPos as a negative size.
-        assert_eq!(view_target_size((800, 60), 100), (800, 0));
+        // CreateWindowExW/SetWindowPos as a negative size — on BOTH axes
+        // (#199: the pane's width contribution clamps the same way).
+        assert_eq!(view_target_size((800, 60), 100, 0), (800, 0));
+        assert_eq!(view_target_size((100, 60), 100, 260), (0, 0));
+    }
+
+    #[test]
+    fn view_target_size_subtracts_the_pane_side_dock() {
+        // #199: a visible pane eats the width; 0 collapses to no pane
+        // (hidden in fullscreen / toggled off).
+        assert_eq!(view_target_size((1920, 1080), 100, 260), (1660, 980));
+        assert_eq!(view_target_size((1920, 1080), 100, 1920), (0, 980));
     }
 
     #[test]
     fn view_target_size_degenerates_to_zero_for_a_nonpositive_client() {
         // A zero or negative client rect (e.g. the pre-layout query in
         // run()) yields (0, 0) on both axes — never negative.
-        assert_eq!(view_target_size((0, 0), 10), (0, 0));
-        assert_eq!(view_target_size((-5, -5), 0), (0, 0));
+        assert_eq!(view_target_size((0, 0), 10, 0), (0, 0));
+        assert_eq!(view_target_size((-5, -5), 0, 0), (0, 0));
     }
 
     // ---- WM_DPICHANGED rect adoption (#79) ----

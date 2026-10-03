@@ -342,6 +342,9 @@ fn apply_rename(owner: HWND, old: &[u16], new_full: &[u16]) {
         }
     }
     if applied {
+        // #199: the renamed row's path changed — the pane's snapshot holds
+        // the old one; rebuild before the retitle's selection sync runs.
+        crate::window::pane_refresh(owner);
         refresh_title(owner);
     }
 }

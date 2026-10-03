@@ -115,6 +115,14 @@ pub(crate) struct Config {
     pub(crate) multiple_instances: i32,
     pub(crate) show_status: i32,
     pub(crate) show_controls: i32,
+    /// The playlist pane's visibility (#199, riviv-authored — upstream
+    /// never built the viv.c:36 pane). Default off: a new surface must
+    /// not appear uninvited (the zero-perturbation negative control).
+    pub(crate) show_playlist_pane: i32,
+    /// The pane's docked width in px (#199). The domain lives in
+    /// `pane::clamp_width` (120..=720, default 260); the raw value is
+    /// clamped at every read so a hand-edited ini cannot break layout.
+    pub(crate) playlist_pane_width: i32,
     pub(crate) prevent_sleep: i32,
     pub(crate) loop_animations_once: i32,
     pub(crate) mouse_wheel_action: i32,
@@ -226,6 +234,8 @@ impl Default for Config {
             multiple_instances: 0,
             show_status: 1,
             show_controls: 1,
+            show_playlist_pane: 0,
+            playlist_pane_width: crate::pane::DEFAULT_WIDTH,
             prevent_sleep: 1,
             loop_animations_once: 1,
             mouse_wheel_action: 0,
@@ -402,6 +412,8 @@ impl Config {
         apply_byte!(show_status = "show_status");
         apply_byte!(pixel_info = "statusbar_pixel_info");
         apply_byte!(show_controls = "show_controls");
+        apply_byte!(show_playlist_pane = "show_playlist_pane");
+        apply_int!(playlist_pane_width = "playlist_pane_width");
         apply_byte!(auto_zoom = "auto_zoom");
         apply_byte!(auto_zoom_type = "auto_zoom_type");
         apply_int!(auto_fit_wide_mul = "auto_fit_wide_mul");
@@ -495,7 +507,7 @@ impl Config {
         if root && self.appdata != 0 {
             return vec![("appdata".to_string(), i(self.appdata))];
         }
-        let int_pairs: [(&str, String); 65] = [
+        let int_pairs: [(&str, String); 67] = [
             ("x", i(self.x)),
             ("y", i(self.y)),
             ("wide", i(self.wide)),
@@ -517,6 +529,8 @@ impl Config {
             ("show_status", i(self.show_status)),
             ("statusbar_pixel_info", i(self.pixel_info)),
             ("show_controls", i(self.show_controls)),
+            ("show_playlist_pane", i(self.show_playlist_pane)),
+            ("playlist_pane_width", i(self.playlist_pane_width)),
             ("auto_zoom", i(self.auto_zoom)),
             ("auto_zoom_type", i(self.auto_zoom_type)),
             ("auto_fit_wide_mul", i(self.auto_fit_wide_mul)),
@@ -724,17 +738,18 @@ mod tests {
         assert_eq!(back, c, "every save key must be a load key");
         // 61 int keys + the riviv-authored keep_zoom (#68) + sharpen
         // (#185) + white_balance (#191) + contrast (#193) + the renderer
-        // string key (#80) + one *_keys line per command in Cmd::ALL
-        // order (125 rows now — #193's tail append added its own) —
+        // string key (#80) + the pane's two keys (#199) + one *_keys line
+        // per command in Cmd::ALL order (126 rows now — #199's tail
+        // append added its own) —
         // bound rows and empty rows alike (#42's shell septet, #43's
-        // file-management octet, #178's/#185's/#191's/#193's
+        // file-management octet, #178's/#185's/#191's/#193's/#199's
         // tail-appended rows among them; no bound-row count is pinned
         // here — the DEFAULT_KEYS table is its own source of truth and a
         // hand-counted number would only drift).
         assert_eq!(
             c.to_pairs(false).len(),
-            190,
-            "the save table + keep_zoom + sharpen + white_balance + contrast + renderer"
+            193,
+            "the save table + keep_zoom + sharpen + white_balance + contrast + renderer + pane pair"
         );
     }
 
@@ -785,7 +800,7 @@ mod tests {
         let c = Config::default();
         assert_eq!(
             c.to_pairs(true).len(),
-            190,
+            193,
             "active store writes the full table"
         );
         let c = Config {

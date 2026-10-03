@@ -5,6 +5,11 @@
 - 基线:master `6474c2a`(v0.4.0 收官);exe 6,859,776 B(v0.4.0 发布口径,本票零代码变更不重测);test 817 过/0 fail/3 ignored(v0.4.0 发版口径,commit 钩子将亲跑)
 - 证据性质:上游锚点/代码锚点均为本会话亲读(grep/Read);**本轮未跑任何新探针**——布局实测类结论(auto-fit 计入面板宽的观感、巨列表滚动性能)留给实现票
 
+## 追记(2026-10-03,用户拍板)
+
+- 用户裁定原文:「我没啥要排版的,保持和原版软件一致就行」。因原版对该面板零实现零规格,可执行读法 = **六题全按推荐项 + 观感对齐原版既有 chrome**(全停靠、系统原生控件、极简表面):O1=A 停靠 pane(右缘;原版 chrome 无浮动窗先例)、O2a=A 快照重建、O2b=A 固定名序(Jump To=原版唯一列表 UI 先例)、O3=A v1 即 owner-data 虚拟化、O4=A v1 仅选中/双击/Enter 跳转、O5=A 开关+宽度两 ini 键(参照原版持久化 toolbar/几何惯例)、O6=A 默认无键、Controls 页可绑(原版键表无 toolbar toggle 键)。
+- auto-fit 计入面板宽(窗宽 = 面板 + 图像有效区,图像保持完整可见——与「窗随图缩放」语义一致);fullscreen 藏面板随其余 chrome 退出、恢复时还原(原版 fullscreen=纯图面)。
+
 ## 结论一句话
 
 playlist pane 是 viv.c:36 的一句愿望(`[HIGH] playlist pane or tool window`),上游零实现、零规格(死菜单枚举 `_VIV_MENU_NAVIGATE_PLAYLIST` 证之;上游无应用级 .rc,菜单全代码建表,无 UI 规可对);riviv 侧模型与列表构建**全部现成**——playlist.rs(#6/#39)承载全部播放列表语义,jumpto_dlg.rs:98-132 的 `entries().to_vec()` → `nav_compare` 排序 → `filename_part` 展示就是面板的列表构建链,故本特性 ≈ **把 Jump To 对话框做成持久停靠/浮动面板 + 导航实时高亮同步**;新工作集中在 UI 壳、三个布局侵入面(#80 viewport 几何 / auto-fit 窗口缩放 / fullscreen)、大列表虚拟化、同步策略;beyond-upstream 表面照 #68 keep_zoom、#178 undo-delete 先例记 README Differences。
