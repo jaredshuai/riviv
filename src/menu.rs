@@ -2921,51 +2921,66 @@ mod tests {
                 }
             }
         }
-        let grandfathered = |lang: loc::Language, slot: Slot, c: char| -> bool {
-            // Upstream's own en_us.h/zh_cn.h carry these double claims,
-            // quoted verbatim by the en/zh-CN tables (and zh-Hant reuses
-            // the zh-CN letters per entry, inheriting the same shape).
-            // Windows cycles focus between duplicate access letters, so
-            // the pairs are legal as shipped; the test's live net is
-            // that NO NEW collision can enter any language.
-            // EN: View B = Status &Bar/&Best Fit (en_us.h:71);
-            // Pan/Scan C = In&crease Height/De&cre&ase Height
-            // (en_us.h:95-96, the latter's double & is upstream's own
-            // typo — Windows honors the first); Pan/Scan D = &Decrease
-            // Size/Move &Down; Animation I = the increase-rate pair.
-            // ZH: File D/P (the delete and properties pairs), Navigate S,
-            // View B/F/W, Pan/Scan D/W (the move-vs-size family), and
-            // Animation I mirror the same rows in zh_cn.h's letters.
-            matches!(
-                (lang, slot, c),
-                (loc::Language::English, Slot::View, 'B')
-                    | (loc::Language::English, Slot::ViewPanScan, 'C')
-                    | (loc::Language::English, Slot::ViewPanScan, 'D')
-                    | (loc::Language::English, Slot::Animation, 'I')
-                    | (loc::Language::ChineseSimplified, Slot::File, 'D')
-                    | (loc::Language::ChineseSimplified, Slot::File, 'P')
-                    | (loc::Language::ChineseSimplified, Slot::Navigate, 'S')
-                    | (loc::Language::ChineseSimplified, Slot::View, 'B')
-                    | (loc::Language::ChineseSimplified, Slot::View, 'F')
-                    | (loc::Language::ChineseSimplified, Slot::View, 'W')
-                    | (loc::Language::ChineseSimplified, Slot::ViewPanScan, 'D')
-                    | (loc::Language::ChineseSimplified, Slot::ViewPanScan, 'W')
-                    | (loc::Language::ChineseSimplified, Slot::Animation, 'I')
-                    | (loc::Language::ChineseTraditional, Slot::File, 'D')
-                    | (loc::Language::ChineseTraditional, Slot::File, 'P')
-                    | (loc::Language::ChineseTraditional, Slot::Navigate, 'S')
-                    | (loc::Language::ChineseTraditional, Slot::View, 'B')
-                    | (loc::Language::ChineseTraditional, Slot::View, 'F')
-                    | (loc::Language::ChineseTraditional, Slot::View, 'W')
-                    | (loc::Language::ChineseTraditional, Slot::ViewPanScan, 'D')
-                    | (loc::Language::ChineseTraditional, Slot::ViewPanScan, 'W')
-                    | (loc::Language::ChineseTraditional, Slot::Animation, 'I')
-            )
-        };
-        for (lang, slot, c) in collisions {
+        // Upstream's own en_us.h/zh_cn.h carry these double claims,
+        // quoted verbatim by the en/zh-CN tables (and zh-Hant reuses
+        // the zh-CN letters per entry, inheriting the same shape).
+        // Windows cycles focus between duplicate access letters, so
+        // the pairs are legal as shipped; the test's live net is that
+        // no NEW collision can enter any language — neither a fresh
+        // (language, level, letter) key nor a THIRD row joining one of
+        // these pairs (each key must stay exactly one duplicate claim,
+        // i.e. two rows).
+        // EN: View B = Status &Bar/&Best Fit (en_us.h:71);
+        // Pan/Scan C = In&crease Height/De&cre&ase Height
+        // (en_us.h:95-96, the latter's double & is upstream's own
+        // typo — Windows honors the first); Pan/Scan D = &Decrease
+        // Size/Move &Down; Animation I = the increase-rate pair.
+        // ZH: File D/P (the delete and properties pairs), Navigate S,
+        // View B/F/W, Pan/Scan D/W (the move-vs-size family), and
+        // Animation I mirror the same rows in zh_cn.h's letters.
+        const GRANDFATHERED_PAIRS: &[(loc::Language, Slot, char)] = &[
+            (loc::Language::English, Slot::View, 'B'),
+            (loc::Language::English, Slot::ViewPanScan, 'C'),
+            (loc::Language::English, Slot::ViewPanScan, 'D'),
+            (loc::Language::English, Slot::Animation, 'I'),
+            (loc::Language::ChineseSimplified, Slot::File, 'D'),
+            (loc::Language::ChineseSimplified, Slot::File, 'P'),
+            (loc::Language::ChineseSimplified, Slot::Navigate, 'S'),
+            (loc::Language::ChineseSimplified, Slot::View, 'B'),
+            (loc::Language::ChineseSimplified, Slot::View, 'F'),
+            (loc::Language::ChineseSimplified, Slot::View, 'W'),
+            (loc::Language::ChineseSimplified, Slot::ViewPanScan, 'D'),
+            (loc::Language::ChineseSimplified, Slot::ViewPanScan, 'W'),
+            (loc::Language::ChineseSimplified, Slot::Animation, 'I'),
+            (loc::Language::ChineseTraditional, Slot::File, 'D'),
+            (loc::Language::ChineseTraditional, Slot::File, 'P'),
+            (loc::Language::ChineseTraditional, Slot::Navigate, 'S'),
+            (loc::Language::ChineseTraditional, Slot::View, 'B'),
+            (loc::Language::ChineseTraditional, Slot::View, 'F'),
+            (loc::Language::ChineseTraditional, Slot::View, 'W'),
+            (loc::Language::ChineseTraditional, Slot::ViewPanScan, 'D'),
+            (loc::Language::ChineseTraditional, Slot::ViewPanScan, 'W'),
+            (loc::Language::ChineseTraditional, Slot::Animation, 'I'),
+        ];
+        let mut counts: Vec<((loc::Language, Slot, char), usize)> = Vec::new();
+        for key in &collisions {
+            match counts.iter_mut().find(|(k, _)| k == key) {
+                Some((_, n)) => *n += 1,
+                None => counts.push((*key, 1)),
+            }
+        }
+        for (key, count) in counts {
             assert!(
-                grandfathered(lang, slot, c),
-                "{lang:?}: access letter {c:?} claimed twice under {slot:?}"
+                GRANDFATHERED_PAIRS.contains(&key),
+                "{:?}: access letter {:?} claimed twice under {:?}",
+                key.0,
+                key.2,
+                key.1
+            );
+            assert_eq!(
+                count, 1,
+                "{:?}: {:?} under {:?} grew past its grandfathered pair",
+                key.0, key.2, key.1
             );
         }
     }

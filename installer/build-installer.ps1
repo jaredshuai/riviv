@@ -9,7 +9,10 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-if ($Lang -ne "Chinese" -and $Lang -ne "ChineseTraditional" -and $Lang -ne "English") {
+# -cne, not -ne: PowerShell comparisons are case-insensitive by default,
+# but the !if comparisons in riviv.nsi are case-sensitive — a lowercased
+# -Lang must fail here rather than silently build English downstream.
+if (($Lang -cne "Chinese") -and ($Lang -cne "ChineseTraditional") -and ($Lang -cne "English")) {
     # riviv.nsi maps only the exact values "Chinese"/"ChineseTraditional" to
     # their builds; anything else silently builds English — fail the typo loudly.
     throw "Lang must be 'Chinese', 'ChineseTraditional' or 'English' (got '$Lang')"
