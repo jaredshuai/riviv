@@ -1177,27 +1177,32 @@ mod tests {
     }
 
     #[test]
-    fn every_control_has_a_localized_label_in_both_languages() {
-        for page in &PAGES {
-            assert!(!loc::get_for(loc::Language::English, page.title).is_empty());
+    fn every_control_has_a_localized_label_in_every_language() {
+        for page in PAGES {
+            for lang in loc::Language::ALL {
+                assert!(
+                    !loc::get_for(lang, page.title).is_empty(),
+                    "{lang:?} page title"
+                );
+            }
             for c in page.controls {
-                assert!(
-                    !loc::get_for(loc::Language::English, c.label).is_empty(),
-                    "{:?}",
-                    c.label
-                );
-                assert!(
-                    !loc::get_for(loc::Language::ChineseSimplified, c.label).is_empty(),
-                    "{:?}",
-                    c.label
-                );
+                for lang in loc::Language::ALL {
+                    assert!(
+                        !loc::get_for(lang, c.label).is_empty(),
+                        "{lang:?} {:?}",
+                        c.label
+                    );
+                }
                 if let Kind::Combo(entries) = c.kind {
                     assert!(!entries.is_empty());
                     for e in entries {
-                        assert!(!loc::get_for(loc::Language::English, e.label).is_empty());
-                        assert!(
-                            !loc::get_for(loc::Language::ChineseSimplified, e.label).is_empty()
-                        );
+                        for lang in loc::Language::ALL {
+                            assert!(
+                                !loc::get_for(lang, e.label).is_empty(),
+                                "{lang:?} {:?}",
+                                e.label
+                            );
+                        }
                     }
                 }
             }

@@ -2580,18 +2580,21 @@ mod tests {
     }
 
     #[test]
-    fn menu_strings_are_non_empty_in_both_languages_for_every_entry() {
-        // Every localized row must resolve to real text in BOTH tables —
+    fn menu_strings_are_non_empty_in_every_language_for_every_entry() {
+        // Every localized row must resolve to real text in EVERY table —
         // an empty caption would append a blank menu row (or, for the
-        // hidden rows, a blank Controls-list entry).
+        // hidden rows, a blank Controls-list entry). `Language::ALL` is
+        // the registration point, so a future fourth table joins this
+        // net without touching the seam (#203).
         for entry in ENTRIES {
             let id = match entry {
                 Entry::Separator { .. } => continue,
                 Entry::Popup { loc, .. } => *loc,
                 Entry::Item { loc, .. } | Entry::HiddenItem { loc, .. } => *loc,
             };
-            assert!(!loc::get_for(loc::Language::English, id).is_empty());
-            assert!(!loc::get_for(loc::Language::ChineseSimplified, id).is_empty());
+            for lang in loc::Language::ALL {
+                assert!(!loc::get_for(lang, id).is_empty(), "{lang:?} {id:?}");
+            }
         }
     }
 
@@ -2865,17 +2868,105 @@ mod tests {
         }
     }
 
-    /// Every context row's caption resolves to real text in BOTH language
-    /// tables (an empty caption would append a blank row).
+    /// Every context row's caption resolves to real text in EVERY table
+    /// (an empty caption would append a blank row).
     #[test]
-    fn context_rows_carry_non_empty_captions_in_both_languages() {
+    fn context_rows_carry_non_empty_captions_in_every_language() {
         for row in context_rows(false) {
             let id = match row {
                 ContextRow::Command { label, .. } | ContextRow::Popup { label, .. } => label,
                 ContextRow::Pop | ContextRow::Separator => continue,
             };
-            assert!(!loc::get_for(loc::Language::English, id).is_empty());
-            assert!(!loc::get_for(loc::Language::ChineseSimplified, id).is_empty());
+            for lang in loc::Language::ALL {
+                assert!(!loc::get_for(lang, id).is_empty(), "{lang:?} {id:?}");
+            }
+        }
+    }
+
+    /// O6 (#203): within one menu level — everything sharing a `parent`
+    /// slot, popup captions included — no two displayed rows may claim
+    /// the same access letter, per language. The CJK tables' mnemonics
+    /// are explicit `(&X)` annotations rather than letters derived from
+    /// the word, so a collision is a data bug, not a translation
+    /// accident; `HiddenItem` rows are skipped because the menu-bar
+    /// build filters them out (upstream's MF_OWNERDRAW filter, the same
+    /// reason they never display a caption in a menu). Upstream's own
+    /// en_us.h/zh_cn.h carry a handful of double claims (inventoried in
+    /// the grandfathered list below) — the tables quote those verbatim,
+    /// Windows cycles focus between duplicate claims, and the test's
+    /// live net is that no NEW collision can enter any language.
+    #[test]
+    fn mnemonics_do_not_collide_within_a_menu_level_in_any_language() {
+        let mnemonic = |s: &str| {
+            s.chars()
+                .zip(s.chars().skip(1))
+                .find(|(a, _)| *a == '&')
+                .map(|(_, b)| b.to_ascii_uppercase())
+        };
+        let mut collisions: Vec<(loc::Language, Slot, char)> = Vec::new();
+        for lang in loc::Language::ALL {
+            let mut seen: Vec<(Slot, char)> = Vec::new();
+            for entry in ENTRIES {
+                let (id, parent) = match entry {
+                    Entry::Separator { .. } | Entry::HiddenItem { .. } => continue,
+                    Entry::Popup { loc, parent, .. } => (*loc, *parent),
+                    Entry::Item { loc, parent, .. } => (*loc, *parent),
+                };
+                if let Some(c) = mnemonic(loc::get_for(lang, id)) {
+                    if seen.contains(&(parent, c)) {
+                        collisions.push((lang, parent, c));
+                    } else {
+                        seen.push((parent, c));
+                    }
+                }
+            }
+        }
+        let grandfathered = |lang: loc::Language, slot: Slot, c: char| -> bool {
+            // Upstream's own en_us.h/zh_cn.h carry these double claims,
+            // quoted verbatim by the en/zh-CN tables (and zh-Hant reuses
+            // the zh-CN letters per entry, inheriting the same shape).
+            // Windows cycles focus between duplicate access letters, so
+            // the pairs are legal as shipped; the test's live net is
+            // that NO NEW collision can enter any language.
+            // EN: View B = Status &Bar/&Best Fit (en_us.h:71);
+            // Pan/Scan C = In&crease Height/De&cre&ase Height
+            // (en_us.h:95-96, the latter's double & is upstream's own
+            // typo — Windows honors the first); Pan/Scan D = &Decrease
+            // Size/Move &Down; Animation I = the increase-rate pair.
+            // ZH: File D/P (the delete and properties pairs), Navigate S,
+            // View B/F/W, Pan/Scan D/W (the move-vs-size family), and
+            // Animation I mirror the same rows in zh_cn.h's letters.
+            matches!(
+                (lang, slot, c),
+                (loc::Language::English, Slot::View, 'B')
+                    | (loc::Language::English, Slot::ViewPanScan, 'C')
+                    | (loc::Language::English, Slot::ViewPanScan, 'D')
+                    | (loc::Language::English, Slot::Animation, 'I')
+                    | (loc::Language::ChineseSimplified, Slot::File, 'D')
+                    | (loc::Language::ChineseSimplified, Slot::File, 'P')
+                    | (loc::Language::ChineseSimplified, Slot::Navigate, 'S')
+                    | (loc::Language::ChineseSimplified, Slot::View, 'B')
+                    | (loc::Language::ChineseSimplified, Slot::View, 'F')
+                    | (loc::Language::ChineseSimplified, Slot::View, 'W')
+                    | (loc::Language::ChineseSimplified, Slot::ViewPanScan, 'D')
+                    | (loc::Language::ChineseSimplified, Slot::ViewPanScan, 'W')
+                    | (loc::Language::ChineseSimplified, Slot::Animation, 'I')
+                    | (loc::Language::ChineseTraditional, Slot::File, 'D')
+                    | (loc::Language::ChineseTraditional, Slot::File, 'P')
+                    | (loc::Language::ChineseTraditional, Slot::Navigate, 'S')
+                    | (loc::Language::ChineseTraditional, Slot::View, 'B')
+                    | (loc::Language::ChineseTraditional, Slot::View, 'F')
+                    | (loc::Language::ChineseTraditional, Slot::View, 'W')
+                    | (loc::Language::ChineseTraditional, Slot::ViewPanScan, 'D')
+                    | (loc::Language::ChineseTraditional, Slot::ViewPanScan, 'W')
+                    | (loc::Language::ChineseTraditional, Slot::Animation, 'I')
+            )
+        };
+        for (lang, slot, c) in collisions {
+            assert!(
+                grandfathered(lang, slot, c),
+                "{lang:?}: access letter {c:?} claimed twice under {slot:?}"
+            );
         }
     }
 
