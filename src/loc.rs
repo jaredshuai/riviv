@@ -1418,7 +1418,7 @@ const ZH_HANT: [&str; Id::COUNT] = [
     "捲動",                              // ActionScroll
     "放大",                              // ActionZoomIn
     "下一張影像",                        // ActionNextImage
-    "內容功能表",                        // ActionContextMenu
+    "快顯功能表",                        // ActionContextMenu
     "縮小",                              // ActionZoomOut
     "上一張影像",                        // ActionPreviousImage
     "縮放",                              // ActionZoom
