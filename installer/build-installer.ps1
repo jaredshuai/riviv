@@ -1,5 +1,5 @@
 # Build the riviv NSIS installer (#26).
-# Usage: .\build-installer.ps1 [-Lang Chinese|English] [-SkipBuild]
+# Usage: .\build-installer.ps1 [-Lang Chinese|ChineseTraditional|English] [-SkipBuild]
 #   -Lang: installer language (default Chinese, upstream's default)
 #   -SkipBuild: skip cargo build --release (reuse target/release/riviv.exe)
 # Requires NSIS 3.x (makensis.exe) — e.g. `winget install NSIS.NSIS`.
@@ -9,10 +9,10 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-if ($Lang -ne "Chinese" -and $Lang -ne "English") {
-    # riviv.nsi maps only the exact value "Chinese" to the Chinese build;
-    # anything else silently builds English — fail the typo loudly.
-    throw "Lang must be 'Chinese' or 'English' (got '$Lang')"
+if ($Lang -ne "Chinese" -and $Lang -ne "ChineseTraditional" -and $Lang -ne "English") {
+    # riviv.nsi maps only the exact values "Chinese"/"ChineseTraditional" to
+    # their builds; anything else silently builds English — fail the typo loudly.
+    throw "Lang must be 'Chinese', 'ChineseTraditional' or 'English' (got '$Lang')"
 }
 $repo = Split-Path -Parent (Split-Path -Parent $PSCommandPath)
 $nsisDir = Join-Path $repo "installer\nsis"
