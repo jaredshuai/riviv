@@ -49,11 +49,19 @@ XPStyle on
 	!define LANG_CODE "zh-CN"
 	!define LANG_NAME "Chinese"
 !else
-	!define LICENSE_FILE "installer_license_English.txt"
-	!define INSTALL_OPTIONS_FILE "InstallOptions.ini"
-	!define INSTALL_OPTIONS2_FILE "InstallOptions2.ini"
-	!define LANG_CODE "en-US"
-	!define LANG_NAME "English"
+	!if "${LANG}" == "ChineseTraditional"
+		!define LICENSE_FILE "installer_license_ChineseTraditional.txt"
+		!define INSTALL_OPTIONS_FILE "InstallOptions_ChineseTraditional.ini"
+		!define INSTALL_OPTIONS2_FILE "InstallOptions2_ChineseTraditional.ini"
+		!define LANG_CODE "zh-TW"
+		!define LANG_NAME "ChineseTraditional"
+	!else
+		!define LICENSE_FILE "installer_license_English.txt"
+		!define INSTALL_OPTIONS_FILE "InstallOptions.ini"
+		!define INSTALL_OPTIONS2_FILE "InstallOptions2.ini"
+		!define LANG_CODE "en-US"
+		!define LANG_NAME "English"
+	!endif
 !endif
 
 ; riviv ships x64 only for now.
@@ -99,7 +107,11 @@ Page custom InstallOptions2
 !if "${LANG}" == "Chinese"
 	!insertmacro MUI_LANGUAGE "SimpChinese"
 !else
-	!insertmacro MUI_LANGUAGE "English"
+	!if "${LANG}" == "ChineseTraditional"
+		!insertmacro MUI_LANGUAGE "TradChinese"
+	!else
+		!insertmacro MUI_LANGUAGE "English"
+	!endif
 !endif
 
 !insertmacro GetOptions
@@ -406,11 +418,15 @@ Function InstallOptions
 	!insertmacro INSTALLOPTIONS_INITDIALOG "${INSTALL_OPTIONS_FILE}"
 
 	; upstream ships these headers English in both languages; the port
-	; localizes them for the Chinese build (port deviation, PR #35).
+	; localizes them for the Chinese builds (port deviation, PR #35).
 	!if "${LANG}" == "Chinese"
 		!insertmacro MUI_HEADER_TEXT "选择安装选项" "选择其他安装选项。"
 	!else
-		!insertmacro MUI_HEADER_TEXT "Select Install Options" "Choose any additional install options."
+		!if "${LANG}" == "ChineseTraditional"
+			!insertmacro MUI_HEADER_TEXT "選擇安裝選項" "選擇其他安裝選項。"
+		!else
+			!insertmacro MUI_HEADER_TEXT "Select Install Options" "Choose any additional install options."
+		!endif
 	!endif
 
 	!insertmacro INSTALLOPTIONS_SHOW
@@ -424,7 +440,11 @@ Function InstallOptions2
 	!if "${LANG}" == "Chinese"
 		!insertmacro MUI_HEADER_TEXT "选择安装选项" "选择其他安装选项。"
 	!else
-		!insertmacro MUI_HEADER_TEXT "Select Install Options" "Choose any additional install options."
+		!if "${LANG}" == "ChineseTraditional"
+			!insertmacro MUI_HEADER_TEXT "選擇安裝選項" "選擇其他安裝選項。"
+		!else
+			!insertmacro MUI_HEADER_TEXT "Select Install Options" "Choose any additional install options."
+		!endif
 	!endif
 
 	!insertmacro INSTALLOPTIONS_SHOW

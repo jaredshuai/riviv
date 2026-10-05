@@ -1,5 +1,6 @@
-//! Bilingual (en-US / zh-CN) string tables + one-shot system-language
-//! detection (upstream `localization.c`/`localization.h`).
+//! Trilingual (en-US / zh-CN / zh-Hant) string tables + one-shot
+//! system-language detection (upstream `localization.c`/`localization.h`;
+//! the zh-Hant table is riviv's own — upstream never shipped one, #203).
 //!
 //! riviv carries ONLY the IDs it already displays — the enum grows with
 //! each consuming issue (menus #23, the options dialog #24, associations +
@@ -7,22 +8,28 @@
 //! full 247-ID table as dead code. Upstream picks the language once at
 //! startup from `GetUserDefaultUILanguage` (localization.c:55-73) — the
 //! traditional-Chinese langids included, mapped onto the simplified table —
-//! and has no runtime switching; riviv mirrors that: a process-wide
-//! default of English, overwritten once by `init` before any UI exists
-//! (unit tests never call `init`, so pure-function tests see English).
+//! and has no runtime switching; riviv mirrors the detect-once semantics
+//! but owns a real zh-Hant table, so those langids land on it (#203): a
+//! process-wide default of English, overwritten once by `init` before any
+//! UI exists (unit tests never call `init`, so pure-function tests see
+//! English).
 //!
-//! The entries are the upstream strings verbatim
+//! The en-US/zh-CN entries are the upstream strings verbatim
 //! (localization_en_us.h/localization_zh_cn.h, cited per entry) except the
-//! app name, which carries the riviv brand in BOTH languages — upstream
-//! leaves "void Image Viewer" untranslated in its zh table too.
+//! app name, which carries the riviv brand in every language — upstream
+//! leaves "void Image Viewer" untranslated in its zh table too. The
+//! zh-Hant entries are riviv-authored (Taiwanese terminology; mnemonics
+//! reuse the zh-CN letters per entry so the per-layer collision design
+//! carries over unchanged).
 
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use windows::Win32::Globalization::GetUserDefaultUILanguage;
 
 /// A displayable string. Variant order must match the table order in
-/// `EN_US` and `ZH_CN` (both are `[&str; Id::COUNT]`, so a length or
-/// order drift is a compile error / test failure, not a runtime hazard).
+/// `EN_US`, `ZH_CN` and `ZH_HANT` (each is `[&str; Id::COUNT]`, so a
+/// length or order drift is a compile error / test failure, not a runtime
+/// hazard).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Id {
     /// Window-title suffix and message-box caption base
@@ -520,7 +527,7 @@ pub(crate) enum Id {
     /// The sharpen combo's off row — the docs domain's 0 (#185).
     OptionsSharpenOff,
     /// The sharpen combo's level rows 1..=10 (#185; numerals are their
-    /// own localization in both tables).
+    /// own localization in every table).
     OptionsSharpen1,
     OptionsSharpen2,
     OptionsSharpen3,
@@ -600,16 +607,35 @@ pub(crate) enum Id {
 }
 
 impl Id {
-    /// Variant count; array-typing both tables against this keeps them
+    /// Variant count; array-typing every table against this keeps them
     /// length-locked to the enum by construction.
     pub(crate) const COUNT: usize = Self::OptionsContrast10 as usize + 1;
 }
 
-/// Table choice (upstream `LOCALIZATION_LANGUAGE_*`, localization.h:30-32).
+/// Table choice (upstream `LOCALIZATION_LANGUAGE_*`, localization.h:30-32;
+/// the zh-Hant variant is riviv's own — upstream ships no traditional
+/// strings, #203).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Language {
     English,
     ChineseSimplified,
+    ChineseTraditional,
+}
+
+impl Language {
+    /// Every language the app ships, in enum order — the single place a
+    /// new table registers (upstream viv.c:30: "has to be a list too, to
+    /// support multiple language ids"). Test seams iterate this instead
+    /// of enumerating variants by hand, so a fourth table can never be
+    /// silently left out of the "every string non-empty" net. Only the
+    /// test seams read it today; the runtime paths go through
+    /// `current_language`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) const ALL: [Language; 3] = [
+        Language::English,
+        Language::ChineseSimplified,
+        Language::ChineseTraditional,
+    ];
 }
 
 /// en-US table — upstream localization_en_us.h:31/197-199/260-262.
@@ -1290,13 +1316,356 @@ const ZH_CN: [&str; Id::COUNT] = [
     "10",                       // OptionsContrast10 (#193, riviv)
 ];
 
-/// Map a `GetUserDefaultUILanguage` LANGID onto the table choice
-/// (localization.c:64-71): both traditional-Chinese langids land on the
-/// SIMPLIFIED table — upstream ships no zh-Hant strings. The neutral
-/// Chinese langid (0x0004) is not in the list and stays English.
+/// zh-Hant table — riviv-authored (upstream ships no zh-Hant strings,
+/// localization.c ships only en_us/zh_cn; #203 per O1=A). Taiwanese
+/// terminology; mnemonics reuse the zh-CN letters per entry.
+const ZH_HANT: [&str; Id::COUNT] = [
+    "riviv",          // AppName — the brand stays untranslated (both zh tables)
+    "載入中...",      // StatusBarLoading (zh_cn.h:197)
+    "找不到檔案。",   // StatusBarFileNotFound (zh_cn.h:198)
+    "載入影像失敗。", // StatusBarFailedToLoadImage (zh_cn.h:199)
+    "開啟影像",       // OpenImageCaption (zh_cn.h:261)
+    "所有影像檔",     // OpenAllImageFiles (zh_cn.h:262)
+    "所有檔案",       // OpenAllFiles (zh_cn.h:263)
+    // Menu block (zh_cn.h:34/35/36/38/52/67/70/77/88/89/97-100/115/160-164/177/182).
+    "檔案(&F)",          // MenuFile
+    "開啟檔案(&O)...",   // MenuOpenFile
+    "開啟資料夾(&F)...", // MenuOpenFolder
+    "新增檔案(&A)...",   // MenuAddFile
+    "結束(&X)",          // MenuExit
+    "編輯(&E)",          // MenuEdit (#41)
+    "剪下(&T)",          // MenuCut
+    "複製(&C)",          // MenuCopy
+    "複製檔名",          // MenuCopyFilename — no mnemonic upstream
+    "複製影像(&Y)",      // MenuCopyImage
+    "貼上(&P)",          // MenuPaste
+    "復原刪除(&U)",      // MenuUndoDelete (#178 — riviv-authored)
+    "檢視(&V)",          // MenuView
+    "功能表(&M)",        // MenuMenu
+    "全螢幕(&F)",        // MenuFullscreen
+    "1:1",               // MenuOneToOne
+    "最適大小(&B)",      // MenuBestFit
+    "平移和掃描(&N)",    // MenuPanScan (#44; zh_cn.h:90)
+    "增加尺寸(&I)",      // MenuPanScanIncreaseSize (zh_cn.h:91)
+    "減少尺寸(&D)",      // MenuPanScanDecreaseSize (zh_cn.h:92)
+    "增加寬度(&W)",      // MenuPanScanIncreaseWidth (zh_cn.h:93)
+    "減少寬度(&W)",      // MenuPanScanDecreaseWidth (zh_cn.h:94)
+    "增加高度(&H)",      // MenuPanScanIncreaseHeight (zh_cn.h:95)
+    "減少高度(&E)",      // MenuPanScanDecreaseHeight (zh_cn.h:96)
+    "向上移動(&U)",      // MenuPanScanMoveUp (zh_cn.h:101)
+    "向下移動(&D)",      // MenuPanScanMoveDown (zh_cn.h:102)
+    "向左移動(&L)",      // MenuPanScanMoveLeft (zh_cn.h:103)
+    "向右移動(&R)",      // MenuPanScanMoveRight (zh_cn.h:104)
+    "向左上移動",        // MenuPanScanMoveUpLeft (zh_cn.h:105)
+    "向右上移動",        // MenuPanScanMoveUpRight (zh_cn.h:106)
+    "向左下移動",        // MenuPanScanMoveDownLeft (zh_cn.h:107)
+    "向右下移動",        // MenuPanScanMoveDownRight (zh_cn.h:108)
+    "置中(&C)",          // MenuPanScanMoveCenter (zh_cn.h:109)
+    "重設(&S)",          // MenuPanScanReset (zh_cn.h:110)
+    "縮放(&Z)",          // MenuZoom
+    "放大(&I)",          // MenuZoomIn
+    "縮小(&O)",          // MenuZoomOut
+    "重設(&R)",          // MenuZoomReset
+    "選項(&O)...",       // MenuOptions
+    "瀏覽(&N)",          // MenuNavigate
+    "下一個(&N)",        // MenuNext
+    "上一個(&P)",        // MenuPrevious
+    "首頁(&H)",          // MenuHome
+    "末頁(&E)",          // MenuEnd
+    "說明(&H)",          // MenuHelp
+    "關於(&A)",          // MenuAbout
+    // Options block (#24; zh_cn.h:209-238/264-276 + 86-87 + two riviv labels).
+    "選項 - riviv",                      // OptionsCaption (brand swap)
+    "一般",                              // OptionsGeneral
+    "檢視",                              // OptionsView
+    "控制項",                            // OptionsControls
+    "確定",                              // OptionsOk
+    "取消",                              // OptionsCancel
+    "將設定儲存於 %APPDATA%\\riviv(&S)", // OptionsAppdata (path swap)
+    "允許多個執行個體(&I)",              // OptionsMultipleInstances
+    "開始功能表捷徑(&M)",                // OptionsStartMenu
+    "檔案關聯",                          // OptionsAssociations
+    "全選(&A)",                          // OptionsCheckAll
+    "全不選(&N)",                        // OptionsCheckNone
+    "縮小點陣圖模式(&S):",               // OptionsShrinkBlitMode
+    "放大點陣圖模式(&M):",               // OptionsMagnifyBlitMode
+    "最近鄰",                            // OptionsBlitNearest
+    "線性",                              // OptionsBlitLinear
+    "保持長寬比(&K)",                    // OptionsKeepAspectRatio
+    "填滿視窗",                          // OptionsFillWindow — 同上,去掉助記符
+    "全螢幕時填滿視窗",                  // OptionsFullscreenFill (riviv)
+    "自動調整視窗(&Z):",                 // OptionsAutoZoom
+    "50%",                               // OptionsAutoZoom50
+    "100%",                              // OptionsAutoZoom100
+    "200%",                              // OptionsAutoZoom200
+    "自動調整",                          // OptionsAutoZoomAutoFit
+    "視窗背景色彩(&W):",                 // OptionsWindowedBg
+    "全螢幕背景色彩(&F):",               // OptionsFullscreenBg
+    "顯示剩餘影格(&R)",                  // OptionsFrameMinus (riviv)
+    "左鍵動作(&L):",                     // OptionsLeftClickAction
+    "右鍵動作(&R):",                     // OptionsRightClickAction
+    "滑鼠滾輪動作(&M):",                 // OptionsMouseWheelAction
+    "X 鍵動作(&B):",                     // OptionsXButtonAction — riviv 增補 (#44)
+    "命令(&C):",                         // OptionsCommands
+    "所選命令的設定",                    // OptionsSettingsForSelected
+    "新增(&A)...",                       // OptionsAddKey
+    "編輯(&E)...",                       // OptionsEditKey
+    "刪除(&V)",                          // OptionsRemoveKey
+    "新增鍵盤快速鍵",                    // AddKeyCaption
+    "編輯鍵盤快速鍵",                    // EditKeyCaption
+    "快速鍵(&K):",                       // OptionsShortcutKey
+    "目前使用此快速鍵的命令:",           // OptionsShortcutKeyUsedBy
+    "捲動",                              // ActionScroll
+    "放大",                              // ActionZoomIn
+    "下一張影像",                        // ActionNextImage
+    "內容功能表",                        // ActionContextMenu
+    "縮小",                              // ActionZoomOut
+    "上一張影像",                        // ActionPreviousImage
+    "縮放",                              // ActionZoom
+    "下一張/上一張",                     // ActionNextPrev
+    "上一張/下一張",                     // ActionPrevNext
+    // Everything block (#22; zh_cn.h:37/40/281-284).
+    "開啟 Everything 搜尋(&S)...", // MenuOpenEverythingSearch
+    "新增 Everything 搜尋...",     // MenuAddEverythingSearch
+    "載入 Everything 搜尋",        // EverythingLoadCaption
+    "新增 Everything 搜尋",        // EverythingAddCaption
+    "隨機化",                      // EverythingRandomize
+    "Everything 無法使用",         // EverythingNotAvailable
+    // Slideshow block (#37; zh_cn.h:78/118-140/200/203-206/249-253/265).
+    "投影片(&S)",      // MenuSlideshow
+    "投影片(&S)",      // MenuSlideshowMenu
+    "播放/暫停(&P)",   // MenuSlideshowPlayPause
+    "速率(&R)",        // MenuSlideshowRate
+    "降低速率(&D)",    // MenuSlideshowRateDecrease
+    "提高速率(&I)",    // MenuSlideshowRateIncrease
+    "250 毫秒",        // MenuRate250Milliseconds
+    "500 毫秒",        // MenuRate500Milliseconds
+    "&1 秒",           // MenuRate1Second
+    "&2 秒",           // MenuRate2Seconds
+    "&3 秒",           // MenuRate3Seconds
+    "&4 秒",           // MenuRate4Seconds
+    "&5 秒",           // MenuRate5Seconds
+    "&6 秒",           // MenuRate6Seconds
+    "&7 秒",           // MenuRate7Seconds
+    "&8 秒",           // MenuRate8Seconds
+    "&9 秒",           // MenuRate9Seconds
+    "1&0 秒",          // MenuRate10Seconds
+    "20 秒",           // MenuRate20Seconds
+    "30 秒",           // MenuRate30Seconds
+    "40 秒",           // MenuRate40Seconds
+    "50 秒",           // MenuRate50Seconds
+    "1 分鐘",          // MenuRate1Minute
+    "自訂...",         // MenuRateCustom
+    "設定自訂速率",    // CustomRateCaption
+    "自訂速率(&C):",   // CustomRateLabel
+    "毫秒",            // CustomRateMilliseconds
+    "秒",              // CustomRateSeconds
+    "分鐘",            // CustomRateMinutes
+    "投影片播放中",    // StatusBarSlideshowPlaying
+    "位置",            // StatusBarPosLabel (zh_cn.h:201, composed)
+    "縮放",            // StatusBarZoomLabel (zh_cn.h:201, composed)
+    "長寬比",          // StatusBarAspectLabel (zh_cn.h:201, composed)
+    "動畫速率",        // StatusBarAnimationRateLabel (zh_cn.h:202)
+    "投影片播放間隔",  // StatusBarSlideshowRateLabel (zh_cn.h:203)
+    "分鐘",            // StatusBarMinutes (zh_cn.h:204)
+    "秒",              // StatusBarSeconds (zh_cn.h:205)
+    "毫秒",            // StatusBarMilliseconds (zh_cn.h:206)
+    "播放/暫停投影片", // ActionPlayPauseSlideshow
+    "播放/暫停動畫",   // ActionPlayPauseAnimation
+    // Animation menu block (#38; zh_cn.h:143/144-157/231).
+    "動畫(&A)",                       // MenuAnimation
+    "播放/暫停(&P)",                  // MenuAnimationPlayPause
+    "向前跳躍(&F)",                   // MenuAnimationJumpForward
+    "向後跳躍(&B)",                   // MenuAnimationJumpBackward
+    "短距離向前跳躍(&F)",             // MenuAnimationShortJumpForward
+    "短距離向後跳躍(&B)",             // MenuAnimationShortJumpBackward
+    "長距離向前跳躍(&F)",             // MenuAnimationLongJumpForward
+    "長距離向後跳躍(&B)",             // MenuAnimationLongJumpBackward
+    "下一個影格(&S)",                 // MenuAnimationFrameStep
+    "上一個影格(&V)",                 // MenuAnimationPreviousFrame
+    "第一個影格(&I)",                 // MenuAnimationFirstFrame
+    "最後一個影格(&L)",               // MenuAnimationLastFrame
+    "降低速率(&D)",                   // MenuAnimationRateDecrease
+    "提高速率(&I)",                   // MenuAnimationRateIncrease
+    "重設速率(&E)",                   // MenuAnimationRateReset
+    "在投影片中至少播放一次動畫(&P)", // OptionsLoopAnimationsOnce (zh_cn.h:231)
+    "排序(&S)",                       // MenuSort (zh_cn.h:165)
+    "名稱(&N)",                       // MenuSortName (zh_cn.h:166)
+    "完整路徑(&P)",                   // MenuSortFullPath (zh_cn.h:167)
+    "大小(&S)",                       // MenuSortSize (zh_cn.h:168)
+    "修改日期(&M)",                   // MenuSortDateModified (zh_cn.h:169)
+    "建立日期(&C)",                   // MenuSortDateCreated (zh_cn.h:170)
+    "遞增(&A)",                       // MenuSortAscending (zh_cn.h:171)
+    "遞減(&D)",                       // MenuSortDescending (zh_cn.h:172)
+    "隨機(&S)",                       // MenuShuffle (zh_cn.h:173)
+    "跳至(&J)...",                    // MenuJumpTo (zh_cn.h:174)
+    "跳至",                           // JumpToCaption (zh_cn.h:256)
+    "預先載入",                       // StatusBarPreload (zh_cn.h:196)
+    "預先載入下一張影像(&N)",         // OptionsPreloadNext (zh_cn.h:232)
+    "快取最後一張影像(&L)",           // OptionsCacheLast (zh_cn.h:233)
+    "標題列格式(&T):",                // OptionsTitleBarFormat (zh_cn.h:277)
+    "完整路徑",                       // OptionsTitleBarFormatFullPath (zh_cn.h:278)
+    "僅檔名",                         // OptionsTitleBarFormatFilenameOnly (zh_cn.h:279)
+    "無",                             // OptionsTitleBarFormatNone (zh_cn.h:280)
+    "命令列選項(&C)",                 // MenuCommandLineOptions (zh_cn.h:179)
+    // UsageText — riviv's translation of viv.c:11862-11894 (upstream
+    // hardcodes English; the issue mandates the bilingual body).
+    "用法:\nriviv.exe [/參數] [檔名]\n\
+     \n\
+     參數:\n\
+     /slideshow\t開始投影片播放。\n\
+     /close\t\t投影片播放完畢後結束。\n\
+     /fullscreen\t全螢幕啟動。\n\
+     /maximized\t最大化啟動。\n\
+     /window\t\t視窗化啟動。\n\
+     /ontop\t\t視窗置於最上層。\n\
+     /minimal\t\t無邊框視窗。\n\
+     /compact\t\t有邊框視窗。\n\
+     /x <x> /y <y> /width <寬> /height <高>\n\
+     \t\t設定視窗位置和大小。\n\
+     /rate <速率>\t設定投影片速率(毫秒)。\n\
+     /name\t\t依名稱排序。\n\
+     /path\t\t依完整路徑排序。\n\
+     /size\t\t依大小排序。\n\
+     /dm\t\t依修改日期排序。\n\
+     /dc\t\t依建立日期排序。\n\
+     /ascending\t遞增排序。\n\
+     /descending\t遞減排序。\n\
+     /shuffle\t\t隨機播放清單。\n\
+     /<bmp|gif|ico|jpeg|jpg|png|tif|tiff|webp>\n\
+     \t\t安裝檔案關聯。\n\
+     /no<bmp|gif|ico|jpeg|jpg|png|tif|tiff|webp>\n\
+     \t\t解除檔案關聯。\n\
+     /appdata\t\t將設定儲存到 appdata。\n\
+     /noappdata\t將設定儲存到 exe 所在目錄。\n\
+     /startmenu\t新增開始功能表捷徑。\n\
+     /nostartmenu\t移除開始功能表捷徑。\n\
+     /install <路徑>\t安裝到指定路徑。\n\
+     /install-options <...> 安裝後以指定選項執行。\n\
+     /uninstall <路徑>\t從指定路徑解除安裝。", // UsageText
+    "控制項(&C)",       // MenuControls (zh_cn.h:72)
+    "播放清單窗格(&L)", // MenuPlaylistPane (#199, riviv-authored; L — the View level's P belongs to Preset)
+    "上一個",           // ToolbarPreviousImage (zh_cn.h:188)
+    "下一個",           // ToolbarNextImage (zh_cn.h:189)
+    "播放",             // ToolbarPlaySlideshow (zh_cn.h:190)
+    "暫停",             // ToolbarPauseSlideshow (zh_cn.h:191)
+    "最適大小",         // ToolbarBestFit (zh_cn.h:192)
+    "實際大小",         // ToolbarActualSize (zh_cn.h:193)
+    // #46 block (zh_cn.h:68-87/111-114).
+    "標題列",                 // MenuCaption (zh_cn.h:68)
+    "邊框",                   // MenuThickFrame (zh_cn.h:69)
+    "狀態列(&B)",             // MenuStatusBar (zh_cn.h:71)
+    "預設(&P)",               // MenuPreset (zh_cn.h:73)
+    "最小(&M)",               // MenuMinimal (zh_cn.h:74)
+    "精簡(&C)",               // MenuCompact (zh_cn.h:75)
+    "正常(&N)",               // MenuNormal (zh_cn.h:76)
+    "視窗大小(&W)",           // MenuWindowSize (zh_cn.h:79)
+    "50%",                    // MenuWindowSize50 (zh_cn.h:80)
+    "100%",                   // MenuWindowSize100 (zh_cn.h:81)
+    "200%",                   // MenuWindowSize200 (zh_cn.h:82)
+    "自動調整(&A)",           // MenuWindowSizeAutoFit (zh_cn.h:83)
+    "重新整理(&R)",           // MenuRefresh (zh_cn.h:84)
+    "允許縮小(&A)",           // MenuAllowShrinking (zh_cn.h:85)
+    "保持長寬比(&K)",         // MenuKeepAspectRatio (zh_cn.h:86)
+    "填滿視窗(&F)",           // MenuFillWindow (zh_cn.h:87)
+    "置頂(&T)",               // MenuOnTop (zh_cn.h:111)
+    "永遠(&A)",               // MenuAlways (zh_cn.h:112)
+    "播放投影片或動畫時(&W)", // MenuWhilePlaying (zh_cn.h:113)
+    "永不(&N)",               // MenuNever (zh_cn.h:114)
+    // The #42 shell verb block (zh_cn.h:41-46/51).
+    "開啟檔案位置(&L)...",          // MenuOpenFileLocation
+    "編輯(&E)...",                  // MenuFileEdit
+    "預覽(&V)...",                  // MenuPreview
+    "列印(&P)...",                  // MenuPrint
+    "設為桌面背景(&D)",             // MenuSetDesktopWallpaper
+    "關閉(&C)",                     // MenuClose
+    "內容(&P)",                     // MenuProperties
+    "刪除(&D)",                     // MenuDelete (#43)
+    "刪除（資源回收筒）",           // MenuDeleteRecycle (#43)
+    "刪除（永久）",                 // MenuDeletePermanently (#43)
+    "重新命名(&M)",                 // MenuRename (#43)
+    "順時針旋轉(&K)",               // MenuRotateClockwise (#43)
+    "逆時針旋轉(&N)",               // MenuRotateCounterclockwise (#43)
+    "複製到資料夾(&F)...",          // MenuCopyTo (#43)
+    "移動到資料夾(&V)...",          // MenuMoveTo (#43)
+    "重新命名",                     // RenameCaption (#43)
+    "複製到",                       // CopyToCaption (#43)
+    "移動到",                       // MoveToCaption (#43)
+    "切換影像時保持縮放與平移(&Z)", // OptionsKeepZoom (#68, riviv)
+    "資源回收筒中找不到該檔案",     // UndoFailedNotInBin (#178, riviv)
+    "原路徑已存在同名檔案",         // UndoFailedTargetExists (#178, riviv)
+    "還原失敗",                     // UndoFailedMove (#178, riviv)
+    "銳利化",                       // MenuSharpen (#185, riviv)
+    "銳利化:",                      // OptionsSharpen (#185, riviv)
+    "關",                           // OptionsSharpenOff (#185, riviv)
+    "1",                            // OptionsSharpen1 (#185, riviv)
+    "2",                            // OptionsSharpen2 (#185, riviv)
+    "3",                            // OptionsSharpen3 (#185, riviv)
+    "4",                            // OptionsSharpen4 (#185, riviv)
+    "5",                            // OptionsSharpen5 (#185, riviv)
+    "6",                            // OptionsSharpen6 (#185, riviv)
+    "7",                            // OptionsSharpen7 (#185, riviv)
+    "8",                            // OptionsSharpen8 (#185, riviv)
+    "9",                            // OptionsSharpen9 (#185, riviv)
+    "10",                           // OptionsSharpen10 (#185, riviv)
+    "白平衡",                       // MenuWhiteBalance (#191, riviv)
+    "白平衡:",                      // OptionsWhiteBalance (#191, riviv)
+    "關",                           // OptionsWhiteBalanceOff (#191, riviv)
+    "-10",                          // OptionsWhiteBalanceMinus10 (#191, riviv)
+    "-9",                           // OptionsWhiteBalanceMinus9 (#191, riviv)
+    "-8",                           // OptionsWhiteBalanceMinus8 (#191, riviv)
+    "-7",                           // OptionsWhiteBalanceMinus7 (#191, riviv)
+    "-6",                           // OptionsWhiteBalanceMinus6 (#191, riviv)
+    "-5",                           // OptionsWhiteBalanceMinus5 (#191, riviv)
+    "-4",                           // OptionsWhiteBalanceMinus4 (#191, riviv)
+    "-3",                           // OptionsWhiteBalanceMinus3 (#191, riviv)
+    "-2",                           // OptionsWhiteBalanceMinus2 (#191, riviv)
+    "-1",                           // OptionsWhiteBalanceMinus1 (#191, riviv)
+    "1",                            // OptionsWhiteBalance1 (#191, riviv)
+    "2",                            // OptionsWhiteBalance2 (#191, riviv)
+    "3",                            // OptionsWhiteBalance3 (#191, riviv)
+    "4",                            // OptionsWhiteBalance4 (#191, riviv)
+    "5",                            // OptionsWhiteBalance5 (#191, riviv)
+    "6",                            // OptionsWhiteBalance6 (#191, riviv)
+    "7",                            // OptionsWhiteBalance7 (#191, riviv)
+    "8",                            // OptionsWhiteBalance8 (#191, riviv)
+    "9",                            // OptionsWhiteBalance9 (#191, riviv)
+    "10",                           // OptionsWhiteBalance10 (#191, riviv)
+    "對比",                         // MenuContrast (#193, riviv)
+    "對比:",                        // OptionsContrast (#193, riviv)
+    "關",                           // OptionsContrastOff (#193, riviv)
+    "-10",                          // OptionsContrastMinus10 (#193, riviv)
+    "-9",                           // OptionsContrastMinus9 (#193, riviv)
+    "-8",                           // OptionsContrastMinus8 (#193, riviv)
+    "-7",                           // OptionsContrastMinus7 (#193, riviv)
+    "-6",                           // OptionsContrastMinus6 (#193, riviv)
+    "-5",                           // OptionsContrastMinus5 (#193, riviv)
+    "-4",                           // OptionsContrastMinus4 (#193, riviv)
+    "-3",                           // OptionsContrastMinus3 (#193, riviv)
+    "-2",                           // OptionsContrastMinus2 (#193, riviv)
+    "-1",                           // OptionsContrastMinus1 (#193, riviv)
+    "1",                            // OptionsContrast1 (#193, riviv)
+    "2",                            // OptionsContrast2 (#193, riviv)
+    "3",                            // OptionsContrast3 (#193, riviv)
+    "4",                            // OptionsContrast4 (#193, riviv)
+    "5",                            // OptionsContrast5 (#193, riviv)
+    "6",                            // OptionsContrast6 (#193, riviv)
+    "7",                            // OptionsContrast7 (#193, riviv)
+    "8",                            // OptionsContrast8 (#193, riviv)
+    "9",                            // OptionsContrast9 (#193, riviv)
+    "10",                           // OptionsContrast10 (#193, riviv)
+];
+
+/// Map a `GetUserDefaultUILanguage` LANGID onto the table choice. Upstream
+/// maps both traditional-Chinese langids onto the SIMPLIFIED table
+/// (localization.c:64-71) because it ships no zh-Hant strings; riviv has
+/// the third table, so zh-TW/zh-HK land on it (#203 — a behavior change
+/// for traditional-Chinese systems, recorded in README Differences). The
+/// neutral Chinese langid (0x0004) is not in the list and stays English.
 pub(crate) fn language_from_langid(langid: u16) -> Language {
     match langid {
-        0x0804 | 0x0404 | 0x0C04 => Language::ChineseSimplified,
+        0x0804 => Language::ChineseSimplified,
+        0x0404 | 0x0C04 => Language::ChineseTraditional,
         _ => Language::English,
     }
 }
@@ -1322,8 +1691,12 @@ pub(crate) fn init() {
 
 /// The table choice `get` is currently reading (English until `init`).
 pub(crate) fn current_language() -> Language {
+    // The raw discriminants (0/1/2) are the AtomicU8's whole encoding;
+    // any value out of range falls back to English like upstream's
+    // uninitialized-variable default (localization.c:34).
     match LANGUAGE.load(Ordering::Relaxed) {
         1 => Language::ChineseSimplified,
+        2 => Language::ChineseTraditional,
         _ => Language::English,
     }
 }
@@ -1332,6 +1705,7 @@ fn table(lang: Language) -> &'static [&'static str; Id::COUNT] {
     match lang {
         Language::English => &EN_US,
         Language::ChineseSimplified => &ZH_CN,
+        Language::ChineseTraditional => &ZH_HANT,
     }
 }
 
@@ -1353,13 +1727,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn chinese_langids_select_the_simplified_table() {
-        // 0x0804 zh-CN, 0x0404 zh-TW, 0x0C04 zh-HK — upstream maps the
-        // TRADITIONAL langids onto the simplified zh table as well
-        // (localization.c:65-71).
+    fn chinese_langids_select_their_own_tables() {
+        // 0x0804 zh-CN → the simplified table; 0x0404 zh-TW / 0x0C04
+        // zh-HK → the traditional table (#203 — upstream mapped the
+        // TRADITIONAL langids onto the simplified table for lack of
+        // zh-Hant strings, localization.c:65-71).
         assert_eq!(language_from_langid(0x0804), Language::ChineseSimplified);
-        assert_eq!(language_from_langid(0x0404), Language::ChineseSimplified);
-        assert_eq!(language_from_langid(0x0C04), Language::ChineseSimplified);
+        assert_eq!(language_from_langid(0x0404), Language::ChineseTraditional);
+        assert_eq!(language_from_langid(0x0C04), Language::ChineseTraditional);
     }
 
     #[test]
@@ -1375,10 +1750,62 @@ mod tests {
     }
 
     #[test]
-    fn every_id_has_a_non_empty_string_in_both_tables() {
+    fn every_id_has_a_non_empty_string_in_every_language() {
+        for lang in Language::ALL {
+            for (i, s) in table(lang).iter().enumerate() {
+                assert!(!s.is_empty(), "{lang:?} table empty at index {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn zh_hant_is_a_distinct_table_not_a_simplified_copy() {
+        // The zh-Hant table uses Taiwanese terminology, so most entries
+        // differ from zh-CN. The legitimate equals are the structural
+        // strings ("riviv", "1:1", the numeric scale rows, pure-ASCII
+        // tokens) plus the handful of simplified/traditional homographs
+        // (毫秒, 秒, 取消, 播放 …) — measured 97. The floor of 150 sits
+        // well above a byte-for-byte copy (0) and well below the real
+        // table (196 at #203), so the drafting stub can never pass.
+        let diffs = (0..Id::COUNT).filter(|&i| ZH_HANT[i] != ZH_CN[i]).count();
+        assert!(
+            diffs > 150,
+            "only {diffs}/{} entries differ from zh-CN",
+            Id::COUNT
+        );
+    }
+
+    #[test]
+    fn zh_hant_reuses_the_zh_cn_mnemonic_letters_per_entry() {
+        // The CJK mnemonics are explicit "&X"/(&X) annotations, not
+        // letters derived from the word, so zh-Hant can and does keep
+        // the zh-CN assignment per entry — the per-layer collision
+        // design (e.g. View's P belongs to Preset, so Playlist Pane
+        // took L, #199) carries over unchanged, and the grandfathered
+        // upstream pairs (menu.rs's collision test) stay the same
+        // shape. Also pins the format invariant itself: a CJK string
+        // carries at most one & (a literal & would need doubling, and
+        // none of the zh-CN strings has one).
+        let mnemonic = |s: &str| {
+            s.chars()
+                .zip(s.chars().skip(1))
+                .find(|(a, _)| *a == '&')
+                .map(|(_, b)| b)
+        };
         for i in 0..Id::COUNT {
-            assert!(!EN_US[i].is_empty(), "en table empty at index {i}");
-            assert!(!ZH_CN[i].is_empty(), "zh table empty at index {i}");
+            assert!(
+                ZH_CN[i].matches('&').count() <= 1,
+                "zh-CN string has more than one & at index {i}"
+            );
+            assert!(
+                ZH_HANT[i].matches('&').count() <= 1,
+                "zh-Hant string has more than one & at index {i}"
+            );
+            assert_eq!(
+                mnemonic(ZH_CN[i]),
+                mnemonic(ZH_HANT[i]),
+                "mnemonic drift from zh-CN at index {i}"
+            );
         }
     }
 
@@ -1598,6 +2025,48 @@ mod tests {
         assert_eq!(get_for(zh, Id::ActionZoom), "缩放");
         assert_eq!(get_for(zh, Id::ActionNextPrev), "下一张/上一张");
         assert_eq!(get_for(zh, Id::ActionPrevNext), "上一张/下一张");
+    }
+
+    #[test]
+    fn zh_hant_carries_the_taiwanese_terminology() {
+        // #203 spot anchors across the table's blocks: the Taiwanese
+        // vocabulary (檔案/檢視/功能表/投影片/滑鼠/資源回收筒/建立日期/
+        // 重新整理), the riviv-authored rows, the structural equals, and
+        // the usage body.
+        let tw = Language::ChineseTraditional;
+        assert_eq!(get_for(tw, Id::AppName), "riviv");
+        assert_eq!(get_for(tw, Id::StatusBarLoading), "載入中...");
+        assert_eq!(
+            get_for(tw, Id::StatusBarFailedToLoadImage),
+            "載入影像失敗。"
+        );
+        assert_eq!(get_for(tw, Id::MenuFile), "檔案(&F)");
+        assert_eq!(get_for(tw, Id::MenuView), "檢視(&V)");
+        assert_eq!(get_for(tw, Id::MenuMenu), "功能表(&M)");
+        assert_eq!(get_for(tw, Id::MenuSlideshow), "投影片(&S)");
+        assert_eq!(get_for(tw, Id::MenuUndoDelete), "復原刪除(&U)");
+        assert_eq!(get_for(tw, Id::MenuPlaylistPane), "播放清單窗格(&L)");
+        assert_eq!(get_for(tw, Id::OptionsGeneral), "一般");
+        assert_eq!(get_for(tw, Id::OptionsControls), "控制項");
+        assert_eq!(
+            get_for(tw, Id::OptionsMultipleInstances),
+            "允許多個執行個體(&I)"
+        );
+        assert_eq!(
+            get_for(tw, Id::OptionsMouseWheelAction),
+            "滑鼠滾輪動作(&M):"
+        );
+        assert_eq!(get_for(tw, Id::MenuDeleteRecycle), "刪除（資源回收筒）");
+        assert_eq!(get_for(tw, Id::MenuSortDateCreated), "建立日期(&C)");
+        assert_eq!(get_for(tw, Id::MenuRefresh), "重新整理(&R)");
+        // Structural equals: the homograph and numeral rows.
+        assert_eq!(get_for(tw, Id::MenuOneToOne), "1:1");
+        assert_eq!(get_for(tw, Id::OptionsOk), "確定");
+        assert_eq!(get_for(tw, Id::MenuRate1Second), "&1 秒");
+        // The usage body keeps the zh-CN tab structure verbatim.
+        let usage = get_for(tw, Id::UsageText);
+        assert!(usage.contains("/close\t\t投影片播放完畢後結束。"));
+        assert!(usage.contains("/fullscreen\t全螢幕啟動。"));
     }
 
     #[test]
