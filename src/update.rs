@@ -14,12 +14,14 @@
 //! user-level Failed outcome — network failures are expected, never
 //! fatal, per ADR 0007 D3).
 
+use std::collections::VecDeque;
 use std::ffi::c_void;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::loc;
 use crate::text::to_wide;
-use windows::Win32::Foundation::{GetLastError, HWND, LPARAM};
+use windows::Win32::Foundation::{GetLastError, HWND};
 use windows::Win32::Networking::WinHttp::{
     INTERNET_DEFAULT_HTTPS_PORT, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_ADDREQ_FLAG_ADD,
     WINHTTP_FLAG_SECURE, WinHttpAddRequestHeaders, WinHttpCloseHandle, WinHttpConnect, WinHttpOpen,
@@ -39,10 +41,12 @@ pub(crate) const RELEASES_URL: &str = "https://github.com/jaredshuai/riviv/relea
 const API_HOST: &str = "api.github.com";
 const API_PATH: &str = "/repos/jaredshuai/riviv/releases/latest";
 
-/// The worker's reply lands here; wparam is unused, lparam carries a
-/// boxed Outcome. WM_APP+1/+2/+3 are the load kick, the Everything
-/// retry, and the pane jump — this is the class's fourth private
-/// message (ADR 0007 D2).
+/// The worker's wake-up call: the message itself carries NO payload —
+/// the verdict waits in `REPLY_QUEUE` (a posted pointer would let any
+/// peer process forge this message and crash the handler on an invalid
+/// lparam; cubic #211 P2). WM_APP+1/+2/+3 are the load kick, the
+/// Everything retry, and the pane jump — this is the class's fourth
+/// private message (ADR 0007 D2).
 pub(crate) const UPDATE_REPLY_MESSAGE: u32 = WM_APP + 4;
 
 /// One check at a time: a second menu click while a check is in flight
@@ -50,6 +54,12 @@ pub(crate) const UPDATE_REPLY_MESSAGE: u32 = WM_APP + 4;
 /// the worker before it posts, so a fresh click right after a verdict
 /// starts a new check.
 static CHECK_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// The verdict hand-off (ADR 0007 D2): the worker parks the Outcome
+/// here and posts the bare notification; the UI thread's handler pops.
+/// Single-flight means at most one producer and one entry — a forged or
+/// spurious message can only ever find the queue empty and be ignored.
+static REPLY_QUEUE: Mutex<VecDeque<Outcome>> = Mutex::new(VecDeque::new());
 
 /// What the UI thread should do after a check completes.
 #[derive(Debug)]
@@ -85,11 +95,18 @@ pub(crate) fn parse_semver(s: &str) -> Option<(u64, u64, u64)> {
 /// Pull the `"tag_name"` value out of the API response. Hand-rolled on
 /// purpose (one field, no JSON crate — the zero-dependency principle):
 /// tolerant of field order and surrounding whitespace, strict about the
+/// body being a JSON object (first non-space char `{`) and about the
 /// value's shape (the caller's parse_semver rejects garbage, and a
 /// non-200 error body carries no tag_name at all, which is exactly the
 /// Failed path — that is why no status-code query FFI exists, ADR 0007
 /// D4). Returns the first match; the API emits exactly one.
 pub(crate) fn parse_tag_name(body: &str) -> Option<&str> {
+    // The structure gate: a plain-text blob that merely quotes the key
+    // cannot smuggle a tag past the strict value parse (cubic #211 P2).
+    let body = body.trim_start();
+    if !body.starts_with('{') {
+        return None;
+    }
     let key = "\"tag_name\"";
     let start = body.find(key)? + key.len();
     let rest = &body[start..];
@@ -105,6 +122,11 @@ pub(crate) fn parse_tag_name(body: &str) -> Option<&str> {
 /// equal or older (or the tag spelling differs but compares equal) =>
 /// UpToDate; anything unparseable on either side => Failed.
 pub(crate) fn decide(current: &str, latest_tag: &str) -> Outcome {
+    // The running version is our own build metadata — parsed leniently
+    // (a `-prerelease` suffix drops before the numeric compare) so a
+    // beta build still compares instead of always reporting failure;
+    // the server-side tag stays strict (cubic #211 P3).
+    let current = current.split_once('-').map_or(current, |(v, _)| v);
     match (parse_semver(current), parse_semver(latest_tag)) {
         (Some(c), Some(l)) if l > c => {
             Outcome::Available(latest_tag.trim_start_matches('v').to_string())
@@ -149,9 +171,9 @@ pub(crate) fn begin(hwnd: HWND) {
     }
 }
 
-/// The background half: fetch, decide, post the boxed outcome. The
-/// in-flight gate clears before the post so the next click can start
-/// once the verdict is queued.
+/// The background half: fetch, decide, park the verdict in the queue,
+/// post the bare notification. The in-flight gate clears before the
+/// post so the next click can start once the verdict is queued.
 fn worker(hwnd: HWND) {
     let outcome = match fetch_latest_body() {
         Ok(body) => decide(
@@ -161,32 +183,34 @@ fn worker(hwnd: HWND) {
         Err(_) => Outcome::Failed,
     };
     CHECK_RUNNING.store(false, Ordering::SeqCst);
-    let boxed = Box::into_raw(Box::new(outcome));
+    if let Ok(mut queue) = REPLY_QUEUE.lock() {
+        // Single-flight guarantees no concurrent producer; the clear
+        // drops any verdict a dying window never claimed.
+        queue.clear();
+        queue.push_back(outcome);
+    }
     // SAFETY: hwnd was live when begin() ran on the UI thread. If the
-    // window has died since, PostMessageW simply fails and the box is
-    // reclaimed below — the pointer is handed over exactly once either
-    // way.
-    let posted = unsafe {
+    // window has died since, the post simply fails and the queued
+    // verdict stays unclaimed — nothing crosses the message boundary,
+    // so there is no pointer to hand over or reclaim.
+    let _ = unsafe {
         PostMessageW(
             Some(hwnd),
             UPDATE_REPLY_MESSAGE,
             Default::default(),
-            LPARAM(boxed as isize),
+            Default::default(),
         )
     };
-    if posted.is_err() {
-        // SAFETY: the post failed, so nobody else received the pointer.
-        drop(unsafe { Box::from_raw(boxed) });
-    }
 }
 
 /// Runs on the UI thread from wnd_proc's UPDATE_REPLY_MESSAGE arm:
-/// take the boxed outcome back and show the verdict.
-pub(crate) fn on_reply(hwnd: HWND, lparam: LPARAM) {
-    // SAFETY: the pointer was produced by Box::into_raw on the worker
-    // and delivered by PostMessage — this arm is its single consumer.
-    let outcome = unsafe { Box::from_raw(lparam.0 as *mut Outcome) };
-    match *outcome {
+/// claim the queued verdict and show it. A message with nothing queued
+/// (forged or spurious) is ignored.
+pub(crate) fn on_reply(hwnd: HWND) {
+    let Some(outcome) = REPLY_QUEUE.lock().ok().and_then(|mut q| q.pop_front()) else {
+        return;
+    };
+    match outcome {
         Outcome::UpToDate => {
             show_box(
                 hwnd,
@@ -302,8 +326,12 @@ fn fetch_latest_body() -> Result<String, ()> {
         fail!("WinHttpOpen");
     }
     let session = Handle(session);
-    // SAFETY: session.0 is the live session handle.
-    if unsafe { WinHttpSetTimeouts(session.0, 0, 5_000, 5_000, 10_000) }.is_err() {
+    // SAFETY: session.0 is the live session handle. All four timeouts
+    // are nonzero — resolve included: 0 would mean infinite per the
+    // MSDN contract, and a hung resolver would wedge the single-flight
+    // gate for the rest of the session with no Failed box ever shown
+    // (cubic #211 P2).
+    if unsafe { WinHttpSetTimeouts(session.0, 5_000, 5_000, 5_000, 10_000) }.is_err() {
         fail!("WinHttpSetTimeouts");
     }
     let host = to_wide(API_HOST);
@@ -440,6 +468,17 @@ mod tests {
         assert_eq!(parse_tag_name(""), None);
         // A truncated value (no closing quote) is None.
         assert_eq!(parse_tag_name(r#"{"tag_name":"v0.5.0"#), None);
+        // Non-JSON bodies that merely quote the key are None — the
+        // structure gate (cubic #211 P2).
+        assert_eq!(
+            parse_tag_name("garbage \"tag_name\":\"v9.9.9\" trailing"),
+            None
+        );
+        // Leading whitespace before the `{` stays tolerated.
+        assert_eq!(
+            parse_tag_name("  {\"tag_name\":\"v0.5.0\"}"),
+            Some("v0.5.0")
+        );
     }
 
     #[test]
@@ -452,6 +491,17 @@ mod tests {
         }
         assert!(matches!(decide("0.5.0", "garbage"), Outcome::Failed));
         assert!(matches!(decide("bad", "v0.6.0"), Outcome::Failed));
+        // A prerelease-suffixed running version compares leniently (the
+        // server-side tag stays strict; cubic #211 P3).
+        assert!(matches!(
+            decide("1.0.0-beta.1", "v1.0.0"),
+            Outcome::UpToDate
+        ));
+        match decide("1.0.0-beta.1", "v1.1.0") {
+            Outcome::Available(v) => assert_eq!(v, "1.1.0"),
+            other => panic!("expected Available, got {other:?}"),
+        }
+        assert!(matches!(decide("0.5.0", "v1.0.0-rc1"), Outcome::Failed));
     }
 
     #[test]

@@ -9651,11 +9651,12 @@ unsafe extern "system" fn wnd_proc(
             everything::send_random(hwnd);
             LRESULT(0)
         }
-        // #210: the update check's boxed reply (WM_APP+4 — the fourth
-        // private WM_APP message, ADR 0007 D2). This arm is the box's
-        // single consumer.
+        // #210: the update check's reply notification (WM_APP+4 — the
+        // fourth private WM_APP message, ADR 0007 D2). Payload-free by
+        // design: the verdict waits in update::REPLY_QUEUE, so a forged
+        // message can only pop an empty queue.
         update::UPDATE_REPLY_MESSAGE => {
-            update::on_reply(hwnd, lparam);
+            update::on_reply(hwnd);
             LRESULT(0)
         }
         WM_CLOSE => {

@@ -16,13 +16,13 @@ viv.c 零更新机制(亲证,#208 R1)——更新检查是 riviv 首个引入网
 `Win32_Networking_WinHttp` feature(registry windows-0.62.0 Cargo.toml:505 亲核)启用,零新第三方 crate、近零体积。**dumpbin 证据**(本 ADR 留档,VS18 BuildTools 14.51.36231 x64):
 
 - 改前(= v0.5.0 发布 exe,6,872,576 B;#210 双臂复跑 2026-10-06:pre-change 代码态重建字节一致,dumpbin 大小写不敏感去重):24 DLL——advapi32 / api-ms-crt×6+core-synch+shcore / bcryptprimitives / combase / comctl32 / comdlg32 / d2d1 / d3d11 / gdi32 / kernel32 / mscms / ntdll / ole32 / oleaut32 / shell32 / user32 / VCRUNTIME140,无任何网络 DLL(raw dumpbin 行 kernel32 双记共 25 行——初稿误按行计数且 crt 误记 ×5,双臂复跑订正)。
-- 改后(6,888,960 B,+16,384 B):25 DLL,唯一增量 = **winhttp.dll**(双臂 diff 恰一条,PR 亲跑 dumpbin 复核通过 2026-10-06)。
+- 改后(6,895,104 B,+22,528 B;cubic #211 五项采纳后的终态,首版实现为 6,888,960 B/+16,384 B):25 DLL,唯一增量 = **winhttp.dll**(双臂 diff 恰一条,首版与终态各亲跑一次 dumpbin 复核通过 2026-10-06)。
 
-地板合规:winhttp.dll 随系统交付(XP SP3 起),Win10 1607 地板自带、装机≈100%、无授权费——依赖原则第 6 条合格;TLS 面由系统 WinHTTP 承担(1607 默认 TLS 1.2,GitHub API 要求 1.2+,无沟)。否决项:urlmon `URLDownloadToFile`(COM+IE 缓存怪癖)、第三方 reqwest(**不违**依赖原则字面[禁的是外部工具链],败于 hyper/tokio 依赖树+MB 级体积,#208 O4 评审订正)。
+地板合规:winhttp.dll 随系统交付(WinHTTP 5.1 自 XP SP1 起;初稿误记 SP3,cubic #211 P3 订正),Win10 1607 地板自带、装机≈100%、无授权费——依赖原则第 6 条合格;TLS 面由系统 WinHTTP 承担(1607 默认 TLS 1.2,GitHub API 要求 1.2+,无沟)。否决项:urlmon `URLDownloadToFile`(COM+IE 缓存怪癖)、第三方 reqwest(**不违**依赖原则字面[禁的是外部工具链],败于 hyper/tokio 依赖树+MB 级体积,#208 O4 评审订正)。
 
-### D2. 回执协议 = 后台线程 + WM_APP+4 盒装回执
+### D2. 回执协议 = 后台线程 + WM_APP+4 纯通知 + 进程内队列
 
-单飞闸(static AtomicBool)挡重入;`Builder::spawn` 失败走用户级(#65 P2 先例,绝不 panic)。结果 `Box<Outcome>` 经 `PostMessageW(WM_APP+4)` 递送(wparam 弃用/lparam=指针);投递失败(窗口已亡)由 worker 收回盒。WM_APP+1/+2/+3 已被 load kick / Everything retry / pane jump 占用,+4 为本特性。
+单飞闸(static AtomicBool)挡重入;`Builder::spawn` 失败走用户级(#65 P2 先例,绝不 panic)。结果 `Outcome` 由 worker 放入进程内 `Mutex<VecDeque<Outcome>>` 队列后投递**零载荷**的 `PostMessageW(WM_APP+4)`——指针不跨消息边界,外进程伪造该消息只能弹到空队列被忽略(cubic #211 P2 采纳;初稿盒装指针经 lparam 递送的方案废弃)。单飞保证至多一个生产者,worker 入队前清队(窗口已亡未领取的旧裁决不滞留);投递失败(窗口已亡)仅留未领取条目随进程退出。WM_APP+1/+2/+3 已被 load kick / Everything retry / pane jump 占用,+4 为本特性。四个超时全非零(resolve/connect/send/receive = 5s/5s/5s/10s)——MSDN 契约 0=无限,cubic #211 P2:resolve 若无限,DNS 挂起会让单飞闸整会话卡死且永不弹 Failed。
 
 ### D3. 失败语义 = 独立 UX 决定(ADR 0001 不适用,显式不引申)
 
