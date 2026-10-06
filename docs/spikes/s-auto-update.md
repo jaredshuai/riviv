@@ -7,7 +7,7 @@
 
 ## 结论一句话
 
-自动更新是**首个无上游锚点的纯用户愿望票**(viv.c 零更新机制,亲证);横评定形态:框架应用(Clash Verge Rev / cc-switch)的自动替换靠框架 updater(Tauri 插件+minisign 签名),搬运不了;**样本内两台原生 Win32 同形态应用(Everything / Sumatra PDF)均走 HTTP 查版本 → 提示 → 开页或下载安装器,无一做进程内自替换(样本观察,非 Win32 通律)**;与上游同门的 Everything 给出文化对标(Help→Check for Updates… 菜单行、`check_for_updates_on_startup` ini 键默认关);riviv 侧硬约束 = exe 今日零网络 DLL 导入(PE 导入表基线在案),WinHTTP 是唯一合依赖原则的系统通道(windows 0.62 feature 在,零新第三方 crate),但**新 DLL 静态导入 = S1 地板规则 ADR 硬前置**;推荐首刀 = notify-only(Help 菜单手动检查 + 三态对话框 + 有新版开 releases 页),下载/安装/portable 自替换留作后继刀。
+自动更新是**首个无上游锚点的纯用户愿望票**(viv.c 零更新机制,亲证);横评定形态:框架应用(Clash Verge Rev / cc-switch)的自动替换靠框架 updater(Tauri 插件+minisign 签名),搬运不了;**样本内两台原生 Win32 同形态应用(Everything / Sumatra PDF)的公共骨架 = HTTP 查版本 → 提示 → 开页/下载安装器(样本观察,非 Win32 通律);「运行中原地自替换」两样本皆无,但 Sumatra 对 portable 另有 helper 进程自替换分支(旧实例退出→新 exe 覆盖→重启,见横评表)——O1=C 存在原生先例**;与上游同门的 Everything 给出文化对标(Help→Check for Updates… 菜单行、`check_for_updates_on_startup` ini 键);riviv 侧硬约束 = exe 今日零网络 DLL 导入(PE 导入表基线在案),WinHTTP 是系统通道中最合依赖原则的一条(windows 0.62 feature 在,零新第三方 crate;第三方 crate 不被原则禁止,败于依赖树/体积,见 O4),但**新 DLL 静态导入 = S1 地板规则 ADR 硬前置**;推荐首刀 = notify-only(Help 菜单手动检查 + 三态对话框 + 有新版开 releases 页),下载/安装/portable 自替换留作后继刀。
 
 ## 为什么做
 
@@ -22,10 +22,10 @@
 | **Clash Verge Rev** | Tauri 2 框架 | tauri-plugin-updater(v2.9.0):latest.json 清单 + minisign 签名验证 + 双通道(stable/alpha)+ CDN 回退;资产在 GitHub Releases | 框架自带,**不可搬运**;可学:签名验证思想、清单与渠道分离 |
 | **cc-switch** | Tauri 桌面应用 | .msi 经 GitHub Releases 分发,Tauri 式更新流 | 同上,不可搬运 |
 | **DeepSeek desktop** | —(未定位到官方 Windows desktop) | dsh 更新面本轮未能核实(搜索摘要所引 issue 精确链接两轮均不可核,且后续摘要显示 dsh 生态已有 auto-update 插件,「反例」不成立) | 无结论,**不作为拍板证据** |
-| **Everything**(voidtools,与上游同门) | 原生 Win32,无框架 | Help→Check for Updates…;ini `check_for_updates_on_startup`(静默安装默认关);发现新版走 voidtools.com 下载 | **文化对标最强**:菜单位置、ini 键名、默认关,三个决定可照抄 |
-| **Sumatra PDF** | 原生 Win32 C++ | 设置勾选「自动检查更新」→ 查官方站版本 → 提供下载安装器 | 同形态先例:HTTP 查版本+下载安装器,无框架 |
+| **Everything**(voidtools,与上游同门) | 原生 Win32,无框架 | Help→Check for Updates…;ini `check_for_updates_on_startup`(静默安装默认关;交互安装默认未核);发现新版走 voidtools.com 下载 | **文化对标最强**:菜单位置、ini 键名可照;默认值面实现票再核 |
+| **Sumatra PDF** | 原生 Win32 C++ | `CheckForUpdates` **默认开**(每日至多一次,官方隐私政策明文),查官方站版本;安装版提供下载安装器;**portable 版另有自替换分支**:下载 `PortableExe*` 资产 → 以 `-update-self-to` 启动新 exe → 旧实例退出 → 新 exe 覆盖原位 → 重启(helper 进程模式;Codex 评审核并附 [UpdateCheck.cpp](https://github.com/sumatrapdfreader/sumatrapdf/blob/master/src/UpdateCheck.cpp) 链接,本轮未亲读,实现票前亲读) | 同形态先例**两条**:查版本+安装器骨架,与 **portable 自替换 helper 进程**(= O1=C 的原生先例,注意它也是先退出再覆盖,非运行中原地替换) |
 
-**横评归纳(样本 = 上表五款,泛化以上述观察为限)**:①两台原生 Win32 应用(Everything/Sumatra,n=2)均走查版本→提示→开页/下载安装器,未观察到位内自替换——**样本观察,非通律**;②两台框架应用的自动替换均依赖框架 updater(Electron autoUpdater / Tauri updater),代价是签名体系+清单服务;③voidtools 家族惯例 = 手动菜单 + 启动检查开关默认关。
+**横评归纳(样本 = 上表五款,泛化以上述观察为限)**:①两台原生 Win32 应用(Everything/Sumatra,n=2)的公共骨架 = 查版本→提示→开页/下载安装器;**「运行中原地自替换」未观察到**——Sumatra 的 portable 自替换是 helper 进程模式且先退出旧实例再覆盖;②两台框架应用的自动替换均依赖框架 updater(Electron autoUpdater / Tauri updater),代价是签名体系+清单服务;③启动检查默认值两原生样本**相反**(Everything 静默装默认关、Sumatra 默认开)——横评不构成「原生默认手动」的依据,默认值是 riviv 自己拍;④voidtools 家族惯例 = Help 菜单手动行 + 启动检查 ini 开关。
 
 ## riviv 侧证据(全部本地可复核)
 
@@ -34,7 +34,7 @@
 | R1 | 上游零更新机制 | c-original grep:仅 os.c:111-112 `os_major_version`(shell 集成用);viv.c:958-965 Help 菜单无 update 行;全库无 version check/下载器 |
 | R2 | exe 今日零网络 DLL 导入 | `grep -aoE '[a-z0-9_-]+\.dll' target/release/riviv.exe` 全量 = advapi32/bcryptprimitives/combase/comctl32/comdlg32/d2d1/d3d11/dbghelp/gdi32/kernel32/mscms/ntdll/ole32/oleaut32/shell32/user32 + api-ms-*;无 winhttp/wininet/ws2_32/urlmon。**注:字符串法是本 spike 的便宜证据;实现票 ADR 前须 dumpbin /imports 正式留档**(S1 地板规则先例 #156) |
 | R3 | WinHTTP 走 windows 0.62 feature 即得,零新第三方 crate | registry windows-0.62.* Cargo.toml:505 `Win32_Networking_WinHttp = ["Win32_Networking"]`;riviv Cargo.toml 现未启用任何 Networking feature |
-| R4 | GitHub API 渠道现成且带免费校验面 | `GET api.github.com/repos/jaredshuai/riviv/releases/latest` 本机亲通(curl,2026-10-06);响应含 `tag_name` 与 `assets[].digest`(sha256,v0.4.0/v0.5.0 资产亲见);未认证限流 60 req/h/IP——手动检查绰绰有余 |
+| R4 | GitHub API 渠道现成且带免费**完整性**校验面 | `GET api.github.com/repos/jaredshuai/riviv/releases/latest` 本机亲通(curl,2026-10-06);响应含 `tag_name` 与 `assets[].digest`(sha256,v0.4.0/v0.5.0 资产亲见);未认证限流 60 req/h/IP——手动检查绰绰有余。**digest 是 integrity-only**:哈希与二进制同源(GitHub 同一信任域),防损坏/传输错、不防投毒;若后继刀走「下载即执行」,称『已验证』前须另立信任锚(Authenticode/独立 pinned key——Tauri 的 minisign 即此类独立锚) |
 | R5 | 版本比较有纯函数落点 | tag `vX.Y.Z` vs `CARGO_PKG_VERSION`:手写 parse+semver 三元比较(不引 semver crate/serde;单字段 JSON 手解析),入测试网(质量档位:纯逻辑产品标准) |
 | R6 | Help 菜单/助记符余量 | Help 层现两行:Command Line Options(C)/About(A),三表一致(loc.rs:696/831、1036/1170、1376/1510);**U 在 Help 层内空闲可用**——但 U 并非全表空闲:Edit 层 Undo Delete(loc.rs:662/1002/1342)与 Pan/Scan 层 Move Up(675/1015/1355)三表均占 U;撞车网按弹层判重(菜单层内不撞即可,助记符逐层分配 = #203 O6 机制),Help 层用 U 运行时合法;新行推荐落 Command Line Options 与 About 之间(Everything 惯例:检查更新在 About 附近) |
 | R7 | 安装器替换面风险(后继刀的坑) | 运行中实例锁 exe:NSIS 安装器覆盖在跑文件会失败,「下载+安装」须先关实例(单实例 mutex 转发语义 #109 也在场,交互在实现票核);**首刀 notify-only 不碰此面** |
@@ -42,12 +42,12 @@
 
 ## 开放问题(拍板项;全附推荐)
 
-- **O1 首刀范围**:**A = notify-only**(WinHTTP 查 `releases/latest`,semver 比较,三态对话框:已是最新 / 有新版 vX.Y.Z→「打开下载页?」(ShellExecute `html_url`) / 网络失败;**推荐**——横评原生公共形态,网络只读不下载,风险面最小,覆盖「知道有新版」的全部价值)/ B = 下载+sha256 校验+跑安装器(digest 免费拿,但引入 R7 替换坑+安装器语言三选一设计题,留二刀)/ C = portable 自替换(running-exe rename 技巧,最重,最远)。
-- **O2 触发**:**A = 仅 Help 菜单手动**(推荐,Everything/Sumatra 的默认姿势;零新 ini 键,零启动时序面)/ B = +启动自动检查(后台线程+节流;Everything 键名 `check_for_updates_on_startup` 默认 0[负控纪律];留二刀)。
+- **O1 首刀范围**:**A = notify-only**(WinHTTP 查 `releases/latest`,semver 比较,三态对话框:已是最新 / 有新版 vX.Y.Z→「打开下载页?」(ShellExecute `html_url`) / 网络失败;**推荐**——样本内原生公共骨架,网络只读不下载,风险面最小,覆盖「知道有新版」的全部价值)/ B = 下载+digest 校验+跑安装器(integrity-only,见 R4;认证锚与 R7 替换坑+安装器语言三选一设计题,留二刀)/ C = portable 自替换(**有原生先例**:Sumatra helper 进程模式 = 下载新 exe → 新 exe 带 `-update-self-to` 类开关启动 → 旧实例退出 → 覆盖 → 重启;非运行中原地替换;最重,最远)。
+- **O2 触发**:**A = 仅 Help 菜单手动**(推荐——riviv 侧理由:零新 ini 键、零启动时序面、负控纪律;**横评不背书**:两原生样本启动检查默认值相反[Everything 静默装默认关/Sumatra 默认开],归纳③)/ B = +启动自动检查(后台线程+节流;Everything 键名 `check_for_updates_on_startup` 默认 0[负控纪律];留二刀)。
 - **O3 渠道**:**GitHub `releases/latest` 单渠道钉死**(推荐;本仓无自有服务器,Latest 标记即发布语义;不设镜像/备源)。
-- **O4 网络栈**:**A = WinHTTP**(windows feature 启用,推荐;系统组件、无 COM、显式超时/UA;**ADR 硬前置**=新 DLL 静态导入+R2 基线对照)/ B = urlmon `URLDownloadToFile`(一行下载但 COM+IE 缓存怪癖,劣)/ C = 第三方 reqwest(违零外部依赖原则,否决)。
+- **O4 网络栈**:**A = WinHTTP**(windows feature 启用,推荐;系统组件、无 COM、显式超时/UA;**ADR 硬前置**=新 DLL 静态导入+R2 基线对照)/ B = urlmon `URLDownloadToFile`(一行下载但 COM+IE 缓存怪癖,劣)/ C = 第三方 reqwest(**不被依赖原则禁止**——原则第 1 条禁的是外部工具链,非第三方 crate[AGENTS.md 依赖原则原文];败因=hyper/tokio 异步依赖树+TLS 后端体积(MB 级,须 ADR 0005 式体积论证),而 WinHTTP 经 windows feature 零新 crate 近零体积)。
 - **O5 UI/语言面**:Help 菜单新行(三表同步,~6 新串:菜单行+三态文案+按钮)+ 消息框复用现有 MessageBox 通道;**无新默认热键**(菜单行即可);助记符 U(R6 修正口径:**Help 层内**空闲;跨层 U 已被 Edit 层 Undo Delete / Pan/Scan 层 Move Up 占用,不在同层、按层判重合法);新 key 入撞车网净面(grandfather 钉精确计数的既有机制自动护住)。
-- **O6 失败语义**:手动检查失败 = 用户级消息框、窗口不退出(ADR 0001 用户级姿态);HTTP 全程后台线程,回执走 WM_APP 族(worker 线程先例),UI 永不冻结;(二刀若做)启动检查失败 = 静默 + stderr breadcrumb。**非选择项,随 O1=A 即生效,列出供否决**。
+- **O6 失败语义(独立 UX 决定,非 ADR 0001 引申)**:ADR 0001 的用户级=图片加载失败且规定**不弹框**;更新网络失败是新恢复类,ADR 不裁此事。推荐:手动检查失败 = 消息框告知(用户主动询问,应有回答;**可否决**)/ 启动检查(若二刀)失败 = 静默 + stderr breadcrumb;HTTP 全程后台线程,回执走 WM_APP 族(worker 线程先例),UI 永不冻结。
 
 ## 边界与风险(实现票前须知)
 
