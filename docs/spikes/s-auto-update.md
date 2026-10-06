@@ -7,7 +7,7 @@
 
 ## 结论一句话
 
-自动更新是**首个无上游锚点的纯用户愿望票**(viv.c 零更新机制,亲证);横评定形态:框架应用(Clash Verge Rev / cc-switch)的自动替换靠框架 updater(Tauri 插件+minisign 签名),搬运不了;**原生 Win32 同形态应用(Everything / Sumatra PDF)的公共形态 = HTTP 查版本 → 提示 → 开页或下载安装器,没有一家做进程内自替换**;与上游同门的 Everything 给出文化对标(Help→Check for Updates… 菜单行、`check_for_updates_on_startup` ini 键默认关);riviv 侧硬约束 = exe 今日零网络 DLL 导入(PE 导入表基线在案),WinHTTP 是唯一合依赖原则的系统通道(windows 0.62 feature 在,零新第三方 crate),但**新 DLL 静态导入 = S1 地板规则 ADR 硬前置**;推荐首刀 = notify-only(Help 菜单手动检查 + 三态对话框 + 有新版开 releases 页),下载/安装/portable 自替换留作后继刀。
+自动更新是**首个无上游锚点的纯用户愿望票**(viv.c 零更新机制,亲证);横评定形态:框架应用(Clash Verge Rev / cc-switch)的自动替换靠框架 updater(Tauri 插件+minisign 签名),搬运不了;**样本内两台原生 Win32 同形态应用(Everything / Sumatra PDF)均走 HTTP 查版本 → 提示 → 开页或下载安装器,无一做进程内自替换(样本观察,非 Win32 通律)**;与上游同门的 Everything 给出文化对标(Help→Check for Updates… 菜单行、`check_for_updates_on_startup` ini 键默认关);riviv 侧硬约束 = exe 今日零网络 DLL 导入(PE 导入表基线在案),WinHTTP 是唯一合依赖原则的系统通道(windows 0.62 feature 在,零新第三方 crate),但**新 DLL 静态导入 = S1 地板规则 ADR 硬前置**;推荐首刀 = notify-only(Help 菜单手动检查 + 三态对话框 + 有新版开 releases 页),下载/安装/portable 自替换留作后继刀。
 
 ## 为什么做
 
@@ -21,11 +21,11 @@
 |---|---|---|---|
 | **Clash Verge Rev** | Tauri 2 框架 | tauri-plugin-updater(v2.9.0):latest.json 清单 + minisign 签名验证 + 双通道(stable/alpha)+ CDN 回退;资产在 GitHub Releases | 框架自带,**不可搬运**;可学:签名验证思想、清单与渠道分离 |
 | **cc-switch** | Tauri 桌面应用 | .msi 经 GitHub Releases 分发,Tauri 式更新流 | 同上,不可搬运 |
-| **DeepSeek desktop** | —(无官方 Windows desktop) | 官方 dsh CLI **零更新检查**(2026-08 仍有 open idea issue 求加);npx 每次重拉 = 事实上的更新 | 反例数据点:大热工具也可以没有更新面 |
+| **DeepSeek desktop** | —(未定位到官方 Windows desktop) | dsh 更新面本轮未能核实(搜索摘要所引 issue 精确链接两轮均不可核,且后续摘要显示 dsh 生态已有 auto-update 插件,「反例」不成立) | 无结论,**不作为拍板证据** |
 | **Everything**(voidtools,与上游同门) | 原生 Win32,无框架 | Help→Check for Updates…;ini `check_for_updates_on_startup`(静默安装默认关);发现新版走 voidtools.com 下载 | **文化对标最强**:菜单位置、ini 键名、默认关,三个决定可照抄 |
 | **Sumatra PDF** | 原生 Win32 C++ | 设置勾选「自动检查更新」→ 查官方站版本 → 提供下载安装器 | 同形态先例:HTTP 查版本+下载安装器,无框架 |
 
-**横评归纳**:①原生 Win32 应用的公共形态 = 查版本→提示→开页/下载安装器,无一家做进程内自替换;②全自动替换专属框架应用(Electron autoUpdater / Tauri updater),代价是签名体系+清单服务;③voidtools 家族惯例 = 手动菜单 + 启动检查开关默认关。
+**横评归纳(样本 = 上表五款,泛化以上述观察为限)**:①两台原生 Win32 应用(Everything/Sumatra,n=2)均走查版本→提示→开页/下载安装器,未观察到位内自替换——**样本观察,非通律**;②两台框架应用的自动替换均依赖框架 updater(Electron autoUpdater / Tauri updater),代价是签名体系+清单服务;③voidtools 家族惯例 = 手动菜单 + 启动检查开关默认关。
 
 ## riviv 侧证据(全部本地可复核)
 
@@ -36,7 +36,7 @@
 | R3 | WinHTTP 走 windows 0.62 feature 即得,零新第三方 crate | registry windows-0.62.* Cargo.toml:505 `Win32_Networking_WinHttp = ["Win32_Networking"]`;riviv Cargo.toml 现未启用任何 Networking feature |
 | R4 | GitHub API 渠道现成且带免费校验面 | `GET api.github.com/repos/jaredshuai/riviv/releases/latest` 本机亲通(curl,2026-10-06);响应含 `tag_name` 与 `assets[].digest`(sha256,v0.4.0/v0.5.0 资产亲见);未认证限流 60 req/h/IP——手动检查绰绰有余 |
 | R5 | 版本比较有纯函数落点 | tag `vX.Y.Z` vs `CARGO_PKG_VERSION`:手写 parse+semver 三元比较(不引 semver crate/serde;单字段 JSON 手解析),入测试网(质量档位:纯逻辑产品标准) |
-| R6 | Help 菜单/助记符余量 | Help 层现两行:Command Line Options(C)/About(A),三表一致(loc.rs:696/831、1036/1170、1376/1510);**U 三表全空闲**——Check for &Updates / 检查更新(&U) / 檢查更新(&U) 可用;新行推荐落 Command Line Options 与 About 之间(Everything 惯例:检查更新在 About 附近) |
+| R6 | Help 菜单/助记符余量 | Help 层现两行:Command Line Options(C)/About(A),三表一致(loc.rs:696/831、1036/1170、1376/1510);**U 在 Help 层内空闲可用**——但 U 并非全表空闲:Edit 层 Undo Delete(loc.rs:662/1002/1342)与 Pan/Scan 层 Move Up(675/1015/1355)三表均占 U;撞车网按弹层判重(菜单层内不撞即可,助记符逐层分配 = #203 O6 机制),Help 层用 U 运行时合法;新行推荐落 Command Line Options 与 About 之间(Everything 惯例:检查更新在 About 附近) |
 | R7 | 安装器替换面风险(后继刀的坑) | 运行中实例锁 exe:NSIS 安装器覆盖在跑文件会失败,「下载+安装」须先关实例(单实例 mutex 转发语义 #109 也在场,交互在实现票核);**首刀 notify-only 不碰此面** |
 | R8 | TLS/地板 | Win10 1607 的 WinHTTP 默认启 TLS 1.2;GitHub API 要求 TLS 1.2+ ⇒ 地板上无沟 |
 
@@ -46,7 +46,7 @@
 - **O2 触发**:**A = 仅 Help 菜单手动**(推荐,Everything/Sumatra 的默认姿势;零新 ini 键,零启动时序面)/ B = +启动自动检查(后台线程+节流;Everything 键名 `check_for_updates_on_startup` 默认 0[负控纪律];留二刀)。
 - **O3 渠道**:**GitHub `releases/latest` 单渠道钉死**(推荐;本仓无自有服务器,Latest 标记即发布语义;不设镜像/备源)。
 - **O4 网络栈**:**A = WinHTTP**(windows feature 启用,推荐;系统组件、无 COM、显式超时/UA;**ADR 硬前置**=新 DLL 静态导入+R2 基线对照)/ B = urlmon `URLDownloadToFile`(一行下载但 COM+IE 缓存怪癖,劣)/ C = 第三方 reqwest(违零外部依赖原则,否决)。
-- **O5 UI/语言面**:Help 菜单新行(三表同步,~6 新串:菜单行+三态文案+按钮)+ 消息框复用现有 MessageBox 通道;**无新默认热键**(菜单行即可);助记符 U(R6);新 key 入撞车网净面(grandfather 钉精确计数的既有机制自动护住)。
+- **O5 UI/语言面**:Help 菜单新行(三表同步,~6 新串:菜单行+三态文案+按钮)+ 消息框复用现有 MessageBox 通道;**无新默认热键**(菜单行即可);助记符 U(R6 修正口径:**Help 层内**空闲;跨层 U 已被 Edit 层 Undo Delete / Pan/Scan 层 Move Up 占用,不在同层、按层判重合法);新 key 入撞车网净面(grandfather 钉精确计数的既有机制自动护住)。
 - **O6 失败语义**:手动检查失败 = 用户级消息框、窗口不退出(ADR 0001 用户级姿态);HTTP 全程后台线程,回执走 WM_APP 族(worker 线程先例),UI 永不冻结;(二刀若做)启动检查失败 = 静默 + stderr breadcrumb。**非选择项,随 O1=A 即生效,列出供否决**。
 
 ## 边界与风险(实现票前须知)
@@ -65,6 +65,6 @@
 
 - Clash Verge Rev:[repo](https://github.com/Clash-Verge-rev/clash-verge-rev) / [DeepWiki Update Mechanism](https://deepwiki.com/clash-verge-rev/clash-verge-rev/10.2-update-mechanism) / [Tauri v2 updater](https://v2.tauri.app/plugin/updater)
 - cc-switch:[repo](https://github.com/farion1231/cc-switch) / [docs](https://ccswitch.io)
-- DeepSeek dsh 无更新检查:GitHub idea issue「Auto-update / update notification for the official dsh」(2026-08-16,WebSearch 摘要,issue 精确链接未逐字核)
+- DeepSeek dsh:无可靠链接(两轮搜索摘要互相矛盾且精确 issue 链接不可核,已从证据面移除,见横评表注)
 - Everything:voidtools.com FAQ/CLI 文档(Help→Check for Updates、`check_for_updates_on_startup`、静默安装默认不查)
 - Sumatra PDF:[repo](https://github.com/sumatrapdfreader/sumatrapdf)(设置内自动检查更新,UpdateCheck 实现)
