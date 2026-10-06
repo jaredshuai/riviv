@@ -2651,7 +2651,7 @@ mod tests {
         // #199's tail append: the pane toggle rides the tail.
         assert_eq!(Cmd::ViewPlaylistPane.id(), 126);
         // #210's tail append: the update-check row rides the tail
-        // (smoke210 posts it by raw id 127).
+        // (GUI smokes post it by raw id 127).
         assert_eq!(Cmd::HelpCheckUpdates.id(), 127);
         assert_eq!(Cmd::COUNT, 127);
     }

@@ -141,7 +141,10 @@ pub(crate) fn decide(current: &str, latest_tag: &str) -> Outcome {
 /// an unbounded allocation. Pure so the boundary is testable.
 const MAX_BODY_BYTES: usize = 64 * 1024;
 pub(crate) fn body_fits(have: usize, add: usize) -> bool {
-    have + add <= MAX_BODY_BYTES
+    // checked_add: on a 32-bit usize a hostile avail near u32::MAX
+    // would wrap the plain sum below the cap (adversarial review #211
+    // P3 — unreachable on the x64-only ship, but this is the guard).
+    have.checked_add(add).is_some_and(|t| t <= MAX_BODY_BYTES)
 }
 
 /// Help -> Check for Updates (called on the UI thread). Spawns the
@@ -510,5 +513,7 @@ mod tests {
         assert!(body_fits(1, MAX_BODY_BYTES - 1));
         assert!(!body_fits(1, MAX_BODY_BYTES));
         assert!(!body_fits(MAX_BODY_BYTES, 1));
+        // A hostile chunk size that would wrap the sum stays outside.
+        assert!(!body_fits(1, usize::MAX));
     }
 }
