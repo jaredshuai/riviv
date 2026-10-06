@@ -39,6 +39,9 @@ windows = { version = "0.62", features = [
     # QueryDisplayConfig/DisplayConfigGetDeviceInfo — display-profile judge
     # (#130): user32 exports present since Win7, floor-safe
     "Win32_Devices_Display",
+    # 更新检查的 WinHTTP 通道(#210/ADR 0007)——唯一新增网络导入,
+    # 系统组件、1607 地板自带
+    "Win32_Networking_WinHttp",
     "Win32_System_Com",
     "Win32_System_DataExchange",
     "Win32_System_Environment",

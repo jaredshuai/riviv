@@ -1150,6 +1150,10 @@ mod tests {
                 "help_command_line_options_keys",
             ),
             (Cmd::HelpAbout, "help_about_keys"),
+            // #210's tail append (the derived spelling pinned so an
+            // en-caption rename can never silently migrate the key and
+            // drop users' bindings).
+            (Cmd::HelpCheckUpdates, "help_check_for_updates_keys"),
         ];
         for (cmd, name) in expect {
             assert_eq!(ini_name(cmd), name);
