@@ -52,6 +52,7 @@
 | docs/spikes/s-d2d-effects.md | 验证与观察 | current | 调查者/effect chain 咨询复议时 | D2D 显示效果链开题证据:挂点/API/语义/表面 + 开放问题 O1-O6(#180) |
 | docs/spikes/s-playlist-pane.md | 验证与观察 | current | 调查者/playlist pane 咨询复议时 | playlist pane 开题证据:上游零规格/复用缝/侵入面/热键余量 + 开放问题 O1-O6(#197) |
 | docs/spikes/s-i18n.md | 验证与观察 | current | 调查者/I18N 咨询复议时 | I18N beyond en/zh-CN 开题证据:上游双表机制/复用缝/测试缝/安装器面/翻译供给 + 开放问题 O1-O6(#201) |
+| docs/spikes/s-auto-update.md | 验证与观察 | current | 调查者/更新面咨询复议时 | 应用内更新检查开题证据:横评(框架 vs 原生 Win32)/PE 导入基线/GitHub API 渠道/WinHTTP+ADR 硬前置 + 开放问题 O1-O6(#208) |
 | docs/agents/triage-labels.md | 规则与术语 | current | 规划者/标签词汇变化时 | 五标签分诊词汇 |
 | docs/agents/domain.md | 规则与术语 | current | 规划者/文档架构变化时 | 单上下文+ADR 约定 |
 | docs/plan-26-association-nsis.md | 需求与验收 | reference | 书记员/历史留档 | #26 安装族历史规格;特性已交付,原位保留 |
