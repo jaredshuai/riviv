@@ -25,7 +25,7 @@
 | **Everything**(voidtools,与上游同门) | 原生 Win32,无框架 | Help→Check for Updates…;ini `check_for_updates_on_startup`(静默安装默认关;交互安装默认未核);发现新版走 voidtools.com 下载 | **文化对标最强**:菜单位置、ini 键名可照;默认值面实现票再核 |
 | **Sumatra PDF** | 原生 Win32 C++ | `CheckForUpdates` **默认开**(每日至多一次,官方隐私政策明文),查官方站版本;安装版提供下载安装器;**portable 版另有自替换分支**:下载 `PortableExe*` 资产 → 以 `-update-self-to` 启动新 exe → 旧实例退出 → 新 exe 覆盖原位 → 重启(helper 进程模式;Codex 评审核并附 [UpdateCheck.cpp](https://github.com/sumatrapdfreader/sumatrapdf/blob/master/src/UpdateCheck.cpp) 链接,本轮未亲读,实现票前亲读) | 同形态先例**两条**:查版本+安装器骨架,与 **portable 自替换 helper 进程**(= O1=C 的原生先例,注意它也是先退出再覆盖,非运行中原地替换) |
 
-**横评归纳(样本 = 上表五款,泛化以上述观察为限)**:①两台原生 Win32 应用(Everything/Sumatra,n=2)的公共骨架 = 查版本→提示→开页/下载安装器;**「运行中原地自替换」未观察到**——Sumatra 的 portable 自替换是 helper 进程模式且先退出旧实例再覆盖;②两台框架应用的自动替换均依赖框架 updater(Electron autoUpdater / Tauri updater),代价是签名体系+清单服务;③启动检查默认值两原生样本**相反**(Everything 静默装默认关、Sumatra 默认开)——横评不构成「原生默认手动」的依据,默认值是 riviv 自己拍;④voidtools 家族惯例 = Help 菜单手动行 + 启动检查 ini 开关。
+**横评归纳(样本 = 上表五款,泛化以上述观察为限)**:①两台原生 Win32 应用(Everything/Sumatra,n=2)的公共骨架 = 查版本→提示→开页/下载安装器;**「运行中原地自替换」未观察到**——Sumatra 的 portable 自替换是 helper 进程模式且先退出旧实例再覆盖;②两台框架应用的自动替换均依赖框架 updater(**样本内两台皆为 Tauri updater**;Electron autoUpdater 是同类机制的一般例,不在本样本内),代价是签名体系+清单服务;③启动检查默认值两原生样本**相反**(Everything 静默装默认关、Sumatra 默认开)——横评不构成「原生默认手动」的依据,默认值是 riviv 自己拍;④voidtools 家族惯例 = Help 菜单手动行 + 启动检查 ini 开关。
 
 ## riviv 侧证据(全部本地可复核)
 
