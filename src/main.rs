@@ -133,6 +133,7 @@ mod text;
 mod tile;
 mod toolbar;
 mod transform_stage;
+mod update;
 mod window;
 mod zoom;
 

@@ -739,16 +739,16 @@ mod tests {
         // 61 int keys + the riviv-authored keep_zoom (#68) + sharpen
         // (#185) + white_balance (#191) + contrast (#193) + the renderer
         // string key (#80) + the pane's two keys (#199) + one *_keys line
-        // per command in Cmd::ALL order (126 rows now — #199's tail
-        // append added its own) —
+        // per command in Cmd::ALL order (127 rows now — #199's and
+        // #210's tail appends added their own) —
         // bound rows and empty rows alike (#42's shell septet, #43's
-        // file-management octet, #178's/#185's/#191's/#193's/#199's
+        // file-management octet, #178's/#185's/#191's/#193's/#199's/#210's
         // tail-appended rows among them; no bound-row count is pinned
         // here — the DEFAULT_KEYS table is its own source of truth and a
         // hand-counted number would only drift).
         assert_eq!(
             c.to_pairs(false).len(),
-            193,
+            194,
             "the save table + keep_zoom + sharpen + white_balance + contrast + renderer + pane pair"
         );
     }
@@ -800,7 +800,7 @@ mod tests {
         let c = Config::default();
         assert_eq!(
             c.to_pairs(true).len(),
-            193,
+            194,
             "active store writes the full table"
         );
         let c = Config {

@@ -134,6 +134,7 @@ use crate::text::{
     TitleFormat, about_text, dialog_filter, temp_animation_rate_text, temp_pos_zoom_text,
     temp_slideshow_rate_text, title_wide, to_wide,
 };
+use crate::update;
 use crate::zoom::{FitPolicy, View, Viewport};
 use windows::Win32::System::Power::{
     ES_CONTINUOUS, ES_DISPLAY_REQUIRED, ES_SYSTEM_REQUIRED, SetThreadExecutionState,
@@ -7865,6 +7866,9 @@ fn on_command(hwnd: HWND, cmd: menu::Cmd) {
         menu::Cmd::NavShuffle => shuffle_toggle(hwnd),
         menu::Cmd::NavJumpTo => crate::jumpto_dlg::open(hwnd),
         menu::Cmd::HelpCommandLineOptions => show_usage(hwnd),
+        // #210: the notify-only update check (ADR 0007) — the verdict
+        // comes back on UPDATE_REPLY_MESSAGE below.
+        menu::Cmd::HelpCheckUpdates => update::begin(hwnd),
         menu::Cmd::HelpAbout => show_about(hwnd),
     }
 }
@@ -9645,6 +9649,13 @@ unsafe extern "system" fn wnd_proc(
         // a WM_APP message nobody else consumes.
         everything::RETRY_RANDOM_MESSAGE => {
             everything::send_random(hwnd);
+            LRESULT(0)
+        }
+        // #210: the update check's boxed reply (WM_APP+4 — the fourth
+        // private WM_APP message, ADR 0007 D2). This arm is the box's
+        // single consumer.
+        update::UPDATE_REPLY_MESSAGE => {
+            update::on_reply(hwnd, lparam);
             LRESULT(0)
         }
         WM_CLOSE => {

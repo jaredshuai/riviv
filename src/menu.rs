@@ -397,12 +397,18 @@ pub(crate) enum Cmd {
     /// keyless upstream; Controls-page bindable). Tail-appended so every
     /// existing command id stays pinned for the smoke scripts.
     ViewPlaylistPane,
+    /// Help → "Check for Updates" (#210, riviv-authored — upstream has
+    /// no update mechanism, ADR 0007). A notify-only check, not a
+    /// toggle; no default hotkey (the row is menu-reachable like its
+    /// Help siblings). Tail-appended so every existing command id stays
+    /// pinned for the smoke scripts.
+    HelpCheckUpdates,
 }
 
 impl Cmd {
     /// Variant count; also the id space size (ids are 1-based — 0 is the
     /// separator/no-command id in Win32 menus and must stay unassigned).
-    pub(crate) const COUNT: usize = Self::ViewPlaylistPane as usize + 1;
+    pub(crate) const COUNT: usize = Self::HelpCheckUpdates as usize + 1;
 
     /// The WM_COMMAND command id (upstream uses the `VIV_ID_*` enum values;
     /// riviv's ids are app-internal — nothing interoperates — so they run
@@ -608,6 +614,8 @@ impl Cmd {
         Self::ViewWhiteBalance,
         Self::ViewContrast,
         Self::ViewPlaylistPane,
+        // #210's (id 127).
+        Self::HelpCheckUpdates,
     ];
 }
 
@@ -1524,6 +1532,15 @@ pub(crate) const ENTRIES: &[Entry] = &[
         loc: loc::Id::MenuCommandLineOptions,
         parent: Slot::Help,
         cmd: Cmd::HelpCommandLineOptions,
+    },
+    // #210: the spike's placement ruling (s-auto-update R6, following
+    // voidtools' Everything app — the check-for-updates row near About,
+    // not the everything.rs integration) — between the usage row and
+    // About. Not a toggle: no MenuState row, no checkmark.
+    Entry::Item {
+        loc: loc::Id::MenuCheckForUpdates,
+        parent: Slot::Help,
+        cmd: Cmd::HelpCheckUpdates,
     },
     Entry::Item {
         loc: loc::Id::MenuAbout,
@@ -2633,7 +2650,10 @@ mod tests {
         assert_eq!(Cmd::ViewContrast.id(), 125);
         // #199's tail append: the pane toggle rides the tail.
         assert_eq!(Cmd::ViewPlaylistPane.id(), 126);
-        assert_eq!(Cmd::COUNT, 126);
+        // #210's tail append: the update-check row rides the tail
+        // (smoke210 posts it by raw id 127).
+        assert_eq!(Cmd::HelpCheckUpdates.id(), 127);
+        assert_eq!(Cmd::COUNT, 127);
     }
 
     #[test]

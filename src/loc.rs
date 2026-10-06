@@ -604,12 +604,24 @@ pub(crate) enum Id {
     OptionsContrast8,
     OptionsContrast9,
     OptionsContrast10,
+    /// ---- #210: update check ----
+    /// Help → "Check for Updates" (#210, riviv-authored — upstream has
+    /// no update mechanism; the row sits between Command Line Options
+    /// and About like Everything's, ADR 0007).
+    MenuCheckForUpdates,
+    /// Update-check dialog: already on the latest version (#210).
+    UpdateUpToDateText,
+    /// Update-check dialog: a newer release exists; the single `%s`
+    /// placeholder takes the new version number (#210).
+    UpdateNewVersionText,
+    /// Update-check dialog: the network check failed (#210).
+    UpdateFailedText,
 }
 
 impl Id {
     /// Variant count; array-typing every table against this keeps them
     /// length-locked to the enum by construction.
-    pub(crate) const COUNT: usize = Self::OptionsContrast10 as usize + 1;
+    pub(crate) const COUNT: usize = Self::UpdateFailedText as usize + 1;
 }
 
 /// Table choice (upstream `LOCALIZATION_LANGUAGE_*`, localization.h:30-32;
@@ -895,87 +907,91 @@ const EN_US: [&str; Id::COUNT] = [
     "&While Playing Slideshow or Animating", // MenuWhilePlaying (en_us.h:113)
     "&Never",                                // MenuNever (en_us.h:114)
     // The #42 shell verb block (en_us.h:41-46/51).
-    "Open File &Location...",                     // MenuOpenFileLocation
-    "&Edit...",                                   // MenuFileEdit
-    "Pre&view...",                                // MenuPreview
-    "&Print...",                                  // MenuPrint
-    "Set Des&ktop Wallpaper",                     // MenuSetDesktopWallpaper
-    "&Close",                                     // MenuClose
-    "P&roperties",                                // MenuProperties
-    "&Delete",                                    // MenuDelete (#43)
-    "Delete (Recycle)",                           // MenuDeleteRecycle (#43)
-    "Delete (Permanently)",                       // MenuDeletePermanently (#43)
-    "Rena&me",                                    // MenuRename (#43)
-    "Rotate Cloc&kwise",                          // MenuRotateClockwise (#43)
-    "Rotate Cou&nterclockwise",                   // MenuRotateCounterclockwise (#43)
-    "Copy to &Folder...",                         // MenuCopyTo (#43)
-    "Mo&ve to Folder...",                         // MenuMoveTo (#43)
-    "Rename",                                     // RenameCaption (#43)
-    "Copy To",                                    // CopyToCaption (#43)
-    "Move To",                                    // MoveToCaption (#43)
-    "Keep &zoom and pan when changing images",    // OptionsKeepZoom (#68, riviv)
-    "Not found in the Recycle Bin",               // UndoFailedNotInBin (#178, riviv)
-    "A file already exists at the original path", // UndoFailedTargetExists (#178, riviv)
-    "Restore failed",                             // UndoFailedMove (#178, riviv)
-    "Sharpen",                                    // MenuSharpen (#185, riviv)
-    "Sharpen:",                                   // OptionsSharpen (#185, riviv)
-    "Off",                                        // OptionsSharpenOff (#185, riviv)
-    "1",                                          // OptionsSharpen1 (#185, riviv)
-    "2",                                          // OptionsSharpen2 (#185, riviv)
-    "3",                                          // OptionsSharpen3 (#185, riviv)
-    "4",                                          // OptionsSharpen4 (#185, riviv)
-    "5",                                          // OptionsSharpen5 (#185, riviv)
-    "6",                                          // OptionsSharpen6 (#185, riviv)
-    "7",                                          // OptionsSharpen7 (#185, riviv)
-    "8",                                          // OptionsSharpen8 (#185, riviv)
-    "9",                                          // OptionsSharpen9 (#185, riviv)
-    "10",                                         // OptionsSharpen10 (#185, riviv)
-    "White Balance",                              // MenuWhiteBalance (#191, riviv)
-    "White balance:",                             // OptionsWhiteBalance (#191, riviv)
-    "Off",                                        // OptionsWhiteBalanceOff (#191, riviv)
-    "-10",                                        // OptionsWhiteBalanceMinus10 (#191, riviv)
-    "-9",                                         // OptionsWhiteBalanceMinus9 (#191, riviv)
-    "-8",                                         // OptionsWhiteBalanceMinus8 (#191, riviv)
-    "-7",                                         // OptionsWhiteBalanceMinus7 (#191, riviv)
-    "-6",                                         // OptionsWhiteBalanceMinus6 (#191, riviv)
-    "-5",                                         // OptionsWhiteBalanceMinus5 (#191, riviv)
-    "-4",                                         // OptionsWhiteBalanceMinus4 (#191, riviv)
-    "-3",                                         // OptionsWhiteBalanceMinus3 (#191, riviv)
-    "-2",                                         // OptionsWhiteBalanceMinus2 (#191, riviv)
-    "-1",                                         // OptionsWhiteBalanceMinus1 (#191, riviv)
-    "1",                                          // OptionsWhiteBalance1 (#191, riviv)
-    "2",                                          // OptionsWhiteBalance2 (#191, riviv)
-    "3",                                          // OptionsWhiteBalance3 (#191, riviv)
-    "4",                                          // OptionsWhiteBalance4 (#191, riviv)
-    "5",                                          // OptionsWhiteBalance5 (#191, riviv)
-    "6",                                          // OptionsWhiteBalance6 (#191, riviv)
-    "7",                                          // OptionsWhiteBalance7 (#191, riviv)
-    "8",                                          // OptionsWhiteBalance8 (#191, riviv)
-    "9",                                          // OptionsWhiteBalance9 (#191, riviv)
-    "10",                                         // OptionsWhiteBalance10 (#191, riviv)
-    "Contrast",                                   // MenuContrast (#193, riviv)
-    "Contrast:",                                  // OptionsContrast (#193, riviv)
-    "Off",                                        // OptionsContrastOff (#193, riviv)
-    "-10",                                        // OptionsContrastMinus10 (#193, riviv)
-    "-9",                                         // OptionsContrastMinus9 (#193, riviv)
-    "-8",                                         // OptionsContrastMinus8 (#193, riviv)
-    "-7",                                         // OptionsContrastMinus7 (#193, riviv)
-    "-6",                                         // OptionsContrastMinus6 (#193, riviv)
-    "-5",                                         // OptionsContrastMinus5 (#193, riviv)
-    "-4",                                         // OptionsContrastMinus4 (#193, riviv)
-    "-3",                                         // OptionsContrastMinus3 (#193, riviv)
-    "-2",                                         // OptionsContrastMinus2 (#193, riviv)
-    "-1",                                         // OptionsContrastMinus1 (#193, riviv)
-    "1",                                          // OptionsContrast1 (#193, riviv)
-    "2",                                          // OptionsContrast2 (#193, riviv)
-    "3",                                          // OptionsContrast3 (#193, riviv)
-    "4",                                          // OptionsContrast4 (#193, riviv)
-    "5",                                          // OptionsContrast5 (#193, riviv)
-    "6",                                          // OptionsContrast6 (#193, riviv)
-    "7",                                          // OptionsContrast7 (#193, riviv)
-    "8",                                          // OptionsContrast8 (#193, riviv)
-    "9",                                          // OptionsContrast9 (#193, riviv)
-    "10",                                         // OptionsContrast10 (#193, riviv)
+    "Open File &Location...",                         // MenuOpenFileLocation
+    "&Edit...",                                       // MenuFileEdit
+    "Pre&view...",                                    // MenuPreview
+    "&Print...",                                      // MenuPrint
+    "Set Des&ktop Wallpaper",                         // MenuSetDesktopWallpaper
+    "&Close",                                         // MenuClose
+    "P&roperties",                                    // MenuProperties
+    "&Delete",                                        // MenuDelete (#43)
+    "Delete (Recycle)",                               // MenuDeleteRecycle (#43)
+    "Delete (Permanently)",                           // MenuDeletePermanently (#43)
+    "Rena&me",                                        // MenuRename (#43)
+    "Rotate Cloc&kwise",                              // MenuRotateClockwise (#43)
+    "Rotate Cou&nterclockwise",                       // MenuRotateCounterclockwise (#43)
+    "Copy to &Folder...",                             // MenuCopyTo (#43)
+    "Mo&ve to Folder...",                             // MenuMoveTo (#43)
+    "Rename",                                         // RenameCaption (#43)
+    "Copy To",                                        // CopyToCaption (#43)
+    "Move To",                                        // MoveToCaption (#43)
+    "Keep &zoom and pan when changing images",        // OptionsKeepZoom (#68, riviv)
+    "Not found in the Recycle Bin",                   // UndoFailedNotInBin (#178, riviv)
+    "A file already exists at the original path",     // UndoFailedTargetExists (#178, riviv)
+    "Restore failed",                                 // UndoFailedMove (#178, riviv)
+    "Sharpen",                                        // MenuSharpen (#185, riviv)
+    "Sharpen:",                                       // OptionsSharpen (#185, riviv)
+    "Off",                                            // OptionsSharpenOff (#185, riviv)
+    "1",                                              // OptionsSharpen1 (#185, riviv)
+    "2",                                              // OptionsSharpen2 (#185, riviv)
+    "3",                                              // OptionsSharpen3 (#185, riviv)
+    "4",                                              // OptionsSharpen4 (#185, riviv)
+    "5",                                              // OptionsSharpen5 (#185, riviv)
+    "6",                                              // OptionsSharpen6 (#185, riviv)
+    "7",                                              // OptionsSharpen7 (#185, riviv)
+    "8",                                              // OptionsSharpen8 (#185, riviv)
+    "9",                                              // OptionsSharpen9 (#185, riviv)
+    "10",                                             // OptionsSharpen10 (#185, riviv)
+    "White Balance",                                  // MenuWhiteBalance (#191, riviv)
+    "White balance:",                                 // OptionsWhiteBalance (#191, riviv)
+    "Off",                                            // OptionsWhiteBalanceOff (#191, riviv)
+    "-10",                                            // OptionsWhiteBalanceMinus10 (#191, riviv)
+    "-9",                                             // OptionsWhiteBalanceMinus9 (#191, riviv)
+    "-8",                                             // OptionsWhiteBalanceMinus8 (#191, riviv)
+    "-7",                                             // OptionsWhiteBalanceMinus7 (#191, riviv)
+    "-6",                                             // OptionsWhiteBalanceMinus6 (#191, riviv)
+    "-5",                                             // OptionsWhiteBalanceMinus5 (#191, riviv)
+    "-4",                                             // OptionsWhiteBalanceMinus4 (#191, riviv)
+    "-3",                                             // OptionsWhiteBalanceMinus3 (#191, riviv)
+    "-2",                                             // OptionsWhiteBalanceMinus2 (#191, riviv)
+    "-1",                                             // OptionsWhiteBalanceMinus1 (#191, riviv)
+    "1",                                              // OptionsWhiteBalance1 (#191, riviv)
+    "2",                                              // OptionsWhiteBalance2 (#191, riviv)
+    "3",                                              // OptionsWhiteBalance3 (#191, riviv)
+    "4",                                              // OptionsWhiteBalance4 (#191, riviv)
+    "5",                                              // OptionsWhiteBalance5 (#191, riviv)
+    "6",                                              // OptionsWhiteBalance6 (#191, riviv)
+    "7",                                              // OptionsWhiteBalance7 (#191, riviv)
+    "8",                                              // OptionsWhiteBalance8 (#191, riviv)
+    "9",                                              // OptionsWhiteBalance9 (#191, riviv)
+    "10",                                             // OptionsWhiteBalance10 (#191, riviv)
+    "Contrast",                                       // MenuContrast (#193, riviv)
+    "Contrast:",                                      // OptionsContrast (#193, riviv)
+    "Off",                                            // OptionsContrastOff (#193, riviv)
+    "-10",                                            // OptionsContrastMinus10 (#193, riviv)
+    "-9",                                             // OptionsContrastMinus9 (#193, riviv)
+    "-8",                                             // OptionsContrastMinus8 (#193, riviv)
+    "-7",                                             // OptionsContrastMinus7 (#193, riviv)
+    "-6",                                             // OptionsContrastMinus6 (#193, riviv)
+    "-5",                                             // OptionsContrastMinus5 (#193, riviv)
+    "-4",                                             // OptionsContrastMinus4 (#193, riviv)
+    "-3",                                             // OptionsContrastMinus3 (#193, riviv)
+    "-2",                                             // OptionsContrastMinus2 (#193, riviv)
+    "-1",                                             // OptionsContrastMinus1 (#193, riviv)
+    "1",                                              // OptionsContrast1 (#193, riviv)
+    "2",                                              // OptionsContrast2 (#193, riviv)
+    "3",                                              // OptionsContrast3 (#193, riviv)
+    "4",                                              // OptionsContrast4 (#193, riviv)
+    "5",                                              // OptionsContrast5 (#193, riviv)
+    "6",                                              // OptionsContrast6 (#193, riviv)
+    "7",                                              // OptionsContrast7 (#193, riviv)
+    "8",                                              // OptionsContrast8 (#193, riviv)
+    "9",                                              // OptionsContrast9 (#193, riviv)
+    "10",                                             // OptionsContrast10 (#193, riviv)
+    "Check for &Updates", // MenuCheckForUpdates (#210 — U; C is Command Line Options, A is About)
+    "You are running the latest version.", // UpdateUpToDateText (#210)
+    "riviv %s is available. Open the download page?", // UpdateNewVersionText (#210; %s = new version)
+    "Update check failed. Check your connection and try again.", // UpdateFailedText (#210)
 ];
 
 /// zh-CN table — upstream localization_zh_cn.h:31/197-199/261-263.
@@ -1233,87 +1249,91 @@ const ZH_CN: [&str; Id::COUNT] = [
     "播放幻灯片或动画时(&W)", // MenuWhilePlaying (zh_cn.h:113)
     "从不(&N)",               // MenuNever (zh_cn.h:114)
     // The #42 shell verb block (zh_cn.h:41-46/51).
-    "打开文件位置(&L)...",      // MenuOpenFileLocation
-    "编辑(&E)...",              // MenuFileEdit
-    "预览(&V)...",              // MenuPreview
-    "打印(&P)...",              // MenuPrint
-    "设置为桌面壁纸(&D)",       // MenuSetDesktopWallpaper
-    "关闭(&C)",                 // MenuClose
-    "属性(&P)",                 // MenuProperties
-    "删除(&D)",                 // MenuDelete (#43)
-    "删除（回收站）",           // MenuDeleteRecycle (#43)
-    "删除（永久）",             // MenuDeletePermanently (#43)
-    "重命名(&M)",               // MenuRename (#43)
-    "顺时针旋转(&K)",           // MenuRotateClockwise (#43)
-    "逆时针旋转(&N)",           // MenuRotateCounterclockwise (#43)
-    "复制到文件夹(&F)...",      // MenuCopyTo (#43)
-    "移动到文件夹(&V)...",      // MenuMoveTo (#43)
-    "重命名",                   // RenameCaption (#43)
-    "复制到",                   // CopyToCaption (#43)
-    "移动到",                   // MoveToCaption (#43)
-    "换图时保持缩放与平移(&Z)", // OptionsKeepZoom (#68, riviv)
-    "回收站中未找到该文件",     // UndoFailedNotInBin (#178, riviv)
-    "原路径已存在同名文件",     // UndoFailedTargetExists (#178, riviv)
-    "恢复失败",                 // UndoFailedMove (#178, riviv)
-    "锐化",                     // MenuSharpen (#185, riviv)
-    "锐化:",                    // OptionsSharpen (#185, riviv)
-    "关",                       // OptionsSharpenOff (#185, riviv)
-    "1",                        // OptionsSharpen1 (#185, riviv)
-    "2",                        // OptionsSharpen2 (#185, riviv)
-    "3",                        // OptionsSharpen3 (#185, riviv)
-    "4",                        // OptionsSharpen4 (#185, riviv)
-    "5",                        // OptionsSharpen5 (#185, riviv)
-    "6",                        // OptionsSharpen6 (#185, riviv)
-    "7",                        // OptionsSharpen7 (#185, riviv)
-    "8",                        // OptionsSharpen8 (#185, riviv)
-    "9",                        // OptionsSharpen9 (#185, riviv)
-    "10",                       // OptionsSharpen10 (#185, riviv)
-    "白平衡",                   // MenuWhiteBalance (#191, riviv)
-    "白平衡:",                  // OptionsWhiteBalance (#191, riviv)
-    "关",                       // OptionsWhiteBalanceOff (#191, riviv)
-    "-10",                      // OptionsWhiteBalanceMinus10 (#191, riviv)
-    "-9",                       // OptionsWhiteBalanceMinus9 (#191, riviv)
-    "-8",                       // OptionsWhiteBalanceMinus8 (#191, riviv)
-    "-7",                       // OptionsWhiteBalanceMinus7 (#191, riviv)
-    "-6",                       // OptionsWhiteBalanceMinus6 (#191, riviv)
-    "-5",                       // OptionsWhiteBalanceMinus5 (#191, riviv)
-    "-4",                       // OptionsWhiteBalanceMinus4 (#191, riviv)
-    "-3",                       // OptionsWhiteBalanceMinus3 (#191, riviv)
-    "-2",                       // OptionsWhiteBalanceMinus2 (#191, riviv)
-    "-1",                       // OptionsWhiteBalanceMinus1 (#191, riviv)
-    "1",                        // OptionsWhiteBalance1 (#191, riviv)
-    "2",                        // OptionsWhiteBalance2 (#191, riviv)
-    "3",                        // OptionsWhiteBalance3 (#191, riviv)
-    "4",                        // OptionsWhiteBalance4 (#191, riviv)
-    "5",                        // OptionsWhiteBalance5 (#191, riviv)
-    "6",                        // OptionsWhiteBalance6 (#191, riviv)
-    "7",                        // OptionsWhiteBalance7 (#191, riviv)
-    "8",                        // OptionsWhiteBalance8 (#191, riviv)
-    "9",                        // OptionsWhiteBalance9 (#191, riviv)
-    "10",                       // OptionsWhiteBalance10 (#191, riviv)
-    "对比度",                   // MenuContrast (#193, riviv)
-    "对比度:",                  // OptionsContrast (#193, riviv)
-    "关",                       // OptionsContrastOff (#193, riviv)
-    "-10",                      // OptionsContrastMinus10 (#193, riviv)
-    "-9",                       // OptionsContrastMinus9 (#193, riviv)
-    "-8",                       // OptionsContrastMinus8 (#193, riviv)
-    "-7",                       // OptionsContrastMinus7 (#193, riviv)
-    "-6",                       // OptionsContrastMinus6 (#193, riviv)
-    "-5",                       // OptionsContrastMinus5 (#193, riviv)
-    "-4",                       // OptionsContrastMinus4 (#193, riviv)
-    "-3",                       // OptionsContrastMinus3 (#193, riviv)
-    "-2",                       // OptionsContrastMinus2 (#193, riviv)
-    "-1",                       // OptionsContrastMinus1 (#193, riviv)
-    "1",                        // OptionsContrast1 (#193, riviv)
-    "2",                        // OptionsContrast2 (#193, riviv)
-    "3",                        // OptionsContrast3 (#193, riviv)
-    "4",                        // OptionsContrast4 (#193, riviv)
-    "5",                        // OptionsContrast5 (#193, riviv)
-    "6",                        // OptionsContrast6 (#193, riviv)
-    "7",                        // OptionsContrast7 (#193, riviv)
-    "8",                        // OptionsContrast8 (#193, riviv)
-    "9",                        // OptionsContrast9 (#193, riviv)
-    "10",                       // OptionsContrast10 (#193, riviv)
+    "打开文件位置(&L)...",                  // MenuOpenFileLocation
+    "编辑(&E)...",                          // MenuFileEdit
+    "预览(&V)...",                          // MenuPreview
+    "打印(&P)...",                          // MenuPrint
+    "设置为桌面壁纸(&D)",                   // MenuSetDesktopWallpaper
+    "关闭(&C)",                             // MenuClose
+    "属性(&P)",                             // MenuProperties
+    "删除(&D)",                             // MenuDelete (#43)
+    "删除（回收站）",                       // MenuDeleteRecycle (#43)
+    "删除（永久）",                         // MenuDeletePermanently (#43)
+    "重命名(&M)",                           // MenuRename (#43)
+    "顺时针旋转(&K)",                       // MenuRotateClockwise (#43)
+    "逆时针旋转(&N)",                       // MenuRotateCounterclockwise (#43)
+    "复制到文件夹(&F)...",                  // MenuCopyTo (#43)
+    "移动到文件夹(&V)...",                  // MenuMoveTo (#43)
+    "重命名",                               // RenameCaption (#43)
+    "复制到",                               // CopyToCaption (#43)
+    "移动到",                               // MoveToCaption (#43)
+    "换图时保持缩放与平移(&Z)",             // OptionsKeepZoom (#68, riviv)
+    "回收站中未找到该文件",                 // UndoFailedNotInBin (#178, riviv)
+    "原路径已存在同名文件",                 // UndoFailedTargetExists (#178, riviv)
+    "恢复失败",                             // UndoFailedMove (#178, riviv)
+    "锐化",                                 // MenuSharpen (#185, riviv)
+    "锐化:",                                // OptionsSharpen (#185, riviv)
+    "关",                                   // OptionsSharpenOff (#185, riviv)
+    "1",                                    // OptionsSharpen1 (#185, riviv)
+    "2",                                    // OptionsSharpen2 (#185, riviv)
+    "3",                                    // OptionsSharpen3 (#185, riviv)
+    "4",                                    // OptionsSharpen4 (#185, riviv)
+    "5",                                    // OptionsSharpen5 (#185, riviv)
+    "6",                                    // OptionsSharpen6 (#185, riviv)
+    "7",                                    // OptionsSharpen7 (#185, riviv)
+    "8",                                    // OptionsSharpen8 (#185, riviv)
+    "9",                                    // OptionsSharpen9 (#185, riviv)
+    "10",                                   // OptionsSharpen10 (#185, riviv)
+    "白平衡",                               // MenuWhiteBalance (#191, riviv)
+    "白平衡:",                              // OptionsWhiteBalance (#191, riviv)
+    "关",                                   // OptionsWhiteBalanceOff (#191, riviv)
+    "-10",                                  // OptionsWhiteBalanceMinus10 (#191, riviv)
+    "-9",                                   // OptionsWhiteBalanceMinus9 (#191, riviv)
+    "-8",                                   // OptionsWhiteBalanceMinus8 (#191, riviv)
+    "-7",                                   // OptionsWhiteBalanceMinus7 (#191, riviv)
+    "-6",                                   // OptionsWhiteBalanceMinus6 (#191, riviv)
+    "-5",                                   // OptionsWhiteBalanceMinus5 (#191, riviv)
+    "-4",                                   // OptionsWhiteBalanceMinus4 (#191, riviv)
+    "-3",                                   // OptionsWhiteBalanceMinus3 (#191, riviv)
+    "-2",                                   // OptionsWhiteBalanceMinus2 (#191, riviv)
+    "-1",                                   // OptionsWhiteBalanceMinus1 (#191, riviv)
+    "1",                                    // OptionsWhiteBalance1 (#191, riviv)
+    "2",                                    // OptionsWhiteBalance2 (#191, riviv)
+    "3",                                    // OptionsWhiteBalance3 (#191, riviv)
+    "4",                                    // OptionsWhiteBalance4 (#191, riviv)
+    "5",                                    // OptionsWhiteBalance5 (#191, riviv)
+    "6",                                    // OptionsWhiteBalance6 (#191, riviv)
+    "7",                                    // OptionsWhiteBalance7 (#191, riviv)
+    "8",                                    // OptionsWhiteBalance8 (#191, riviv)
+    "9",                                    // OptionsWhiteBalance9 (#191, riviv)
+    "10",                                   // OptionsWhiteBalance10 (#191, riviv)
+    "对比度",                               // MenuContrast (#193, riviv)
+    "对比度:",                              // OptionsContrast (#193, riviv)
+    "关",                                   // OptionsContrastOff (#193, riviv)
+    "-10",                                  // OptionsContrastMinus10 (#193, riviv)
+    "-9",                                   // OptionsContrastMinus9 (#193, riviv)
+    "-8",                                   // OptionsContrastMinus8 (#193, riviv)
+    "-7",                                   // OptionsContrastMinus7 (#193, riviv)
+    "-6",                                   // OptionsContrastMinus6 (#193, riviv)
+    "-5",                                   // OptionsContrastMinus5 (#193, riviv)
+    "-4",                                   // OptionsContrastMinus4 (#193, riviv)
+    "-3",                                   // OptionsContrastMinus3 (#193, riviv)
+    "-2",                                   // OptionsContrastMinus2 (#193, riviv)
+    "-1",                                   // OptionsContrastMinus1 (#193, riviv)
+    "1",                                    // OptionsContrast1 (#193, riviv)
+    "2",                                    // OptionsContrast2 (#193, riviv)
+    "3",                                    // OptionsContrast3 (#193, riviv)
+    "4",                                    // OptionsContrast4 (#193, riviv)
+    "5",                                    // OptionsContrast5 (#193, riviv)
+    "6",                                    // OptionsContrast6 (#193, riviv)
+    "7",                                    // OptionsContrast7 (#193, riviv)
+    "8",                                    // OptionsContrast8 (#193, riviv)
+    "9",                                    // OptionsContrast9 (#193, riviv)
+    "10",                                   // OptionsContrast10 (#193, riviv)
+    "检查更新(&U)", // MenuCheckForUpdates (#210 — U 复用 en;Help 层 C/A 之外空闲)
+    "你正在使用最新版本。", // UpdateUpToDateText (#210)
+    "riviv %s 已可用。打开下载页面?", // UpdateNewVersionText (#210;%s = 新版本号)
+    "更新检查失败。请检查网络连接后重试。", // UpdateFailedText (#210)
 ];
 
 /// zh-Hant table — riviv-authored (upstream ships no zh-Hant strings,
@@ -1573,87 +1593,91 @@ const ZH_HANT: [&str; Id::COUNT] = [
     "播放投影片或動畫時(&W)", // MenuWhilePlaying (zh_cn.h:113)
     "永不(&N)",               // MenuNever (zh_cn.h:114)
     // The #42 shell verb block (zh_cn.h:41-46/51).
-    "開啟檔案位置(&L)...",          // MenuOpenFileLocation
-    "編輯(&E)...",                  // MenuFileEdit
-    "預覽(&V)...",                  // MenuPreview
-    "列印(&P)...",                  // MenuPrint
-    "設為桌面背景(&D)",             // MenuSetDesktopWallpaper
-    "關閉(&C)",                     // MenuClose
-    "內容(&P)",                     // MenuProperties
-    "刪除(&D)",                     // MenuDelete (#43)
-    "刪除（資源回收筒）",           // MenuDeleteRecycle (#43)
-    "刪除（永久）",                 // MenuDeletePermanently (#43)
-    "重新命名(&M)",                 // MenuRename (#43)
-    "順時針旋轉(&K)",               // MenuRotateClockwise (#43)
-    "逆時針旋轉(&N)",               // MenuRotateCounterclockwise (#43)
-    "複製到資料夾(&F)...",          // MenuCopyTo (#43)
-    "移動到資料夾(&V)...",          // MenuMoveTo (#43)
-    "重新命名",                     // RenameCaption (#43)
-    "複製到",                       // CopyToCaption (#43)
-    "移動到",                       // MoveToCaption (#43)
-    "切換影像時保持縮放與平移(&Z)", // OptionsKeepZoom (#68, riviv)
-    "資源回收筒中找不到該檔案",     // UndoFailedNotInBin (#178, riviv)
-    "原路徑已存在同名檔案",         // UndoFailedTargetExists (#178, riviv)
-    "還原失敗",                     // UndoFailedMove (#178, riviv)
-    "銳利化",                       // MenuSharpen (#185, riviv)
-    "銳利化:",                      // OptionsSharpen (#185, riviv)
-    "關",                           // OptionsSharpenOff (#185, riviv)
-    "1",                            // OptionsSharpen1 (#185, riviv)
-    "2",                            // OptionsSharpen2 (#185, riviv)
-    "3",                            // OptionsSharpen3 (#185, riviv)
-    "4",                            // OptionsSharpen4 (#185, riviv)
-    "5",                            // OptionsSharpen5 (#185, riviv)
-    "6",                            // OptionsSharpen6 (#185, riviv)
-    "7",                            // OptionsSharpen7 (#185, riviv)
-    "8",                            // OptionsSharpen8 (#185, riviv)
-    "9",                            // OptionsSharpen9 (#185, riviv)
-    "10",                           // OptionsSharpen10 (#185, riviv)
-    "白平衡",                       // MenuWhiteBalance (#191, riviv)
-    "白平衡:",                      // OptionsWhiteBalance (#191, riviv)
-    "關",                           // OptionsWhiteBalanceOff (#191, riviv)
-    "-10",                          // OptionsWhiteBalanceMinus10 (#191, riviv)
-    "-9",                           // OptionsWhiteBalanceMinus9 (#191, riviv)
-    "-8",                           // OptionsWhiteBalanceMinus8 (#191, riviv)
-    "-7",                           // OptionsWhiteBalanceMinus7 (#191, riviv)
-    "-6",                           // OptionsWhiteBalanceMinus6 (#191, riviv)
-    "-5",                           // OptionsWhiteBalanceMinus5 (#191, riviv)
-    "-4",                           // OptionsWhiteBalanceMinus4 (#191, riviv)
-    "-3",                           // OptionsWhiteBalanceMinus3 (#191, riviv)
-    "-2",                           // OptionsWhiteBalanceMinus2 (#191, riviv)
-    "-1",                           // OptionsWhiteBalanceMinus1 (#191, riviv)
-    "1",                            // OptionsWhiteBalance1 (#191, riviv)
-    "2",                            // OptionsWhiteBalance2 (#191, riviv)
-    "3",                            // OptionsWhiteBalance3 (#191, riviv)
-    "4",                            // OptionsWhiteBalance4 (#191, riviv)
-    "5",                            // OptionsWhiteBalance5 (#191, riviv)
-    "6",                            // OptionsWhiteBalance6 (#191, riviv)
-    "7",                            // OptionsWhiteBalance7 (#191, riviv)
-    "8",                            // OptionsWhiteBalance8 (#191, riviv)
-    "9",                            // OptionsWhiteBalance9 (#191, riviv)
-    "10",                           // OptionsWhiteBalance10 (#191, riviv)
-    "對比",                         // MenuContrast (#193, riviv)
-    "對比:",                        // OptionsContrast (#193, riviv)
-    "關",                           // OptionsContrastOff (#193, riviv)
-    "-10",                          // OptionsContrastMinus10 (#193, riviv)
-    "-9",                           // OptionsContrastMinus9 (#193, riviv)
-    "-8",                           // OptionsContrastMinus8 (#193, riviv)
-    "-7",                           // OptionsContrastMinus7 (#193, riviv)
-    "-6",                           // OptionsContrastMinus6 (#193, riviv)
-    "-5",                           // OptionsContrastMinus5 (#193, riviv)
-    "-4",                           // OptionsContrastMinus4 (#193, riviv)
-    "-3",                           // OptionsContrastMinus3 (#193, riviv)
-    "-2",                           // OptionsContrastMinus2 (#193, riviv)
-    "-1",                           // OptionsContrastMinus1 (#193, riviv)
-    "1",                            // OptionsContrast1 (#193, riviv)
-    "2",                            // OptionsContrast2 (#193, riviv)
-    "3",                            // OptionsContrast3 (#193, riviv)
-    "4",                            // OptionsContrast4 (#193, riviv)
-    "5",                            // OptionsContrast5 (#193, riviv)
-    "6",                            // OptionsContrast6 (#193, riviv)
-    "7",                            // OptionsContrast7 (#193, riviv)
-    "8",                            // OptionsContrast8 (#193, riviv)
-    "9",                            // OptionsContrast9 (#193, riviv)
-    "10",                           // OptionsContrast10 (#193, riviv)
+    "開啟檔案位置(&L)...",                      // MenuOpenFileLocation
+    "編輯(&E)...",                              // MenuFileEdit
+    "預覽(&V)...",                              // MenuPreview
+    "列印(&P)...",                              // MenuPrint
+    "設為桌面背景(&D)",                         // MenuSetDesktopWallpaper
+    "關閉(&C)",                                 // MenuClose
+    "內容(&P)",                                 // MenuProperties
+    "刪除(&D)",                                 // MenuDelete (#43)
+    "刪除（資源回收筒）",                       // MenuDeleteRecycle (#43)
+    "刪除（永久）",                             // MenuDeletePermanently (#43)
+    "重新命名(&M)",                             // MenuRename (#43)
+    "順時針旋轉(&K)",                           // MenuRotateClockwise (#43)
+    "逆時針旋轉(&N)",                           // MenuRotateCounterclockwise (#43)
+    "複製到資料夾(&F)...",                      // MenuCopyTo (#43)
+    "移動到資料夾(&V)...",                      // MenuMoveTo (#43)
+    "重新命名",                                 // RenameCaption (#43)
+    "複製到",                                   // CopyToCaption (#43)
+    "移動到",                                   // MoveToCaption (#43)
+    "切換影像時保持縮放與平移(&Z)",             // OptionsKeepZoom (#68, riviv)
+    "資源回收筒中找不到該檔案",                 // UndoFailedNotInBin (#178, riviv)
+    "原路徑已存在同名檔案",                     // UndoFailedTargetExists (#178, riviv)
+    "還原失敗",                                 // UndoFailedMove (#178, riviv)
+    "銳利化",                                   // MenuSharpen (#185, riviv)
+    "銳利化:",                                  // OptionsSharpen (#185, riviv)
+    "關",                                       // OptionsSharpenOff (#185, riviv)
+    "1",                                        // OptionsSharpen1 (#185, riviv)
+    "2",                                        // OptionsSharpen2 (#185, riviv)
+    "3",                                        // OptionsSharpen3 (#185, riviv)
+    "4",                                        // OptionsSharpen4 (#185, riviv)
+    "5",                                        // OptionsSharpen5 (#185, riviv)
+    "6",                                        // OptionsSharpen6 (#185, riviv)
+    "7",                                        // OptionsSharpen7 (#185, riviv)
+    "8",                                        // OptionsSharpen8 (#185, riviv)
+    "9",                                        // OptionsSharpen9 (#185, riviv)
+    "10",                                       // OptionsSharpen10 (#185, riviv)
+    "白平衡",                                   // MenuWhiteBalance (#191, riviv)
+    "白平衡:",                                  // OptionsWhiteBalance (#191, riviv)
+    "關",                                       // OptionsWhiteBalanceOff (#191, riviv)
+    "-10",                                      // OptionsWhiteBalanceMinus10 (#191, riviv)
+    "-9",                                       // OptionsWhiteBalanceMinus9 (#191, riviv)
+    "-8",                                       // OptionsWhiteBalanceMinus8 (#191, riviv)
+    "-7",                                       // OptionsWhiteBalanceMinus7 (#191, riviv)
+    "-6",                                       // OptionsWhiteBalanceMinus6 (#191, riviv)
+    "-5",                                       // OptionsWhiteBalanceMinus5 (#191, riviv)
+    "-4",                                       // OptionsWhiteBalanceMinus4 (#191, riviv)
+    "-3",                                       // OptionsWhiteBalanceMinus3 (#191, riviv)
+    "-2",                                       // OptionsWhiteBalanceMinus2 (#191, riviv)
+    "-1",                                       // OptionsWhiteBalanceMinus1 (#191, riviv)
+    "1",                                        // OptionsWhiteBalance1 (#191, riviv)
+    "2",                                        // OptionsWhiteBalance2 (#191, riviv)
+    "3",                                        // OptionsWhiteBalance3 (#191, riviv)
+    "4",                                        // OptionsWhiteBalance4 (#191, riviv)
+    "5",                                        // OptionsWhiteBalance5 (#191, riviv)
+    "6",                                        // OptionsWhiteBalance6 (#191, riviv)
+    "7",                                        // OptionsWhiteBalance7 (#191, riviv)
+    "8",                                        // OptionsWhiteBalance8 (#191, riviv)
+    "9",                                        // OptionsWhiteBalance9 (#191, riviv)
+    "10",                                       // OptionsWhiteBalance10 (#191, riviv)
+    "對比",                                     // MenuContrast (#193, riviv)
+    "對比:",                                    // OptionsContrast (#193, riviv)
+    "關",                                       // OptionsContrastOff (#193, riviv)
+    "-10",                                      // OptionsContrastMinus10 (#193, riviv)
+    "-9",                                       // OptionsContrastMinus9 (#193, riviv)
+    "-8",                                       // OptionsContrastMinus8 (#193, riviv)
+    "-7",                                       // OptionsContrastMinus7 (#193, riviv)
+    "-6",                                       // OptionsContrastMinus6 (#193, riviv)
+    "-5",                                       // OptionsContrastMinus5 (#193, riviv)
+    "-4",                                       // OptionsContrastMinus4 (#193, riviv)
+    "-3",                                       // OptionsContrastMinus3 (#193, riviv)
+    "-2",                                       // OptionsContrastMinus2 (#193, riviv)
+    "-1",                                       // OptionsContrastMinus1 (#193, riviv)
+    "1",                                        // OptionsContrast1 (#193, riviv)
+    "2",                                        // OptionsContrast2 (#193, riviv)
+    "3",                                        // OptionsContrast3 (#193, riviv)
+    "4",                                        // OptionsContrast4 (#193, riviv)
+    "5",                                        // OptionsContrast5 (#193, riviv)
+    "6",                                        // OptionsContrast6 (#193, riviv)
+    "7",                                        // OptionsContrast7 (#193, riviv)
+    "8",                                        // OptionsContrast8 (#193, riviv)
+    "9",                                        // OptionsContrast9 (#193, riviv)
+    "10",                                       // OptionsContrast10 (#193, riviv)
+    "檢查更新(&U)", // MenuCheckForUpdates (#210 — U 复用 en;Help 层 C/A 之外空闲)
+    "您正在使用最新版本。", // UpdateUpToDateText (#210;台湾敬语您)
+    "riviv %s 已可使用。開啟下載頁面?", // UpdateNewVersionText (#210;%s = 新版本号;網路/開啟=台湾术语)
+    "更新檢查失敗。請檢查網路連線後再試一次。", // UpdateFailedText (#210)
 ];
 
 /// Map a `GetUserDefaultUILanguage` LANGID onto the table choice. Upstream
@@ -1773,6 +1797,33 @@ mod tests {
             "only {diffs}/{} entries differ from zh-CN",
             Id::COUNT
         );
+    }
+
+    #[test]
+    fn update_check_row_and_dialogs_are_pinned_per_language() {
+        // #210: the Help row's U is the ruling's mnemonic (the layer
+        // holds C and A; the cross-layer U users — Edit's Undo Delete,
+        // Pan/Scan's Move Up — are in other popups, and the menu
+        // collision net judges per layer), and the new-version dialog
+        // is the one string carrying the %s placeholder.
+        let en = get_for(Language::English, Id::MenuCheckForUpdates);
+        assert_eq!(en, "Check for &Updates");
+        assert_eq!(
+            get_for(Language::ChineseSimplified, Id::MenuCheckForUpdates),
+            "检查更新(&U)"
+        );
+        assert_eq!(
+            get_for(Language::ChineseTraditional, Id::MenuCheckForUpdates),
+            "檢查更新(&U)"
+        );
+        for lang in Language::ALL {
+            assert!(
+                get_for(lang, Id::UpdateNewVersionText).contains("%s"),
+                "new-version text lost its %s placeholder in {lang:?}"
+            );
+            assert!(!get_for(lang, Id::UpdateUpToDateText).contains("%s"));
+            assert!(!get_for(lang, Id::UpdateFailedText).contains("%s"));
+        }
     }
 
     #[test]
