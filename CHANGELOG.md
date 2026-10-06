@@ -5,6 +5,18 @@ history by git-cliff (cliff.toml is the policy; do not hand-edit the output).
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+## [0.5.0] - 2026-10-06
+### Added
+
+- Feat(pane): playlist pane — the chrome family's fourth toggle (#199) (595da66)
+- Feat(i18n): #203 zh-Hant third language table - Language::ALL + 293-string Taiwanese table + O6 mnemonic pins (3bff80b)
+- Feat(installer): #203 ChineseTraditional installer build + README (Differences entry, wishlist now empty) (62d5559)
+### Fixed
+
+- Fix(review): #200 cubic 6 + codex 1 findings adopted — clear-before-select (iItem=-1 all-clear, None clears outright), fullscreen-exit selection catch-up, auto-fit pane width from config (function exits fullscreen first), rename updates playlist rows regardless of currency + unconditional pane refresh, View-table count comment, mnemonic P->L both locales (View level's P belongs to Preset) (eddbdee)
+- Fix(review): #204 cubic 3 findings adopted - ps1 -cne case-sensitive whitelist (NSIS !if is case-sensitive; lowercase would silently build English), collision grandfather list pinned to exact pair counts (a third row joining a pair, or any new key, now fails), README copula 'is' inserted. Codex P2 (map 0x1404 zh-MO) NOT adopted: upstream localization.c:65-71 lists exactly three langids - 0x1404 stays English per upstream semantics and the O1=A ruling scope (0x0404/0x0C04 only). (66cfb5a)
+- Fix(i18n): zh-Hant final review (O4=A) - ActionContextMenu 內容功能表 -> 快顯功能表 (9059c40)
+
 ## [0.4.0] - 2026-10-02
 ### Added
 
