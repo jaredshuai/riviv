@@ -36,7 +36,7 @@
 ## 核查面 3:频次闸(每日一次)
 
 - **Sumatra 同构(亲读)**:`constexpr int kSecondsInDay = 60 * 60 * 24`;`timeOfLastUpdateCheck`(FILETIME)**在检查开始时写入**(`GetSystemTimeAsFileTime(&gSettings->timeOfLastUpdateCheck);`)并 Flush;release 版闸 = 至少隔一天。
-- **riviv 落点推荐**:ini 键 `check_for_updates_last_day` = **本地日序数**(1970-01-01 起算的本地日,int;纯函数入测试网)。写时机 = spawn 成功后写内存 config,正常退出经 WM_DESTROY 落盘(window.rs:9680,WM_ENDSESSION 9699 兜底)——当日标记必达;崩溃丢标记 → 下次启动重查一次,无害。**网络失败也记账**(同 Sumatra mark-at-start 语义;离线机每日至多一次静默失败+stderr 面包屑,fetch_latest_body 已有 eprintln)。
+- **riviv 落点推荐**:ini 键 `check_for_updates_last_day` = **本地日序数**(1970-01-01 起算的本地日,int;纯函数入测试网)。写时机 = **判定即记**:首启跳过分支与 spawn 成功分支都把今日写进内存 config(cubic #216 P1——跳过分支若不记账,每次启动都被当作首启,自动检查永不发生),正常退出经 WM_DESTROY 落盘(window.rs:9680,WM_ENDSESSION 9699 兜底)——当日标记 best-effort(见下);**网络失败也记账**(同 Sumatra mark-at-start 语义;离线机每日至多一次静默失败+stderr 面包屑,fetch_latest_body 已有 eprintln)。
 - 跨会话天然继承 ini 双位置语义(appdata 覆盖,config.rs:311/346);时区旅行当日双查无害(本地日粒度)。
 - **手动检查不走闸**(用户驱动即时应答,同 Sumatra 手动路径);开关关掉时不写标记,重开后按陈旧标记立即补查。
 
@@ -52,6 +52,7 @@ ADR 0007 D3 类比已定方向(用户未主动询问→不应答),本轮核对**
 
 - 启动三态中**仅 Available 可见**(temp_text,面 2);UpToDate/Failed 全静默(Failed 的 stderr 面包屑已在 fetch_latest_body);无弹框、无退出路径、无新致命面。
 - 唯一新 UX 面 = **手动点击落在静默检查飞行中**:单飞闸(CHECK_RUNNING)会 no-op 掉点击——违背「用户主动询问必须有答」(D3 手动语义)。处置:**升格机制**——`begin` 增 manual/startup 二态,manual 调用无论是否被闸挡都置 `manual_requested` 标志;on_reply 读并清标志,置位则按手动语义呈现三态框。备选 = no-op(点击无声丢弃,不推荐)。
+- **spawn 失败分支二态分叉(cubic #216 P2)**:现有 `begin` 的 `Builder::spawn` 失败会同步弹 `UpdateFailedText` 框(update.rs:167-174)——startup 模式**静默**(stderr 面包屑,与「仅 Available 可见」约定一致;启动时弹错误框=未请求即打扰);manual 模式保留现有直报框。
 
 ## 核查面 6:ini/Options 面
 
@@ -65,12 +66,12 @@ ADR 0007 D3 类比已定方向(用户未主动询问→不应答),本轮核对**
 
 - **启动检查完成时主窗口在场**:worker 持有的 hwnd 即建窗线程的窗口;用户在网络窗口(至多 ~25s:5/5/5/10 超时)内关窗 → post 失败 → 队列留未领条目随进程退出回收(ADR 0007 D2 已裁,零悬空);WM_ENDSESSION 提前杀同理。
 - **-install / 转发实例**:发起点之前已 return,零请求发出(面 4)。
-- **当日标记时序**:先写内存后落盘;关窗必有 WM_DESTROY save → 当日必达(崩溃除外,面 3)。
+- **当日标记时序**:判定即记写内存,正常退出必经 WM_DESTROY save 调用,但**持久化 best-effort(cubic #216 P2)**——`Config::save` 的写入失败只记日志不阻止退出(config.rs 契约:只读安装目录先例),未落盘则下次启动重查:每启动至多一次静默 GET,有界无害(与 Sumatra 的 appdata 路径不可解析时静默跳过保存同类)。崩溃同此结果。
 - **首启跳过与升级路径统一**:老版本升级上来(ini 无 last_day)同「首启」处理——刚装完必是最新版,跳过近零损失,纯隐私增益。
 
 ## 开放问题(拍板项;全附推荐)
 
-- **P1 默认值**:**A = 开 + 首启跳过**(**推荐**——last_day 缺失=首启,记今日不查,次日起按闸;先例=Sumatra 首启跳过注释原文;Notepad++/Sumatra 双原生样本+VS Code 框架样本默认开;隐私面最软:用户有一天时间在 Options/ini 关掉它)/ B = 开(首启即查;损失对齐「刚装完必最新」论证为零增益)/ C = 关(负控纪律;但横评无原生默认关样本[Everything 未核不计],且启动检查正是本刀价值主通道)。
+- **P1 默认值**:**A = 开 + 首启跳过**(**推荐**——last_day 缺失=首启:照常把今日写进 last_day(含跳过分支,面 3「判定即记」)但本次不发请求,次日起按闸;先例=Sumatra 首启跳过注释原文;Notepad++/Sumatra 双原生样本+VS Code 框架样本默认开;隐私面最软:用户有一天时间在 Options/ini 关掉它)/ B = 开(首启即查;损失对齐「刚装完必最新」论证为零增益)/ C = 关(负控纪律;但横评无原生默认关样本[Everything 未核不计],且启动检查正是本刀价值主通道)。
 - **P2 通知形态**:**A = 状态栏 temp_text**(**推荐**——零新面+不打扰;可见性弱由每日重试补偿)/ B = 模态弹框(横评多数形态,但违背票面不打扰原则)/ C = 任务栏角标(新 COM 面+S1 ADR 成本,不成比例)/ D = 菜单行标记(备选)。
 - **P3 频次闸键面**:**A = 本地日序数 `check_for_updates_last_day`,spawn 成功即记、失败也记**(**推荐**——Sumatra mark-at-start 同构,粒度即日,纯函数可测)/ B = FILETIME UTC 字面同构 Sumatra(精度对本闸无用)。
 - **P4 飞行中手动点击**:**A = 升格为手动呈现**(**推荐**——用户主动询问必须有答,D3 手动语义)/ B = no-op 丢弃(点击无声,不推荐)。
