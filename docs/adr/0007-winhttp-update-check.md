@@ -1,8 +1,8 @@
 # ADR 0007: 应用内更新检查(notify-only)——WinHTTP 静态导入
 
 - 日期: 2026-10-06
-- 状态: 已接受(O1:A / O2:A / O3:A / O4:A / O5:A / O6:A 全按推荐,用户拍板 2026-10-06「全按推荐」;实现票 #210;spike #208 证据电池 `docs/spikes/s-auto-update.md`)
-- 范围: Help→Check for Updates 的网络栈选型与导入面、回执协议、失败语义;**不含**下载/安装/portable 自替换(O1=B/C 留作后继刀)、启动自动检查(O2=B 留作后继刀)
+- 状态: 已接受(O1:A / O2:A / O3:A / O4:A / O5:A / O6:A 全按推荐,用户拍板 2026-10-06「全按推荐」;实现票 #210;spike #208 证据电池 `docs/spikes/s-auto-update.md`。**O2 后继刀已落**:启动自动检查经 #214 spike(`docs/spikes/s-startup-update-check.md`)P1-P4 全按推荐,用户拍板 2026-10-07「全按推荐」,实现票 #217,决策 = D6)
+- 范围: Help→Check for Updates 的网络栈选型与导入面、回执协议、失败语义;**不含**下载/安装/portable 自替换(O1=B/C 留作后继刀)。启动自动检查原为 O2=B 留作后继刀,**已由 D6 裁定落地**(#214/#217)
 - 上游权威: #208 spike(横评/PE 基线/依赖原则核对)、AGENTS「依赖原则」第 6 条(系统能力装机≈100% 且无授权费)、s1-platform-floor(新增 DLL 静态导入须 dumpbin 证据并写 ADR)、ADR 0001(错误处理姿态的边界——本 ADR 明确其**不**裁更新网络失败)
 
 ## 背景
@@ -36,6 +36,18 @@ ADR 0001 的用户级 = 图片加载失败且规定**不弹框**;更新网络失
 
 「打开下载页」= ShellExecuteW 开 `https://github.com/jaredshuai/riviv/releases/latest`(canonical 永远指向最新,无需解析 html_url)。riviv **永不下载、永不校验、永不替换**任何文件——GitHub `assets[].digest` 是 integrity-only(与二进制同信任域,#208 R4),称「已验证下载」前须另立信任锚,那是 O1=B 的前置而非本刀的事。
 
+### D6. 启动自动检查(#214/#217;O2=B 后继刀)
+
+复用 D1/D2/D4 全部底座(WinHTTP worker、WM_APP+4 零载荷回执、手解析严苛失败)——本节只裁增量。拍板 2026-10-07「全按推荐」(spike `s-startup-update-check` P1-P4):
+
+- **P1=A 默认开 + 首启跳过**:ini 键 `check_for_updates_on_startup`(BYTE 档)默认 1——双原生同形态样本(Notepad++/Sumatra)默认开,Sumatra `UpdateCheck.cpp` 亲读同构。`check_for_updates_last_day`(int 档)= 本地日序数(`days_from_civil` 纯函数,`GetLocalTime` 薄壳);**≤0 = 从未** → 首启(全新安装或自 #214 前版本升级)照常记今日但**不发请求**(刚装完必是最新版;Sumatra 首启跳过先例——「给隐私敏感用户留出关闭时间」)。
+- **P2=A 通知 = 状态栏 temp_text**:启动态仅 Available 可见——`status_set_temp_text`(#47 基建,3 秒闪现);UpToDate/Failed 静默(D3 启动语义:用户未询问;Failed 的 stderr 面包屑是诊断通道)。可见性弱点(3s 即逝/可被 panscan flash 替换/`show_status=0` 或全屏不可见)由**每日闸的幂等重试**补偿:明日启动再提示,直到更新;单次丢失无累积伤害。
+- **P3=A 频次闸 = 判定即记**:两个标记分支(MarkOnly/Check)都把今日写进内存 config,WM_DESTROY 常规落盘——**best-effort**(`Config::save` 写失败只记日志,只读安装目录先例;未落盘 = 下次启动重查一次,有界)。网络失败也记账(Sumatra mark-at-start 同构)。跳过分支若不记账会把每次启动都变成首启,自动检查永不发生(cubic #216 P1)。手动检查不走闸。
+- **P4=A 升格**:`MANUAL_REQUESTED` 标志在手动入口置位(含被单飞闸挡住的点击),`on_reply` 读清后按手动三态框呈现——用户主动询问必须有答(D3 手动半边)。
+- spawn 失败二态分叉:手动 = 直报框(既有);启动 = stderr 静默(cubic #216 P2)。发起点 = run() 泵前、`refresh_status` 后,`IsWindow` 守卫;-install/转发实例在发起点之前已退出,持锁实例独查;`multiple_instances=1` 时各实例各查(幂等)。Options General 页第三行 checkbox(`Kind::Checkbox` 既有机制)编辑开关;日序数键不暴露。
+
 ## 验证
 
 纯函数(parse/semver/decision/上限)入单测;loc 三表 + 助记符 U(Help 层内空闲,撞车网按层判重)+ 撞车网/复用网/非空网自动覆盖新键;冒烟 = 菜单行在场 + WM_COMMAND 127 → 三态框端到端(当前版本=已是最新臂;**过期版本探针 exe**(临时 0.4.0 构建)走「有新版 0.5.0」臂,点「否」不开浏览器);README Differences 记段。
+
+D6 增量(#217):闸判定(`should_check` 全输入类)+ 日序数(`days_from_civil` 锚点/闰边界)入单测;config 两键入往返网+拼写钉测;Options 模型经既有 field 往返测;冒烟 = 首启跳过(删 ini 两连启)/当日闸(同日双启单请求)/开关关零请求/Available temp_text 落点(过期版本探针 exe,环境敏感标注意:真实 GitHub API)/手动升格;README Differences #210 段扩句。

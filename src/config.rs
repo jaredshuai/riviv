@@ -192,6 +192,19 @@ pub(crate) struct Config {
     /// every other int key; the consumption point —
     /// [`crate::transform_stage::EffectChain::from_config`] — clamps).
     pub(crate) contrast: i32,
+    /// riviv-authored key (#214; upstream has no update mechanism): the
+    /// startup auto-check switch, default ON (the #214 spike's P1=A —
+    /// Notepad++/SumatraPDF, the two verified native samples, both ship
+    /// it on; ADR 0007 D6).
+    pub(crate) check_for_updates_on_startup: i32,
+    /// riviv-authored key (#214): the startup auto-check's daily gate —
+    /// the LOCAL day ordinal (days since 1970-01-01, local midnight) of
+    /// the last day the gate consumed; 0 (or any non-positive hand-edit)
+    /// means "never", which the first launch marks WITHOUT checking (the
+    /// spike's first-run skip — a fresh install is necessarily current).
+    /// Written at decision time (ADR 0007 D6), persisted by the ordinary
+    /// WM_DESTROY save; the Options dialog never edits it.
+    pub(crate) check_for_updates_last_day: i32,
     /// riviv-authored key (#80; upstream has no such setting): which paint
     /// backend the viewport uses — `auto | d2d | warp` (a STRING key;
     /// missing or unrecognized falls back to the `auto` default; a legacy
@@ -275,6 +288,8 @@ impl Default for Config {
             sharpen: 0,
             white_balance: 0,
             contrast: 0,
+            check_for_updates_on_startup: 1,
+            check_for_updates_last_day: 0,
             renderer: RendererKind::Auto,
             keys: KeyMap::default(),
         }
@@ -457,6 +472,11 @@ impl Config {
         apply_int!(sharpen = "sharpen");
         apply_int!(white_balance = "white_balance");
         apply_int!(contrast = "contrast");
+        // #214's pair: the startup-check switch (BYTE like the other
+        // toggles) and the daily-gate day ordinal (int-width — 2026 is
+        // already ~20,700 days past the epoch).
+        apply_byte!(check_for_updates_on_startup = "check_for_updates_on_startup");
+        apply_int!(check_for_updates_last_day = "check_for_updates_last_day");
         // The renderer is a STRING key (riviv-authored, #80): an
         // unrecognized value is a user typo — it falls to the safe `auto`
         // baseline (design §2, the #81 default) in BOTH overlay passes,
@@ -507,7 +527,7 @@ impl Config {
         if root && self.appdata != 0 {
             return vec![("appdata".to_string(), i(self.appdata))];
         }
-        let int_pairs: [(&str, String); 67] = [
+        let int_pairs: [(&str, String); 69] = [
             ("x", i(self.x)),
             ("y", i(self.y)),
             ("wide", i(self.wide)),
@@ -600,6 +620,15 @@ impl Config {
             ("sharpen", i(self.sharpen)),
             ("white_balance", i(self.white_balance)),
             ("contrast", i(self.contrast)),
+            // #214 appends the startup-check pair after contrast.
+            (
+                "check_for_updates_on_startup",
+                i(self.check_for_updates_on_startup),
+            ),
+            (
+                "check_for_updates_last_day",
+                i(self.check_for_updates_last_day),
+            ),
             // #80 appends the renderer STRING key after keep_zoom.
             ("renderer", self.renderer.to_ini().to_string()),
         ];
@@ -738,7 +767,8 @@ mod tests {
         assert_eq!(back, c, "every save key must be a load key");
         // 61 int keys + the riviv-authored keep_zoom (#68) + sharpen
         // (#185) + white_balance (#191) + contrast (#193) + the renderer
-        // string key (#80) + the pane's two keys (#199) + one *_keys line
+        // string key (#80) + the pane's two keys (#199) + #214's startup
+        // update-check pair + one *_keys line
         // per command in Cmd::ALL order (127 rows now — #199's and
         // #210's tail appends added their own) —
         // bound rows and empty rows alike (#42's shell septet, #43's
@@ -748,8 +778,8 @@ mod tests {
         // hand-counted number would only drift).
         assert_eq!(
             c.to_pairs(false).len(),
-            194,
-            "the save table + keep_zoom + sharpen + white_balance + contrast + renderer + pane pair"
+            196,
+            "the save table + keep_zoom + sharpen + white_balance + contrast + renderer + pane pair + update pair"
         );
     }
 
@@ -783,6 +813,29 @@ mod tests {
     }
 
     #[test]
+    fn update_check_keys_default_spell_and_width() {
+        // #214: the startup-check switch defaults ON (P1=A) and
+        // BYTE-truncates like its sibling toggles; the daily-gate day
+        // ordinal is int-width (2026 is already ~20,700 days past the
+        // epoch) and a garbage value parses to 0 — exactly the
+        // first-run sentinel, so a hand-mangled line degrades to the
+        // skip-once path, never a request storm.
+        let c = Config::default();
+        assert_eq!(c.check_for_updates_on_startup, 1);
+        assert_eq!(c.check_for_updates_last_day, 0);
+        let c = parse_apply(
+            "[riviv]\ncheck_for_updates_on_startup=0\ncheck_for_updates_last_day=20700\n",
+            true,
+        );
+        assert_eq!(c.check_for_updates_on_startup, 0);
+        assert_eq!(c.check_for_updates_last_day, 20700);
+        let c = parse_apply("[riviv]\ncheck_for_updates_on_startup=256\n", true);
+        assert_eq!(c.check_for_updates_on_startup, 0, "BYTE truncation");
+        let c = parse_apply("[riviv]\ncheck_for_updates_last_day=abc\n", true);
+        assert_eq!(c.check_for_updates_last_day, 0);
+    }
+
+    #[test]
     fn appdata_key_is_only_read_from_the_root_file() {
         // The appdata switch lives in the exe-dir file only
         // (config.c:178-182) — an appdata file cannot flip it.
@@ -800,7 +853,7 @@ mod tests {
         let c = Config::default();
         assert_eq!(
             c.to_pairs(true).len(),
-            194,
+            196,
             "active store writes the full table"
         );
         let c = Config {
