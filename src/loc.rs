@@ -616,12 +616,18 @@ pub(crate) enum Id {
     UpdateNewVersionText,
     /// Update-check dialog: the network check failed (#210).
     UpdateFailedText,
+    /// Options → General: the startup-check checkbox caption (#214).
+    OptionsCheckUpdatesOnStartup,
+    /// Startup check found a newer release: the 3-second status-bar
+    /// flash (P2=A); the single `%s` placeholder takes the new version
+    /// number (#214).
+    UpdateAvailableTemp,
 }
 
 impl Id {
     /// Variant count; array-typing every table against this keeps them
     /// length-locked to the enum by construction.
-    pub(crate) const COUNT: usize = Self::UpdateFailedText as usize + 1;
+    pub(crate) const COUNT: usize = Self::UpdateAvailableTemp as usize + 1;
 }
 
 /// Table choice (upstream `LOCALIZATION_LANGUAGE_*`, localization.h:30-32;
@@ -992,6 +998,8 @@ const EN_US: [&str; Id::COUNT] = [
     "You are running the latest version.", // UpdateUpToDateText (#210)
     "riviv %s is available. Open the download page?", // UpdateNewVersionText (#210; %s = new version)
     "Update check failed. Check your connection and try again.", // UpdateFailedText (#210)
+    "Check for &updates on startup", // OptionsCheckUpdatesOnStartup (#214 — U, free on the General dialog; cubic #218)
+    "New version %s available", // UpdateAvailableTemp (#214; %s = new version; the 3-s startup flash)
 ];
 
 /// zh-CN table — upstream localization_zh_cn.h:31/197-199/261-263.
@@ -1334,6 +1342,8 @@ const ZH_CN: [&str; Id::COUNT] = [
     "你正在使用最新版本。", // UpdateUpToDateText (#210)
     "riviv %s 已可用。打开下载页面?", // UpdateNewVersionText (#210;%s = 新版本号)
     "更新检查失败。请检查网络连接后重试。", // UpdateFailedText (#210)
+    "启动时检查更新(&U)", // OptionsCheckUpdatesOnStartup (#214;U 同 en,cubic #218)
+    "新版本 %s 可用", // UpdateAvailableTemp (#214;%s = 新版本号;启动 3 秒闪现)
 ];
 
 /// zh-Hant table — riviv-authored (upstream ships no zh-Hant strings,
@@ -1678,6 +1688,8 @@ const ZH_HANT: [&str; Id::COUNT] = [
     "您正在使用最新版本。", // UpdateUpToDateText (#210;台湾敬语您)
     "riviv %s 已可使用。開啟下載頁面?", // UpdateNewVersionText (#210;%s = 新版本号;網路/開啟=台湾术语)
     "更新檢查失敗。請檢查網路連線後再試一次。", // UpdateFailedText (#210)
+    "啟動時檢查更新(&U)",               // OptionsCheckUpdatesOnStartup (#214;U 同 en,cubic #218)
+    "新版本 %s 可用",                   // UpdateAvailableTemp (#214;%s = 新版本号;啟動 3 秒閃現)
 ];
 
 /// Map a `GetUserDefaultUILanguage` LANGID onto the table choice. Upstream
@@ -1823,6 +1835,38 @@ mod tests {
             );
             assert!(!get_for(lang, Id::UpdateUpToDateText).contains("%s"));
             assert!(!get_for(lang, Id::UpdateFailedText).contains("%s"));
+        }
+        // #214: the startup pair — the General checkbox carries the U
+        // mnemonic like its table siblings (S/I) and the hand-built
+        // rows (M/A/N); U is free on that dialog (the Help-layer U of
+        // the menu row lives on the main window, a different scope —
+        // cubic #218 caught the first draft mnemonic-less). The
+        // startup flash carries the one %s.
+        assert_eq!(
+            get_for(Language::English, Id::OptionsCheckUpdatesOnStartup),
+            "Check for &updates on startup"
+        );
+        assert_eq!(
+            get_for(
+                Language::ChineseSimplified,
+                Id::OptionsCheckUpdatesOnStartup
+            ),
+            "启动时检查更新(&U)"
+        );
+        assert_eq!(
+            get_for(
+                Language::ChineseTraditional,
+                Id::OptionsCheckUpdatesOnStartup
+            ),
+            "啟動時檢查更新(&U)"
+        );
+        for lang in Language::ALL {
+            assert!(
+                get_for(lang, Id::UpdateAvailableTemp).contains("%s"),
+                "startup flash lost its %s placeholder in {lang:?}"
+            );
+            assert!(!get_for(lang, Id::OptionsCheckUpdatesOnStartup).contains("%s"));
+            assert!(get_for(lang, Id::OptionsCheckUpdatesOnStartup).contains('&'));
         }
     }
 

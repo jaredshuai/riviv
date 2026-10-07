@@ -86,10 +86,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GWL_EXSTYLE, GWL_STYLE, GWLP_USERDATA, GetClientRect, GetCursorPos, GetForegroundWindow,
     GetMenu, GetMessageW, GetParent, GetSystemMetrics, GetWindowLongPtrW, GetWindowRect, HICON,
     HMENU, HTCAPTION, HTMENU, HWND_BOTTOM, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST, IDC_ARROW,
-    IMAGE_ICON, IsIconic, IsWindowVisible, IsZoomed, KillTimer, LR_DEFAULTCOLOR, LoadCursorW,
-    LoadImageW, MB_ICONERROR, MB_ICONQUESTION, MB_OK, MENU_ITEM_FLAGS, MF_BYCOMMAND, MF_CHECKED,
-    MF_ENABLED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MFT_RADIOCHECK,
-    MINMAXINFO, MSG, MenuItemFromPoint, MessageBoxW, PostMessageW, PostQuitMessage,
+    IMAGE_ICON, IsIconic, IsWindow, IsWindowVisible, IsZoomed, KillTimer, LR_DEFAULTCOLOR,
+    LoadCursorW, LoadImageW, MB_ICONERROR, MB_ICONQUESTION, MB_OK, MENU_ITEM_FLAGS, MF_BYCOMMAND,
+    MF_CHECKED, MF_ENABLED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MF_UNCHECKED,
+    MFT_RADIOCHECK, MINMAXINFO, MSG, MenuItemFromPoint, MessageBoxW, PostMessageW, PostQuitMessage,
     RegisterClassExW, SC_MONITORPOWER, SHOW_WINDOW_CMD, SM_CXICON, SM_CXSMICON, SM_CYICON,
     SM_CYSMICON, SW_HIDE, SW_MAXIMIZE, SW_RESTORE, SW_SHOW, SW_SHOWNORMAL, SWP_FRAMECHANGED,
     SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SYSTEM_METRICS_INDEX,
@@ -770,8 +770,10 @@ fn resample_pixel_refresh(hwnd: HWND) {
 /// Land a 3-second status flash (#47; upstream `_viv_status_set_temp_text`,
 /// viv.c:11737-11758): a showing text's timer dies first, the text replaces
 /// whatever was there, the bar refreshes, and a fresh timer arms only when
-/// a text landed. `None` clears (the timer's own expiry path).
-fn status_set_temp_text(hwnd: HWND, text: Option<String>) {
+/// a text landed. `None` clears (the timer's own expiry path). `pub(crate)`
+/// since #214: the startup update check's Available verdict lands here
+/// (update::on_reply).
+pub(crate) fn status_set_temp_text(hwnd: HWND, text: Option<String>) {
     // SAFETY: the borrow spans the swap only.
     let had_text = (unsafe { state_of(hwnd) }).is_some_and(|state| {
         let had = state.status_temp.is_some();
@@ -10669,6 +10671,45 @@ pub(crate) fn run() -> Result<(), String> {
     // first ShowWindow above and the bar is still empty here. Upstream
     // populates it at startup the same way (viv.c:5415).
     refresh_status(hwnd);
+
+    // The startup update check (#214, O2=B; spike s-startup-update-check,
+    // P1=A/P3=A; ADR 0007 D6): gated before any spawn, and the day-mark
+    // advances at DECISION time — the first-run skip branch (a fresh
+    // install, or an upgrade from a pre-#214 ini with no day key) marks
+    // today without a request, so the check can never wedge into
+    // permanent first-run status (cubic #216 P1) and the first request
+    // waits one launch (opt-out grace; an already-stale install simply
+    // learns a day later — cubic #218 P3). The network stays on
+    // the worker thread; the pump below owns the reply (WM_APP+4, the
+    // #210 protocol).
+    // SAFETY: the borrow spans the gate reads and the mark write only;
+    // local_day_ordinal takes no window state.
+    let startup_check = (unsafe { state_of(hwnd) }).is_some_and(|state| {
+        let today = update::local_day_ordinal();
+        match update::should_check(
+            state.config.check_for_updates_on_startup != 0,
+            state.config.check_for_updates_last_day,
+            today,
+        ) {
+            update::Gate::Skip => false,
+            update::Gate::MarkOnly => {
+                state.config.check_for_updates_last_day = today;
+                false
+            }
+            update::Gate::Check => {
+                state.config.check_for_updates_last_day = today;
+                true
+            }
+        }
+    });
+    if startup_check {
+        // SAFETY: a read-only liveness probe — the window was created
+        // and shown above; this only keeps a theoretical immediate-exit
+        // startup line from wasting one request on a dead target.
+        if unsafe { IsWindow(Some(hwnd)) }.as_bool() {
+            update::begin_startup(hwnd);
+        }
+    }
 
     let mut msg = MSG::default();
     loop {

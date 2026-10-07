@@ -453,6 +453,11 @@ pub(crate) enum Field {
     /// the tonal axis). Same contract: edits the persistent level, the
     /// OK arm replays it onto the live chain's contrast stage.
     Contrast,
+    /// The check-for-updates-on-startup checkbox (#214; riviv-authored —
+    /// upstream has no update mechanism). Edits the
+    /// `check_for_updates_on_startup` key (P1=A default ON; the daily
+    /// gate's day key is NOT editable here).
+    CheckUpdatesOnStartup,
     WindowedBg,
     FullscreenBg,
     LeftClickAction,
@@ -520,6 +525,24 @@ pub(crate) const GENERAL: &[Ctrl] = &[
         label_w: 0,
         x: 0,
         y: 18,
+        w: 186,
+        h: 10,
+    },
+    // Check for updates on startup (#214; a riviv-authored row — upstream
+    // has no update mechanism at all). GEOMETRICALLY it lands BELOW the
+    // hand-built association block (the start-menu checkbox owns (0,36)
+    // per rc:34 and the Associations group box spans y=54..178,
+    // options_dlg.rs build_general_assoc — the 18-du pitch slots above
+    // are all taken); TABLE-wise appended last so every prior ctrl_id
+    // stays stable for the smoke scripts (Codex #218 P1: the first draft
+    // sat at y=36, on top of the start-menu row).
+    Ctrl {
+        kind: Kind::Checkbox,
+        label: loc::Id::OptionsCheckUpdatesOnStartup,
+        field: Field::CheckUpdatesOnStartup,
+        label_w: 0,
+        x: 0,
+        y: 186,
         w: 186,
         h: 10,
     },
@@ -824,6 +847,9 @@ pub(crate) struct OptionsModel {
     pub(crate) sharpen: Option<i32>,
     pub(crate) white_balance: Option<i32>,
     pub(crate) contrast: Option<i32>,
+    /// #214: mirrors the `check_for_updates_on_startup` key (checkbox —
+    /// always representable, never None-shaped).
+    pub(crate) check_updates_on_startup: bool,
     pub(crate) windowed_bg: [u8; 3],
     pub(crate) fullscreen_bg: [u8; 3],
     pub(crate) left_click_action: Option<i32>,
@@ -851,6 +877,7 @@ impl OptionsModel {
             Field::PreloadNext => self.preload_next,
             Field::CacheLast => self.cache_last,
             Field::KeepZoom => self.keep_zoom,
+            Field::CheckUpdatesOnStartup => self.check_updates_on_startup,
             _ => return None,
         })
     }
@@ -868,6 +895,7 @@ impl OptionsModel {
             Field::PreloadNext => self.preload_next = value,
             Field::CacheLast => self.cache_last = value,
             Field::KeepZoom => self.keep_zoom = value,
+            Field::CheckUpdatesOnStartup => self.check_updates_on_startup = value,
             _ => {}
         }
     }
@@ -947,6 +975,7 @@ impl OptionsModel {
             sharpen: Some(config.sharpen),
             white_balance: Some(config.white_balance),
             contrast: Some(config.contrast),
+            check_updates_on_startup: to_bool(config.check_for_updates_on_startup),
             windowed_bg: config.windowed_bg(),
             fullscreen_bg: config.fullscreen_bg(),
             left_click_action: Some(config.left_click_action),
@@ -1028,6 +1057,9 @@ impl OptionsModel {
         // #68: keep_zoom only changes the NEXT image change's view edge;
         // the current display owes nothing.
         config.keep_zoom = i32::from(self.keep_zoom);
+        // #214: the startup-check switch — next launch's gate reads it;
+        // the running session owes nothing either way.
+        config.check_for_updates_on_startup = i32::from(self.check_updates_on_startup);
         config.windowed_background_color_r = i32::from(self.windowed_bg[0]);
         config.windowed_background_color_g = i32::from(self.windowed_bg[1]);
         config.windowed_background_color_b = i32::from(self.windowed_bg[2]);
@@ -1107,7 +1139,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!((bools, values, colors), (11, 11, 2));
+        assert_eq!((bools, values, colors), (12, 11, 2));
     }
 
     #[test]
@@ -1173,7 +1205,7 @@ mod tests {
                 );
             }
         }
-        assert_eq!(seen.len(), 24);
+        assert_eq!(seen.len(), 25);
     }
 
     #[test]
@@ -1250,6 +1282,7 @@ mod tests {
             sharpen: Some(6),
             white_balance: Some(-5),
             contrast: Some(4),
+            check_updates_on_startup: false,
             windowed_bg: [10, 20, 30],
             fullscreen_bg: [1, 2, 3],
             left_click_action: Some(3),
@@ -1276,6 +1309,8 @@ mod tests {
         assert_eq!(config.keep_zoom, 1);
         assert_eq!(config.sharpen, 6);
         assert_eq!(config.white_balance, -5);
+        // #214: the startup-check switch round-trips with the rest.
+        assert_eq!(config.check_for_updates_on_startup, 0);
         assert_eq!(config.windowed_background_color_r, 10);
         assert_eq!(config.fullscreen_background_color_b, 3);
         assert_eq!(config.left_click_action, 3);
