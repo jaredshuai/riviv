@@ -60,9 +60,11 @@ const API_PATH: &str = "/repos/jaredshuai/riviv/releases/latest";
 pub(crate) const UPDATE_REPLY_MESSAGE: u32 = WM_APP + 4;
 
 /// One check at a time: a second menu click while a check is in flight
-/// is ignored (two replies would stack two message boxes). Cleared by
-/// the worker before it posts, so a fresh click right after a verdict
-/// starts a new check.
+/// is ignored (two replies would stack two message boxes). Released by
+/// the UI thread when it CONSUMES a verdict (on_reply) — never by the
+/// worker — so the clear-vs-post window cannot admit a second flight
+/// (Codex #218 P2); a fresh click after the verdict landed (the box
+/// closed, or the flash shown) starts a new check as before.
 static CHECK_RUNNING: AtomicBool = AtomicBool::new(false);
 
 /// P4=A escalation (#214): a MANUAL click sets this even when the
@@ -225,13 +227,14 @@ pub(crate) fn local_day_ordinal() -> i32 {
     days_from_civil(st.wYear as i32, st.wMonth as u32, st.wDay as u32)
 }
 
-/// The shared single-flight spawn (ADR 0007 D2). Returns false ONLY for
-/// a thread-creation failure (the gate is re-cleared so a retry can
-/// run); already-in-flight returns true — the caller's escalation flag
-/// is what keeps that case honest for manual clicks.
-fn dispatch(hwnd: HWND) -> bool {
+/// The shared single-flight spawn (ADR 0007 D2). Err carries the spawn
+/// failure verbatim (the caller decides the audience: box or breadcrumb,
+/// Codex #218 P1); Ok covers both running and already-in-flight — the
+/// caller's escalation flag is what keeps the gated case honest for
+/// manual clicks. On failure the gate re-clears so a retry can run.
+fn dispatch(hwnd: HWND) -> std::io::Result<()> {
     if CHECK_RUNNING.swap(true, Ordering::SeqCst) {
-        return true;
+        return Ok(());
     }
     // HWND is a plain Win32 handle (not a pointer into Rust memory),
     // but windows-rs marks the raw pointer non-Send; carry it across
@@ -241,10 +244,10 @@ fn dispatch(hwnd: HWND) -> bool {
         .name("update-check".to_string())
         .spawn(move || worker(HWND(hwnd_raw as *mut _)))
     {
-        Ok(_) => true,
-        Err(_) => {
+        Ok(_) => Ok(()),
+        Err(e) => {
             CHECK_RUNNING.store(false, Ordering::SeqCst);
-            false
+            Err(e)
         }
     }
 }
@@ -253,13 +256,14 @@ fn dispatch(hwnd: HWND) -> bool {
 /// spawn failure answers the user directly — Builder::spawn maps to a
 /// user-level outcome instead of panicking the process (#65 P2
 /// discipline; we are still on the UI thread, so the box can show
-/// synchronously).
+/// synchronously), with the io error breadcrumbed for diagnostics.
 pub(crate) fn begin(hwnd: HWND) {
     // Set BEFORE the gate: a click swallowed by an in-flight silent
     // startup check still owes the user the manual presentation when
     // that verdict lands (P4=A).
     MANUAL_REQUESTED.store(true, Ordering::SeqCst);
-    if !dispatch(hwnd) {
+    if let Err(e) = dispatch(hwnd) {
+        eprintln!("update check: worker spawn failed: {e}");
         show_box(
             hwnd,
             loc::get(loc::Id::UpdateFailedText),
@@ -271,16 +275,19 @@ pub(crate) fn begin(hwnd: HWND) {
 /// The startup half (#214, P1=A): called once from run() before the
 /// pump, after the daily gate marked today. Silent on every failure —
 /// a spawn failure is an stderr breadcrumb, not a box (the user never
-/// asked anything; cubic #216 P2).
+/// asked anything; cubic #216 P2), carrying the io error verbatim
+/// (Codex #218 P1).
 pub(crate) fn begin_startup(hwnd: HWND) {
-    if !dispatch(hwnd) {
-        eprintln!("startup update check: worker spawn failed — skipped silently");
+    if let Err(e) = dispatch(hwnd) {
+        eprintln!("startup update check: worker spawn failed: {e} — skipped silently");
     }
 }
 
 /// The background half: fetch, decide, park the verdict in the queue,
-/// post the bare notification. The in-flight gate clears before the
-/// post so the next click can start once the verdict is queued.
+/// post the bare notification. The gate stays HELD here — only the UI
+/// thread's consumption (on_reply) releases it, so a click can never
+/// wedge a second flight into the clear-vs-post window and stack two
+/// boxes (Codex #218 P2; the worker used to clear before posting).
 fn worker(hwnd: HWND) {
     let outcome = match fetch_latest_body() {
         Ok(body) => decide(
@@ -289,7 +296,6 @@ fn worker(hwnd: HWND) {
         ),
         Err(_) => Outcome::Failed,
     };
-    CHECK_RUNNING.store(false, Ordering::SeqCst);
     if let Ok(mut queue) = REPLY_QUEUE.lock() {
         // Single-flight guarantees no concurrent producer; the clear
         // drops any verdict a dying window never claimed.
@@ -323,6 +329,10 @@ pub(crate) fn on_reply(hwnd: HWND) {
     let Some(outcome) = REPLY_QUEUE.lock().ok().and_then(|mut q| q.pop_front()) else {
         return;
     };
+    // Consumed: release the single-flight gate here (an empty-pop forged
+    // message must NOT release it — a real verdict may still be in the
+    // pipe; Codex #218 P2).
+    CHECK_RUNNING.store(false, Ordering::SeqCst);
     let manual = MANUAL_REQUESTED.swap(false, Ordering::SeqCst);
     match outcome {
         Outcome::UpToDate if manual => {

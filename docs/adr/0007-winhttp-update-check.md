@@ -45,6 +45,7 @@ ADR 0001 的用户级 = 图片加载失败且规定**不弹框**;更新网络失
 - **P3=A 频次闸 = 判定即记**:两个标记分支(MarkOnly/Check)都把今日写进内存 config,WM_DESTROY 常规落盘——**best-effort**(`Config::save` 写失败只记日志,只读安装目录先例;未落盘 = 下次启动重查一次,有界)。网络失败也记账(Sumatra mark-at-start 同构)。跳过分支若不记账会把每次启动都变成首启,自动检查永不发生(cubic #216 P1)。手动检查不走闸。
 - **P4=A 升格**:`MANUAL_REQUESTED` 标志在手动入口置位(含被单飞闸挡住的点击),`on_reply` 读清后按手动三态框呈现——用户主动询问必须有答(D3 手动半边)。
 - spawn 失败二态分叉:手动 = 直报框(既有);启动 = stderr 静默(cubic #216 P2)。发起点 = run() 泵前、`refresh_status` 后,`IsWindow` 守卫;-install/转发实例在发起点之前已退出,持锁实例独查;`multiple_instances=1` 时各实例各查(幂等)。Options General 页第三行 checkbox(`Kind::Checkbox` 既有机制)编辑开关;日序数键不暴露。
+- **实现修订(Codex #218 三项全采纳,P1×2+P2)**:①spawn 失败的 io 错误原样进 stderr 面包屑(手动路径同时保留框);②单飞闸改由 **UI 线程消费裁决时(on_reply 成功弹出后)释放**,worker 不再清闸——封掉 worker 清闸与投递之间可塞入第二个 flight、叠两个框的窗口;③General 页新行的几何落在 hand-built 关联块(开始菜单 checkbox y=36[rc:34]+Associations 组框 y=54..178)**下方 y=186**,初稿 y=36 与开始菜单行同位系撞车。
 
 ## 验证
 

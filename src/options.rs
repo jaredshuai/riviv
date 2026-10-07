@@ -529,16 +529,20 @@ pub(crate) const GENERAL: &[Ctrl] = &[
         h: 10,
     },
     // Check for updates on startup (#214; a riviv-authored row — upstream
-    // has no update mechanism at all). The General page's third checkbox,
-    // continuing the 18-du pitch; TABLE-wise appended last so every
-    // prior ctrl_id stays stable for the smoke scripts.
+    // has no update mechanism at all). GEOMETRICALLY it lands BELOW the
+    // hand-built association block (the start-menu checkbox owns (0,36)
+    // per rc:34 and the Associations group box spans y=54..178,
+    // options_dlg.rs build_general_assoc — the 18-du pitch slots above
+    // are all taken); TABLE-wise appended last so every prior ctrl_id
+    // stays stable for the smoke scripts (Codex #218 P1: the first draft
+    // sat at y=36, on top of the start-menu row).
     Ctrl {
         kind: Kind::Checkbox,
         label: loc::Id::OptionsCheckUpdatesOnStartup,
         field: Field::CheckUpdatesOnStartup,
         label_w: 0,
         x: 0,
-        y: 36,
+        y: 186,
         w: 186,
         h: 10,
     },
