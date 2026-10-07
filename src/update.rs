@@ -173,9 +173,11 @@ pub(crate) enum Gate {
     /// already consumed.
     Skip,
     /// First run (or a hand-mangled/never-written gate): mark today so
-    /// this never reads as first-run again, but send no request — a
-    /// fresh install is necessarily current (the spike's first-run
-    /// skip, Sumatra's precedent).
+    /// this never reads as first-run again, but send no request — one
+    /// launch of opt-out grace before the first request (Sumatra's
+    /// stated reason: privacy-sensitive users can disable it in time).
+    /// An already-stale install simply learns a day later (cubic #218
+    /// P3 — "necessarily current" was the imprecise first draft).
     MarkOnly,
     /// A previous day owns the mark: mark today AND run the check.
     Check,
@@ -188,6 +190,13 @@ pub(crate) enum Gate {
 /// caller writes `today` into the config for BOTH marking arms —
 /// skip-branch-without-mark would wedge every launch into first-run
 /// status forever (cubic #216 P1).
+///
+/// The `<= 0` sentinel deliberately conflates pre-1970 ordinals with
+/// "never" (cubic #218 P3 noted the ambiguity): only today's
+/// `local_day_ordinal` is ever written, so a negative mark means the
+/// system clock itself sits before the epoch — a machine whose clock is
+/// that broken has no TLS story anyway, and the gate self-heals one
+/// launch after the clock is fixed (the stale negative re-marks).
 pub(crate) fn should_check(enabled: bool, last_day: i32, today: i32) -> Gate {
     if !enabled {
         Gate::Skip
@@ -290,10 +299,19 @@ pub(crate) fn begin_startup(hwnd: HWND) {
 /// boxes (Codex #218 P2; the worker used to clear before posting).
 fn worker(hwnd: HWND) {
     let outcome = match fetch_latest_body() {
-        Ok(body) => decide(
-            env!("CARGO_PKG_VERSION"),
-            parse_tag_name(&body).unwrap_or(""),
-        ),
+        Ok(body) => {
+            let outcome = decide(
+                env!("CARGO_PKG_VERSION"),
+                parse_tag_name(&body).unwrap_or(""),
+            );
+            // A fetched body that still yields Failed is a parse loss —
+            // breadcrumb it so EVERY Failed outcome leaves a stderr trace
+            // (the transport stages log inside fetch; cubic #218 P3).
+            if matches!(outcome, Outcome::Failed) {
+                eprintln!("update check: response carried no parseable tag_name");
+            }
+            outcome
+        }
         Err(_) => Outcome::Failed,
     };
     if let Ok(mut queue) = REPLY_QUEUE.lock() {

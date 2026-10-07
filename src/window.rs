@@ -10677,8 +10677,9 @@ pub(crate) fn run() -> Result<(), String> {
     // advances at DECISION time — the first-run skip branch (a fresh
     // install, or an upgrade from a pre-#214 ini with no day key) marks
     // today without a request, so the check can never wedge into
-    // permanent first-run status (cubic #216 P1) and a just-installed
-    // build (necessarily current) costs nothing. The network stays on
+    // permanent first-run status (cubic #216 P1) and the first request
+    // waits one launch (opt-out grace; an already-stale install simply
+    // learns a day later — cubic #218 P3). The network stays on
     // the worker thread; the pump below owns the reply (WM_APP+4, the
     // #210 protocol).
     // SAFETY: the borrow spans the gate reads and the mark write only;

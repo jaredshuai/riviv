@@ -40,12 +40,13 @@ ADR 0001 的用户级 = 图片加载失败且规定**不弹框**;更新网络失
 
 复用 D1/D2/D4 全部底座(WinHTTP worker、WM_APP+4 零载荷回执、手解析严苛失败)——本节只裁增量。拍板 2026-10-07「全按推荐」(spike `s-startup-update-check` P1-P4):
 
-- **P1=A 默认开 + 首启跳过**:ini 键 `check_for_updates_on_startup`(BYTE 档)默认 1——双原生同形态样本(Notepad++/Sumatra)默认开,Sumatra `UpdateCheck.cpp` 亲读同构。`check_for_updates_last_day`(int 档)= 本地日序数(`days_from_civil` 纯函数,`GetLocalTime` 薄壳);**≤0 = 从未** → 首启(全新安装或自 #214 前版本升级)照常记今日但**不发请求**(刚装完必是最新版;Sumatra 首启跳过先例——「给隐私敏感用户留出关闭时间」)。
-- **P2=A 通知 = 状态栏 temp_text**:启动态仅 Available 可见——`status_set_temp_text`(#47 基建,3 秒闪现);UpToDate/Failed 静默(D3 启动语义:用户未询问;Failed 的 stderr 面包屑是诊断通道)。可见性弱点(3s 即逝/可被 panscan flash 替换/`show_status=0` 或全屏不可见)由**每日闸的幂等重试**补偿:明日启动再提示,直到更新;单次丢失无累积伤害。
+- **P1=A 默认开 + 首启跳过**:ini 键 `check_for_updates_on_startup`(BYTE 档)默认 1——双原生同形态样本(Notepad++/Sumatra)默认开,Sumatra `UpdateCheck.cpp` 亲读同构。`check_for_updates_last_day`(int 档)= 本地日序数(`days_from_civil` 纯函数,`GetLocalTime` 薄壳);**≤0 = 从未** → 首启(全新安装或自 #214 前版本升级)照常记今日但**不发请求**(一次 opt-out 宽限——Sumatra 首启跳过先例「给隐私敏感用户留出关闭时间」;已陈旧的安装晚一天获知,「刚装完必最新」初稿措辞经 cubic #218 P3 订正)。`≤0` 哨兵有意把 pre-1970 序数并入「从未」:负标记只能来自时钟坏到 1970 前的机器(无 TLS 可言),时钟修复后一启自愈。
+- **P2=A 通知 = 状态栏 temp_text**:启动态仅 Available 可见——`status_set_temp_text`(#47 基建,3 秒闪现);UpToDate/Failed 静默(D3 启动语义:用户未询问;Failed 的 stderr 面包屑是诊断通道——传输级在 fetch 各 stage、解析级在 worker(cubic #218 P3 补全),每个 Failed 都有迹)。可见性弱点(3s 即逝/可被 panscan flash 替换/`show_status=0` 或全屏不可见)由**每日闸的幂等重试**补偿:明日启动再提示,直到更新;单次丢失无累积伤害。
 - **P3=A 频次闸 = 判定即记**:两个标记分支(MarkOnly/Check)都把今日写进内存 config,WM_DESTROY 常规落盘——**best-effort**(`Config::save` 写失败只记日志,只读安装目录先例;未落盘 = 下次启动重查一次,有界)。网络失败也记账(Sumatra mark-at-start 同构)。跳过分支若不记账会把每次启动都变成首启,自动检查永不发生(cubic #216 P1)。手动检查不走闸。
 - **P4=A 升格**:`MANUAL_REQUESTED` 标志在手动入口置位(含被单飞闸挡住的点击),`on_reply` 读清后按手动三态框呈现——用户主动询问必须有答(D3 手动半边)。
 - spawn 失败二态分叉:手动 = 直报框(既有);启动 = stderr 静默(cubic #216 P2)。发起点 = run() 泵前、`refresh_status` 后,`IsWindow` 守卫;-install/转发实例在发起点之前已退出,持锁实例独查;`multiple_instances=1` 时各实例各查(幂等)。Options General 页第三行 checkbox(`Kind::Checkbox` 既有机制)编辑开关;日序数键不暴露。
 - **实现修订(Codex #218 三项全采纳,P1×2+P2)**:①spawn 失败的 io 错误原样进 stderr 面包屑(手动路径同时保留框);②单飞闸改由 **UI 线程消费裁决时(on_reply 成功弹出后)释放**,worker 不再清闸——封掉 worker 清闸与投递之间可塞入第二个 flight、叠两个框的窗口;③General 页新行的几何落在 hand-built 关联块(开始菜单 checkbox y=36[rc:34]+Associations 组框 y=54..178)**下方 y=186**,初稿 y=36 与开始菜单行同位系撞车。
+- **实现修订(cubic #218 四项 P3 全采纳)**:④「刚装完必最新」论证改精确(见 P1);⑤pre-1970 负序数并入哨兵 = 有意决定(见 P1);⑥解析级 Failed 补 worker 面包屑(见 P2);⑦General 行助记符 **U**(`Check for &updates on startup`,三表同;该对话框 S/I/M/A/N+扩展字母在场、U 空闲;初稿无助记符与同页 sibling 惯例不符)。
 
 ## 验证
 
