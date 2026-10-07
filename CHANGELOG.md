@@ -5,6 +5,15 @@ history by git-cliff (cliff.toml is the policy; do not hand-edit the output).
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+## [0.6.0] - 2026-10-07
+### Added
+
+- Feat(update): #210 Help→Check for Updates — notify-only WinHTTP check (#210) (e12bb57)
+### Fixed
+
+- Fix(update): #211 cubic review — all 5 findings adopted (20e5b7e)
+- Fix(update): #211 adversarial round — 4×P3 adopted (codex channel down, in-session pass) (b9951c1)
+
 ## [0.5.0] - 2026-10-06
 ### Added
 
