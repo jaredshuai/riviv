@@ -13,11 +13,12 @@
 
 **推迟到 M8,与 HDR 同期**(追记 2026-09-26 #136:已解绑——HDR/WCG 输出不再依赖
 AVIF;AVIF 输入面=移出 M8 的 L3 观察票 #138,详见下方「决策影响」第 1 条)。
-**追记 2026-10-21 #215 重审:三条路线两死一生——imazen 系否决未解除(rav1d-safe
+**追记 2026-10-21 #215 重审:三条路线两死一生(A 维持工具链否决、B 仅加速)——
+imazen 系否决未解除(rav1d-safe
 Cargo.toml 仍 AGPL 双授,GitHub BSD-2 字段是 fork 带入的上游 COPYING 探测噪声,
-#215 触发证据第 1 条实为误报);oxideav 路线(MIT 纯 Rust 全链)本地实测①⑥通过、
-④可接待实现票、⑤记录性偏离,唯体积 +1.59 MiB≈4.2× 基准线须独立 ADR 破例 +
-用户拍板——证据与结论见文末「重审(2026-10-21,#215)」节。**
+#215 触发证据第 1 条实为误报);oxideav 路线(MIT 纯 Rust 全链)本地实测①过、
+⑥构造性过、④可接待实现票、⑤记录性偏离,唯体积 +1.59 MiB≈4.1× 基准线须独立
+ADR 破例 + 用户拍板——证据与结论见文末「重审(2026-10-21,#215)」节。**
 原三路线结论(2026-09-21)保留如下:
 三条路线当前全部不过门槛:A(dav1d,C)
 需 meson/nasm/pkg-config 外部工具链且构建期联网(违反依赖原则①,
@@ -82,8 +83,9 @@ MIT 侧 oxideav 自认脚手架不成熟。AVIF 位深/gain map 与 HDR 语义�
 - 触发:#138 触发器 (a) 疑似满足(#215 票面 2026-10-07 GitHub 元数据)+ (c)
   里程碑收尾兜底;本节为重审产出,纪律 = 重审 ≠ 开工。
 - 全部生态事实 2026-10-21 当日亲查(GitHub API / crates.io API / 仓库文件);
-  全部数字为本机实测(rustc 1.98.0,Win11 26300;探针工程 `%TEMP%\riviv-s215\`,
-  语料与探针产物同目录,勿入库)。
+  探针节数字为本机实测(rustc 1.98.0,Win11 26300;探针工程 `%TEMP%\riviv-s215\`,
+  语料与探针产物同目录,勿入库);上游自报数字(语料量级、性能、MSRV 等)均随文
+  标注出处,非本机实测。
 
 ### 触发证据复核(两条)
 
@@ -102,7 +104,7 @@ MIT 侧 oxideav 自认脚手架不成熟。AVIF 位深/gain map 与 HDR 语义�
    2026-10-12 有 push)——单本体仍非候选,定性不变。
 2. **oxideav 活跃化 = 真触发。** 分仓结构成形(OxideAV/oxideav-workspace +
    -core + -av1 + -heif + -avif,全 MIT,MSRV 统一 1.80),发版节奏
-   avif 半年 15 版(0.0.4 2026-04-25 → 0.0.15 2026-10-17),av1 0.1.21 /
+   avif 半年 12 版(0.0.4 2026-04-25 → 0.0.15 2026-10-17),av1 0.1.21 /
    heif 0.0.12 均本周在发。crates.io 上 oxideav-av1 的「orphan-rebuild scaffold」
    描述**已过期**:仓库自述 clean-room rebuild 已落地(r390 起独立一致性语料
    16/16 字节精确,逐版增长),workspace README codecs 表现值 AV1 解码
@@ -110,14 +112,14 @@ MIT 侧 oxideav 自认脚手架不成熟。AVIF 位深/gain map 与 HDR 语义�
    kernels(纯标量 Rust)」、AVIF 行「✅ ~99%——8/10/12-bit 全布局、alpha、
    grid/overlay/iden,fuzzed」。
 
-### 本地探针(三面全绿)
+### 本地探针(三面 PASS + 体积量测)
 
 | 核查面 | 方法 | 结果 |
 |---|---|---|
 | ①纯 Rust 静态链零外部工具链 | 探针工程 `cargo build --release`(oxideav-avif 0.0.15 默认 feature) | **PASS**:全程零 nasm/meson/pkg-config;`cargo tree` oxideav 侧 = avif+av1+heif+core+bytemuck/serde_json/thiserror,**零 `*-sys`/cc/bindgen/cmake**;heif 以 `default-features = false` 被引入,**不拖 h264/h265/h266** |
 | 跨编码器互操作 | image 0.25.10(ravif 0.13/rav1e 0.8.1)自造 64×64 四象限语料(339 B,ftyp brand=avif 实录,同 B-report 配方)→ oxideav `probe`/`info`/`decode` | **PASS**:`decode` <1 ms(zenavif 臂同语料 5 ms),四象限像素 l1=1(有损舍入级) |
 | 10-bit 深度路径 | oxideav 自编码 10-bit 4:4:4+alpha 无损(q=0,623 B)→ 解码 | **PASS**:`info.bit_depth=10`、`has_alpha=true`;`decode` 得 `Yuva444P10Le` 四平面 16-bit LE,luma/alpha 样本**逐值精确往返**,`<1 ms` |
-| 体积量级 | 纯解码臂 exe(仅链 oxideav,无 image——与语料生成臂 3,412,480 B 对比可证)− 空基线 | **+1,671,680 B ≈ +1.59 MiB**(1,795,584 − 123,904;release, cg16) |
+| 体积量级 | 纯解码臂 exe(仅链 oxideav,无 image——与语料生成臂 3,412,480 B 对比可证)− 空基线 | **+1,671,680 B ≈ +1.59 MiB**(1,795,584 − 123,904;release,codegen-units 16) |
 
 - API 面顺带核实(读取已编译版本源码):image-crate 合同(probe/info/decode/
   decode_rgba8);`ImageInfo` 携带 `bit_depth`/`has_icc`/`frames`/`is_sequence`;
@@ -130,21 +132,22 @@ MIT 侧 oxideav 自认脚手架不成熟。AVIF 位深/gain map 与 HDR 语义�
 |---|---|---|
 | ① 纯 Rust+静态链+零外部工具链 | **过(实测)** | 上表探针 |
 | ② 新依赖落纯逻辑层 | 过(设计) | 解码纯逻辑进 loader 管线,unsafe 壳不加码 |
-| ③ 体积 ≤ +400 KB/格式 | **超限:+1.59 MiB ≈ 4.2× 基准线 → 须独立 ADR(编解码器类,阈值与理由单独论证)+ 用户拍板** | 上表探针;400 KB 阈值本就按「解码格式」校准(ADR 0005 D1),codec 超限不能援引渲染引擎先例——ADR 0005 D1 明言其破例「不回写放松原则③」;对照量级:resvg +3.38 MiB、zenavif 臂 +3.67 MiB,oxideav 为至今测得最便宜的全链 AVIF |
+| ③ 体积 ≤ +400 KB/格式 | **超限:+1.59 MiB ≈ 4.1× 基准线 → 须独立 ADR(编解码器类,阈值与理由单独论证)+ 用户拍板** | 上表探针;400 KB 阈值本就按「解码格式」校准(ADR 0005 D1),codec 超限不能援引渲染引擎先例——ADR 0005 D1 明言其破例「不回写放松原则③」;对照量级:resvg +3.38 MiB、zenavif 臂 +3.67 MiB,oxideav 为至今测得最便宜的全链 AVIF |
 | ④ 同管线(魔数+icm+帧时序) | 可过(实现票落实) | 魔数=ftyp brand 探测;ICC=`has_icc`+`Metadata.icc`(API 已核实,本地未解带 ICC 样张=已知缺口,实现票 QA 项);帧时序=`avis`/`decode_all` 对齐现帧管线 |
 | ⑤ 优先 image 同族 | **记录性偏离** | image 0.25 的同族解码 feature = `avif-native`(dav1d/C,即本表路线 A)已被①否决,纯 Rust 解码在 image 生态不存在;oxideav 为唯一过①的解码路线,且刻意自仿 image 合同 API(生态外、合同内) |
 | ⑥ 装机≈100% 无授权费 | 过(构造性) | 代码随行、MIT,行为不随装机变(与 WIC 相反) |
 
 ### 风险与缓解
 
-1. **API churn**:avif 0.0.x 无 semver 稳定承诺,半年 15 版 → riviv 侧锁精确
+1. **API churn**:avif 0.0.x 无 semver 稳定承诺,半年 12 版 → riviv 侧锁精确
    版本,升级走独立票。
 2. **单主作者**(OxideAV,Mark Karpeles)bus factor → MIT 可 fork,锁版本后
    冻结面可控。
 3. **纯标量无 SIMD**:12 MP 静图自报 0.31 s 串行 / 0.097 s@8 workers;查看器
    单图加载场景可接受,`ExecutionContext` 线程预算实现票可后加。
 4. **真实世界样张覆盖**:自报 114/114 字节精确;本地仅 rav1e 编码互操作 + 自
-   往返,未持有第三方 10-bit 样张 → 实现票 QA 矩阵项。
+   往返,未持有第三方 10-bit 样张;grid/overlay/iden 与 `avis` 序列亦未本地
+   实测(仅上游自报 + API 亲核)→ 实现票 QA 矩阵项。
 
 ### 重审结论
 
@@ -153,6 +156,8 @@ MIT 侧 oxideav 自认脚手架不成熟。AVIF 位深/gain map 与 HDR 语义�
 为设计判断 + API 亲核,**ICC 路径未本地实测,留实现票 QA 落实**;⑤为记录性
 偏离(见上表理由);唯③超限须破例。**产出 = 建议开 AVIF 输入面实现票(oxideav
 路线),前置条件 = 用户拍板体积破例(编解码器类独立 ADR,建议锚值 +1.59 MiB
-实测)——拍板前不开工。**WIC 地位
-不变(仅「有则用」加速,永不作加载决策);imazen 系与 C 工具链路线维持否决。
+实测——探针口径,riviv 内增量以实现票实测为准,防把探针差分直接当库内增量
+锚定)——拍板前不开工。**WIC 地位
+不变(仅「有则用」加速,永不作加载决策);imazen 系与路线 A(dav1d/C 工具链)
+维持否决。
 #138 可在实现票开立时关闭(其 (a) 触发经本重审成立)。
