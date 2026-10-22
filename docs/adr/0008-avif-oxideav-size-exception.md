@@ -1,0 +1,43 @@
+# ADR 0008: AVIF 输入面路线 = oxideav,编解码器类体积破例
+
+- 日期: 2026-10-22
+- 状态: 已接受(用户拍板 2026-10-22「接受」+1.59 MiB;重审证据 = #215 / `docs/spikes/s-avif.md`「重审(2026-10-21,#215)」节;实现票 #220;观察票 #138 随本决策关闭)
+- 范围: AVIF 输入面(still + `avis` 序列)的解码路线裁定与依赖原则③的编解码器类破例;**不含** HDR 输出/gain map 消费(#136 已解绑)、深度保留(= ADR 0003 FP16 域;10/12-bit 输入按 PNG16 同例截断至现行 8-bit master)
+- 上游权威: s-avif.md(2026-09-21 三路线表 + 2026-10-21 重审节)、#136 票面 F7/F8 与处置评论、AGENTS「依赖原则」、s1-platform-floor(新增 DLL 静态导入须 dumpbin 证据并写 ADR)
+
+## 背景
+
+AVIF 输入面自 #136 解绑后挂起为 L3 观察票 #138,触发器 (a)=出现 MIT/BSD 兼容、能过依赖原则的纯 Rust 全链。#215 重审(证据全部 2026-10-21 当日亲查 + 本机探针)结论:
+
+- **imazen 系否决未解除**:rav1d-safe 的 GitHub license 字段显 BSD-2 是探测器读了 fork 带入的上游 COPYING;权威源(Cargo.toml 0.7.0 prep + LICENSE-AGPL3/LICENSE-COMMERCIAL 随包发行 + crates.io 元数据)仍 `AGPL-3.0-only OR LicenseRef-Imazen-Commercial`,zenavif 仍 AGPL——对 MIT 的 riviv 一票否决维持。(#215 票面触发证据第 1 条「rav1d 许可变更」经复核为误报。)
+- **memorysafety/rav1d 单本体非候选**:BSD-2 不变,但 v1.1.0(2025-05)后 17 个月无新 release,裸 C 风格 unsafe API + 无容器 demux 现状未变。
+- **oxideav = 真触发成立**:全 MIT(avif 0.0.15 / av1 0.1.21 / heif 0.0.12 / core 0.1.40,MSRV 1.80),clean-room 语料自报 155 流 + 114/114 真实静图字节精确。本机探针三 PASS:纯 cargo 零外部工具链(依赖树零 `*-sys`/cc/bindgen,heif 以 default-features=false 引入不拖 h264/h265/h266)、跨编码器互操作(ravif/rav1e 语料,四象限 l1=1,<1 ms)、10-bit 4:4:4+alpha 无损往返逐值精确(Yuva444P10Le)。
+- **唯一硬门不过 = 体积**:纯解码臂双 bin 差分 **+1,671,680 B ≈ +1.59 MiB ≈ 4.1× 依赖原则③的 400 KB 基准线**(400 KB 本就按「解码格式」校准,ADR 0005 D1)。
+
+## 决策
+
+### D1. 路线 = oxideav-avif(精确锁版本),其余路线维持否决
+
+唯一直接依赖 `oxideav-avif = "=0.0.15"`(registry feature 默认开,带 pixel decode);传递 av1/heif/core 面以重审探针树为准。否决项维持:dav1d/C(违反①外部工具链)、WIC(装机漂移违反⑥,仅存「有则用」加速且永不作加载决策)、imazen 系(AGPL)。依赖原则⑤为**记录性偏离**:image 同族的解码 feature(`avif-native`)即 dav1d/C 路线已被①否决,纯 Rust 解码在 image 生态不存在;oxideav 自仿 image 合同 API(probe/info/decode),生态外、合同内。
+
+### D2. 体积破例 = 编解码器类独立锚,不回写放松③
+
+本破例锚值 **+1.59 MiB(探针口径:独立探针 exe 双 bin 差分)**,库内实际增量以实现票 #220 双臂实录为准并回填本 ADR(先例:resvg 探针 3.92 MiB → 库内 3.38 MiB)。与 ADR 0005 的关系:**不援引其先例**——0005 D1 的独立阈值以「渲染引擎非编解码器」为正当性来源,本 ADR 的正当性 = 用户对 AVIF 格式覆盖面的直接拍板(2026-10-22「接受」);400 KB 基准线对后续编解码器**原样有效**,下一个超限者仍须各自 ADR + 拍板。
+
+### D3. 管线与深度语义
+
+同管线接入不旁路:魔数嗅探(ftyp brand)进现有嗅探层、`Metadata.icc` 进现有 icm 链(带 ICC 样张为 #220 必测项)、`avis` 序列走现有帧时序契约。10/12-bit 文件正确解码但截断至现行 8-bit sRGB master(**PNG16 同例**);深度保留属 ADR 0003 FP16 中间格式域,非本决策范围。错误路径遵循 ADR 0001 用户级(保留旧图、不退出、不弹框)。
+
+### D4. S1 合规:导入面证据为 #220 回填项
+
+oxideav 全纯 Rust,**预期零新 DLL 静态导入**;但按 s1-platform-floor 纪律,#220 仍须附 `dumpbin /imports` 双臂 diff 证据回填本 ADR——若出现新 DLL 即停,另走 ADR。
+
+### D5. 风险承接(全部 #220 验收项)
+
+API churn(0.0.x 无 semver 承诺,半年 12 版)→ 精确锁 + 升级独立票;单主作者 bus factor → MIT 可 fork,锁版本冻结面可控;纯标量无 SIMD(12 MP 自报 0.31 s 串行)→ 查看器场景可接受,`ExecutionContext` 线程预算为后继可选项;真实样张覆盖(自报 114/114)→ #220 本地 QA 矩阵补验(ICC、第三方 10-bit、grid)。
+
+## 后果
+
+- exe 体积将增长约 1.6 MiB 量级(实际值以 #220 实录为准;AGENTS 体积基线数字随发版更新)。
+- #138 关闭(其触发器 (a) 经重审成立并已消费);AVIF 输入面从观察态转实施态(#220)。
+- 本 ADR 不为任何后续编解码器(如 JXL/HEIC 解码)预设先例——各自 ADR + 拍板。
