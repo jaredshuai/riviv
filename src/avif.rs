@@ -30,9 +30,9 @@ pub(crate) const MAX_INPUT_BYTES: u64 = 128 * 1024 * 1024;
 /// master 预算是 512 MiB(8 B/px @ f16)→ 2^26 px,decode 侧的
 /// 单帧像素上限同钉——防 hostile 的「压缩后小、解开后大」帧
 /// (128 MiB 输入 + 高压缩比)在 riviv 的帧级闸之外物化;oxideav
-/// 默认的 2^28 px(≈ 8 GiB @ 12-bit 四平面)不设防。多帧累计由
-/// 动画臂的 header 预闸(tkhd display×frames)与静图预算闸管。
-/// 诚实文件不受影响(2^26 px ≈ 16k×4k 的 12-bit 静图)。
+/// 默认的 2^28 px(≈ 2 GiB @ 12-bit 四平面 × 2 B/样本)不设防。
+/// 多帧累计由动画臂的 header 预闸(tkhd display×frames)与静图
+/// 预算闸管。诚实文件不受影响(2^26 px ≈ 16k×4k 的 12-bit 静图)。
 pub(crate) fn decode_options() -> oxideav_avif::DecodeOptions {
     oxideav_avif::DecodeOptions::default().with_max_pixels(Some(1 << 26))
 }
