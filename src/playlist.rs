@@ -420,13 +420,14 @@ fn next_rand(state: &mut u64, modulus: usize) -> usize {
     (value % modulus as u64) as usize
 }
 
-/// The 11 playable extensions. The first nine match upstream
+/// The 12 playable extensions. The first nine match upstream
 /// `_viv_association_extensions` (viv.c:1136-1147); `apng` is appended
-/// (#108) and `svg` after it (#152 — both beyond-original decodes,
-/// appended past upstream's set like #108's precedent; without the entry
-/// the folder scan, next/prev navigation and the Everything `ext:` query
-/// would all skip SVGs while direct opens work — the format must be
-/// first-class everywhere, not just at the open gate).
+/// (#108), `svg` after it (#152) and `avif` last (#220 — all
+/// beyond-original decodes, appended past upstream's set like #108's
+/// precedent; without the entry the folder scan, next/prev navigation
+/// and the Everything `ext:` query would all skip the format while
+/// direct opens work — the format must be first-class everywhere,
+/// not just at the open gate).
 /// pub(crate): the Everything search prefix derives from this table (#114) —
 /// a search must ask for exactly what the playlist can take.
 pub(crate) const EXTENSIONS: [&str; 12] = [

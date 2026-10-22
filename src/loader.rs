@@ -423,7 +423,13 @@ fn avif_arm_from_file(
         )));
     }
     let mut bytes = Vec::with_capacity(len.min(usize::MAX as u64) as usize);
-    file.read_to_end(&mut bytes)
+    // Bounded read (cubic P2): the metadata length above is a snapshot
+    // — a file growing between the stat and this read would slip past
+    // the budget inside `read_to_end`. `take` caps the read at budget
+    // + 1 byte, so an over-budget stream is still DETECTABLE (the +1)
+    // and rejected below, in `avif_decode_to_sink`.
+    file.take(crate::avif::MAX_INPUT_BYTES + 1)
+        .read_to_end(&mut bytes)
         .map_err(|e| user(format!("read failed ({e})")))?;
     avif_decode_to_sink(&bytes, shown, env, terminate, first_frame_painted, sink)
 }
@@ -515,7 +521,8 @@ fn avif_decode_to_sink(
     if header_px.saturating_mul(per_px) > MAX_TOTAL_FRAME_BYTES {
         return Err(user("image exceeds the decode budget".to_string()));
     }
-    let img = oxideav_avif::decode(bytes).map_err(|e| user(e.to_string()))?;
+    let img = oxideav_avif::decode_with(bytes, &crate::avif::decode_options())
+        .map_err(|e| user(e.to_string()))?;
     // The frame's own colour is the authority for the gate (the same
     // source `info` read, now proven against the decoded item).
     crate::avif::accept_color(&img.color).map_err(user)?;
@@ -561,8 +568,10 @@ fn avif_decode_to_sink(
     // SEQUENCE's first sample carries no metadata (`sequence_picture`
     // fills colour only), so the cover-still ICC via `inspect` backs
     // it up there — the same file-level intent the animation arm uses
-    // (comp-review P3-3).
-    let icc = if img.metadata.icc.is_none() && info.is_sequence && info.has_icc {
+    // (comp-review P3-3). The `icm=0` path never even looks — the same
+    // short-circuit `prepare_transform` holds for every other format
+    // (cubic P3: no inspect parse, no breadcrumb, byte-identical off).
+    let icc = if env.icm && img.metadata.icc.is_none() && info.is_sequence && info.has_icc {
         avif_sequence_icc(bytes, shown)
     } else {
         img.metadata.icc.clone()
@@ -624,33 +633,38 @@ fn avif_stream_animation(
     // The sequence's ICC: the frames carry none (sequence_picture
     // fills colour only) — the cover still's `colr` via `inspect`,
     // prepared once and applied to each frame like the GIF/WebP slot.
-    let icc = if info.has_icc {
+    // `icm=0` never looks (the same short-circuit as every other
+    // format — no parse, no breadcrumb; cubic P3).
+    let icc = if env.icm && info.has_icc {
         avif_sequence_icc(bytes, shown)
     } else {
         None
     };
     let mut transform = icm::prepare(env.icm, icc, shown, env.backend, env.wide_allowed);
-    // Header-level pre-gate (before the whole-file decode): the
-    // tkhd display dims size the charge; `sequence_info` reports
-    // (0, 0) when the track carries none, in which case the gate
-    // degrades to the per-frame audit below (oxideav has no
-    // streaming face, so a hostile table can only spend decode-side
-    // planes there — every riviv master is still gated before it is
-    // assembled).
+    // Both budget gates run up front against the header's parsed
+    // sample table (`info.frames` is the table's count, the same
+    // pre-known total the image crate's animation decoders do not
+    // offer) — which REQUIRES the tkhd display dims: without them
+    // there is nothing to charge against `decode_all`'s whole-file
+    // materialization (cubic P1), and a track with no display size is
+    // a broken/hostile table anyway (tkhd is mandatory) — refuse
+    // user-level rather than decoding ungated.
+    if info.width == 0 || info.height == 0 {
+        return Err(user("the sequence declares no display size".to_string()));
+    }
     if info.frames as usize > MAX_FRAMES {
         return Err(user("animation exceeds the decode budget".to_string()));
     }
-    if info.width != 0 && info.height != 0 {
-        let header_charge = (info.width as usize)
-            .checked_mul(info.height as usize)
-            .and_then(|px| px.checked_mul(4))
-            .map(|b| charged_frame_bytes(b, transform.as_ref()))
-            .ok_or_else(|| user("canvas exceeds the addressable budget".to_string()))?;
-        if header_charge.saturating_mul(info.frames as usize) > MAX_TOTAL_FRAME_BYTES {
-            return Err(user("animation exceeds the decode budget".to_string()));
-        }
+    let header_charge = (info.width as usize)
+        .checked_mul(info.height as usize)
+        .and_then(|px| px.checked_mul(4))
+        .map(|b| charged_frame_bytes(b, transform.as_ref()))
+        .ok_or_else(|| user("canvas exceeds the addressable budget".to_string()))?;
+    if header_charge.saturating_mul(info.frames as usize) > MAX_TOTAL_FRAME_BYTES {
+        return Err(user("animation exceeds the decode budget".to_string()));
     }
-    let decoded = oxideav_avif::decode_all(bytes).map_err(|e| user(e.to_string()))?;
+    let decoded = oxideav_avif::decode_all_with(bytes, &crate::avif::decode_options())
+        .map_err(|e| user(e.to_string()))?;
     let mut emitted = 0usize;
     let mut total_frame_bytes = 0usize;
     let mut canvas: Option<(u32, u32)> = None;
