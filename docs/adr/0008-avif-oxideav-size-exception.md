@@ -26,7 +26,7 @@ AVIF 输入面自 #136 解绑后挂起为 L3 观察票 #138,触发器 (a)=出现
 
 ### D3. 管线与深度语义
 
-同管线接入不旁路:魔数嗅探(ftyp brand)进现有嗅探层、`Metadata.icc` 进现有 icm 链(带 ICC 样张为 #220 必测项)、`avis` 序列走现有帧时序契约。**深度语义与 PNG16 同例走深源路径**:10/12-bit 输入读 `AvifImage` 公有原生 u16 平面(P10/P12,16-bit LE),自建 YUV→RGB16 纯函数转换后进入现有 `ContentSpace::F16Srgb` master(#142/#140 已落,深度不截断;oxideav 打包输出仅 8-bit `to_rgba8`,深路径必须取原生平面);8-bit 量化只发生在既有文档化的深源回退点,不为本格式新增截断(初稿误按 #136 时代的 `into_rgba8` 截断语义落笔,cubic #221 P1 订正——现行 loader 的 `into_rgba8` 仅存于动画 8-bit 恒等臂与 radiance 线性光臂,均有注释钉死)。错误路径遵循 ADR 0001 用户级(保留旧图、不退出、不弹框)。
+同管线接入不旁路:魔数嗅探(ftyp brand)进现有嗅探层、`Metadata.icc` 进现有 icm 链(带 ICC 样张为 #220 必测项)、`avis` 序列走现有帧时序契约。**深度语义与 PNG16 同例走深源路径**:10/12-bit 输入读 `AvifImage` 公有原生 u16 平面(P10/P12,16-bit LE),自建 YUV→RGB16 纯函数转换后进入现有 `ContentSpace::F16Srgb` master(#142/#140 已落,深度不截断;oxideav 打包输出仅 8-bit `to_rgba8`,深路径必须取原生平面);8-bit 量化只发生在既有文档化的深源回退点,不为本格式新增截断(初稿误按 #136 时代的 `into_rgba8` 截断语义落笔,cubic #221 P1 订正——现行 loader 的 `into_rgba8` 仅存于动画 8-bit 恒等臂与 radiance 线性光臂,均有注释钉死)。**深位深 `avis` 交叉格(10/12-bit 序列)= 与 PNG16 动画同例降级静图**(首帧走深源;现行动画管线 8-bit-only,逐帧深源属未来帧管线域,不为本票扩)(补偿评审 F1 钉死)。YUV→RGB16 纯函数的规格以 #220 P4 为准:**range 轴(limited/full,AV1 `color_range`/`ColorInfo`)必须读取**——消费级 AVIF 多为 limited range,钉测须含 limited-range 矢量;矩阵枚举外的 CICP 取值(BT.2020 nclx、identity 等)定义回退/拒绝语义(补偿评审 F2/F3)。错误路径遵循 ADR 0001 用户级(保留旧图、不退出、不弹框)。
 
 ### D4. S1 合规:导入面证据为 #220 回填项
 
