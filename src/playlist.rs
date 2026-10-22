@@ -429,8 +429,8 @@ fn next_rand(state: &mut u64, modulus: usize) -> usize {
 /// first-class everywhere, not just at the open gate).
 /// pub(crate): the Everything search prefix derives from this table (#114) —
 /// a search must ask for exactly what the playlist can take.
-pub(crate) const EXTENSIONS: [&str; 11] = [
-    "bmp", "gif", "ico", "jpeg", "jpg", "png", "tif", "tiff", "webp", "apng", "svg",
+pub(crate) const EXTENSIONS: [&str; 12] = [
+    "bmp", "gif", "ico", "jpeg", "jpg", "png", "tif", "tiff", "webp", "apng", "svg", "avif",
 ];
 
 /// ASCII case-insensitive equality — upstream's
@@ -937,6 +937,13 @@ mod tests {
     fn svg_extension_is_a_valid_playlist_path() {
         assert!(is_valid_path(OsStr::new("vector.svg")));
         assert!(is_valid_path(OsStr::new("vector.SVG")));
+    }
+
+    /// `.avif` 同为可导航扩展名（#220——AVIF 输入面落地,同一张表)。
+    #[test]
+    fn avif_extension_is_a_valid_playlist_path() {
+        assert!(is_valid_path(OsStr::new("photo.avif")));
+        assert!(is_valid_path(OsStr::new("photo.AVIF")));
     }
 
     #[test]

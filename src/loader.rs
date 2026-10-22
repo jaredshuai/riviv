@@ -202,6 +202,16 @@ pub(crate) fn decode_bytes_to_sink(
         if crate::svg::sniff(head) {
             return svg_decode_to_sink(bytes, STDIN_SHOWN_NAME, env, sink);
         }
+        if crate::avif::sniff(head) {
+            return avif_decode_to_sink(
+                bytes,
+                STDIN_SHOWN_NAME,
+                env,
+                terminate,
+                first_frame_painted,
+                sink,
+            );
+        }
         let reader = ImageReader::new(Cursor::new(bytes))
             .with_guessed_format()
             .map_err(|e| Stop::User(format!("{STDIN_SHOWN_NAME}: {e}")))?;
@@ -287,6 +297,19 @@ fn produce(
     if crate::svg::sniff(&prefix[..sniffed]) {
         return svg_arm_from_file(file, &shown, env, sink);
     }
+    // AVIF gate next to the SVG one (#220, ADR 0008): the image
+    // crate's own sniff knows only the `avif` major brand and its
+    // decode side is unsupported anyway (no `avif` feature), so the
+    // oxideav probe — the same predicate `decode` admits by — runs on
+    // the same leading bytes (contents over extension, like the SVG
+    // gate; a renamed/extensionless .avif still decodes). The file
+    // stays open through both gates: anything the AVIF gate refuses
+    // rewinds to byte 0 for the image crate, whose ftyp guess (major
+    // brand `avif`) then fails user-level as an unsupported format —
+    // the fail-closed shape the SVG gate documented.
+    if crate::avif::sniff(&prefix[..sniffed]) {
+        return avif_arm_from_file(file, &shown, env, terminate, first_frame_painted, sink);
+    }
     // Sniff the format from file contents (upstream GDI+ behavior): renamed or
     // extensionless files still decode. `with_guessed_format` rewinds the
     // stream, so the concrete decoders below start at byte 0 — the manual
@@ -367,6 +390,292 @@ fn svg_decode_to_sink(
     let mut frame = assemble_frame(w, h, rgba, &env, None, 8);
     frame.attach_svg(std::sync::Arc::new(source));
     sink(LoadReply::FirstFrame { frame, delay_ms: 0 });
+    Ok(())
+}
+
+/// The file arm of the AVIF decode (#220, ADR 0008): the sniff
+/// admitted the stream, so the whole file is read (AVIF item offsets
+/// are absolute — `decode` needs the complete byte range, the same
+/// whole-file posture as the SVG arm) and handed to the shared bytes
+/// arm. The input budget bounds the read itself before it starts.
+fn avif_arm_from_file(
+    mut file: File,
+    shown: &str,
+    env: DecodeEnv,
+    terminate: &AtomicBool,
+    first_frame_painted: Option<&crate::loadthread::FirstFramePainted>,
+    sink: &mut dyn FnMut(LoadReply),
+) -> Result<(), Stop> {
+    let user = |msg: String| Stop::User(format!("{shown}: {msg}"));
+    // Rewind first: the sniff consumed the leading bytes — the decode
+    // needs byte 0.
+    file.seek(SeekFrom::Start(0))
+        .map_err(|e| user(format!("seek failed ({e})")))?;
+    let len = file
+        .metadata()
+        .map_err(|e| user(format!("metadata read failed ({e})")))?
+        .len();
+    if len > crate::avif::MAX_INPUT_BYTES {
+        return Err(user(format!(
+            "AVIF input {} MiB exceeds the {} MiB budget",
+            len / (1024 * 1024),
+            crate::avif::MAX_INPUT_BYTES / (1024 * 1024)
+        )));
+    }
+    let mut bytes = Vec::with_capacity(len.min(usize::MAX as u64) as usize);
+    file.read_to_end(&mut bytes)
+        .map_err(|e| user(format!("read failed ({e})")))?;
+    avif_decode_to_sink(&bytes, shown, env, terminate, first_frame_painted, sink)
+}
+
+/// The AVIF decode's shared sink wiring (file arm + `stdin:` arm):
+/// probe-admitted bytes through `oxideav_avif` into the same tails
+/// every decode uses. Three shapes, all ADR 0008 D3:
+/// * an 8-bit `avis` sequence → `decode_all` through the animation
+///   protocol (first frame + additional frames + the paint handshake,
+///   the same replies GIF/WebP/APNG stream);
+/// * a 10/12-bit `avis` sequence → DEGRADED TO A STILL (the first
+///   sample through the deep path — `decode` on a sequence returns
+///   exactly that; the animation pipeline is 8-bit-only, the same
+///   ruling as 16-bit APNG);
+/// * a still (8-bit → the RGBA8 tail, 10/12-bit → the native-plane
+///   YUV→RGB16 conversion into the F16Srgb deep path, PNG16's
+///   no-truncation sibling).
+///
+/// The chroma acceptance gate (ADR 0008 D3) refuses files outside
+/// the accepted set before any pixel is converted — never a guess;
+/// every failure below is user-level (keep old image, no dialog,
+/// no exit — ADR 0001).
+fn avif_decode_to_sink(
+    bytes: &[u8],
+    shown: &str,
+    env: DecodeEnv,
+    terminate: &AtomicBool,
+    first_frame_painted: Option<&crate::loadthread::FirstFramePainted>,
+    sink: &mut dyn FnMut(LoadReply),
+) -> Result<(), Stop> {
+    let user = |msg: String| Stop::User(format!("{shown}: {msg}"));
+    if bytes.len() as u64 > crate::avif::MAX_INPUT_BYTES {
+        return Err(user(format!(
+            "AVIF input {} MiB exceeds the {} MiB budget",
+            bytes.len() / (1024 * 1024),
+            crate::avif::MAX_INPUT_BYTES / (1024 * 1024)
+        )));
+    }
+    // Header facts first (the budget gates run before any decode —
+    // oxideav's own default pixel cap is looser than the f16-era
+    // master budget, so this side gates first).
+    let info = oxideav_avif::info(bytes).map_err(|e| user(e.to_string()))?;
+    if info.is_sequence && info.bit_depth == 8 {
+        return avif_stream_animation(
+            bytes,
+            shown,
+            info,
+            env,
+            terminate,
+            first_frame_painted,
+            sink,
+        );
+    }
+    // The still arm — or a deep sequence degraded to its first
+    // sample (`decode` on a sequence file returns exactly the first
+    // frame's picture, verified against oxideav-avif 0.0.15).
+    // Dimensions: the HEADER gate uses `info`'s `ispe` canvas (the
+    // coded extent, which pads sub-8-px images up to AV1's minimum —
+    // conservative for a budget check), but every buffer ASSEMBLY
+    // uses the decoded picture's own extents (oxideav's composition
+    // applies `clap`/`irot`/`imir` and crops back to the true size:
+    // a 2×2 encode decodes back as 2×2 while `info` reported 8×8 —
+    // pinned by the pipeline tests).
+    let header_px = (info.width as usize)
+        .checked_mul(info.height as usize)
+        .ok_or_else(|| user("canvas exceeds the addressable budget".to_string()))?;
+    let per_px = if info.bit_depth > 8 { 8 } else { 4 };
+    if header_px.saturating_mul(per_px) > MAX_TOTAL_FRAME_BYTES {
+        return Err(user("image exceeds the decode budget".to_string()));
+    }
+    let img = oxideav_avif::decode(bytes).map_err(|e| user(e.to_string()))?;
+    // The frame's own colour is the authority for the gate (the same
+    // source `info` read, now proven against the decoded item).
+    crate::avif::accept_color(&img.color).map_err(user)?;
+    let mut w = img.width;
+    let mut h = img.height;
+    if w == 0 || h == 0 {
+        return Err(user("empty image".to_string()));
+    }
+    // A deep sequence's degraded first sample decodes at the CODED
+    // frame size (sequence samples carry no `clap` — the encoder pads
+    // sub-8-px extents to AV1's coded minimum); the display size
+    // lives in the track header. Crop the edge-replicated pad down to
+    // the display dims, top-left — the canvas the file declares. A
+    // still's own `clap`/`irot`/`imir` composition has already cropped
+    // (oxideav applies those in `decode`), so the crop only fires for
+    // the sequence shape; an info size LARGER than the picture is a
+    // mismatched table and fails rather than scaling anything.
+    if info.is_sequence && (info.width != w || info.height != h) {
+        if info.width == 0 || info.height == 0 || info.width > w || info.height > h {
+            return Err(user(
+                "the sequence's display size disagrees with its first frame".to_string(),
+            ));
+        }
+        w = info.width;
+        h = info.height;
+    }
+    if (w as usize)
+        .saturating_mul(h as usize)
+        .saturating_mul(per_px)
+        > MAX_TOTAL_FRAME_BYTES
+    {
+        return Err(user("image exceeds the decode budget".to_string()));
+    }
+    // One ICC→sRGB transform for the still, exactly like every other
+    // format's `prepare_transform` slot (the `icm=0` path stays
+    // byte-identical — no ICC is even looked at).
+    let mut transform = icm::prepare(
+        env.icm,
+        img.metadata.icc.clone(),
+        shown,
+        env.backend,
+        env.wide_allowed,
+    );
+    let frame = if img.bit_depth > 8 {
+        let channels = if img.format.has_alpha() { 4 } else { 3 };
+        let samples = crate::avif::crop_top_left(
+            crate::avif::deep_rgb16(&img),
+            img.width as usize,
+            channels,
+            w as usize,
+            h as usize,
+        );
+        let deep = if img.format.has_alpha() {
+            DeepSamples::Rgba16(&samples)
+        } else {
+            DeepSamples::Rgb16(&samples)
+        };
+        assemble_deep_frame(w, h, deep, &env, transform.as_mut())
+    } else {
+        let rgba = crate::avif::crop_top_left(
+            img.to_rgba8(),
+            img.width as usize,
+            4,
+            w as usize,
+            h as usize,
+        );
+        assemble_frame(w, h, rgba, &env, transform.as_mut(), 8)
+    };
+    sink(LoadReply::FirstFrame { frame, delay_ms: 0 });
+    Ok(())
+}
+
+/// The 8-bit `avis` sequence arm (#220): `decode_all` is oxideav's
+/// whole-file decode (no streaming face — the frame list materializes
+/// before the first reply), so BOTH budget gates run up front against
+/// the header's parsed sample table (`info.frames` is the table's
+/// count, the same pre-known total the image crate's animation
+/// decoders do not offer). Per-frame charge follows the f16-era rule
+/// (`charged_frame_bytes`: a transformed stream's frames land as f16
+/// masters). Frames reply through the same protocol as GIF/WebP/APNG
+/// — first frame, the paint handshake, then additional frames; the
+/// chroma gate runs per decoded frame (the sequence's colour rides
+/// the track's signal, uniform in practice, but each frame is
+/// checked against its own signalled colour). Delay: the sample's
+/// own `Duration` in ms (encode-side timescale 1000; zero delays
+/// pass through to the scheduler's 1 ms floor like WebP's).
+fn avif_stream_animation(
+    bytes: &[u8],
+    shown: &str,
+    info: oxideav_avif::ImageInfo,
+    env: DecodeEnv,
+    terminate: &AtomicBool,
+    first_frame_painted: Option<&crate::loadthread::FirstFramePainted>,
+    sink: &mut dyn FnMut(LoadReply),
+) -> Result<(), Stop> {
+    let user = |msg: String| Stop::User(format!("{shown}: {msg}"));
+    // The sequence's ICC: the frames themselves carry no metadata
+    // (sequence_picture fills colour from the track signal only), but
+    // the cover still may hold a `colr` ICC — `inspect` resolves the
+    // primary's colour, file-level intent for every sample, prepared
+    // once and applied to each frame like the GIF/WebP slot.
+    let icc = if info.has_icc {
+        match oxideav_avif::inspect(bytes) {
+            Ok(parsed) => match parsed.colour {
+                Some(oxideav_avif::Colr::Icc(blob)) => Some(blob),
+                _ => None,
+            },
+            Err(e) => {
+                eprintln!("riviv: icm: {shown}: inspect for ICC failed ({e}) — decoding untagged");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let mut transform = icm::prepare(env.icm, icc, shown, env.backend, env.wide_allowed);
+    // Header-level pre-gate (before the whole-file decode): the
+    // tkhd display dims size the charge; `sequence_info` reports
+    // (0, 0) when the track carries none, in which case the gate
+    // degrades to the per-frame audit below (oxideav has no
+    // streaming face, so a hostile table can only spend decode-side
+    // planes there — every riviv master is still gated before it is
+    // assembled).
+    if info.frames as usize > MAX_FRAMES {
+        return Err(user("animation exceeds the decode budget".to_string()));
+    }
+    if info.width != 0 && info.height != 0 {
+        let header_charge = (info.width as usize)
+            .checked_mul(info.height as usize)
+            .and_then(|px| px.checked_mul(4))
+            .map(|b| charged_frame_bytes(b, transform.as_ref()))
+            .ok_or_else(|| user("canvas exceeds the addressable budget".to_string()))?;
+        if header_charge.saturating_mul(info.frames as usize) > MAX_TOTAL_FRAME_BYTES {
+            return Err(user("animation exceeds the decode budget".to_string()));
+        }
+    }
+    let decoded = oxideav_avif::decode_all(bytes).map_err(|e| user(e.to_string()))?;
+    let mut emitted = 0usize;
+    let mut total_frame_bytes = 0usize;
+    for frame in &decoded {
+        if terminate.load(Ordering::Relaxed) {
+            return Err(Stop::Terminated);
+        }
+        crate::avif::accept_color(&frame.image.color).map_err(user)?;
+        let delay_ms = frame
+            .delay
+            .map(|d| u32::try_from(d.as_millis()).unwrap_or(u32::MAX))
+            .unwrap_or(0);
+        let (w, h) = (frame.image.width, frame.image.height);
+        if w == 0 || h == 0 {
+            return Err(user("empty frame".to_string()));
+        }
+        // The frame-level audit (the always-on leg): every frame
+        // charges its own real canvas at the f16-era rate — the same
+        // cumulative master-bytes contract `stream_animation` holds.
+        let per_frame_bytes = (w as usize)
+            .checked_mul(h as usize)
+            .and_then(|px| px.checked_mul(4))
+            .ok_or_else(|| user("canvas exceeds the addressable budget".to_string()))?;
+        let per_frame_bytes = charged_frame_bytes(per_frame_bytes, transform.as_ref());
+        if emitted >= MAX_FRAMES
+            || total_frame_bytes.saturating_add(per_frame_bytes) > MAX_TOTAL_FRAME_BYTES
+        {
+            return Err(user("animation exceeds the decode budget".to_string()));
+        }
+        total_frame_bytes += per_frame_bytes;
+        let rgba = frame.image.to_rgba8();
+        let frame = assemble_frame(w, h, rgba, &env, transform.as_mut(), 8);
+        if emitted == 0 {
+            sink(LoadReply::FirstFrame { frame, delay_ms });
+            if let Some(signal) = first_frame_painted {
+                crate::loadthread::wait_first_frame_painted(signal, terminate);
+            }
+        } else {
+            sink(LoadReply::AdditionalFrame { frame, delay_ms });
+        }
+        emitted += 1;
+    }
+    if emitted == 0 {
+        return Err(user("no frames decoded".to_string()));
+    }
     Ok(())
 }
 
@@ -4260,6 +4569,285 @@ mod svg_tests {
                 );
             }
             other => panic!("expected a FirstFrame, got {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod avif_pipeline_tests {
+    use super::*;
+    use oxideav_avif::{AvifImage, ColorInfo, ColorRange, EncodeOptions, PixelFormat, Plane};
+
+    fn env() -> DecodeEnv {
+        DecodeEnv {
+            background: [255, 255, 255],
+            icm: false,
+            backend: crate::transform_stage::Backend::Warp,
+            wide_allowed: true,
+            viewport: (0, 0),
+        }
+    }
+
+    /// Decode `stdin:`-shaped bytes through the shared pipeline and
+    /// collect every reply — the AVIF gate's file arm runs the same
+    /// `avif_decode_to_sink` after its own read, so the byte arm
+    /// covers the wiring both arms share.
+    fn replies(bytes: &[u8]) -> Vec<LoadReply> {
+        let mut out = Vec::new();
+        let terminate = AtomicBool::new(false);
+        decode_bytes_to_sink(bytes, env(), &terminate, None, &mut |r| out.push(r));
+        out
+    }
+
+    fn u8_plane(w: usize, data: &[u8]) -> Plane {
+        Plane::new(w, data.to_vec())
+    }
+
+    fn u16_plane(w: usize, data: &[u16]) -> Plane {
+        Plane::new(w * 2, data.iter().flat_map(|v| v.to_le_bytes()).collect())
+    }
+
+    /// The 8-bit RGBA fixture of #220's QA matrix quadrant one: a
+    /// 2×2 four-colour square, identity matrix (from_rgba8's own),
+    /// lossless.
+    fn rgba8_still() -> Vec<u8> {
+        let img = AvifImage::from_rgba8(
+            2,
+            2,
+            vec![
+                255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255,
+            ],
+        )
+        .unwrap();
+        oxideav_avif::encode(&img, &EncodeOptions::default()).unwrap()
+    }
+
+    #[test]
+    fn an_8bit_still_decodes_through_the_gate_to_an_srgb_master() {
+        // The gate admits the file (ftyp brand avif), the accepted
+        // identity colour passes, and the frame lands as the plain
+        // 8-bit Srgb master — pixel-exact through oxideav's packed
+        // output (identity lossless round-trips verbatim).
+        let replies = replies(&rgba8_still());
+        match replies.as_slice() {
+            [LoadReply::FirstFrame { frame, .. }, LoadReply::Complete] => {
+                assert_eq!(frame.content_space, ContentSpace::Srgb);
+                let (w, h) = (frame.width, frame.height);
+                assert_eq!((w, h), (2, 2));
+                let px = |x, y| crate::pixels::sample_master_rgb(frame, x, y).unwrap();
+                assert_eq!(px(0, 0), (255, 0, 0));
+                assert_eq!(px(1, 0), (0, 255, 0));
+                assert_eq!(px(0, 1), (0, 0, 255));
+                assert_eq!(px(1, 1), (255, 255, 255));
+            }
+            other => panic!("expected first frame + complete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_10bit_still_takes_the_deep_f16srgb_master_path() {
+        // ADR 0008 D3: 10-bit input never truncates through the packed
+        // 8-bit output — the native u16 planes convert through the
+        // pure YUV→RGB16 kernel into the F16Srgb master. Identity +
+        // Full keeps the code values verbatim: 512/1023 quantizes to
+        // the read point's 128, 300/1023 to 75.
+        // Identity keeps the planes verbatim (G, B, R) — a grey ramp
+        // needs all three colour planes carrying the same code values.
+        let g = [512u16, 1023, 0, 300];
+        let planes = vec![
+            u16_plane(2, &g),
+            u16_plane(2, &g),
+            u16_plane(2, &g),
+            u16_plane(2, &[1023, 1023, 1023, 1023]),
+        ];
+        let img = AvifImage::new(2, 2, PixelFormat::Yuva444P10Le, planes)
+            .unwrap()
+            .with_color(ColorInfo::new(ColorRange::Full, 1, 13, 0));
+        let file = oxideav_avif::encode(&img, &EncodeOptions::default()).unwrap();
+        let replies = replies(&file);
+        match replies.as_slice() {
+            [LoadReply::FirstFrame { frame, .. }, LoadReply::Complete] => {
+                assert_eq!(
+                    frame.content_space,
+                    ContentSpace::F16Srgb,
+                    "the deep source takes the f16 master"
+                );
+                let px = |x, y| crate::pixels::sample_master_rgb(frame, x, y).unwrap();
+                assert_eq!(px(0, 0), (128, 128, 128), "G=512 → neutral grey");
+                assert_eq!(px(1, 0), (255, 255, 255), "G=1023 → white");
+                assert_eq!(px(0, 1), (0, 0, 0), "G=0 → black");
+                assert_eq!(px(1, 1), (75, 75, 75), "G=300 → ≈74.8 → 75");
+            }
+            other => panic!("expected first frame + complete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_8bit_avis_sequence_streams_with_delays() {
+        // The `avis` arm: `decode_all` frames stream through the same
+        // reply protocol as GIF/WebP/APNG — first frame + additional
+        // frames with their own delays, then Complete.
+        let red = AvifImage::from_rgb8(2, 2, [255, 0, 0].repeat(4)).unwrap();
+        let blue = AvifImage::from_rgb8(2, 2, [0, 0, 255].repeat(4)).unwrap();
+        let frames = vec![
+            oxideav_avif::Frame::new(red, Some(std::time::Duration::from_millis(120))),
+            oxideav_avif::Frame::new(blue, Some(std::time::Duration::from_millis(300))),
+        ];
+        let file = oxideav_avif::encode_all(&frames, &EncodeOptions::default()).unwrap();
+        let replies = replies(&file);
+        match replies.as_slice() {
+            [
+                LoadReply::FirstFrame {
+                    frame: first,
+                    delay_ms: d0,
+                },
+                LoadReply::AdditionalFrame {
+                    frame: second,
+                    delay_ms: d1,
+                },
+                LoadReply::Complete,
+            ] => {
+                assert_eq!((*d0, *d1), (120, 300));
+                assert_eq!(first.content_space, ContentSpace::Srgb);
+                assert_eq!(
+                    crate::pixels::sample_master_rgb(first, 0, 0).unwrap(),
+                    (255, 0, 0)
+                );
+                assert_eq!(
+                    crate::pixels::sample_master_rgb(second, 0, 0).unwrap(),
+                    (0, 0, 255)
+                );
+            }
+            other => panic!("expected two frames + complete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_10bit_avis_degrades_to_a_single_deep_still() {
+        // ADR 0008 D3's cross-shape ruling: a 10/12-bit sequence is a
+        // STILL — the first sample through the deep path, exactly the
+        // 16-bit APNG precedent (the animation pipeline is 8-bit-only,
+        // per-frame deep is future frame-pipeline domain).
+        // Identity planes (G, B, R): a grey ramp needs all three at
+        // the same code values.
+        let g = [1023u16, 0];
+        let planes = vec![u16_plane(2, &g), u16_plane(2, &g), u16_plane(2, &g)];
+        let img = AvifImage::new(2, 1, PixelFormat::Yuv444P10Le, planes)
+            .unwrap()
+            .with_color(ColorInfo::new(ColorRange::Full, 1, 13, 0));
+        let frames = vec![
+            oxideav_avif::Frame::new(img.clone(), Some(std::time::Duration::from_millis(100))),
+            oxideav_avif::Frame::new(img, Some(std::time::Duration::from_millis(100))),
+        ];
+        let file = oxideav_avif::encode_all(&frames, &EncodeOptions::default()).unwrap();
+        let replies = replies(&file);
+        match replies.as_slice() {
+            [LoadReply::FirstFrame { frame, .. }, LoadReply::Complete] => {
+                assert_eq!(frame.content_space, ContentSpace::F16Srgb);
+                // The 2×1 encode padded to AV1's coded 8×8 minimum and
+                // `encode_all` writes the DISPLAY dims as the coded
+                // size too (probed: info 8×8, decode 8×8) — the file
+                // itself declares 8×8, so showing it at 8×8 is the
+                // file's own truth; the edge-replicated pad reads as a
+                // faithful extension of the 2×1 ramp.
+                assert_eq!(frame.width, 8);
+                assert_eq!(frame.height, 8);
+                // The first sample's content: g=1023 (white) then g=0
+                // (black), pad columns replicate the edge.
+                let px = |x, y| crate::pixels::sample_master_rgb(frame, x, y).unwrap();
+                assert_eq!(px(0, 0), (255, 255, 255));
+                assert_eq!(px(1, 0), (0, 0, 0));
+                assert_eq!(px(7, 0), (0, 0, 0), "pad replicates the right edge");
+            }
+            other => panic!("expected ONE frame + complete (degraded still), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn chroma_outside_the_set_fails_user_with_the_reason() {
+        // BT.2020 NCL: accepted-set refuse → user-level failure BEFORE
+        // any frame replies (keep old image, ADR 0001) — and the
+        // message names the refused field.
+        let img = AvifImage::from_rgba8(1, 1, vec![10, 20, 30, 255])
+            .unwrap()
+            .with_color(ColorInfo::new(ColorRange::Full, 9, 13, 9));
+        let file = oxideav_avif::encode(&img, &EncodeOptions::default()).unwrap();
+        let replies = replies(&file);
+        match replies.as_slice() {
+            [LoadReply::FailedUser(msg)] => {
+                assert!(msg.contains("matrix 9"), "{msg}");
+            }
+            other => panic!("expected a user failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_truncated_file_fails_user_level() {
+        // Bad-file path: a probe-admitted header whose payload is cut
+        // short fails user-level (no dialog, no exit — ADR 0001).
+        let mut file = rgba8_still();
+        let cut = file.len() - 8;
+        file.truncate(cut);
+        let replies = replies(&file);
+        assert!(
+            matches!(replies.as_slice(), [LoadReply::FailedUser(_)]),
+            "{replies:?}"
+        );
+    }
+
+    #[test]
+    fn a_png_still_still_takes_the_image_crate_path() {
+        // The gate must not poach neighbours: a PNG stream decodes
+        // through the image crate exactly as before (four-byte magic
+        // is no ftyp box).
+        let png: &[u8] = &[
+            0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0x0d, b'I', b'H', b'D', b'R',
+            0, 0, 0, 1, 0, 0, 0, 1, 8, 6, 0, 0, 0, 0x1f, 0x15, 0xc4, 0x89, 0, 0, 0, 0x0a, b'I',
+            b'D', b'A', b'T', 0x78, 0x9c, 0x63, 0, 1, 0, 0, 0x05, 0, 0x01, 0x0d, 0x0a, 0x2d, 0xb4,
+            0, 0, 0, 0, b'I', b'E', b'N', b'D', 0xae, 0x42, 0x60, 0x82,
+        ];
+        let replies = replies(png);
+        assert!(
+            matches!(
+                replies.as_slice(),
+                [LoadReply::FirstFrame { .. }, LoadReply::Complete]
+            ),
+            "{replies:?}"
+        );
+    }
+
+    #[test]
+    fn mono_and_packed_ya_stills_decode_to_their_expected_greys() {
+        // The mono layouts: Gray8 verbatim and packed Ya8 (luma
+        // replicated, alpha carried — a 0 alpha composites over the
+        // white background to white).
+        let img = AvifImage::new(1, 1, PixelFormat::Gray8, vec![u8_plane(1, &[200])])
+            .unwrap()
+            .with_color(ColorInfo::new(ColorRange::Full, 1, 13, 6));
+        let file = oxideav_avif::encode(&img, &EncodeOptions::default()).unwrap();
+        match replies(&file).as_slice() {
+            [LoadReply::FirstFrame { frame, .. }, LoadReply::Complete] => {
+                assert_eq!(
+                    crate::pixels::sample_master_rgb(frame, 0, 0).unwrap(),
+                    (200, 200, 200)
+                );
+            }
+            other => panic!("grey still: {other:?}"),
+        }
+
+        let img = AvifImage::new(1, 1, PixelFormat::Ya8, vec![u8_plane(2, &[100, 0])])
+            .unwrap()
+            .with_color(ColorInfo::new(ColorRange::Full, 1, 13, 6));
+        let file = oxideav_avif::encode(&img, &EncodeOptions::default()).unwrap();
+        match replies(&file).as_slice() {
+            [LoadReply::FirstFrame { frame, .. }, LoadReply::Complete] => {
+                // alpha 0 over the white background → white.
+                assert_eq!(
+                    crate::pixels::sample_master_rgb(frame, 0, 0).unwrap(),
+                    (255, 255, 255)
+                );
+            }
+            other => panic!("packed-YA still: {other:?}"),
         }
     }
 }
