@@ -446,6 +446,27 @@ fn avif_arm_from_file(
 /// the accepted set before any pixel is converted — never a guess;
 /// every failure below is user-level (keep old image, no dialog,
 /// no exit — ADR 0001).
+/// The sequence's file-level ICC (#220): the frames themselves carry
+/// no metadata (`sequence_picture` fills colour from the track signal
+/// only), but the cover still may hold a `colr` ICC — `inspect`
+/// resolves the primary's colour, the intent for every sample. Shared
+/// by the animation arm (per-frame transform) and the deep-sequence
+/// still arm's backup (comp-review P3-3). A failed inspect downgrades
+/// to untagged with a breadcrumb (the same posture as
+/// `prepare_transform`'s metadata-error arm).
+fn avif_sequence_icc(bytes: &[u8], shown: &str) -> Option<Vec<u8>> {
+    match oxideav_avif::inspect(bytes) {
+        Ok(parsed) => match parsed.colour {
+            Some(oxideav_avif::Colr::Icc(blob)) => Some(blob),
+            _ => None,
+        },
+        Err(e) => {
+            eprintln!("riviv: icm: {shown}: inspect for ICC failed ({e}) — decoding untagged");
+            None
+        }
+    }
+}
+
 fn avif_decode_to_sink(
     bytes: &[u8],
     shown: &str,
@@ -521,6 +542,12 @@ fn avif_decode_to_sink(
         w = info.width;
         h = info.height;
     }
+    // The second gate prices the frame at its DECODED depth (the
+    // stream's, not the header's — a lying av1C declaring 8-bit over a
+    // 12-bit stream would otherwise halve the charge; hostile-only,
+    // but the gate's contract is the master's real bytes — comp-review
+    // P3-2).
+    let per_px = if img.bit_depth > 8 { 8 } else { 4 };
     if (w as usize)
         .saturating_mul(h as usize)
         .saturating_mul(per_px)
@@ -530,14 +557,17 @@ fn avif_decode_to_sink(
     }
     // One ICC→sRGB transform for the still, exactly like every other
     // format's `prepare_transform` slot (the `icm=0` path stays
-    // byte-identical — no ICC is even looked at).
-    let mut transform = icm::prepare(
-        env.icm,
-        img.metadata.icc.clone(),
-        shown,
-        env.backend,
-        env.wide_allowed,
-    );
+    // byte-identical — no ICC is even looked at). A degraded deep
+    // SEQUENCE's first sample carries no metadata (`sequence_picture`
+    // fills colour only), so the cover-still ICC via `inspect` backs
+    // it up there — the same file-level intent the animation arm uses
+    // (comp-review P3-3).
+    let icc = if img.metadata.icc.is_none() && info.is_sequence && info.has_icc {
+        avif_sequence_icc(bytes, shown)
+    } else {
+        img.metadata.icc.clone()
+    };
+    let mut transform = icm::prepare(env.icm, icc, shown, env.backend, env.wide_allowed);
     let frame = if img.bit_depth > 8 {
         let channels = if img.format.has_alpha() { 4 } else { 3 };
         let samples = crate::avif::crop_top_left(
@@ -591,22 +621,11 @@ fn avif_stream_animation(
     sink: &mut dyn FnMut(LoadReply),
 ) -> Result<(), Stop> {
     let user = |msg: String| Stop::User(format!("{shown}: {msg}"));
-    // The sequence's ICC: the frames themselves carry no metadata
-    // (sequence_picture fills colour from the track signal only), but
-    // the cover still may hold a `colr` ICC — `inspect` resolves the
-    // primary's colour, file-level intent for every sample, prepared
-    // once and applied to each frame like the GIF/WebP slot.
+    // The sequence's ICC: the frames carry none (sequence_picture
+    // fills colour only) — the cover still's `colr` via `inspect`,
+    // prepared once and applied to each frame like the GIF/WebP slot.
     let icc = if info.has_icc {
-        match oxideav_avif::inspect(bytes) {
-            Ok(parsed) => match parsed.colour {
-                Some(oxideav_avif::Colr::Icc(blob)) => Some(blob),
-                _ => None,
-            },
-            Err(e) => {
-                eprintln!("riviv: icm: {shown}: inspect for ICC failed ({e}) — decoding untagged");
-                None
-            }
-        }
+        avif_sequence_icc(bytes, shown)
     } else {
         None
     };
@@ -634,6 +653,7 @@ fn avif_stream_animation(
     let decoded = oxideav_avif::decode_all(bytes).map_err(|e| user(e.to_string()))?;
     let mut emitted = 0usize;
     let mut total_frame_bytes = 0usize;
+    let mut canvas: Option<(u32, u32)> = None;
     for frame in &decoded {
         if terminate.load(Ordering::Relaxed) {
             return Err(Stop::Terminated);
@@ -643,13 +663,42 @@ fn avif_stream_animation(
             .delay
             .map(|d| u32::try_from(d.as_millis()).unwrap_or(u32::MAX))
             .unwrap_or(0);
-        let (w, h) = (frame.image.width, frame.image.height);
-        if w == 0 || h == 0 {
+        let (fw, fh) = (frame.image.width, frame.image.height);
+        if fw == 0 || fh == 0 {
             return Err(user("empty frame".to_string()));
         }
+        // The display-dims crop, the same shape the deep-sequence
+        // still arm uses (comp-review P3-1): a sample decodes at its
+        // CODED size (the AV1 minimum pads sub-8-px extents;
+        // edge-replicated), while the display size lives in the tkhd —
+        // show the declared canvas. A display size LARGER than the
+        // frames is a mismatched table and fails rather than scaling.
+        let (w, h) =
+            if info.width != 0 && info.height != 0 && (info.width != fw || info.height != fh) {
+                if info.width > fw || info.height > fh {
+                    return Err(user(
+                        "the sequence's display size disagrees with its frames".to_string(),
+                    ));
+                }
+                (info.width, info.height)
+            } else {
+                (fw, fh)
+            };
+        // The frame-size consistency check `stream_animation` holds
+        // for GIF/WebP/APNG (comp-review P3-5): a table whose samples
+        // disagree with each other is a corrupt stream, not a canvas
+        // swap — user-level, like the image crate's iterators.
+        match canvas {
+            None => canvas = Some((w, h)),
+            Some((cw, ch)) if cw != w || ch != h => {
+                return Err(user("frame size differs from the canvas".to_string()));
+            }
+            Some(_) => {}
+        }
         // The frame-level audit (the always-on leg): every frame
-        // charges its own real canvas at the f16-era rate — the same
-        // cumulative master-bytes contract `stream_animation` holds.
+        // charges its own real (display) canvas at the f16-era rate —
+        // the same cumulative master-bytes contract `stream_animation`
+        // holds.
         let per_frame_bytes = (w as usize)
             .checked_mul(h as usize)
             .and_then(|px| px.checked_mul(4))
@@ -661,7 +710,13 @@ fn avif_stream_animation(
             return Err(user("animation exceeds the decode budget".to_string()));
         }
         total_frame_bytes += per_frame_bytes;
-        let rgba = frame.image.to_rgba8();
+        let rgba = crate::avif::crop_top_left(
+            frame.image.to_rgba8(),
+            fw as usize,
+            4,
+            w as usize,
+            h as usize,
+        );
         let frame = assemble_frame(w, h, rgba, &env, transform.as_mut(), 8);
         if emitted == 0 {
             sink(LoadReply::FirstFrame { frame, delay_ms });

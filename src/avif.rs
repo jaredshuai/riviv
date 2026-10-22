@@ -112,11 +112,17 @@ pub(crate) fn deep_rgb16(image: &AvifImage) -> Vec<u16> {
     };
     let mid = f64::from(1u32 << (depth - 1));
     // identity(0) 无 Kr/Kb——平面即 G,B,R;1 = BT.709,6 = BT.601
-    // (H.273 Table 4;接受集外的矩阵不会到达这里)。
+    // (H.273 Table 4)。`None` 只对 identity 合法:调用前提是
+    // `accept_color` 已过(集外矩阵拒绝在先)——debug_assert 把这
+    // 个前提钉成强制,防未来调用方绕门把集外矩阵静默当 GBR 读
+    //(补偿评审 P3-6)。
     let kr_kb = match image.color.matrix {
         1 => Some((0.2126, 0.0722)),
         6 => Some((0.299, 0.114)),
-        _ => None,
+        _ => {
+            debug_assert_eq!(image.color.matrix, 0, "accept_color gates the matrix");
+            None
+        }
     };
     let mono = fmt.plane_count() == 1;
     let (sx, sy) = fmt.chroma_subsampling();
@@ -197,6 +203,12 @@ pub(crate) fn crop_top_left<T: Copy>(
     dst_h: usize,
 ) -> Vec<T> {
     debug_assert!(dst_w <= src_w);
+    // The identity shape returns the buffer untouched (no copy) — the
+    // animation arm calls this per frame, and the display==coded case
+    // (every honest file) must not pay an extra full-canvas memcpy.
+    if dst_w == src_w && dst_w.saturating_mul(dst_h).saturating_mul(ch) == buf.len() {
+        return buf;
+    }
     if dst_w == src_w {
         // The common no-pad shape: the whole-buffer prefix is exactly
         // the first dst_h rows.
