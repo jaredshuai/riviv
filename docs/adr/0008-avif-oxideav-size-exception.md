@@ -30,7 +30,7 @@ AVIF 输入面自 #136 解绑后挂起为 L3 观察票 #138,触发器 (a)=出现
 
 ### D4. S1 合规:导入面证据为 #220 回填项
 
-oxideav 全纯 Rust,**预期零新 DLL 静态导入**;但按 s1-platform-floor 纪律,#220 仍须附 `dumpbin /imports` 双臂 diff 证据回填本 ADR——若出现新 DLL 即停,另走 ADR。**#220 回填(2026-10-22):双臂 `dumpbin -IMPORTS` 全量 DLL 列表逐行 diff = 零差异**(arm A/arm B 同 D2;两臂导入表同为 27 行,kernel32/user32/gdi32/…/winhttp.dll 全集一致,证据留档 PR)——预期达成,零新 DLL 静态导入,S1 地板不动。
+oxideav 全纯 Rust,**预期零新 DLL 静态导入**;但按 s1-platform-floor 纪律,#220 仍须附 `dumpbin /imports` 双臂 diff 证据回填本 ADR——若出现新 DLL 即停,另走 ADR。**#220 回填(2026-10-22):双臂 `dumpbin -IMPORTS` 全量 DLL 列表逐行 diff = 零差异**(arm A/arm B 同 D2;每臂 26 个原始导入行,含 `KERNEL32.dll`/`kernel32.dll` 大小写双形,即 **25 个唯一 DLL**——与 ADR 0007 记载的同一导入面 25 一致;kernel32/user32/gdi32/…/winhttp.dll 全集一致,证据留档 PR)——预期达成,零新 DLL 静态导入,S1 地板不动。
 
 ### D5. 风险承接(全部 #220 验收项)
 
