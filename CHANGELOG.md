@@ -5,6 +5,16 @@ history by git-cliff (cliff.toml is the policy; do not hand-edit the output).
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+## [0.7.0] - 2026-10-23
+### Added
+
+- Feat(update): #217 启动自动检查更新(O2=B)— P1-P4 全按推荐 (#217) (859eafc)
+- Feat(loader): #220 AVIF 输入面——oxideav 解码接入(ADR 0008) (7f20f76)
+### Fixed
+
+- Fix(loader): #220 补偿评审 P3 五条采纳——display 裁剪对称化/闸费率权威侧/深序列 ICC 回退/帧画布一致性/kernel 前提钉死 (006964e)
+- Fix(loader): #220 cubic 六条全采纳——有界读/icm=0 不碰 ICC/decode 侧像素闸+tkhd 强制/ADR Full-range C 轴订正/两处文档 (e119d78)
+
 ## [0.6.0] - 2026-10-07
 ### Added
 
