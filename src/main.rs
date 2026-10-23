@@ -92,6 +92,7 @@
 
 mod anim;
 mod assoc;
+mod avif;
 mod cli;
 mod clipboard;
 mod config;

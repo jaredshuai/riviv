@@ -589,7 +589,7 @@ unsafe extern "system" fn rebar_proc(
             // SAFETY: lparam points at an NMHDR for the duration of the
             // message (the common control's contract).
             let hdr = unsafe { &*(lparam.0 as *const NMHDR) };
-            if hdr.idFrom == TOOLBAR_ID as _ && hdr.code == NM_CUSTOMDRAW {
+            if hdr.idFrom == TOOLBAR_ID as usize && hdr.code == NM_CUSTOMDRAW {
                 // SAFETY: NMTBCUSTOMDRAW is the NM_CUSTOMDRAW payload of
                 // a toolbar we own.
                 let draw = unsafe { &*(lparam.0 as *const NMTBCUSTOMDRAW) };

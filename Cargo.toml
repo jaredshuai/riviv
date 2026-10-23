@@ -23,6 +23,11 @@ image = { version = "0.25", default-features = false, features = [
 # spike 实测档位逐一相同(svgz 嗅探侧不放行,见 src/svg.rs)。usvg/tiny-skia
 # 经 resvg 重导出取用,不另列直接依赖(防 feature 面漂移)。
 resvg = "0.48.1"
+# AVIF 解码臂(#220/ADR 0008):oxideav = MIT 纯 Rust 全链(编解码器类体积
+# 破例,用户拍板 2026-10-22;探针锚 +1.59 MiB,库内增量以 #220 双臂实录回填
+# ADR)。0.0.x 无 semver 承诺 → 精确锁,版本升级一律独立票;registry feature
+# 默认开(带 pixel decode),传递面 av1/heif/core 以探针树为准。
+oxideav-avif = "=0.0.15"
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Globalization",
