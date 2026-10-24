@@ -36,6 +36,7 @@ v6 激活 = **manifest-only 一刀**:`InitCommonControlsEx` 早在 #79 之前就
 | statusbar | DIFF | 10.19% | A 立体分格;B 扁平+点状 resize gripper |
 | playlist-pane | DIFF | 2.59% | 同尺寸同列形;B 主题化选中/焦点渲染,行高 25→28px |
 | options / jumpto / customrate / everything | DIFF ×4 | 4.3–12.1% | 尺寸/布局/树/页全同;按钮/组合框经典 3D→v6 扁平 |
+| rename-dlg | **未入矩阵** | — | 第五个手造对话框(rename_dlg.rs,同族 button/edit 控件)未实测——完整性口径 = 四实测 + 一未测(边界 7,实现票冒烟补) |
 | about-dlg | DIFF | 2.37% | 文本逐字同(控件 dump 验证);仅 OK 按钮换皮 |
 | main-window / playlist-pane-full | DIFF ×2 | 0.29%/0.62% | 差异全收敛于 chrome 条带,图像区逐字节同 |
 
