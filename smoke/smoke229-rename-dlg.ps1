@@ -209,12 +209,13 @@ public class S229 {
 
 # ---------------------------------------------------------------------------
 # DPI: claim PerMonitorV2 first (matches riviv's embedded manifest so rects
-# and GetDialogBaseUnits land in the same physical-pixel space), fall back
-# to system-aware on pre-1703.
+# and GetDialogBaseUnits land in the same physical-pixel space). The 2017
+# API only exists on 1703+ - on the 1607-1702 floor the P/Invoke throws
+# EntryPointNotFoundException, so guard it and fall back to system-aware.
 # ---------------------------------------------------------------------------
-if ([S229]::SetProcessDpiAwarenessContext([IntPtr](-4)) -eq [IntPtr]::Zero) {
-    [void][S229]::SetProcessDPIAware()
-}
+$pmv2 = $false
+try { $pmv2 = ([S229]::SetProcessDpiAwarenessContext([IntPtr](-4)) -ne [IntPtr]::Zero) } catch { $pmv2 = $false }
+if (-not $pmv2) { [void][S229]::SetProcessDPIAware() }
 
 # ---------------------------------------------------------------------------
 # Stage paths. The exe under test is COPIED to %TEMP%\riviv-229-smoke and
@@ -246,10 +247,14 @@ $foreign = @()
 foreach ($p in (Get-Process riviv -ErrorAction SilentlyContinue)) {
     $path = $null
     try { $path = $p.Path } catch { $path = $null }
-    $threads = 0
-    try { $threads = $p.Threads.Count } catch { $threads = 0 }
+    # -1 = the thread count could not be READ (an inaccessible LIVE
+    # process) - block on it, never tombstone it.
+    $threads = -1
+    try { $threads = $p.Threads.Count } catch { }
     $tombstone = ($threads -eq 0)
-    $staged = (($path -ne $null) -and ($path.StartsWith($Stage, [StringComparison]::OrdinalIgnoreCase)))
+    # $Stage + '\' so a sibling like riviv-229-smoke-evil cannot pass as
+    # staged (and get killed by the teardown filter).
+    $staged = (($path -ne $null) -and ($path.StartsWith($Stage + '\', [StringComparison]::OrdinalIgnoreCase)))
     if ((-not $tombstone) -and (-not $staged)) { $foreign += ('pid=' + $p.Id + ' path=' + $path) }
 }
 if ($foreign.Count -gt 0) {
@@ -258,7 +263,10 @@ if ($foreign.Count -gt 0) {
 }
 
 # Stage prep: wipe and rebuild. A stage that cannot be cleared (a staged
-# exe still locked by an earlier crashed run) is a BLOCK, not a surprise.
+# exe still locked by an earlier crashed run) is a BLOCK, not a surprise;
+# a prep failure (permissions, in-use destination) also routes through
+# BLOCKED instead of an unstructured throw - $ErrorActionPreference is
+# Stop up here, so New-Item/Copy-Item must be guarded.
 if (Test-Path $Stage) {
     Remove-Item $Stage -Recurse -Force -ErrorAction SilentlyContinue
     if (Test-Path (Join-Path $Stage 'riviv.exe')) {
@@ -266,8 +274,14 @@ if (Test-Path $Stage) {
         exit 4
     }
 }
-New-Item -ItemType Directory -Path $Stage | Out-Null
-Copy-Item $Exe $StageExe -Force
+try {
+    New-Item -ItemType Directory -Path $Stage -ErrorAction Stop | Out-Null
+    Copy-Item $Exe $StageExe -Force -ErrorAction Stop
+} catch {
+    Write-Output ('BLOCKED: stage preparation failed: ' + $_.Exception.Message)
+    Remove-Item $Stage -Recurse -Force -ErrorAction SilentlyContinue
+    exit 4
+}
 if (-not (Test-Path $StageExe)) { Write-Output 'BLOCKED: staged exe copy failed.'; exit 4 }
 New-Item -ItemType Directory -Path $Fx | Out-Null
 
@@ -664,11 +678,22 @@ if ($ok5) {
     if ($dlg -eq [IntPtr]::Zero) { $ok5 = $false; $ev5 = 'rename dialog never appeared for the WM_CLOSE run' }
 }
 if ($ok5) {
+    # Type a DIFFERENT name first (cubic P2): with the prefilled "c" the
+    # check cannot tell Cancel from OK - an OK would leave c.png on disk
+    # too. With "z" typed, only a cancel-collapse keeps z.png absent.
+    $edit = [S229]::GetDlgItem($dlg, 1042)
+    Type-IntoEdit $edit 'z'
+    Start-Sleep -Milliseconds 300
+    $tz5 = [S229]::EditText($edit)
+    Det 'S5.typed' ($tz5 -eq 'z') ('edit text=[' + $tz5 + '] expect [z]')
+    if ($tz5 -ne 'z') { $ok5 = $false; $ev5 = 'typing did not land: [' + $tz5 + '] != [z]' }
+}
+if ($ok5) {
     [void][S229]::PostMessage($dlg, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero)   # WM_CLOSE
     $gone = Wait-DlgGone $dlg 5000
     Start-Sleep -Milliseconds 300
-    $cIntact = (Test-Path $Cfx) -and (-not (Test-Path (Join-Path $Fx 'c2.png')))
-    Det 'S5.intact' ($gone -and $cIntact) ('dlg gone=' + $gone + ' c.png intact=' + $cIntact + ' title=[' + (Get-Title $main) + ']')
+    $cIntact = (Test-Path $Cfx) -and (-not (Test-Path (Join-Path $Fx 'z.png')))
+    Det 'S5.intact' ($gone -and $cIntact) ('dlg gone=' + $gone + ' c.png intact + no z.png=' + $cIntact + ' title=[' + (Get-Title $main) + ']')
     if (-not ($gone -and $cIntact)) { $ok5 = $false; $ev5 = 'WM_CLOSE did not collapse to a harmless cancel (gone=' + $gone + ' cIntact=' + $cIntact + ')' }
 }
 if ($ok5) { $ev5 = 'WM_CLOSE collapsed to cancel, c.png untouched' }
@@ -704,7 +729,7 @@ if (-not $iniCleaned) { $script:fail++ }
 $leftover = @(Get-Process riviv -ErrorAction SilentlyContinue | Where-Object {
     $lp = $null
     try { $lp = $_.Path } catch { $lp = $null }
-    ($lp -ne $null) -and ($lp.StartsWith($Stage, [StringComparison]::OrdinalIgnoreCase))
+    ($lp -ne $null) -and ($lp.StartsWith($Stage + '\', [StringComparison]::OrdinalIgnoreCase))
 })
 Det 'T.procs' ($leftover.Count -eq 0) ('staged riviv processes left: ' + (($leftover | ForEach-Object { $_.Id }) -join ','))
 if ($leftover.Count -gt 0) {
@@ -717,7 +742,9 @@ if ($leftover.Count -gt 0) {
 # partially (P3 from the cubic review).
 Stop-Log
 Remove-Item $Stage -Recurse -Force -ErrorAction SilentlyContinue
-Det 'T.stage' (-not (Test-Path $StageExe)) ('stage cleaned: ' + (-not (Test-Path $StageExe)))
+$stageClean = -not (Test-Path $StageExe)
+Det 'T.stage' $stageClean ('stage cleaned: ' + $stageClean)
+if (-not $stageClean) { $script:fail++ }   # a leftover stage is a FAIL, not a note (codex P2)
 
 if ($script:fail -gt 0) {
     Write-Output 'FAILURES: riviv stderr follows (if any).'
@@ -744,7 +771,15 @@ exit 0
     if (Test-Path $Ini) { Remove-Item $Ini -Force -ErrorAction SilentlyContinue }
     Stop-Log
     Remove-Item $Stage -Recurse -Force -ErrorAction SilentlyContinue
-    if (Test-Path $ErrPath) { Remove-Item $ErrPath -Force -ErrorAction SilentlyContinue }
+    if (Test-Path $ErrPath) {
+        # Emit the redirected stderr before deleting it (cubic P3): the
+        # normal failure path prints it; an unexpected-exception path that
+        # silently discards it hides the app's own diagnostics.
+        $body = ''
+        try { $body = (Get-Content $ErrPath -Raw -ErrorAction SilentlyContinue) } catch { $body = '(stderr unreadable)' }
+        if ($body -and ($body.Trim().Length -gt 0)) { Write-Output $body }
+        Remove-Item $ErrPath -Force -ErrorAction SilentlyContinue
+    }
     $script:fail++
     Write-Output ('SMOKE229 RESULT: PASS=' + $script:pass + ' FAIL=' + $script:fail + ' SKIP=' + $script:skip + ' iniCleaned=False')
     exit 1
