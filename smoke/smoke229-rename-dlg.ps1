@@ -277,13 +277,14 @@ if (Test-Path $Stage) {
 try {
     New-Item -ItemType Directory -Path $Stage -ErrorAction Stop | Out-Null
     Copy-Item $Exe $StageExe -Force -ErrorAction Stop
+    New-Item -ItemType Directory -Path $Fx -ErrorAction Stop | Out-Null
 } catch {
     Write-Output ('BLOCKED: stage preparation failed: ' + $_.Exception.Message)
     Remove-Item $Stage -Recurse -Force -ErrorAction SilentlyContinue
     exit 4
 }
 if (-not (Test-Path $StageExe)) { Write-Output 'BLOCKED: staged exe copy failed.'; exit 4 }
-New-Item -ItemType Directory -Path $Fx | Out-Null
+if (-not (Test-Path $Fx)) { Write-Output 'BLOCKED: fixture directory creation failed.'; exit 4 }
 
 $script:logOpen = $false
 try {
@@ -422,12 +423,21 @@ Write-Host ('  [derive] baseUnits=' + $bx + 'x' + $by + ' client=' + $ExpCli.w +
 # ---------------------------------------------------------------------------
 # Fixtures: 8x8 solid PNGs, three colors, mtimes staged c -> b -> a so the
 # DateModified-descending nav order over the launched a,b,c is a, b, c.
+# The PNG writes are .NET File I/O - guard them so a disk failure routes
+# through BLOCKED with cleanup instead of an unstructured throw that
+# strands the copied stage (codex round 2).
 # ---------------------------------------------------------------------------
-[S229]::WritePng8($Cfx, 30, 30, 220)   # blue
-Start-Sleep -Milliseconds 1100
-[S229]::WritePng8($Bfx, 30, 220, 30)   # green
-Start-Sleep -Milliseconds 1100
-[S229]::WritePng8($Afx, 220, 30, 30)   # red
+try {
+    [S229]::WritePng8($Cfx, 30, 30, 220)   # blue
+    Start-Sleep -Milliseconds 1100
+    [S229]::WritePng8($Bfx, 30, 220, 30)   # green
+    Start-Sleep -Milliseconds 1100
+    [S229]::WritePng8($Afx, 220, 30, 30)   # red
+} catch {
+    Write-Output ('BLOCKED: fixture preparation failed: ' + $_.Exception.Message)
+    Remove-Item $Stage -Recurse -Force -ErrorAction SilentlyContinue
+    exit 4
+}
 
 $exitNote = ''
 $ErrPath = Join-Path $env:TEMP 'riviv-229-last-stderr.txt'
@@ -742,7 +752,7 @@ if ($leftover.Count -gt 0) {
 # partially (P3 from the cubic review).
 Stop-Log
 Remove-Item $Stage -Recurse -Force -ErrorAction SilentlyContinue
-$stageClean = -not (Test-Path $StageExe)
+$stageClean = -not (Test-Path $Stage)   # the DIRECTORY, not just the exe (cubic round 2): a partial recursive delete leaving the shell behind is a FAIL
 Det 'T.stage' $stageClean ('stage cleaned: ' + $stageClean)
 if (-not $stageClean) { $script:fail++ }   # a leftover stage is a FAIL, not a note (codex P2)
 
