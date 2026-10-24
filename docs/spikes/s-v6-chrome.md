@@ -7,7 +7,7 @@
 
 ## 结论一句话
 
-v6 激活 = **manifest-only 一刀**:`InitCommonControlsEx` 早在 #79 之前就以上游同款旗标在场(window.rs:9986-9993,`ICC_STANDARD_CLASSES|ICC_BAR_CLASSES|ICC_WIN95_CLASSES` = viv.c:5241 一字不差),comctl32.dll 本就在静态导入表 → 加依赖块即激活,零代码零新 DLL 静态导入(dumpbin 双臂 26 原始导入行逐行 diff 零差异)+512 B;视觉差异面 = comctl32 拥有的全部控件面(工具栏/状态栏/playlist ListView/五个手造对话框/About 按钮,10 面全部几何不变纯换皮),OS 自绘面(菜单栏/上下文菜单/通用文件对话框)逐字节不变;31 项度量唯一漂移 = playlist 行高 25→28px;行为探针双臂全同;**阴性发现:「v6 控件自带 WM_DPICHANGED 处理」在合成直发探针下双臂均零反应 → README:154 残留 seam 的「一石二鸟」预期不成立,v6 收敛为纯视觉决策票**。
+v6 激活 = **manifest-only 一刀**:`InitCommonControlsEx` 早在 #79 之前就以上游同款旗标在场(window.rs:9986-9993,`ICC_STANDARD_CLASSES|ICC_BAR_CLASSES|ICC_WIN95_CLASSES` = viv.c:5241 一字不差),comctl32.dll 本就在静态导入表 → 加依赖块即激活,零代码零新 DLL 静态导入(dumpbin 双臂 26 原始导入行逐行 diff 零差异)+512 B;视觉差异面 = comctl32 拥有的全部控件面(工具栏/状态栏/playlist ListView/五个手造对话框/About 按钮,10 面窗寸/布局逐项全同、纯换皮——唯一例外 = playlist 行高 25→28px,控件内项度量,窗布局不动),OS 自绘面(菜单栏/上下文菜单/通用文件对话框)逐字节不变;31 项度量唯一漂移即该项;行为探针双臂全同;**合成直发探针(阴性观察):WM_DPICHANGED 直发子控件双臂零反应,但该探针不能证真亦不能证伪真实迁移行为 → 「v6 自带 chrome per-monitor 缩放」收益不计入采纳理由,v6 按纯视觉决策票裁**。
 
 ## 为什么做
 
@@ -54,19 +54,19 @@ v6 激活 = **manifest-only 一刀**:`InitCommonControlsEx` 早在 #79 之前就
 | P3.3 toolbar 项路径(8 按钮,TB_GETITEMRECT 40x38) | PASS | PASS |
 | P3.4 About BM_CLICK 关闭 | PASS | PASS |
 
-- **P3.1 阴性发现是本 spike 最重要的裁决性证据**:「v6 控件自带 WM_DPICHANGED 处理 → 收掉 chrome 恒系统 DPI 比例 seam」的预期,在合成直发下不成立(双臂一致无反应)。合成直发 ≠ 真实跨 DPI 迁移的完整消息序(真实路径由窗口管理器逐子走查 + 主题度量刷新),故**真实混合 DPI 硬件上的表现 = 未验证假设,降级为人工 QA 矩阵项**;实现票不得把 chrome per-monitor 缩放当 v6 的既得收益记档。
+- **P3.1 是合成探针阴性观察,不是裁决**:「v6 控件自带 WM_DPICHANGED 处理 → 收掉 chrome 恒系统 DPI 比例 seam」的预期在合成直发下未见高度变化(双臂一致),但该观察**不可归因亦不可外推**——①合成直发 ≠ 真实跨 DPI 迁移的完整消息序(真实路径由窗口管理器逐子走查 + 主题度量刷新);②chrome 几何本由 app 自持(window.rs:8956 `controls_height(logical_dpi())` 定条带高,toolbar.rs:300 同源),高度不变分不清「控件无处理器」与「合成投递未触达控件侧缩放」。处置 = **收益不计入采纳理由(O1 按纯视觉裁);真实混合 DPI 硬件迁移 = 人工 QA 矩阵项(机器不可达),验证后再裁是否另立自家 WM_DPICHANGED 布局链票**。
 - P3.2 技术附注(探针工艺,非回归):ListView 箭头键须 SendMessage 直发(PostMessage 的 WM_KEYDOWN 不驱动默认键处理);Enter 走 pane subclass 路径 posted 即可达;标题跟随跳转而非选中 = app 设计(README:118)。
 
 ## 开放问题(拍板项,全附推荐)
 
 - **O1 是否采纳 v6(纯视觉决策票)**:**A = 采纳(推荐)**——零功能/零度量回归已证、零依赖成本(M3/M4/M5)、对齐上游 20 年默认观感、撤掉 README:154 在案 known difference;代价 = chrome 全控件面视觉一次性全变(发布说明须带观感变化条目)/ **B = 保持 5.82**——唯一理由是极简审美偏好,但 known difference 继续挂账。
 - **O2 行高漂移处置(若 O1=A)**:**接受 28px 系统主题原生值(推荐)**,不手工钉 25px 旧值(钉旧值 = 与主题打架,后续每主题变一次修一次);`playlist_pane_width` 宽度面不受影响。
-- **O3 chrome per-monitor 缩放与 v6 解耦**:P3.1 阴性发现后,v6 不带来它;若将来要收 README:154 残留 seam,须另立刀(自家 WM_DPICHANGED 布局链改造),与 v6 采纳与否无关。
+- **O3 chrome per-monitor 缩放与 v6 解耦**:P3.1 仅证明合成直发未改变子控件高度,不能裁定真实 DPI 迁移时 v6 的缩放行为;不将该收益计入 v6 采纳理由,真实迁移(人工 QA 矩阵项,机器不可达)验证后再决定是否另立自家 WM_DPICHANGED 布局链改造票。
 - **O4 发布与 QA 面(若 O1=A)**:说明稿带观感变化条目 + 截图更新;QA 清单人工面加「混合 DPI 双屏真机迁移」项(机器不可达,P3.1 已证合成探针测不到该面)。
 
 ## 边界与风险(实现票前须知)
 
-1. **视觉验收是人工拍板项**:机器矩阵已证几何零漂移,但「v6 好不好看」只有用户能裁;实现票前 O1 须表态。
+1. **视觉验收是人工拍板项**:机器矩阵已证窗布局零漂移(playlist 行高 25→28 例外在案,系控件内项度量),但「v6 好不好看」只有用户能裁;实现票前 O1 须表态。
 2. 冒烟回归面:既有 smoke 的 chrome 度量断言(78/79 族)在本矩阵实测全同 → 预期零红;实现票仍须全量复跑冒烟矩阵(纪律)。golden81/golden90 为图像区字节断言,不涉 chrome。
 3. context-menu 零差结论的取证面是屏采(best-effort,遮挡敏感):矩阵跑时无人值守,结论可信;复跑时保持无遮挡环境。
 4. 探针产物留档:`%TEMP%\riviv-s227\probe\out\`(双臂 13 面 PNG、metrics.csv、behavior.log、summary.md、menu-A/B.txt、探针脚本 5 只);worktree `%TEMP%\riviv-s227`(实现票落地后清)。
