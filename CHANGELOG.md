@@ -5,6 +5,18 @@ history by git-cliff (cliff.toml is the policy; do not hand-edit the output).
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+## [0.8.0] - 2026-10-24
+### Added
+
+- Feat: Add droid.yml workflow (2a540dc)
+- Feat: Add droid-review.yml workflow (f51fa5f)
+- Feat(chrome): #229 Common-Controls v6 chrome 主题化——manifest-only 激活(#227 spike 后继,O1/O2 外部四 AI 裁定 4/4 收敛) (ea7ab0d)
+### Fixed
+
+- Fix(review): #230 cubic 评审三采纳——build.rs 同源注释改写 + smoke229 门收紧与清理顺序 (41d69bd)
+- Fix(review): #230 bot 行内 9 findings 处置——cubic 7 + codex 3(1 重叠,1 已于 41d69bd) (a9d0209)
+- Fix(review): #230 二轮追评两采纳——T.stage 查目录本身 + fixture 写入走 BLOCKED (abd6bc5)
+
 ## [0.7.0] - 2026-10-23
 ### Added
 
