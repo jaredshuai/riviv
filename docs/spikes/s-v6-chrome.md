@@ -7,7 +7,7 @@
 
 ## 结论一句话
 
-v6 激活 = **manifest-only 一刀**:`InitCommonControlsEx` 早在 #79 之前就以上游同款旗标在场(window.rs:9986-9993,`ICC_STANDARD_CLASSES|ICC_BAR_CLASSES|ICC_WIN95_CLASSES` = viv.c:5241 一字不差),comctl32.dll 本就在静态导入表 → 加依赖块即激活,零代码零新 DLL 静态导入(dumpbin 双臂 26 原始导入行逐行 diff 零差异)+512 B;视觉差异面 = comctl32 拥有的全部控件面(工具栏/状态栏/playlist ListView/五个手造对话框/About 按钮,10 面窗寸/布局逐项全同、纯换皮——唯一例外 = playlist 行高 25→28px,控件内项度量,窗布局不动),OS 自绘面(菜单栏/上下文菜单/通用文件对话框)逐字节不变;31 项度量唯一漂移即该项;行为探针双臂全同;**合成直发探针(阴性观察):WM_DPICHANGED 直发子控件双臂零反应,但该探针不能证真亦不能证伪真实迁移行为 → 「v6 自带 chrome per-monitor 缩放」收益不计入采纳理由,v6 按纯视觉决策票裁**。
+v6 激活 = **manifest-only 一刀**:`InitCommonControlsEx` 早在 #79 之前就以上游同款旗标在场(window.rs:9986-9993,`ICC_STANDARD_CLASSES|ICC_BAR_CLASSES|ICC_WIN95_CLASSES` = viv.c:5241 一字不差),comctl32.dll 本就在静态导入表 → 加依赖块即激活,零代码零新 DLL 静态导入(dumpbin 双臂 26 原始导入行逐行 diff 零差异)+512 B;视觉差异面 = comctl32 拥有的全部控件面(工具栏/状态栏/playlist ListView/五个手造对话框之四 = Options/JumpTo/CustomRate/Everything——Rename 未入矩阵,边界 7——加 About 按钮,10 面窗寸/布局逐项全同、纯换皮——唯一例外 = playlist 行高 25→28px,控件内项度量,窗布局不动),OS 自绘面(菜单栏/上下文菜单/通用文件对话框)逐字节不变;31 项度量唯一漂移即该项;行为探针双臂全同;**合成直发探针(阴性观察):WM_DPICHANGED 直发子控件双臂零反应,但该探针不能证真亦不能证伪真实迁移行为 → 「v6 自带 chrome per-monitor 缩放」收益不计入采纳理由,v6 按纯视觉决策票裁**。实测口径 = 本机 Windows 11 26100、200% 单屏(地板覆盖见边界 6)。
 
 ## 为什么做
 
@@ -25,7 +25,7 @@ v6 激活 = **manifest-only 一刀**:`InitCommonControlsEx` 早在 #79 之前就
 | M4 | 体积 +512 B | manifest 资源段增量;远低于任何阈值,不涉 ADR |
 | M5 | 地板零沟 | v6 自 XP;riviv min-OS 1607(AGENTS S1);uxtheme.dll 双臂均已加载 |
 
-## 视觉矩阵(13 面,200% 单屏,PrintWindow PW_RENDERFULLCONTENT,探针 DPI-aware)
+## 视觉矩阵(13 面,Windows 11 26100 本机构建、200% 单屏,PrintWindow PW_RENDERFULLCONTENT,探针 DPI-aware;地板 1607 面未测,边界 6)
 
 | surface | hash | pixel-diff | 观察 |
 |---|---|---|---|
@@ -59,7 +59,7 @@ v6 激活 = **manifest-only 一刀**:`InitCommonControlsEx` 早在 #79 之前就
 
 ## 开放问题(拍板项,全附推荐)
 
-- **O1 是否采纳 v6(纯视觉决策票)**:**A = 采纳(推荐)**——零功能/零度量回归已证、零依赖成本(M3/M4/M5)、对齐上游 20 年默认观感、撤掉 README:154 在案 known difference;代价 = chrome 全控件面视觉一次性全变(发布说明须带观感变化条目)/ **B = 保持 5.82**——唯一理由是极简审美偏好,但 known difference 继续挂账。
+- **O1 是否采纳 v6(纯视觉决策票)**:**A = 采纳(推荐)**——零功能回归、窗布局度量逐项全同(playlist 行高 25→28 唯一漂移,O2 接受;Rename 未测面见边界 7)、零依赖成本(M3/M4/M5)、对齐上游 20 年默认观感、撤掉 README:154 在案 known difference;代价 = chrome 全控件面视觉一次性全变(发布说明须带观感变化条目;地板 1607 机视觉面未测,边界 6)/ **B = 保持 5.82**——唯一理由是极简审美偏好,但 known difference 继续挂账。
 - **O2 行高漂移处置(若 O1=A)**:**接受 28px 系统主题原生值(推荐)**,不手工钉 25px 旧值(钉旧值 = 与主题打架,后续每主题变一次修一次);`playlist_pane_width` 宽度面不受影响。
 - **O3 chrome per-monitor 缩放与 v6 解耦**:P3.1 仅证明合成直发未改变子控件高度,不能裁定真实 DPI 迁移时 v6 的缩放行为;不将该收益计入 v6 采纳理由,真实迁移(人工 QA 矩阵项,机器不可达)验证后再决定是否另立自家 WM_DPICHANGED 布局链改造票。
 - **O4 发布与 QA 面(若 O1=A)**:说明稿带观感变化条目 + 截图更新;QA 清单人工面加「混合 DPI 双屏真机迁移」项(机器不可达,P3.1 已证合成探针测不到该面)。
@@ -71,7 +71,9 @@ v6 激活 = **manifest-only 一刀**:`InitCommonControlsEx` 早在 #79 之前就
 3. context-menu 零差结论的取证面是屏采(best-effort,遮挡敏感):矩阵跑时无人值守,结论可信;复跑时保持无遮挡环境。
 4. 探针产物留档:`%TEMP%\riviv-s227\probe\out\`(双臂 13 面 PNG、metrics.csv、behavior.log、summary.md、menu-A/B.txt、探针脚本 5 只);worktree `%TEMP%\riviv-s227`(实现票落地后清)。
 5. 会话卫生注记:两个前会话遗留 zombie riviv 进程(PID 53376/66156,~32K,taskkill 拒绝访问,无窗口未参与任何探针)——已在 summary.md hygiene 节留档,不阻塞本票。
+6. **地板覆盖未测**:机器矩阵实测口径 = 本机 Windows 11 26100、200% 单屏;Win10 1607 地板机的 v6 视觉/度量面未入矩阵(实现票 QA 面:地板机或最接近环境过一遍);「菜单零差」结论限本构建(v6 在 XP 时代曾主题化菜单,OS 版本敏感性注记)。
+7. **Rename 对话框未入矩阵**:riviv 第五个手造对话框(rename_dlg.rs,与四 Dialog 同族 button/edit 控件)未实测——完整性口径以「四实测 + 一未测」记,实现票冒烟补几何/行为 + 人工 QA。
 
 ## 拍板路径
 
-用户对 O1 表态(开工词即裁决)→ A 则立实现票:manifest 依赖块(抄 worktree 补丁转正式注释)+ README:154 段改写(known difference 撤销改记实测差异面)+ 全量冒烟复跑 + QA 清单(含混合 DPI 真机人工项);量级 = 小实现票(单 PR)。
+用户对 O1 表态(开工词即裁决)→ A 则立实现票:manifest 依赖块(抄 worktree 补丁转正式注释)+ README:154 段改写(known difference 撤销改记实测差异面)+ 全量冒烟复跑 + Rename 对话框冒烟(边界 7)+ QA 清单(含混合 DPI 真机与地板机人工项,边界 6/O4);量级 = 小实现票(单 PR)。
