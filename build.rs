@@ -11,8 +11,9 @@ fn main() {
     res.set_icon("res/riviv.ico");
     // PerMonitorV2 (#79): the loader applies this before any user code,
     // replacing the old first-line SetProcessDPIAware and its
-    // query-ordering hazard class outright. Deliberately DPI-only (no
-    // Common-Controls v6 dependency — see res/riviv.manifest).
+    // query-ordering hazard class outright. Also carries the
+    // Common-Controls v6 dependency since #229 (manifest-only — see
+    // res/riviv.manifest).
     res.set_manifest_file("res/riviv.manifest");
     // The icon lands as the FIRST icon resource — id 1 — which the window
     // class loads via LoadImageW(MAKEINTRESOURCEW(1)) (upstream

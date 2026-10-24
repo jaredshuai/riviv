@@ -39,12 +39,12 @@
 # EQUAL on master and impl). Only a weak sanity check guards it.
 #
 # Scenarios (single launch, playlist a,b,c, current = a):
-#   S0 gates: exe present; LIVING-PROCESS gate - only a riviv process
-#       whose Path is readable AND has threads blocks (terminated
-#       remnants with 0 threads / unreadable path are tombstones and are
-#       let through, e.g. the known 0-thread riviv PIDs some machines
-#       carry); stage prep (exe copied to %TEMP%\riviv-229-smoke, the run
-#       BLOCKS if the stage cannot be prepared).
+#   S0 gates: exe present; LIVING-PROCESS gate - only a riviv process with
+#       at least one thread blocks (terminated remnants always show 0
+#       threads and are let through, e.g. the known 0-thread riviv PIDs
+#       some machines carry); stage prep (exe copied to
+#       %TEMP%\riviv-229-smoke, the run BLOCKS if the stage cannot be
+#       prepared).
 #   S1 shape + geometry: WM_COMMAND 15 opens the dialog; class
 #       riviv_rename; exactly 3 direct children with ids 1042/1/2; all
 #       visible; client size == dlu(186,51); each control rect ==
@@ -236,17 +236,19 @@ $LogPath = Join-Path $Stage 'smoke229-run.log'
 if (-not (Test-Path $Exe)) { Write-Output ('MISSING EXE: ' + $Exe); exit 2 }
 
 # The LIVING-PROCESS gate: only a riviv process that is demonstrably alive
-# blocks - Path readable AND at least one thread. Terminated remnants (0
-# threads, unreadable/empty path) are tombstones some machines cannot shed;
-# they are let through. A process running from OUR stage root is also let
-# through (it is staged, not foreign).
+# blocks - at least one thread (the decisive tombstone marker: a terminated
+# remnant always shows 0 threads). Path readability is NOT part of the
+# tombstone test - an elevated or cross-bitness live instance can hide its
+# path, and letting those through would only convert a true single-instance
+# hijack into an honest S1 red; a process running from OUR stage root is
+# still let through (it is staged, not foreign).
 $foreign = @()
 foreach ($p in (Get-Process riviv -ErrorAction SilentlyContinue)) {
     $path = $null
     try { $path = $p.Path } catch { $path = $null }
     $threads = 0
     try { $threads = $p.Threads.Count } catch { $threads = 0 }
-    $tombstone = ($threads -eq 0) -or [string]::IsNullOrEmpty($path)
+    $tombstone = ($threads -eq 0)
     $staged = (($path -ne $null) -and ($path.StartsWith($Stage, [StringComparison]::OrdinalIgnoreCase)))
     if ((-not $tombstone) -and (-not $staged)) { $foreign += ('pid=' + $p.Id + ' path=' + $path) }
 }
@@ -710,6 +712,10 @@ if ($leftover.Count -gt 0) {
     $leftover | Stop-Process -Force -ErrorAction SilentlyContinue
     $script:fail++
 }
+# Stop the transcript BEFORE removing the stage: the log file lives in the
+# stage and an open transcript handle would make the directory delete fail
+# partially (P3 from the cubic review).
+Stop-Log
 Remove-Item $Stage -Recurse -Force -ErrorAction SilentlyContinue
 Det 'T.stage' (-not (Test-Path $StageExe)) ('stage cleaned: ' + (-not (Test-Path $StageExe)))
 
@@ -736,9 +742,10 @@ exit 0
         Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
     }
     if (Test-Path $Ini) { Remove-Item $Ini -Force -ErrorAction SilentlyContinue }
+    Stop-Log
     Remove-Item $Stage -Recurse -Force -ErrorAction SilentlyContinue
+    if (Test-Path $ErrPath) { Remove-Item $ErrPath -Force -ErrorAction SilentlyContinue }
     $script:fail++
     Write-Output ('SMOKE229 RESULT: PASS=' + $script:pass + ' FAIL=' + $script:fail + ' SKIP=' + $script:skip + ' iniCleaned=False')
-    Stop-Log
     exit 1
 }
