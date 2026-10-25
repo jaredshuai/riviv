@@ -200,7 +200,20 @@ Write-Output 'ABOUT TEXT (escaped; U+2014/U+00A9 as markers, \n per line):'
 if ($read3) { Show-Escaped $script:text3 } else { Write-Output '  | <unreadable>' }
 
 $rd = 'text unreadable (static=' + $static3 + ' dlg=' + $script:dlg + ' read=' + $read3 + ')'
-$hasVersion = $read3 -and $script:text3.StartsWith('riviv 0.1.0', [StringComparison]::Ordinal)
+# Evergreen version pin: the About body's version line follows the exe's
+# ProductVersion, so this smoke stays valid across releases (the original
+# hard 'riviv 0.1.0' pin went stale at v0.2.0 and silently aged 7 releases).
+# An exe with no ProductVersion must NOT degrade the pin to a bare
+# 'riviv ' prefix (StartsWith would then match any app-name opener) -
+# the sentinel keeps the assertion strong and fails loudly instead.
+$pv3 = (Get-Item $RunExe).VersionInfo.ProductVersion
+if ([string]::IsNullOrWhiteSpace($pv3)) {
+    Write-Output 'S3a preflight: staged exe carries NO ProductVersion - cannot derive the version line'
+    $wantVer3 = 'riviv <no-product-version>'
+} else {
+    $wantVer3 = 'riviv ' + $pv3
+}
+$hasVersion = $read3 -and $script:text3.StartsWith($wantVer3, [StringComparison]::Ordinal)
 $hasLicense = $read3 -and $script:text3.Contains($WantLicense)
 $hasCredit  = $read3 -and $script:text3.Contains($WantCredit)
 $hasUp      = $read3 -and $script:text3.Contains('Upstream: https://www.voidtools.com/voidimageviewer/')
@@ -209,7 +222,7 @@ $hasRnd     = $read3 -and $script:text3.Contains('Renderer: ')
 $noOld      = $read3 -and (-not $script:text3.Contains('Upstream (MIT):'))
 $detail3 = $rd
 if ($read3) { $detail3 = 'got=[' + (Esc $script:text3) + ']' }
-Check 'S3a body opens with the version line "riviv 0.1.0"' $hasVersion $detail3
+Check ('S3a body opens with the version line "' + $wantVer3 + '" (derived from the staged exe)') $hasVersion $detail3
 Check ('S3b license line verbatim [' + (Esc $WantLicense) + ']') $hasLicense $detail3
 Check ('S3c credit line verbatim [' + (Esc $WantCredit) + ']') $hasCredit $detail3
 Check 'S3d Upstream URL verbatim' $hasUp $detail3
