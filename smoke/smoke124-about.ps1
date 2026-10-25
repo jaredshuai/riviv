@@ -203,7 +203,16 @@ $rd = 'text unreadable (static=' + $static3 + ' dlg=' + $script:dlg + ' read=' +
 # Evergreen version pin: the About body's version line follows the exe's
 # ProductVersion, so this smoke stays valid across releases (the original
 # hard 'riviv 0.1.0' pin went stale at v0.2.0 and silently aged 7 releases).
-$wantVer3 = 'riviv ' + (Get-Item $RunExe).VersionInfo.ProductVersion
+# An exe with no ProductVersion must NOT degrade the pin to a bare
+# 'riviv ' prefix (StartsWith would then match any app-name opener) -
+# the sentinel keeps the assertion strong and fails loudly instead.
+$pv3 = (Get-Item $RunExe).VersionInfo.ProductVersion
+if ([string]::IsNullOrWhiteSpace($pv3)) {
+    Write-Output 'S3a preflight: staged exe carries NO ProductVersion - cannot derive the version line'
+    $wantVer3 = 'riviv <no-product-version>'
+} else {
+    $wantVer3 = 'riviv ' + $pv3
+}
 $hasVersion = $read3 -and $script:text3.StartsWith($wantVer3, [StringComparison]::Ordinal)
 $hasLicense = $read3 -and $script:text3.Contains($WantLicense)
 $hasCredit  = $read3 -and $script:text3.Contains($WantCredit)
