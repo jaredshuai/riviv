@@ -91,8 +91,10 @@ MIT)**,备选 ed25519-dalek(+63 KB,BSD-3,依赖树 ~10 crate);WinHTTP 默认重
 2. **签名工具 = 仓内独立小工程 `tools/riviv-sign/`**(不进主 crate/主
    workspace):**不能**做成主 crate 的第二 `[[bin]]`——同一构建图内 cargo 的
    feature 合一会把签名侧 feature(随机数等)并进 ship 构建污染最小面。命令面
-   `keygen / sign / verify`(sign = `sk.sign(asset_bytes, None)` 确定性签名,
-   与探针同 API)。
+   `keygen / sign / verify`。**sign 与 verify 的被签消息 = 下节域分离构造的
+   同一缓冲**(codex #236 P1 采纳:signer 侧若仍签裸资产字节而 client 验域
+   分离缓冲,每个正确发版都会验签失败;两侧必须共用同一消息构造公式,实现票
+   以「签名↔验签往返钉测」锁死,发版回验环节即端到端哨兵)。
 3. **发版新步骤**(插在四资产构建后、`gh release create` 前):每资产
    `riviv-sign sign` → `<asset>.sig`(raw 64 B,4 个);上传资产 4+4=8 个文件;
    现有「下载回验 SHA」环节升格为「下载 exe+sig → `riviv-sign verify` → SHA
@@ -106,39 +108,57 @@ MIT)**,备选 ed25519-dalek(+63 KB,BSD-3,依赖树 ~10 crate);WinHTTP 默认重
    旧资产+旧 sig 在新 tag 下失配(降级重放闭死)、同版本异资产失配(错包替换
    闭死)、未来格式演进有 magic 可版本化;`.sig` 仍 raw 64 B 零解析面。
    资产字节整体进内存一次(≤ 128 MB 预算同内存上限,8.5 MB 量级无压力)。
-5. **私钥事故预案**:丢失 → 老公钥无法再签,发布带新公钥的版本,老版本内置
-   更新断供(用户手动下载一次过渡版,无安全问题);疑似泄漏 → **换钥 + 过渡
-   版双钥各签(资产 `.sig`/`-v2.sig` 并挂),过渡版验任一;过渡版之后的版本
-   一律只验新钥**——「验任一」只存在于过渡版存续期,且攻击者需同时持旧私钥
-   与渠道投毒能力才构成攻击面,该面随存量升级单调收敛(cubic #236 P1#2
-   采纳后的形态:旧钥在 pinned-key 模型下**无法真正吊销**是固有残留——只内嵌
-   旧公钥的老 exe 最多信任到过渡版为止,同 Tauri/minisign 形态,接受并留档;
-   根治 = Authenticode 级链式信任,超出本刀)。可选缓解「exe 内嵌最低安全版本
-   单调闸」记录不推荐(每发版改硬编码,仪式负担换冗余防线)。
+5. **私钥事故预案(便利恢复与安全恢复分层,codex #236 P1 订正后的形态)**:
+   - **丢失**(私钥不在了,无对手):发布带新公钥的版本,老版本内置更新断供,
+     用户手动下载一次过渡版,无安全问题。
+   - **疑似泄漏**(私钥可能在对手手里):双钥过渡**不构成安全恢复**——旧钥
+     持有者可对任意字节构造合法签名,「过渡版验任一」意味着过渡版与一切更旧
+     存量在该窗口内完全可被伪造(时间上限外的收敛靠存量升级,滞留过渡版的
+     用户暴露面无界);旧钥在 pinned-key 模型下**无法真正吊销**是固有残留
+     (同 Tauri/minisign 形态)。因此预案分两层:**便利层** = 非泄漏场景的
+     平滑换钥(过渡版双签,之后版本只验新钥,窗口内双持攻击面=旧钥+渠道
+     投毒,随存量升级单调收敛,如实留档);**安全层** = 确认泄漏时带外公告
+     用户停止内置更新、手动从可信渠道取带新钥的版本(OSV/README 公告),
+     Authenticode 级链式信任才是根治,超出本刀。可选缓解「exe 内嵌最低安全
+     版本单调闸」记录不推荐(每发版改硬编码,仪式负担换冗余防线,且对持钥
+     对手可伪造任意「≤闸版本」消息无效——版本闸挡得住重放挡不住伪造)。
 
-## portable 自替换(O1=C,推演;Sumatra helper 模式对映,s-auto-update O1=C 先例)
+## portable 自替换(O1=C,推演;Sumatra helper 模式对映,s-auto-update O1=C 先例;
+codex #236 四 findings 订正后的形态)
 
 - 安装版(O1=B):下载对应语言 Setup 资产 → 验签 → 框「将关闭 riviv 并运行
-  安装程序」→ 自身退出 → `ShellExecuteW` Setup(安装器既有 staged exe
-  `/install` runas 自提升先例;R7 的「覆盖在跑文件」由先退出解掉)。
-- portable 版:下载新 portable 资产 → 验签 → 存 `%TEMP%` → 以
-  `-update-self-to <原路径>` 启动 helper(新 exe)→ helper 等旧进程退出
-  (等单实例 mutex 消失)→ `MoveFileEx` 替换原位 → 启动新 exe → helper 退出。
-  **与 #109 单实例转发的交互是载重点**:helper 启动会被 mutex 转发拦成「第二
-  实例」——`cli.rs` 必须在 mutex 创建**之前**识别 `-update-self-to` 短路
-  (installer `/install` 同型先例),实现票钉测。
+  安装程序」→ **先 `ShellExecuteW` Setup 再退出自身**(codex #236 P2 采纳:
+  初稿「先退出再启动」无人调 ShellExecuteW);「覆盖在跑文件」(R7)由安装器
+  既有握手解——`assoc.rs::process_install_command_line` 的 staged `/install`
+  进程本来就会关闭并等待存量查看器再落盘,Setup 路径复用同型语义。
+- portable 版(三步订正全采纳):
+  - **落盘位置 = 原 exe 同目录旁置 staging**(codex P2 采纳:USB 盘 portable
+    的 `%TEMP%` 跨卷,`MoveFileEx` 跨卷要么带 `MOVEFILE_COPY_ALLOWED` 退化为
+    copy+delete 非原子、要么直接失败;同卷 rename 才是原子替换);
+  - **helper 等待对象 = 父进程句柄**(spawn 时继承传递;codex P1 采纳:
+    `multiple_instances=1` 时 `RIVIV` mutex 根本不创建,等 mutex 消失会
+    立即通过并对在跑映像动 `MoveFileEx`);
+  - **替换动作 = helper 读自身盘上字节(运行中可读)→ 复制为同目录
+    staging → rename staging 覆盖旧文件 → 启动新 exe → helper 退出**
+    (codex P1 采纳:运行中的 helper 自身映像不能被 `MoveFileEx` 移动,
+    初稿「helper Move 自己」结构性失败);
+  - **与 #109 单实例转发的交互仍是载重点**:helper 启动会被 mutex 转发拦成
+    「第二实例」——`cli.rs` 必须在 mutex 创建**之前**识别 `-update-self-to`
+    短路(installer `/install` 同型先例),实现票钉测。
 - 资产选择纯函数:安装版三语 Setup(zh-CN/zh-TW/en-US,loc 已检测系统语言)
-  / portable 版 portable 资产;「本实例是安装版还是 portable」的判定(注册表
-  uninstall 键/ini 区分)实现票定。
+  / portable 版 portable 资产;「安装版 vs portable」判定 = **Uninstall.exe
+  邻接或安装器写显式标记**(codex P2 采纳:初稿「注册表 uninstall 键/ini
+  区分」不可靠——现行 `riviv.nsi` 只**读**标准 uninstall 键从不写,`appdata`
+  是正交的用户选项,两侧都构不成判别式),实现票定。
 
 ## 失败语义(推演;ADR 0001 不裁此面——同 ADR 0007 D3 先例,更新类失败独立 UX)
 
 | 失败类 | 用户面 | stderr 面 | 旧版保护 |
 |---|---|---|---|
 | 网络/超时/下载中断 | 框「下载失败」 | 各 stage GetLastError 面包屑(fetch 同型) | 删半成品;旧版不动 |
-| **验签失败** | 框「签名校验失败,已取消安装」 | 记录资产名/期望公钥 | **删除下载物;绝不执行——D5 不变式的硬边界,无任何自动降级**(人工通道:提示可去 releases 页) |
+| **验签失败** | 框「签名校验失败,已取消安装,请勿安装此更新」 | 记录资产名/期望公钥 | **删除下载物;绝不执行——D5 不变式的硬边界,无任何自动降级,也不引导去 releases 页**(codex #236 P1 采纳:验签失败本身可能意味渠道正被投毒,把用户推向同一渠道=把安全边界变点击旁路;人肉通道由用户自担,应用不递梯子) |
 | 磁盘写失败/空间不足 | 同网络类 | io 错误原样 | 旧版不动 |
-| 替换/安装器失败 | fail-soft 框 | 面包屑 | 旧版保持可运行 |
+| 替换/安装器失败 | fail-soft 框 | 面包屑 | **边界如实收窄**(codex #236 P1 采纳):portable helper 路径 = 同卷原子 rename 前旧版字节未动,「旧版可运行」有保障;安装器路径 = 保障止于「Setup 启动前」,Setup 自身的覆盖语义(现行 `assoc.rs` staged 安装 `CopyFileW` 直覆盖、无备份)中途 I/O 失败可破安装——实现票评估按 assoc 先例加 staging/备份,本票只记录边界不承诺 |
 
 预算纪律:JSON 元数据维持 64 KB(D4 不变);资产流式**写盘**(不进内存),
 上限另立(建议 128 MB 量级,敌意流防线);验签在盘上完整字节流完成后进行。
