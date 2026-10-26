@@ -34,12 +34,12 @@ MIT)**,备选 ed25519-dalek(+63 KB,BSD-3,依赖树 ~10 crate);WinHTTP 默认重
 ### E2 纯 Rust 候选横评(探针口径 = 双 bin 差分;五工程同 harness、同
 `[profile.release]`(lto=thin+strip,riviv 同款)、消息走运行时文件读防 const-fold)
 
-| 路线 | 体积增量(vs base 139,776 B) | 依赖树 | 许可 | 验签耗时 @8,523,776 B | 备注 |
+| 路线 | 体积增量(vs base 139,776 B) | 依赖树 | 许可 | 验签耗时 @8,523,776 B(真实资产) | 备注 |
 |---|---|---|---|---|---|
-| **compact 2.6.0 裸档**(`default-features=false`) | +205,824 B | **0 crate(单叶)** | MIT | 26.98 ms | 全 `inline(always)` 展开致大 |
-| **compact 2.6.0 + `opt_size`**(推荐) | **+30,208 B** | **0 crate(单叶)** | MIT | 25.67 ms | `opt_size`=算术层 `inline(never)`(源码亲核),舍速度换体积;速度对单次更新无感 |
-| dalek 2.1.0(`default-features=false`,`verify_strict`) | +62,976 B | ~10 crate(curve25519-dalek+sha2+subtle+digest 族+proc-macro 链,全纯 Rust、零 `*-sys`/cc/bindgen) | BSD-3-Clause | 9.09 ms | 2.1.0 = 长稳线(2024-01 起) |
-| dalek 3.0.0(同上) | +65,024 B | 同上 | BSD-3-Clause(MSRV 1.85) | 8.14 ms | 3.0.0 刚发布(registry 亲核),churn 风险 |
+| **compact 2.6.0 裸档**(`default-features=false`) | +205,824 B | **0 crate(单叶)** | MIT | 未实测(opt_size 仅 inline 策略差,计算量同阶;速度面非决策因素——cubic #236 P3 计时归属订正:裸档未上大文件) | 全 `inline(always)` 展开致大 |
+| **compact 2.6.0 + `opt_size`**(推荐) | **+30,208 B** | **0 crate(单叶)** | MIT | 25.67 ms(big.bin 复测 26.98 ms) | `opt_size`=算术层 `inline(never)`(源码亲核),舍速度换体积;速度对单次更新无感 |
+| dalek 2.1.0(`default-features=false`,`verify_strict`) | +62,976 B | ~10 crate(curve25519-dalek+sha2+subtle+digest 族+proc-macro 链,全纯 Rust、零 `*-sys`/cc/bindgen) | BSD-3-Clause | 8.14 ms(big.bin 复测 9.09 ms) | 2.1.0 = 长稳线(2024-01 起) |
+| dalek 3.0.0(同上) | +65,024 B | 同上 | BSD-3-Clause(MSRV 1.85) | 8.79 ms | 3.0.0 刚发布(registry 亲核),churn 风险 |
 | ring / libsodium-sys | 未探针 | C/asm 经 cc 编译 | — | — | 依赖原则①否决(非纯 Rust),同 s-avif 对 reqwest 的处理 |
 
 - 元数据来源:`cargo info --registry crates-io` 亲跑(license/版本/feature 面);
@@ -68,9 +68,10 @@ MIT)**,备选 ed25519-dalek(+63 KB,BSD-3,依赖树 ~10 crate);WinHTTP 默认重
 ### E4 端到端仪式演示(信任锚全链)
 
 固定 seed `000102…1f`(探针专用,公钥 `03a107bf…31b8`)→ `probe-keygen`
-对 E3 下载的真实资产离线签名 → `probe-time`(compact+opt_size 与 dalek 双配置)
-验签:双 `true`,25.67 ms / 8.14 ms。**下载(过 CDN)→ 验签 → 通过,即产品
-形态的最小闭环,探针级全部走通。**
+对 E3 下载的真实资产离线签名 → `probe-time`(compact+opt_size 与 dalek
+**2.1.0** 双配置)验签:双 `true`,25.67 ms / 8.14 ms(dalek 3.0.0 单独工程
+复测 8.79 ms)。**下载(过 CDN)→ 验签 → 通过,即产品形态的最小闭环,探针级
+全部走通。**
 
 ## 依赖原则逐项(ed25519-compact + opt_size 路线)
 
@@ -96,10 +97,24 @@ MIT)**,备选 ed25519-dalek(+63 KB,BSD-3,依赖树 ~10 crate);WinHTTP 默认重
    `riviv-sign sign` → `<asset>.sig`(raw 64 B,4 个);上传资产 4+4=8 个文件;
    现有「下载回验 SHA」环节升格为「下载 exe+sig → `riviv-sign verify` → SHA
    对拍」(机械面不变量 +1)。
-4. **私钥事故预案**:丢失 → 老公钥无法再签,发布带新公钥的版本,老版本内置
-   更新断供(用户手动下载一次过渡版,无安全问题);疑似泄漏 → 换钥 + 过渡版
-   双钥各签(资产 `-v2.sig` 并挂),exe 验任一。v1 单钥 raw 64 B 起步,容器化
-   (magic+key-id)留实现票再裁。
+4. **签名消息域分离(cubic #236 P1#3 采纳:raw sig 只认证字节,不认证版本/
+   资产身份——被投毒渠道可重放旧签名资产做降级/错包替换,须绑定)**:被签消息
+   ≠ 裸资产字节,而是
+   `"riviv-update-v1\n" + <tag> + "\n" + <asset-文件名> + "\n" + <资产字节>`
+   (tag 与文件名都是发版仪式已知值,客户端从 API `tag_name` 比较与
+   `assets[].name` 选择得到同一对,验签前构造同前缀缓冲——纯函数)。效果:
+   旧资产+旧 sig 在新 tag 下失配(降级重放闭死)、同版本异资产失配(错包替换
+   闭死)、未来格式演进有 magic 可版本化;`.sig` 仍 raw 64 B 零解析面。
+   资产字节整体进内存一次(≤ 128 MB 预算同内存上限,8.5 MB 量级无压力)。
+5. **私钥事故预案**:丢失 → 老公钥无法再签,发布带新公钥的版本,老版本内置
+   更新断供(用户手动下载一次过渡版,无安全问题);疑似泄漏 → **换钥 + 过渡
+   版双钥各签(资产 `.sig`/`-v2.sig` 并挂),过渡版验任一;过渡版之后的版本
+   一律只验新钥**——「验任一」只存在于过渡版存续期,且攻击者需同时持旧私钥
+   与渠道投毒能力才构成攻击面,该面随存量升级单调收敛(cubic #236 P1#2
+   采纳后的形态:旧钥在 pinned-key 模型下**无法真正吊销**是固有残留——只内嵌
+   旧公钥的老 exe 最多信任到过渡版为止,同 Tauri/minisign 形态,接受并留档;
+   根治 = Authenticode 级链式信任,超出本刀)。可选缓解「exe 内嵌最低安全版本
+   单调闸」记录不推荐(每发版改硬编码,仪式负担换冗余防线)。
 
 ## portable 自替换(O1=C,推演;Sumatra helper 模式对映,s-auto-update O1=C 先例)
 
@@ -145,9 +160,11 @@ MIT)**,备选 ed25519-dalek(+63 KB,BSD-3,依赖树 ~10 crate);WinHTTP 默认重
 - **P1 crate**:A = ed25519-compact `=2.6.0` + `opt_size`(**推荐**:零依赖、
   +30 KB、MIT、够快)/ B = ed25519-dalek 2.1.0(更快 3×、组织维护,但 +63 KB
   且依赖树 ×10)。
-- **P2 签名资产形态**:A = per-asset raw `<asset>.sig` 64 B ×4(**推荐**:
-  零解析面、免客户端哈希)/ B = 单一 signed manifest(少 3 个资产,但引入
-  manifest 格式+SHA-256 依赖+解析面)。
+- **P2 签名资产形态**:A = per-asset raw `<asset>.sig` 64 B ×4,**签名消息按
+  仪式节 4 域分离绑定 tag+资产名**(**推荐**:零解析面、免客户端哈希、降级
+  重放与错包替换闭死)/ B = 单一 signed manifest(少 3 个资产,但引入
+  manifest 格式+SHA-256 依赖+解析面,且防重放同样要绑版本——域分离的裸 sig
+  已覆盖其安全收益)。
 - **P3 首刀范围**:A = O1=B+C 同刀(**推荐**:下载/验签/失败语义底座完全共用,
   portable 半边缺了则 portable 用户无法用内置更新)/ B = 先 B(仅安装版)后 C。
 - **P4 触发 UX**:A = 手动 Available 框升三钮 MB_YESNOCANCEL
