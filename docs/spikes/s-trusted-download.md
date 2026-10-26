@@ -131,17 +131,31 @@ codex #236 四 findings 订正后的形态)
   初稿「先退出再启动」无人调 ShellExecuteW);「覆盖在跑文件」(R7)由安装器
   既有握手解——`assoc.rs::process_install_command_line` 的 staged `/install`
   进程本来就会关闭并等待存量查看器再落盘,Setup 路径复用同型语义。
-- portable 版(三步订正全采纳):
-  - **落盘位置 = 原 exe 同目录旁置 staging**(codex P2 采纳:USB 盘 portable
-    的 `%TEMP%` 跨卷,`MoveFileEx` 跨卷要么带 `MOVEFILE_COPY_ALLOWED` 退化为
-    copy+delete 非原子、要么直接失败;同卷 rename 才是原子替换);
-  - **helper 等待对象 = 父进程句柄**(spawn 时继承传递;codex P1 采纳:
-    `multiple_instances=1` 时 `RIVIV` mutex 根本不创建,等 mutex 消失会
-    立即通过并对在跑映像动 `MoveFileEx`);
-  - **替换动作 = helper 读自身盘上字节(运行中可读)→ 复制为同目录
-    staging → rename staging 覆盖旧文件 → 启动新 exe → helper 退出**
-    (codex P1 采纳:运行中的 helper 自身映像不能被 `MoveFileEx` 移动,
-    初稿「helper Move 自己」结构性失败);
+  **Setup 启动须传递当前安装目录**(codex #236 P2 二轮采纳:`riviv.nsi` 的
+  `$INSTDIR` 默认 `$PROGRAMFILES64\riviv`,其目录恢复所读的 uninstall 键值
+  现行脚本从不写入——自定义目录安装会被静默装出第二份而旧安装原地滞留);
+  机制 = nsi 侧接参 + 落显式安装标记,实现票定。
+- portable 版(文件名三段消歧 + 生命周期,cubic #236 P2 二轮采纳;codex
+  三步订正全采纳):
+  - **下载物/验签对象 = `<原 exe 目录>\riviv-update-<tag>.exe`**(同目录
+    旁置;codex P2 采纳:USB 盘 portable 的 `%TEMP%` 跨卷,`MoveFileEx`
+    跨卷要么带 `MOVEFILE_COPY_ALLOWED` 退化为 copy+delete 非原子、要么直接
+    失败);
+  - **helper = 同一文件**,由旧实例以
+    `-update-self-to <原路径>` 启动;等待对象 = **父进程句柄**(spawn 时
+    继承传递;codex P1 采纳:`multiple_instances=1` 时 `RIVIV` mutex 根本
+    不创建,等 mutex 消失会立即通过并对在跑映像动 `MoveFileEx`);
+  - **替换序列**(helper 读自身盘上字节——运行中可读;运行中的 helper
+    自身映像不能被 Move,codex P1 采纳):写 `<原路径>.tmp` → rename
+    `<原路径>`→`<原路径>.old` → rename `<原路径>.tmp`→`<原路径>`
+    (第二步失败则 rename 回滚)→ 启动新 exe → 删 `<原路径>.old`(父进程
+    已退,无锁)→ helper 退出;helper 自身文件运行中不可删 → **新版启动时
+    旁置残留清扫 `riviv-update-*.exe`**(同 staged-ini 清理纪律)。
+  - **原子性如实限定**(cubic #236 P2 二轮采纳):同卷双 rename 在 NTFS
+    上原子,FAT/exFAT 家族替换语义弱——「旧版字节完整在位直到第二次 rename
+    成功」的保障成立且失败可 rename-back 回滚,但两段 rename 之间的中断
+    窗口随文件系统而异;实现票选有明确替换/回滚语义的 API
+    (`ReplaceFileW` 带备份为候选)或限定并验证支持的文件系统。
   - **与 #109 单实例转发的交互仍是载重点**:helper 启动会被 mutex 转发拦成
     「第二实例」——`cli.rs` 必须在 mutex 创建**之前**识别 `-update-self-to`
     短路(installer `/install` 同型先例),实现票钉测。
@@ -158,7 +172,7 @@ codex #236 四 findings 订正后的形态)
 | 网络/超时/下载中断 | 框「下载失败」 | 各 stage GetLastError 面包屑(fetch 同型) | 删半成品;旧版不动 |
 | **验签失败** | 框「签名校验失败,已取消安装,请勿安装此更新」 | 记录资产名/期望公钥 | **删除下载物;绝不执行——D5 不变式的硬边界,无任何自动降级,也不引导去 releases 页**(codex #236 P1 采纳:验签失败本身可能意味渠道正被投毒,把用户推向同一渠道=把安全边界变点击旁路;人肉通道由用户自担,应用不递梯子) |
 | 磁盘写失败/空间不足 | 同网络类 | io 错误原样 | 旧版不动 |
-| 替换/安装器失败 | fail-soft 框 | 面包屑 | **边界如实收窄**(codex #236 P1 采纳):portable helper 路径 = 同卷原子 rename 前旧版字节未动,「旧版可运行」有保障;安装器路径 = 保障止于「Setup 启动前」,Setup 自身的覆盖语义(现行 `assoc.rs` staged 安装 `CopyFileW` 直覆盖、无备份)中途 I/O 失败可破安装——实现票评估按 assoc 先例加 staging/备份,本票只记录边界不承诺 |
+| 替换/安装器失败 | fail-soft 框 | 面包屑 | **边界如实收窄**(codex #236 P1 采纳):portable helper 路径 = 第二次 rename 成功前旧版字节完整在位、失败可 rename-back 回滚(两段 rename 间的中断窗口随文件系统而异,NTFS 原子/FAT 家族弱,实现票以明确替换语义 API 收口);安装器路径 = 保障止于「Setup 启动前」,Setup 自身的覆盖语义(现行 `assoc.rs` staged 安装 `CopyFileW` 直覆盖、无备份)中途 I/O 失败可破安装——实现票评估按 assoc 先例加 staging/备份,本票只记录边界不承诺 |
 
 预算纪律:JSON 元数据维持 64 KB(D4 不变);资产流式**写盘**(不进内存),
 上限另立(建议 128 MB 量级,敌意流防线);验签在盘上完整字节流完成后进行。
