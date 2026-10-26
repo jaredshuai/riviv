@@ -45,6 +45,7 @@
 | docs/adr/0005-svg-resvg-full.md | 设计与决策 | current | 规划者/SVG 依赖复议时 | ADR:resvg-full 体积破例(#152;D6 交互式重栅) |
 | docs/adr/0006-d2d-effect-chain.md | 设计与决策 | current | 规划者/效果链扩展或 WARP 排除解除复议时 | ADR:D2D 显示效果链地基(#182 裁定 O1-O6;实现票族 #183①起) |
 | docs/adr/0007-winhttp-update-check.md | 设计与决策 | current | 规划者/更新机制扩展(O1 下载安装/O2 启动检查后继刀)时 | ADR:应用内更新检查 notify-only(#210;WinHTTP 静态导入,双臂 dumpbin 证据) |
+| docs/adr/0008-avif-oxideav-size-exception.md | 设计与决策 | current | 规划者/AVIF 依赖复议时 | ADR:AVIF 输入面 oxideav 体积破例(#220;2026-10-26 补登——原漏登,#235 spike 登记时发现) |
 | smoke/ | 验证与观察 | current | 执行者/冒烟脚本增改时 | GUI 冒烟脚本 15 份(smoke173=故障注入矩阵,#172)+golden81/golden90 语料+README;QA 机器面主力(2026-09-29 卫生盘点补登) |
 | docs/spikes/s-fault-injection.md | 验证与观察 | current | 调查者/故障注入手段复议时 | 注入手段选型证据链:合成弦被忽略/TDR 框弃/PnP-VM 需提权→seam 定案(#172) |
 | docs/spikes/s1-platform-floor.md | 验证与观察 | current | 调查者/平台地板再评估时 | min-OS 钉死 1607 的导入表证据(#97) |
@@ -56,6 +57,7 @@
 | docs/spikes/s-auto-update.md | 验证与观察 | current | 调查者/更新面咨询复议时 | 应用内更新检查开题证据:横评(框架 vs 原生 Win32)/PE 导入基线/GitHub API 渠道/WinHTTP+ADR 硬前置 + 开放问题 O1-O6(#208) |
 | docs/spikes/s-startup-update-check.md | 验证与观察 | current | 调查者/启动检查复议时 | 启动自动检查开题证据(#214;落地 #217/#218;2026-10-24 补登——原漏登,s-v6-chrome 登记时发现) |
 | docs/spikes/s-v6-chrome.md | 验证与观察 | current | 调查者/v6 主题化复议时 | Common-Controls v6 chrome 开题证据:manifest-only 激活/零新 DLL/视觉矩阵 13 面(四 Dialog 实测+Rename 未测)/度量漂移 1 项/合成探针阴性观察(#227;O1 拍板待用户) |
+| docs/spikes/s-trusted-download.md | 验证与观察 | current | 调查者/O1 下载安装后继刀复议时 | 下载+安装信任锚开题证据:CNG 双证据否决/纯 Rust 横评带数字/下载通道+端到端仪式实测/RELEASE 仪式与 portable 自替换推演 + 拍板项 P1-P4(#235) |
 | docs/agents/triage-labels.md | 规则与术语 | current | 规划者/标签词汇变化时 | 五标签分诊词汇 |
 | docs/agents/domain.md | 规则与术语 | current | 规划者/文档架构变化时 | 单上下文+ADR 约定 |
 | docs/plan-26-association-nsis.md | 需求与验收 | reference | 书记员/历史留档 | #26 安装族历史规格;特性已交付,原位保留 |
