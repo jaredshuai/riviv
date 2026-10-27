@@ -18,14 +18,18 @@
 powershell -NoProfile -ExecutionPolicy Bypass -File smoke\smoke237-trusted-update.ps1 [-NewExe <path>] [-OldExe <path>] [-ProbeExe <path>]
 ```
 
-场景(S0-S6;新 exe 与 v0.8.0 基线臂 exe 双臂,断言全部 SHA 对拍不用版本号;
-S3/S5 走真实 GitHub 渠道,网络不可达时如实 BLOCKED):S1 helper 自替换端到端
-(`-update-self-to` 短路先于 RIVIV mutex——持锁真窗口在场时换体仍落地,
-牺牲父进程句柄经 STARTF_USESTDHANDLES/hStdInput 继承,替换后下一启动清扫
-helper 残体);S2 悬空参退出码 2;S3 三钮 Available(2/6/7)+「是」在无 .sig
-资产渠道的今日真实行为=下载失败框;S4 riviv-sign 篡改臂(rc1 VERIFY-FAIL/
-原样 VERIFY-OK);S5 写拒绝目录臂;S6 smoke78 回归 + 旧文案钉检查(只报告)。
-退出码:0 全绿 / 1 FAIL / 2 缺 exe / 4 外来活 riviv。日志
+场景(S0-S7;新 exe 与 v0.8.0 基线臂 exe 双臂,断言全部 SHA 对拍不用版本号;
+S3/S5/S7 走真实 GitHub 渠道,网络不可达时如实 BLOCKED):S1 helper 自替换端到端
+(`-update-self-to` 短路先于 RIVIV mutex——持锁真窗口在场时换体仍落地;P/Invoke
+**镜像生产 spawn_helper 形状**:lpApplicationName=NULL 模块名取命令行首引号词
+(ab51bcd P1 修复后契约,IntPtr 型参数保真 NULL,防 PS `$null`→空串 123),
+牺牲父进程句柄经 STARTF_USESTDHANDLES/hStdInput 继承;替换后下一启动清扫
+helper 残体与现场栽的 riviv.exe.tmp 残件);S2 悬空参退出码 2;S3 三钮
+Available(2/6/7)+「是」→下载失败框(渠道无 .sig);S4 riviv-sign 篡改臂
+(rc1 VERIFY-FAIL/原样 VERIFY-OK);S5 写拒绝目录臂;S7 Installed 形态语言臂
+(哑 Uninstall.exe 邻接 → 本地化 Setup 资产名随框文案语言,%TEMP% staging 不
+落 exe 目录);S6 smoke78 回归 + 旧文案钉检查(只报告)。退出码:0 无 FAIL /
+1 有 FAIL / 2 缺 exe / 4 外来活 riviv。日志
 `%TEMP%\riviv-237-smoke\smoke237.log`。
 
 ## smoke126-renderer.ps1(#126 `-renderer` sticky 开关 + dump output_gen)

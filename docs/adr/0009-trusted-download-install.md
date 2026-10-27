@@ -3,7 +3,7 @@
 - 日期: 2026-10-27
 - 状态: 已接受(P1-P4 全按推荐,用户拍板 2026-10-26「全按推荐」;实现票 #237;spike #235 证据电池 `docs/spikes/s-trusted-download.md`,PR #236 评审 17 findings 全处置)
 - 范围: O1=B(下载+验签+跑安装器)+ O1=C(portable 自替换)同刀;信任锚选型、签名形态与仪式、下载通道、双形态安装语义、失败语义、riviv-sign 工具、触发 UX。**不含**: Authenticode 级链式信任、私钥泄漏后的根治(见 D7 预案分层)
-- 上游权威: spike #235(CNG 双证据否决/横评带数字/下载通道实测/端到端仪式演示)、ADR 0007 D5(notify-only 边界与「称『已验证下载』前须另立信任锚」的动因)、ADR 0001(显式不裁更新失败面——同 ADR 0007 D3 先例)、依赖原则③(体积;本刀 +30 KB 级,**无需破例 ADR**)、s1-platform-floor(新 DLL 导入纪律)
+- 上游权威: spike #235(CNG 双证据否决/横评带数字/下载通道实测/端到端仪式演示)、ADR 0007 D5(notify-only 边界与「称『已验证下载』前须另立信任锚」的动因)、ADR 0001(显式不裁更新失败面——同 ADR 0007 D3 先例)、依赖原则③(体积;本刀双臂实录 +72 KB 级、零新 DLL,**无需破例 ADR**)、s1-platform-floor(新 DLL 导入纪律)
 
 ## 背景
 
@@ -23,11 +23,11 @@ ADR 0007 D5 钉死 notify-only:「riviv 永不下载、永不校验、永不替�
 "riviv-update-v1\n" + <tag> + "\n" + <资产文件名> + "\n" + <资产字节>
 ```
 
-tag 与文件名都是发版仪式已知值,客户端从检查得来的 tag 与自己构造的资产名得到同一对,验签前构造同前缀缓冲(纯函数)。效果:旧资产+旧 sig 在新 tag 下失配(降级重放闭死)、同版本异资产失配(错包替换闭死)、格式演进有 magic 可版本化。残余面如实:`tag_name` 值与资产名都含 LF 时存在字段走私碰撞,但 tag 上游经 `parse_semver` 数字门、资产名恒为自构 ASCII 名,实践不可达(测试明文留档该已知残余)。**signer 与 client 的消息构造必须同一公式**(codex #236 P1:signer 签裸字节而 client 验域分离缓冲=每个正确发版都验签失败)——两份实现有意分离(见 D8),以「跨实现测试向量」钉死锁合(`src/sig.rs` 内嵌 riviv-sign 产出的向量,tag 与资产名故意异版防字段对调),发版回验环节是端到端哨兵。
+tag 与文件名都是发版仪式已知值,客户端从检查得来的 tag 与自己构造的资产名得到同一对,验签前构造同前缀缓冲(纯函数)。效果:旧资产+旧 sig 在新 tag 下失配(降级重放闭死)、同版本异资产失配(错包替换闭死)、格式演进有 magic 可版本化。残余面如实:①`tag_name` 值与资产名都含 LF 时存在字段走私碰撞,但 tag 上游经 `parse_semver` 数字门、资产名恒为自构 ASCII 名,实践不可达(测试明文留档该已知残余);②**保障边界 = 安装版以下、非渠道全量**(cubic #238 P1 处置):无钥攻击者只能重放「严格新于安装版」的**真实签名发版**(decide() 数值门拒绝一切降级),`releases/latest` 响应被替换为陈旧真实发版时用户最多拿到「新于己、旧于最新」的真版本——miss-not-corrupt;「单调最低版本闸」类增强经 spike 评估**记录不推荐**(每发版改硬编码的仪式负担换冗余防线,对持钥对手可伪造任意「≤闸」消息无效),持钥者的任意伪造属 D7 泄漏预案面。**signer 与 client 的消息构造必须同一公式**(codex #236 P1:signer 签裸字节而 client 验域分离缓冲=每个正确发版都验签失败)——两份实现有意分离(见 D8),以「跨实现测试向量」双侧钉死锁合(`src/sig.rs` 与 riviv-sign 各内嵌同一向量,tag 与资产名故意异版防字段对调),发版回验环节是端到端哨兵。
 
 ### D3. 下载通道 = 复用 ADR 0007 WinHTTP 底座,流式写盘 + 128 MB 预算
 
-E3 实测:默认重定向策略(跟随同方案 302)走通 github.com → release-assets CDN 链,零新重定向代码;下载 URL 由 tag+资产名直接构造(不经 API 二次解析——D2 的域分离使任何 URL 混淆都过不了验签,构造即安全)。`winhttp_get` 从 #210 的 `fetch_latest_body` 参数化抽出(host/path/sink),检查与下载共用一条传输壳。资产**流式写盘不进内存**(8.5 MB 量级,预算 128 MB 另立=敌意流防线,`asset_fits` 纯函数与 D4 的 64 KB JSON 预算同构);sig 走内存 sink 且必须**恰好 64 B**(404 的 HTML 体超预算自然落失败)。验签在盘上完整字节流落地后进行(读回内存一次,≤128 MB 上限内),绝不流中验签。**staging 位置分形态**(codex #236 P2 采纳):portable = exe 同目录旁置(`riviv-update-<tag>.exe`,USB 盘的 `%TEMP%` 跨卷,`MoveFileEx` 跨卷要么退化 copy+delete 非原子要么直接失败);installed = `%TEMP%`(标准用户进程写不进 Program Files,Setup 自提升)。
+E3 实测:默认重定向策略(跟随同方案 302)走通 github.com → release-assets CDN 链,零新重定向代码;下载 URL 由 tag+资产名直接构造(不经 API 二次解析——D2 的域分离使任何 URL 混淆都过不了验签,构造即安全)。`winhttp_get` 从 #210 的 `fetch_latest_body` 参数化抽出(host/path/sink),检查与下载共用一条传输壳;壳内统一 **HTTP 200 门**(cubic #238 P2:非 200 资产体落盘会死在验签、弹「渠道投毒」框——错分失败类)+ **每次读分配上限 64 KB**(`avail` 系服务器口径,#237 重构曾把 #210 的「先查预算再分配」退化成「先分配后查」——codex #238 抓回)。资产**流式写盘不进内存**(8.5 MB 量级,预算 128 MB 另立=敌意流防线,`asset_fits` 纯函数与 D4 的 64 KB JSON 预算同构);sig 走内存 sink 且必须**恰好 64 B**(404 的 HTML 体超预算自然落失败)。验签在盘上完整字节流落地后进行(读回内存一次,≤128 MB 上限内),绝不流中验签。**staging 位置分形态**(codex #236 P2 采纳):portable = exe 同目录旁置(`riviv-update-<tag>-<pid>.exe`,pid 后缀=per-flight 唯一——`multiple_instances=1` 双实例并发接同一更新时共享确定性名字会让一方的截断落进另一方的读/验签/spawn,最坏把半成品交进 helper(codex #238);清扫前缀不受影响;USB 盘的 `%TEMP%` 跨卷,`MoveFileEx` 跨卷要么退化 copy+delete 非原子要么直接失败);installed = `%TEMP%`(标准用户进程写不进 Program Files,Setup 自提升)。
 
 ### D4. 安装版路径 = Setup relay,先启后退,`/installdir` 传当前目录
 
@@ -38,10 +38,10 @@ E3 实测:默认重定向策略(跟随同方案 302)走通 github.com → releas
 Sumatra helper 模式对映(codex #236 四 findings 订正后的形态):
 
 - 下载物/验签对象 = `<exe 目录>\riviv-update-<tag>.exe`;helper = **同一下载物**,由旧实例以 `-update-self-to <原路径>` 启动;
-- 等待对象 = **父进程句柄**(spawn 时 STARTF_USESTDHANDLES + hStdInput 继承传递,子端 GetStdHandle 读回;`multiple_instances=1` 时 RIVIV mutex 根本不创建,等 mutex 会立即通过对在跑映像动手——codex #236 P1);60 s 上限=挂死守卫(超时放弃,旧版无恙,残留由清扫收);
+- 等待对象 = **父进程句柄**(spawn 时 STARTF_USESTDHANDLES + hStdInput 继承传递,子端 GetStdHandle 读回;`multiple_instances=1` 时 RIVIV mutex 根本不创建,等 mutex 会立即通过对在跑映像动手——codex #236 P1);60 s 上限=挂死守卫(超时放弃,旧版无恙,残留由清扫收)。**straggler 实例残余如实**(cubic #238 P2 处置):同目录多实例下,helper 只等「发起方」退出;替换瞬间的另一在跑旧实例不受锁害(rename 型替换容忍运行中映像,其继续从旧字节运行),最坏情形 ReplaceFileW 失败或 `.old` 删除失败 → 走 fail-soft 框、旧版完整在位、下次更新重试——退化不损坏,「确保全部实例退出再替换」的进程间协调对 `multiple_instances=1` 的边缘并发不成比例,记录不采;
 - **`-update-self-to` 短路在单实例 mutex 创建之前**(`run()` 内、install pass 后;#109 载重交互:helper 启动时旧实例仍持锁,走到转发逻辑会被当第二实例静默丢弃)——纯解析函数钉测;
 - 替换序列:helper 读自身盘上字节(运行中可读)→ 写 `<orig>.tmp` → **`ReplaceFileW(orig, tmp, backup=orig.old)`**(三步 rename 舞的单调用形态:旧版字节完整在位直到替换落地、备份内建、失败即败不半换;第二步失败 rename-back 的回滚语义由该 API 合同承担)→ 启动新 exe → 删 `<orig>.old`(父进程已退;滞留旧映像的 straggler 实例使删除失败=无害,下次清扫重试)→ helper 退出;
-- helper 自身映像运行中不可删 → **每次启动旁置清扫** `riviv-update-*.exe` 前缀、`<exe 名>.old` 备份与 `<exe 名>.tmp`(写 tmp 后、ReplaceFileW 前崩溃滞留的半成品;评审 #238 补 .tmp 盲区;exe 目录 + `%TEMP%` 两处,staged-ini 清理纪律同款;删除失败=仍被占用,fail-soft 下次再扫);
+- helper 自身映像运行中不可删 → **每次启动旁置清扫** `riviv-update-*.exe` 前缀、`<exe 名>.old` 备份与 `<exe 名>.tmp`(写 tmp 后、ReplaceFileW 前崩溃滞留的半成品;评审 #238 补 .tmp 盲区;exe 目录 + `%TEMP%` 两处,staged-ini 清理纪律同款;删除失败=仍被占用,fail-soft 下次再扫)。多实例残余:他实例的启动清扫撞上在飞下载时,open 句柄(无 FILE_SHARE_DELETE)使删除自然失败;下载已闭、验签前的窄窗被删则该 flight 退化为 fail-soft 重试(cubic #238 P2 处置记录,无安全面——被删物无法通过验签);
 - 原子性如实限定(cubic #236 P2 二轮采纳):同卷双 rename 在 NTFS 原子,FAT/exFAT 家族替换语义弱——「旧版字节完整在位直到替换成功 + 失败可回滚」成立,两段之间的中断窗口随文件系统而异,留档不掩盖。
 
 ### D6. 失败语义 = 独立 UX 表(ADR 0001 不裁,同 0007 D3 先例)
@@ -71,6 +71,6 @@ Sumatra helper 模式对映(codex #236 四 findings 订正后的形态):
 
 - 纯函数入测试网:域分离消息构造字节级钉测+sign/verify 往返+跨实现向量+篡改/重放/错包/错钥五向拒绝(sig.rs 7 测试);资产名对拍真实 v0.8.0 四资产名、staging/URL 构造、128 MB 预算边界、Uninstall.exe 邻接判定(update_install.rs 5 测试);helper 行解析全拼写/非 helper 行/悬空参、清扫谓词、清扫只删残留(self_replace.rs 5 测试);Outcome::Available 改带原始 tag 的 decide 钉测更新。
 - loc 三表:新 4 串(安装预告/下载失败/验签失败/替换失败)+ 三钮措辞改写;非空网/撞车网自动覆盖。
-- 机械面(双臂亲录 2026-10-27,VS BuildTools dumpbin 14.51.36231):arm A = `ba46b39` 重建 8,523,776 B(与 v0.8.0 发布字节一致,基线复现);arm B = 本刀评审修复后态 8,595,968 B,**库内净增 +72,192 B**(初版 8,596,480/+72,704,孪生收敛 −512 B;发版锚以全量干净重构建为准——v0.7.0 勘误先例。探针 +30,208 B 系 verify-only 口径:s-avif 教训重演,探针差分不含本刀其余新代码面 update_install/self_replace/loc 等;量级距任何阈值余量充分,无需破例);dumpbin 双臂各 25 唯一 DLL、**diff 恰零条=零新 DLL 导入**(纯算术零 OS API,GetStdHandle 在既有 kernel32 面)。
+- 机械面(双臂亲录 2026-10-27,VS BuildTools dumpbin 14.51.36231):arm A = `ba46b39` 重建 8,523,776 B(与 v0.8.0 发布字节一致,基线复现);arm B = 评审处置终态 8,598,016 B,**库内净增 +74,240 B**(初版 8,596,480 → 孪生收敛 8,595,968 → 状态码门+pid 后缀等评审修复 8,598,016;发版锚以全量干净重构建为准——v0.7.0 勘误先例。探针 +30,208 B 系 verify-only 口径:s-avif 教训重演,探针差分不含本刀其余新代码面 update_install/self_replace/loc 等;量级距任何阈值余量充分,无需破例);dumpbin 双臂各 25 唯一 DLL、**diff 恰零条=零新 DLL 导入**(纯算术零 OS API,GetStdHandle 在既有 kernel32 面;WinHttpQueryHeaders 在既有 winhttp 面)。
 - 冒烟四臂(smoke237,子代理串行):验签通过(工具级;应用内全链待首个带 `.sig` 发版)/篡改 1 B 失败/网络失败/磁盘失败 + 资产选择(三语名=单测对拍真实 v0.8.0 资产名;运行时臂=本机语言+双形态的 stderr 面包屑断言——UI 语言按 D4 同款检测即一切,单值不可注入)+ `-update-self-to` 端到端(含持锁真窗口在场证明短路不被转发);1607 真机走既有观察项通道。
 - 兼容面:v0.8.0 存量只认 notify-only(无 `.sig` 资产时点「是」=下载失败框,不炸),**首个带签名资产的发版起仪式生效**。

@@ -39,6 +39,13 @@ pub(crate) const MAGIC: &str = "riviv-update-v1";
 /// Build the domain-separated signed message. Must stay byte-identical
 /// to `tools/riviv-sign/src/main.rs::signed_message` — the pinned test
 /// vector below is the lock.
+///
+/// Memory note: this copies the whole asset into the message buffer on
+/// top of the caller's read — a transient 2× peak (worst case ~256 MB
+/// at the 128 MB budget, ~17 MB at the real 8.5 MB assets; review #238
+/// cubic, accepted tradeoff: ed25519-compact takes the message by
+/// slice, so a zero-copy layout would need a pre-sized read into the
+/// message tail — machinery not worth the real-asset sizes).
 pub(crate) fn signed_message(tag: &str, asset_name: &str, asset: &[u8]) -> Vec<u8> {
     let mut msg = Vec::with_capacity(MAGIC.len() + tag.len() + asset_name.len() + asset.len() + 3);
     msg.extend_from_slice(MAGIC.as_bytes());

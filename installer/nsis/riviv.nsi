@@ -172,6 +172,9 @@ no_existing_install_dir:
 	ClearErrors
 	${GetOptions} $CMDLINE "/installdir" $R1
 	IfErrors no_update_installdir
+	; Empty-value guard (#238): a bare `/installdir ""` must not wipe
+	; $INSTDIR to the empty string (bogus install target).
+	StrCmp $R1 "" no_update_installdir
 	StrCpy $INSTDIR $R1
 
 no_update_installdir:

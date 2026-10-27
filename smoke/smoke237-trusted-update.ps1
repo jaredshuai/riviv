@@ -60,12 +60,17 @@
 #   S1 helper self-replace end-to-end (THE core):
 #       a) a REAL riviv window (new exe, staged elsewhere) is up and holds
 #          the RIVIV mutex;
-#       b) PS P/Invokes CreateProcessW to run the staged helper
-#          (-update-self-to <old>\riviv.exe) with STARTF_USESTDHANDLES and
-#          hStdInput = an inherited PROCESS_SYNCHRONIZE handle to a
-#          sacrificial ping process (bInheritHandles=TRUE); after 2 s the
-#          helper is still alive, riviv.exe still has the BASELINE sha, and
-#          no .tmp/.old exists (still waiting);
+#       b) PS P/Invokes CreateProcessW MIRRORING THE PRODUCTION spawn_helper
+#          SHAPE (ab51bcd, review #238 P1): lpApplicationName = NULL (the
+#          module comes from the command line's first QUOTED word - a
+#          quoted appname is a literal path WITH quotes = ERROR_INVALID_NAME
+#          123; the pre-fix smoke passed an explicit unquoted appname and
+#          silently bypassed the bug), no env/cwd override, lpCommandLine =
+#          the full quoted line, STARTF_USESTDHANDLES and hStdInput = an
+#          inherited PROCESS_SYNCHRONIZE handle to a sacrificial ping
+#          process (bInheritHandles=TRUE); after 2 s the helper is still
+#          alive, riviv.exe still has the BASELINE sha, and no .tmp/.old
+#          exists (still waiting);
 #       c) kill the sacrifice -> poll <=30 s: riviv.exe sha == NEW sha,
 #          riviv.exe.old absent, .tmp absent, helper exit code 0, the
 #          helper staging file still on disk (normal: only a future startup
@@ -74,8 +79,11 @@
 #          riviv.exe while the mutex owner is alive forwards and exits 0
 #          fast WITHOUT sweeping (the helper staging file survives);
 #       e) close the owner window -> launch the replaced riviv.exe again ->
-#          it now reaches the startup sweep: the staging file is deleted
-#          within 15 s and the new code opens a normal window; close it.
+#          it now reaches the startup sweep: the staging file AND a planted
+#          riviv.exe.tmp residue (the ab51bcd predicate arm - a crash
+#          between write-tmp and ReplaceFile would strand a half-build
+#          forever) are deleted within 15 s and the new code opens a normal
+#          window; close it.
 #   S2 helper dangling switch: `riviv-update-v0.9.0.exe -update-self-to`
 #       (no arg) from a fresh substage -> exit code 2, no MessageBox at any
 #       point during its life, the replaced riviv.exe bytes untouched.
@@ -112,6 +120,15 @@
 #       FAIL; then smoke78-view-child.ps1 is re-run against the probe exe
 #       (it takes -Exe) and its DONE line is mapped 1:1; falling back to
 #       the new exe is stated in the evidence if the probe is unavailable.
+#   S7 install-flavor language arm: the probe runs INSTALLED (a dummy
+#       Uninstall.exe beside it = the whole detect_flavor adjacency test),
+#       127 -> Available -> BM_CLICK YES -> the flight targets the
+#       LOCALIZED Setup asset (riviv-0.8.0.x64.<locale>-Setup.exe; locale
+#       read off the box text's language), the breadcrumb pins
+#       flavor=Installed and a staging path OUTSIDE the exe dir (Installed
+#       staging = %TEMP%), the channel's missing Setup .sig lands the
+#       download-failed box, zero staging residue anywhere, the dummy
+#       marker untouched, clean exit.
 #
 # ADAPTATIONS vs the ticket sketch (all code-grounded, not behavior
 # drift): (1) `git worktree add --detach` - the branch is checked out in
@@ -162,8 +179,14 @@ public class S237 {
 
     // CharSet.Unicode is REQUIRED: without it the StringBuilder command
     // line marshals as ANSI bytes and CreateProcessW reads them as UTF-16
-    // garbage (the W entry point).
-    [DllImport("kernel32.dll", SetLastError=true, CharSet=CharSet.Unicode)] public static extern bool CreateProcessW(string applicationName, StringBuilder commandLine, IntPtr procAttrs, IntPtr threadAttrs, bool inheritHandles, uint creationFlags, IntPtr environment, string currentDirectory, ref STARTUPINFOW si, out PROCESS_INFORMATION pi);
+    // garbage (the W entry point). applicationName/currentDirectory are
+    // IntPtr - NOT string: a literal $null string param is bound by PS as
+    // an EMPTY-STRING buffer and lpApplicationName="" is ERROR_INVALID_NAME
+    // (the diag237 lesson); IntPtr Zero is a REAL NULL. This is exactly the
+    // production spawn_helper shape (ab51bcd, review #238 P1): appname NULL
+    // (module from the command line's first QUOTED word), no env/cwd
+    // override.
+    [DllImport("kernel32.dll", SetLastError=true, CharSet=CharSet.Unicode)] public static extern bool CreateProcessW(IntPtr applicationName, StringBuilder commandLine, IntPtr procAttrs, IntPtr threadAttrs, bool inheritHandles, uint creationFlags, IntPtr environment, IntPtr currentDirectory, ref STARTUPINFOW si, out PROCESS_INFORMATION pi);
     [DllImport("kernel32.dll")] public static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
     [DllImport("kernel32.dll")] public static extern bool SetHandleInformation(IntPtr h, uint mask, uint flags);
     [DllImport("kernel32.dll")] public static extern bool CloseHandle(IntPtr h);
@@ -235,6 +258,7 @@ $S2Dir    = Join-Path $Stage 's2'       # dangling-switch helper copy
 $ProbeDir = Join-Path $Stage 'probe'    # 0.0.1 probe (portable)
 $RoDir    = Join-Path $Stage 'ro'       # write-denied copy for S5
 $TampDir  = Join-Path $Stage 'tamper'   # S4 same-name tampered asset
+$S7Dir    = Join-Path $Stage 's7'       # S7 probe + dummy Uninstall.exe (Installed)
 $LogPath  = Join-Path $Stage 'smoke237.log'
 $OldTarget = Join-Path $OldDir 'riviv.exe'
 $HelperFile = Join-Path $OldDir 'riviv-update-v0.9.0.exe'
@@ -242,6 +266,7 @@ $OldIni  = Join-Path $OldDir 'riviv.ini'
 $WinIni  = Join-Path $WinDir 'riviv.ini'
 $ErrNew  = Join-Path $Stage 'probe-stderr.log'
 $ErrRo   = Join-Path $Stage 'ro-stderr.log'
+$ErrS7   = Join-Path $Stage 's7-stderr.log'
 
 # Box-text match strings, built from char codes so THIS FILE STAYS PURE
 # ASCII (the PS 5.1 param-binding trap). The disjunctions cover the en-US,
@@ -533,7 +558,7 @@ if ($still.Count -gt 0) {
 # assertion may read the name as truth).
 $prepOk = $true
 try {
-    foreach ($d in @($OldDir, $WinDir, $S2Dir, $ProbeDir, $RoDir, $TampDir)) {
+    foreach ($d in @($OldDir, $WinDir, $S2Dir, $ProbeDir, $RoDir, $TampDir, $S7Dir)) {
         New-Item -ItemType Directory -Path $d -Force -ErrorAction Stop | Out-Null
     }
     Copy-Item $OldExe $OldTarget -Force -ErrorAction Stop
@@ -545,7 +570,7 @@ try {
     $prepOk = $false
 }
 $iniPre = @()
-foreach ($d in @($OldDir, $WinDir, $S2Dir, $ProbeDir, $RoDir)) {
+foreach ($d in @($OldDir, $WinDir, $S2Dir, $ProbeDir, $RoDir, $S7Dir)) {
     if (Clear-Ini $d) { $iniPre += (Split-Path $d -Leaf) }
 }
 Det 'S0.stage' $prepOk ('staged: old\riviv.exe=' + (Sha8 $OldTarget) + ' helper(new bytes)=' + (Sha8 $HelperFile) + ' iniPrecheckCleared=[' + ($iniPre -join ',') + ']')
@@ -597,12 +622,18 @@ if ($ok1) {
         $si.dwFlags = [uint32]0x00000100   # STARTF_USESTDHANDLES
         $si.hStdInput = $sacH
         $pi = New-Object 'S237+PROCESS_INFORMATION'
-        # applicationName/currentDirectory MUST be explicit: PowerShell binds
-        # a literal $null to a string P/Invoke parameter as an EMPTY-STRING
-        # buffer, and lpApplicationName="" / lpCurrentDirectory="" fail with
-        # name errors (the diag237 lesson). lpApplicationName is the module;
-        # the command line's first token stays the helper's argv[0].
-        $spawned = [S237]::CreateProcessW($HelperFile, $cmd, [IntPtr]::Zero, [IntPtr]::Zero, $true, [uint32]0, [IntPtr]::Zero, $OldDir, [ref]$si, [ref]$pi)
+        # MIRRORS the production spawn_helper call shape (ab51bcd, review
+        # #238 P1): lpApplicationName = NULL - the module comes from the
+        # command line's first QUOTED word; a QUOTED lpApplicationName is a
+        # literal path WITH the quotes in it = ERROR_INVALID_NAME (123), the
+        # on-machine P/Invoke proof behind the fix. No env/cwd override,
+        # like production. The IntPtr-typed params pass a REAL NULL (a
+        # literal $null string param would be bound by PS as an
+        # EMPTY-STRING buffer and fail with the same 123 - the diag237
+        # lesson). The first smoke run passed an explicit UNQUOTED appname,
+        # which silently bypassed the production bug - this harness now
+        # reproduces the call verbatim.
+        $spawned = [S237]::CreateProcessW([IntPtr]::Zero, $cmd, [IntPtr]::Zero, [IntPtr]::Zero, $true, [uint32]0, [IntPtr]::Zero, [IntPtr]::Zero, [ref]$si, [ref]$pi)
         [void][S237]::CloseHandle($sacH)   # the child holds its own copy
         if (-not $spawned) {
             $ok1 = $false; $ev1 = 'CreateProcessW(helper) failed'
@@ -665,18 +696,24 @@ if ($ok1) {
 if ($ok1) {
     # (e) owner closes (mutex released) -> the NEXT start reaches the sweep:
     # the staging file is deleted and the replaced exe opens a normal window.
+    # ab51bcd widened the sweep predicate with <exe>.tmp (a crash between
+    # write-tmp and ReplaceFile would strand a half-built file forever) -
+    # plant a LIVE residue and demand its removal alongside the staging file.
     if ($script:pa.MainWindowHandle -ne [IntPtr]::Zero) {
         [void][S237]::PostMessage($script:pa.MainWindowHandle, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero)
     }
     $acode = Wait-Exit $script:pa 30000
     Det 'S1.e.closeOwner' ($acode -eq 0) ('owner closed code=' + $acode)
     Clear-Ini $OldDir
+    $tmpResidue = Join-Path $OldDir 'riviv.exe.tmp'
+    [IO.File]::WriteAllBytes($tmpResidue, [byte[]](1, 2, 3))
     $pr = Start-Process -FilePath $OldTarget -PassThru -WorkingDirectory $OldDir
     $pr.Handle | Out-Null
-    $swept = Wait-Until { -not (Test-Path $HelperFile) } 15000
+    $swept = Wait-Until { (-not (Test-Path $HelperFile)) -and (-not (Test-Path $tmpResidue)) } 15000
     $wr = Wait-MainWindow $pr 15000
-    $ok1 = $swept -and ($wr -ne [IntPtr]::Zero)
-    Det 'S1.e.sweep' $ok1 ('staging file swept=' + $swept + ' replaced exe window=' + ($wr -ne [IntPtr]::Zero))
+    $tmpGone = -not (Test-Path $tmpResidue)
+    $ok1 = $swept -and ($wr -ne [IntPtr]::Zero) -and $tmpGone
+    Det 'S1.e.sweep' $ok1 ('staging file swept=' + (-not (Test-Path $HelperFile)) + ' planted .tmp residue swept=' + $tmpGone + ' replaced exe window=' + ($wr -ne [IntPtr]::Zero))
     if ($ok1) {
         [void][S237]::PostMessage($wr, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero)
         $rcode = Wait-Exit $pr 30000
@@ -1089,6 +1126,113 @@ elseif ($ev5 -like 'BLOCKED*') { $state5 = 'BLOCKED' }
 Emit-S 'S5' 'disk-failure-arm' $state5 $ev5
 
 # ===========================================================================
+# S7: the INSTALL-flavor language arm. The probe runs INSTALLED - a dummy
+# Uninstall.exe sits beside it, which is the whole adjacency test
+# (detect_flavor) - so the update targets the LOCALIZED Setup asset
+# (riviv-0.8.0.x64.<locale>-Setup.exe; the locale follows the box text's
+# language) and, unlike the portable S3, the staging dir is %TEMP%, never
+# beside the exe.
+# ===========================================================================
+$ok7 = $probeOk
+$ev7 = 'BLOCKED: probe exe unavailable'
+$script:s7Done = $false
+$setupName = ''
+if ($ok7) {
+    Clear-Ini $S7Dir
+    Copy-Item $script:probeStage (Join-Path $S7Dir 'riviv.exe') -Force
+    # The adjacency marker itself (existence is the whole test; the bytes
+    # are a MZ header for plausibility only).
+    [IO.File]::WriteAllBytes((Join-Path $S7Dir 'Uninstall.exe'), [byte[]](0x4D, 0x5A, 0x90, 0x00))
+    $pp7 = Start-Process -FilePath (Join-Path $S7Dir 'riviv.exe') -PassThru -WorkingDirectory $S7Dir -RedirectStandardError $ErrS7
+    $pp7.Handle | Out-Null
+    $wp7 = Wait-MainWindow $pp7 15000
+    $ok7 = ($wp7 -ne [IntPtr]::Zero) -and (-not $pp7.HasExited)
+    if (-not $ok7) { $ev7 = 'probe window never came up (S7 Installed staging)' }
+}
+if ($ok7) {
+    Post-Cmd $wp7 127
+    $res7 = Wait-Avail-Or-NetFail $pp7.Id 120000
+    if ($res7.netFail) {
+        # Channel unusable at the CHECK stage (quota / reachability).
+        [void](Click-FirstButton $res7.dlg)
+        [void](Wait-BoxGone $res7.dlg 8000)
+        [void][S237]::PostMessage($wp7, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero)
+        [void](Wait-Exit $pp7 15000)
+        if (-not $pp7.HasExited) { Stop-Process -Id $pp7.Id -Force -ErrorAction SilentlyContinue }
+        $ev7 = 'BLOCKED: real channel unusable - check-failed box showed ([' + (Fmt20 $res7.text) + ']) (probe closed)'
+        Emit-S 'S7' 'install-flavor-language-arm' 'BLOCKED' $ev7
+        $script:s7Done = $true
+        $ok7 = $false
+    } elseif ($res7.dlg -eq [IntPtr]::Zero) {
+        [void][S237]::PostMessage($wp7, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero)
+        [void](Wait-Exit $pp7 15000)
+        if (-not $pp7.HasExited) { Stop-Process -Id $pp7.Id -Force -ErrorAction SilentlyContinue }
+        $ok7 = $false
+        $ev7 = 'no Available and no check-failed box within 120s (S7; probe closed)'
+    } else {
+        $dlg7 = $res7.dlg
+    }
+}
+if ($ok7) {
+    $btnIds7 = Box-Buttons $dlg7
+    $txt7 = [S237]::BoxText($dlg7)
+    $idsOk = (($btnIds7.Count -eq 3) -and ($btnIds7 -contains 6) -and ($btnIds7 -contains 7) -and ($btnIds7 -contains 2))
+    $txtOk = Test-AvailText $txt7
+    # The Setup asset's locale follows the UI language the box text shows.
+    if ($txt7.Contains($zhAvail)) { $setupName = 'riviv-0.8.0.x64.zh-CN-Setup.exe' }
+    elseif ($txt7.Contains($zhAvailTw)) { $setupName = 'riviv-0.8.0.x64.zh-TW-Setup.exe' }
+    elseif ($txt7.Contains('is available')) { $setupName = 'riviv-0.8.0.x64.en-US-Setup.exe' }
+    $ok7 = $idsOk -and $txtOk -and ($setupName -ne '')
+    Det 'S7.box' $ok7 ('buttons=' + $btnIds7.Count + ' ids=[' + (($btnIds7 | Sort-Object) -join ',') + '] (expect 3: 2,6,7) text=[' + (Fmt20 $txt7) + '] setupAsset=' + $setupName)
+    if (-not $ok7) { $ev7 = 'Available box wrong (S7): buttons=' + (($btnIds7 | Sort-Object) -join ',') + ' text=[' + (Fmt20 $txt7) + ']' }
+}
+if ($ok7) {
+    # YES -> the install flight targets the LOCALIZED Setup asset; today's
+    # channel ships no .sig beside the Setup -> the sig fetch 404s and the
+    # download-failed box shows. The flight's breadcrumbs land in the
+    # stderr REDIRECT FILE (no unread-pipe 4K hang); it is read only after
+    # the probe has closed and released the handle.
+    [void](Click-Button $dlg7 6)
+    [void](Wait-BoxGone $dlg7 8000)
+    $dlg7b = Wait-FailedBox $pp7.Id 60000
+    $up7 = ($dlg7b -ne [IntPtr]::Zero)
+    $txtOk7 = $false
+    $txt7b = ''
+    if ($up7) {
+        $txt7b = [S237]::BoxText($dlg7b)
+        $txtOk7 = Test-FailText $txt7b
+        [void](Click-FirstButton $dlg7b)
+        [void](Wait-BoxGone $dlg7b 8000)
+    }
+    [void][S237]::PostMessage($wp7, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero)
+    $code7 = Wait-Exit $pp7 30000
+    if ($code7 -eq $null) { Stop-Process -Id $pp7.Id -Force -ErrorAction SilentlyContinue }
+    $crumb7 = ''
+    try { $crumb7 = (Get-Content $ErrS7 -Raw -ErrorAction Stop) } catch { $crumb7 = '' }
+    $fetchOk = ($setupName -ne '') -and $crumb7.Contains('update install: fetching ' + $setupName)
+    $flavorOk = $crumb7.Contains('flavor=Installed')
+    # Installed staging lives in %TEMP% - the exe dir must never see a
+    # staging path in the breadcrumb.
+    $stagedOutsideExeDir = ($crumb7.Contains('update install: fetching')) -and (-not $crumb7.Contains($S7Dir))
+    $res7left = @(Get-Residue $env:TEMP) + @(Get-Residue $S7Dir)
+    $dummyOk = (Test-Path (Join-Path $S7Dir 'Uninstall.exe'))
+    $ok7 = $up7 -and $txtOk7 -and ($code7 -eq 0) -and $fetchOk -and $flavorOk -and ($res7left.Count -eq 0) -and $dummyOk
+    Det 'S7.arm' $ok7 ('failedBox=[' + (Fmt20 $txt7b) + '] exit=' + $code7 + ' fetchBreadcrumb=' + $fetchOk + ' flavorInstalled=' + $flavorOk + ' stagingNotBesideExe=' + $stagedOutsideExeDir + ' residue=' + ($res7left -join ';') + ' dummyUninstallIntact=' + $dummyOk)
+    if ($ok7) {
+        $ev7 = 'Installed probe: yes -> localized Setup fetch [' + $setupName + '] -> failed box; zero staging residue (%TEMP% + exe dir), dummy Uninstall.exe untouched, exit 0'
+    } else {
+        $ev7 = 'S7 arm: box=' + $up7 + ' textOk=' + $txtOk7 + ' exit=' + $code7 + ' fetch=' + $fetchOk + ' flavor=' + $flavorOk + ' residueClean=' + ($res7left.Count -eq 0) + ' dummy=' + $dummyOk + ' stagedOutside=' + $stagedOutsideExeDir
+    }
+}
+if (-not $script:s7Done) {
+    $state7 = 'FAIL'
+    if (-not $probeOk) { $state7 = 'BLOCKED' }
+    elseif ($ok7) { $state7 = 'PASS' }
+    elseif ($ev7 -like 'BLOCKED*') { $state7 = 'BLOCKED' }
+    Emit-S 'S7' 'install-flavor-language-arm' $state7 $ev7
+}
+
+# ===========================================================================
 # S6: regression - (a) grep the smoke family for pins of the retired
 # notify-only Available copy (report-only, never FAILs); (b) re-run
 # smoke78-view-child.ps1 against the probe exe (it takes -Exe).
@@ -1128,16 +1272,16 @@ foreach ($p in (Get-Process | Where-Object { ($_.Name -eq 'riviv') -or ($_.Name 
     }
 }
 Start-Sleep -Milliseconds 800   # let force-killed images release their file locks before the removal
-foreach ($d in @($OldDir, $WinDir, $S2Dir, $ProbeDir, $RoDir, $TampDir)) {
+foreach ($d in @($OldDir, $WinDir, $S2Dir, $ProbeDir, $RoDir, $TampDir, $S7Dir)) {
     Remove-Item $d -Recurse -Force -ErrorAction SilentlyContinue
 }
-foreach ($d in @($OldDir, $WinDir, $S2Dir, $ProbeDir, $RoDir, $TampDir)) {
+foreach ($d in @($OldDir, $WinDir, $S2Dir, $ProbeDir, $RoDir, $TampDir, $S7Dir)) {
     if (Test-Path $d) {
         Start-Sleep -Milliseconds 800   # lock release latency, one retry
         Remove-Item $d -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
-$stageSubLeft = @($OldDir, $WinDir, $S2Dir, $ProbeDir, $RoDir, $TampDir | Where-Object { Test-Path $_ })
+$stageSubLeft = @($OldDir, $WinDir, $S2Dir, $ProbeDir, $RoDir, $TampDir, $S7Dir | Where-Object { Test-Path $_ })
 Det 'T.stage' ($stageSubLeft.Count -eq 0) ('staged subdirs removed: ' + ($stageSubLeft.Count -eq 0))
 if ($stageSubLeft.Count -gt 0) { $script:fail++ }
 $tempRes = @(Get-Residue $env:TEMP)
@@ -1160,7 +1304,7 @@ exit 0
         }
     }
     Start-Sleep -Milliseconds 800   # lock release latency before the removal
-    foreach ($d in @($OldDir, $WinDir, $S2Dir, $ProbeDir, $RoDir, $TampDir)) {
+    foreach ($d in @($OldDir, $WinDir, $S2Dir, $ProbeDir, $RoDir, $TampDir, $S7Dir)) {
         Remove-Item $d -Recurse -Force -ErrorAction SilentlyContinue
     }
     $script:fail++

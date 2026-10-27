@@ -64,11 +64,15 @@ pub(crate) fn asset_name(tag: &str, flavor: Flavor, lang: Language) -> String {
     }
 }
 
-/// The staged download's file name (`riviv-update-<tag>.exe`) — the
-/// portable helper IS this file, and the startup sweep matches the
-/// `riviv-update-` prefix (ADR 0009 D5).
+/// The staged download's file name (`riviv-update-<tag>-<pid>.exe`) —
+/// the portable helper IS this file, and the startup sweep matches the
+/// `riviv-update-` prefix (ADR 0009 D5). The pid suffix is the
+/// per-flight uniqueness: with `multiple_instances=1` two instances can
+/// accept the same update, and a shared deterministic name would let
+/// one flight's truncate land under another's read/verify/spawn —
+/// worst case handing the helper a partial copy (review #238 codex).
 pub(crate) fn staging_file_name(tag: &str) -> String {
-    format!("riviv-update-{tag}.exe")
+    format!("riviv-update-{tag}-{}.exe", std::process::id())
 }
 
 /// The download host (the release-assets redirect chain starts at
@@ -334,6 +338,7 @@ pub(crate) fn on_install_reply(hwnd: HWND) {
                     false,
                 ) {
                     eprintln!("update install: launching the Setup failed: {e}");
+                    let _ = std::fs::remove_file(&staged);
                     crate::update::show_box(
                         hwnd,
                         loc::get(loc::Id::UpdateReplaceFailedText),
@@ -453,7 +458,15 @@ mod tests {
 
     #[test]
     fn staging_and_url_names_compose_from_the_tag() {
-        assert_eq!(staging_file_name("v0.9.0"), "riviv-update-v0.9.0.exe");
+        // The staging name carries the pid (per-flight uniqueness) but
+        // keeps the sweep-matching prefix and .exe tail.
+        let name = staging_file_name("v0.9.0");
+        assert!(name.starts_with("riviv-update-v0.9.0-"), "{name}");
+        assert!(name.ends_with(".exe"), "{name}");
+        assert!(
+            name.ends_with(&format!("-{}.exe", std::process::id())),
+            "{name}"
+        );
         assert_eq!(
             dl_path("v0.9.0", "riviv-0.9.0-portable.exe", false),
             "/jaredshuai/riviv/releases/download/v0.9.0/riviv-0.9.0-portable.exe"

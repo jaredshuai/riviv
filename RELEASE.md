@@ -49,9 +49,9 @@
 
 ### 签名仪式(#237 起,ADR 0009;**首个带签名资产的发版生效**——下个版本即首验)
 
-工具 = `tools/riviv-sign/`(仓内独立小工程,`cd tools/riviv-sign && cargo build --release` 出 `target/release/riviv-sign.exe`;有意不做主 crate 第二 [[bin]],防 feature 合并污染 ship 构建)。
+工具 = `tools/riviv-sign/`(仓内独立小工程,`cd tools/riviv-sign && cargo build --release` 出 `target/release/riviv-sign.exe`,**并跑 `cargo test`**——工具侧跨实现向量钉测与主 crate 的 `src/sig.rs` 钉同一向量,防 signer↔client 公式漂移;有意不做主 crate 第二 [[bin]],防 feature 合并污染 ship 构建)。
 
-1. **密钥(一次性,#237 实现时已做)**:`riviv-sign keygen <seed-file>` 生成生产钥;公钥 hex 已嵌 `src/sig.rs::PUBKEY_HEX`。私钥 seed 文件**离线双拷、永不入库、不进构建**;丢失/泄漏事故预案与换钥语义见 ADR 0009 D7(换钥=改代码发版,老版本内置更新断供,用户手动过渡一次)。
-2. **发版新步骤**(插在四资产构建后、`gh release create` 前):staging 目录内逐资产 `riviv-sign sign <seed> vX.Y.Z <asset>` → 产出 `<asset>.sig`(raw 64 B)×4;被签消息 = `"riviv-update-v1\n"+tag+"\n"+资产名+"\n"+资产字节`(域分离,与客户端 `src/sig.rs` 同构——跨实现向量钉测在主 crate 测试网)。
-3. **上传面 4+4=8 文件**:`gh release create` 资产列表追加四个 `.sig`。
+1. **密钥(一次性,#237 实现时已做)**:`riviv-sign keygen <seed-file>` 生成生产钥(keygen 拒绝覆盖已存在的 seed 文件);公钥 hex 已嵌 `src/sig.rs::PUBKEY_HEX`。私钥 seed 文件**离线双拷、永不入库、不进构建**;丢失/泄漏事故预案与换钥语义见 ADR 0009 D7(换钥=改代码发版,老版本内置更新断供,用户手动过渡一次)。
+2. **发版新步骤**(插在四资产构建后、`gh release create` 前):staging 目录内逐资产 `riviv-sign sign <seed> vX.Y.Z <asset>` → 产出 `<asset>.sig`(raw 64 B)×4;被签消息 = `"riviv-update-v1\n"+tag+"\n"+资产名+"\n"+资产字节`(域分离,与客户端 `src/sig.rs` 同构)。**资产必须先改成最终发版文件名再签**(如 portable 的 `riviv-X.Y.Z-portable.exe`、Setup 的 `riviv-X.Y.Z.x64.<lang>-Setup.exe`)——消息内含文件名,本地名与上传名不一致时客户端验签必失败。
+3. **上传面 4+4=8 文件**:`gh release create` 资产列表追加四个 `.sig`——完整形态:`gh release create vX.Y.Z -R jaredshuai/riviv --title "…" --notes-file <说明稿> --latest <portable.exe> <portable.exe>.sig <zh-CN-Setup.exe> <zh-CN-Setup.exe>.sig <zh-TW-Setup.exe> <zh-TW-Setup.exe>.sig <en-US-Setup.exe> <en-US-Setup.exe>.sig`。
 4. **回验环节升格**(机械面不变量 +1):四资产上传后,下载 exe+sig → `riviv-sign verify <pubkey-hex> vX.Y.Z <exe> <sig>` 全部 VERIFY-OK → 再按既有 SHA 对拍(与 staged QA exe 同源)。此步 = signer↔client 消息构造同构的端到端哨兵。

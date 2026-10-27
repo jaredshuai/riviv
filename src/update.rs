@@ -3,10 +3,13 @@
 //! GitHub's `releases/latest` API on a background thread, compares the
 //! tag against `CARGO_PKG_VERSION`, and reports back on
 //! `UPDATE_REPLY_MESSAGE` (WM_APP+4) for the UI thread to show one of
-//! three message boxes. Notify-only by ruling: riviv never downloads,
-//! verifies, or replaces anything — "new version" opens the releases
+//! three message boxes. Since #237 (ADR 0009) the Available box is
+//! three-button: YES hands the tag to `update_install` (the download →
+//! domain-separated verify → install channel), NO opens the releases
 //! page in the browser (the canonical URL always redirects to the
-//! latest release, so the response's html_url never needs parsing).
+//! latest release, so the response's html_url never needs parsing),
+//! CANCEL dismisses; the startup flash stays notify-only (never
+//! touching disk unprompted).
 //!
 //! #214 added the startup auto-check (ADR 0007 D6; spike
 //! s-startup-update-check, P1-P4 all recommended): the same worker and
@@ -33,8 +36,9 @@ use crate::text::to_wide;
 use windows::Win32::Foundation::{GetLastError, HWND};
 use windows::Win32::Networking::WinHttp::{
     INTERNET_DEFAULT_HTTPS_PORT, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_ADDREQ_FLAG_ADD,
-    WINHTTP_FLAG_SECURE, WinHttpAddRequestHeaders, WinHttpCloseHandle, WinHttpConnect, WinHttpOpen,
-    WinHttpOpenRequest, WinHttpQueryDataAvailable, WinHttpReadData, WinHttpReceiveResponse,
+    WINHTTP_FLAG_SECURE, WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_QUERY_STATUS_CODE,
+    WinHttpAddRequestHeaders, WinHttpCloseHandle, WinHttpConnect, WinHttpOpen, WinHttpOpenRequest,
+    WinHttpQueryDataAvailable, WinHttpQueryHeaders, WinHttpReadData, WinHttpReceiveResponse,
     WinHttpSendRequest, WinHttpSetTimeouts,
 };
 use windows::Win32::System::SystemInformation::GetLocalTime;
@@ -424,8 +428,10 @@ pub(crate) fn show_box(hwnd: HWND, text: &str, flags: MESSAGEBOX_STYLE) {
     };
 }
 
-/// Notify-only's single action (ADR 0007 D5): open the canonical
-/// releases page — it always redirects to the latest release.
+/// The NO button's action (ADR 0009 D9 — the ADR 0007 D5 notify-only
+/// escape hatch, kept verbatim): open the canonical releases page — it
+/// always redirects to the latest release. The YES path is
+/// `update_install::begin_install`.
 fn open_releases_page(hwnd: HWND) {
     let url = to_wide(RELEASES_URL);
     // SAFETY: url is NUL-terminated and outlives the call; hwnd is the
@@ -447,6 +453,10 @@ fn open_releases_page(hwnd: HWND) {
 /// Err aborts the transfer (budget breach or write failure — the sink
 /// owns both destination and budget).
 pub(crate) type ChunkSink<'a> = &'a mut dyn FnMut(&[u8], usize) -> Result<(), ()>;
+
+/// Per-read allocation cap inside `winhttp_get` (#238): `avail` is
+/// server-shaped; a hostile server must not turn it into an allocation.
+const MAX_CHUNK_BYTES: u32 = 64 * 1024;
 
 /// The unsafe transport shell shared by every update GET (#237 factored
 /// the #210 original): one GET over WinHTTP with a UA header (GitHub's
@@ -519,6 +529,7 @@ pub(crate) fn winhttp_get(host: &str, path: &str, on_chunk: ChunkSink<'_>) -> Re
     }
     let connect = Handle(connect);
     let verb = to_wide("GET");
+    let path_display = path.to_string(); // for the status breadcrumb (path is shadowed below)
     let path = to_wide(path);
     // SAFETY: verb/path are NUL-terminated; null version/referrer and a
     // null accept-types array select the documented defaults (HTTP/1.1,
@@ -558,6 +569,37 @@ pub(crate) fn winhttp_get(host: &str, path: &str, on_chunk: ChunkSink<'_>) -> Re
     if unsafe { WinHttpReceiveResponse(request.0, std::ptr::null_mut()) }.is_err() {
         fail!("WinHttpReceiveResponse");
     }
+    // The status gate (#238 cubic P2/codex review): without it a 5xx
+    // error body streams to disk and dies at VERIFY — the user would
+    // see the poisoned-channel box for a plain server failure (the
+    // wrong row of ADR 0009 D6's table). Redirects are already walked
+    // (the final status is the CDN's 200). The #210-era check path
+    // relied on a non-200 body carrying no tag_name (ADR 0007 D4) —
+    // same Failed verdict, this just fails earlier with a cleaner
+    // breadcrumb.
+    let mut status: u32 = 0;
+    let mut status_len: u32 = 4; // preload 4 or the query fails 0x8007007A (#235 lesson)
+    // SAFETY: status is a 4-byte out-buffer for the NUMBER-flagged
+    // query; the trailing index out-param is null (first and only
+    // header of that name); request.0 is live with a received response.
+    if unsafe {
+        WinHttpQueryHeaders(
+            request.0,
+            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+            None,
+            Some(&mut status as *mut u32 as *mut c_void),
+            &mut status_len,
+            std::ptr::null_mut(),
+        )
+    }
+    .is_err()
+    {
+        fail!("WinHttpQueryHeaders(status)");
+    }
+    if status != 200 {
+        eprintln!("update: HTTP {status} for {path_display}");
+        return Err(());
+    }
     let mut total = 0usize;
     loop {
         let mut avail: u32 = 0;
@@ -568,11 +610,17 @@ pub(crate) fn winhttp_get(host: &str, path: &str, on_chunk: ChunkSink<'_>) -> Re
         if avail == 0 {
             break;
         }
-        let mut chunk = vec![0u8; avail as usize];
+        // Cap the read before allocating (#238 codex P1): `avail` is
+        // server-shaped and could be huge; the #210 original checked
+        // the budget BEFORE allocating, and the #237 refactor moved
+        // that check into the sink — this restores an allocation bound
+        // (the sink still owns the total-budget verdict).
+        let want = avail.min(MAX_CHUNK_BYTES);
+        let mut chunk = vec![0u8; want as usize];
         let mut read: u32 = 0;
-        // SAFETY: chunk holds avail bytes; read is the out-param;
+        // SAFETY: chunk holds `want` bytes; read is the out-param;
         // request.0 is live.
-        if unsafe { WinHttpReadData(request.0, chunk.as_mut_ptr().cast(), avail, &mut read) }
+        if unsafe { WinHttpReadData(request.0, chunk.as_mut_ptr().cast(), want, &mut read) }
             .is_err()
         {
             fail!("WinHttpReadData");
