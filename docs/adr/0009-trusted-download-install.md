@@ -71,6 +71,6 @@ Sumatra helper 模式对映(codex #236 四 findings 订正后的形态):
 
 - 纯函数入测试网:域分离消息构造字节级钉测+sign/verify 往返+跨实现向量+篡改/重放/错包/错钥五向拒绝(sig.rs 7 测试);资产名对拍真实 v0.8.0 四资产名、staging/URL 构造、128 MB 预算边界、Uninstall.exe 邻接判定(update_install.rs 5 测试);helper 行解析全拼写/非 helper 行/悬空参、清扫谓词、清扫只删残留(self_replace.rs 5 测试);Outcome::Available 改带原始 tag 的 decide 钉测更新。
 - loc 三表:新 4 串(安装预告/下载失败/验签失败/替换失败)+ 三钮措辞改写;非空网/撞车网自动覆盖。
-- 机械面(双臂亲录 2026-10-27,VS BuildTools dumpbin 14.51.36231):arm A = `ba46b39` 重建 8,523,776 B(与 v0.8.0 发布字节一致,基线复现);arm B = 本刀 8,596,480 B,**库内净增 +72,704 B**(探针 +30,208 B 系 verify-only 口径——s-avif 教训重演:探针差分不含本刀其余新代码面 update_install/self_replace/loc 等,双臂实录为准;量级距任何阈值余量充分,无需破例);dumpbin 双臂各 25 唯一 DLL、**diff 恰零条=零新 DLL 导入**(纯算术零 OS API,GetStdHandle 在既有 kernel32 面)。
+- 机械面(双臂亲录 2026-10-27,VS BuildTools dumpbin 14.51.36231):arm A = `ba46b39` 重建 8,523,776 B(与 v0.8.0 发布字节一致,基线复现);arm B = 本刀评审修复后态 8,595,968 B,**库内净增 +72,192 B**(初版 8,596,480/+72,704,孪生收敛 −512 B;发版锚以全量干净重构建为准——v0.7.0 勘误先例。探针 +30,208 B 系 verify-only 口径:s-avif 教训重演,探针差分不含本刀其余新代码面 update_install/self_replace/loc 等;量级距任何阈值余量充分,无需破例);dumpbin 双臂各 25 唯一 DLL、**diff 恰零条=零新 DLL 导入**(纯算术零 OS API,GetStdHandle 在既有 kernel32 面)。
 - 冒烟四臂(smoke237,子代理串行):验签通过(工具级;应用内全链待首个带 `.sig` 发版)/篡改 1 B 失败/网络失败/磁盘失败 + 资产选择(三语名=单测对拍真实 v0.8.0 资产名;运行时臂=本机语言+双形态的 stderr 面包屑断言——UI 语言按 D4 同款检测即一切,单值不可注入)+ `-update-self-to` 端到端(含持锁真窗口在场证明短路不被转发);1607 真机走既有观察项通道。
 - 兼容面:v0.8.0 存量只认 notify-only(无 `.sig` 资产时点「是」=下载失败框,不炸),**首个带签名资产的发版起仪式生效**。
