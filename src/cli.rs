@@ -129,7 +129,7 @@ pub(crate) fn stdin_launch_keeps_own_window(cl: &[u16]) -> bool {
 
 /// ASCII case-insensitive compare against a switch name (upstream
 /// `string_icompare_lowercase_ascii`).
-fn eq_switch(word: &[u16], name: &str) -> bool {
+pub(crate) fn eq_switch(word: &[u16], name: &str) -> bool {
     word.len() == name.len()
         && word.iter().zip(name.as_bytes()).all(|(c, b)| {
             let lower = if (b'A' as u16..=b'Z' as u16).contains(c) {

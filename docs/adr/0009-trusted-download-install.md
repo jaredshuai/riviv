@@ -41,7 +41,7 @@ Sumatra helper 模式对映(codex #236 四 findings 订正后的形态):
 - 等待对象 = **父进程句柄**(spawn 时 STARTF_USESTDHANDLES + hStdInput 继承传递,子端 GetStdHandle 读回;`multiple_instances=1` 时 RIVIV mutex 根本不创建,等 mutex 会立即通过对在跑映像动手——codex #236 P1);60 s 上限=挂死守卫(超时放弃,旧版无恙,残留由清扫收);
 - **`-update-self-to` 短路在单实例 mutex 创建之前**(`run()` 内、install pass 后;#109 载重交互:helper 启动时旧实例仍持锁,走到转发逻辑会被当第二实例静默丢弃)——纯解析函数钉测;
 - 替换序列:helper 读自身盘上字节(运行中可读)→ 写 `<orig>.tmp` → **`ReplaceFileW(orig, tmp, backup=orig.old)`**(三步 rename 舞的单调用形态:旧版字节完整在位直到替换落地、备份内建、失败即败不半换;第二步失败 rename-back 的回滚语义由该 API 合同承担)→ 启动新 exe → 删 `<orig>.old`(父进程已退;滞留旧映像的 straggler 实例使删除失败=无害,下次清扫重试)→ helper 退出;
-- helper 自身映像运行中不可删 → **每次启动旁置清扫** `riviv-update-*.exe` 前缀与 `<exe 名>.old`(exe 目录 + `%TEMP%` 两处;staged-ini 清理纪律同款);
+- helper 自身映像运行中不可删 → **每次启动旁置清扫** `riviv-update-*.exe` 前缀、`<exe 名>.old` 备份与 `<exe 名>.tmp`(写 tmp 后、ReplaceFileW 前崩溃滞留的半成品;评审 #238 补 .tmp 盲区;exe 目录 + `%TEMP%` 两处,staged-ini 清理纪律同款;删除失败=仍被占用,fail-soft 下次再扫);
 - 原子性如实限定(cubic #236 P2 二轮采纳):同卷双 rename 在 NTFS 原子,FAT/exFAT 家族替换语义弱——「旧版字节完整在位直到替换成功 + 失败可回滚」成立,两段之间的中断窗口随文件系统而异,留档不掩盖。
 
 ### D6. 失败语义 = 独立 UX 表(ADR 0001 不裁,同 0007 D3 先例)
@@ -72,5 +72,5 @@ Sumatra helper 模式对映(codex #236 四 findings 订正后的形态):
 - 纯函数入测试网:域分离消息构造字节级钉测+sign/verify 往返+跨实现向量+篡改/重放/错包/错钥五向拒绝(sig.rs 7 测试);资产名对拍真实 v0.8.0 四资产名、staging/URL 构造、128 MB 预算边界、Uninstall.exe 邻接判定(update_install.rs 5 测试);helper 行解析全拼写/非 helper 行/悬空参、清扫谓词、清扫只删残留(self_replace.rs 5 测试);Outcome::Available 改带原始 tag 的 decide 钉测更新。
 - loc 三表:新 4 串(安装预告/下载失败/验签失败/替换失败)+ 三钮措辞改写;非空网/撞车网自动覆盖。
 - 机械面(双臂亲录 2026-10-27,VS BuildTools dumpbin 14.51.36231):arm A = `ba46b39` 重建 8,523,776 B(与 v0.8.0 发布字节一致,基线复现);arm B = 本刀 8,596,480 B,**库内净增 +72,704 B**(探针 +30,208 B 系 verify-only 口径——s-avif 教训重演:探针差分不含本刀其余新代码面 update_install/self_replace/loc 等,双臂实录为准;量级距任何阈值余量充分,无需破例);dumpbin 双臂各 25 唯一 DLL、**diff 恰零条=零新 DLL 导入**(纯算术零 OS API,GetStdHandle 在既有 kernel32 面)。
-- 冒烟四臂(子代理串行):验签通过/篡改 1 B 失败/网络失败/磁盘失败 + 三语资产选择 + `-update-self-to` 端到端;1607 真机走既有观察项通道。
+- 冒烟四臂(smoke237,子代理串行):验签通过(工具级;应用内全链待首个带 `.sig` 发版)/篡改 1 B 失败/网络失败/磁盘失败 + 资产选择(三语名=单测对拍真实 v0.8.0 资产名;运行时臂=本机语言+双形态的 stderr 面包屑断言——UI 语言按 D4 同款检测即一切,单值不可注入)+ `-update-self-to` 端到端(含持锁真窗口在场证明短路不被转发);1607 真机走既有观察项通道。
 - 兼容面:v0.8.0 存量只认 notify-only(无 `.sig` 资产时点「是」=下载失败框,不炸),**首个带签名资产的发版起仪式生效**。

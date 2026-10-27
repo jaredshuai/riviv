@@ -24,8 +24,8 @@ use std::sync::atomic::Ordering;
 
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::WindowsAndMessaging::{
-    IDOK, MB_ICONERROR, MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_OKCANCEL, MESSAGEBOX_STYLE,
-    MessageBoxW, PostMessageW, WM_APP, WM_CLOSE,
+    IDOK, MB_ICONERROR, MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_OKCANCEL, MessageBoxW,
+    PostMessageW, WM_APP, WM_CLOSE,
 };
 use windows::core::PCWSTR;
 
@@ -153,7 +153,7 @@ pub(crate) enum InstallOutcome {
     SigFailed,
 }
 
-/// The YES arm of the three-button Available box (#237; ADR 0009 D8):
+/// The YES arm of the three-button Available box (#237; ADR 0009 D9):
 /// one background flight — select asset, fetch sig + asset, verify,
 /// park the verdict, post the notification. The UI thread stays free.
 pub(crate) fn begin_install(hwnd: HWND, tag: String) {
@@ -189,7 +189,7 @@ pub(crate) fn begin_install(hwnd: HWND, tag: String) {
         Err(e) => {
             INSTALL_RUNNING.store(false, Ordering::SeqCst);
             eprintln!("update install: worker spawn failed: {e}");
-            show_box(
+            crate::update::show_box(
                 HWND(hwnd_raw as *mut _),
                 loc::get(loc::Id::UpdateDownloadFailedText),
                 MB_ICONERROR | MB_OK,
@@ -280,7 +280,7 @@ pub(crate) fn on_install_reply(hwnd: HWND) {
             // (P4=A: the asker gets the full automatic channel).
             let Ok(orig) = std::env::current_exe() else {
                 eprintln!("update install: current_exe failed at handoff");
-                show_box(
+                crate::update::show_box(
                     hwnd,
                     loc::get(loc::Id::UpdateReplaceFailedText),
                     MB_ICONERROR | MB_OK,
@@ -291,7 +291,7 @@ pub(crate) fn on_install_reply(hwnd: HWND) {
             if crate::self_replace::spawn_helper(&staged, &orig) {
                 close_self(hwnd);
             } else {
-                show_box(
+                crate::update::show_box(
                     hwnd,
                     loc::get(loc::Id::UpdateReplaceFailedText),
                     MB_ICONERROR | MB_OK,
@@ -334,7 +334,7 @@ pub(crate) fn on_install_reply(hwnd: HWND) {
                     false,
                 ) {
                     eprintln!("update install: launching the Setup failed: {e}");
-                    show_box(
+                    crate::update::show_box(
                         hwnd,
                         loc::get(loc::Id::UpdateReplaceFailedText),
                         MB_ICONERROR | MB_OK,
@@ -347,14 +347,14 @@ pub(crate) fn on_install_reply(hwnd: HWND) {
             }
         }
         InstallOutcome::DownloadFailed => {
-            show_box(
+            crate::update::show_box(
                 hwnd,
                 loc::get(loc::Id::UpdateDownloadFailedText),
                 MB_ICONWARNING | MB_OK,
             );
         }
         InstallOutcome::SigFailed => {
-            show_box(
+            crate::update::show_box(
                 hwnd,
                 loc::get(loc::Id::UpdateSigFailedText),
                 MB_ICONERROR | MB_OK,
@@ -369,23 +369,6 @@ fn close_self(hwnd: HWND) {
     // SAFETY: hwnd is the live owner on the UI thread; the close path
     // runs in the pump as for any user close.
     let _ = unsafe { PostMessageW(Some(hwnd), WM_CLOSE, Default::default(), Default::default()) };
-}
-
-/// One localized box (update.rs show_box's local twin — that one is
-/// private and this module owns its own presentation anyway).
-fn show_box(hwnd: HWND, text: &str, flags: MESSAGEBOX_STYLE) {
-    let text_wide = to_wide(text);
-    let caption = to_wide(loc::get(loc::Id::AppName));
-    // SAFETY: both buffers outlive the modal call; hwnd is the live
-    // owner (or None-safe from the helper context).
-    let _ = unsafe {
-        MessageBoxW(
-            Some(hwnd),
-            PCWSTR(text_wide.as_ptr()),
-            PCWSTR(caption.as_ptr()),
-            flags,
-        )
-    };
 }
 
 /// Fetch one raw 64 B signature into memory (the sig must be EXACTLY

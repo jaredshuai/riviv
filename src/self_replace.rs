@@ -63,21 +63,6 @@ const PARENT_WAIT_MS: u32 = 60_000;
 /// directories).
 const STAGING_PREFIX: &str = "riviv-update-";
 
-/// ASCII case-insensitive compare (the tokenizer already stripped the
-/// switch prefix; `cli::eq_switch` is private there, and one local
-/// helper keeps this module's parse self-contained).
-fn eq_word(word: &[u16], name: &str) -> bool {
-    word.len() == name.len()
-        && word.iter().zip(name.as_bytes()).all(|(c, b)| {
-            let lower = if (b'A' as u16..=b'Z' as u16).contains(c) {
-                *c + 32
-            } else {
-                *c
-            };
-            lower == *b as u16
-        })
-}
-
 /// Parse a raw command line as the helper's launch line: the
 /// `-update-self-to` switch (unquoted, `-`/`/`-prefixed, dot-free —
 /// `cli::parse`'s switch test) with the original exe path as the next
@@ -101,7 +86,7 @@ pub(crate) fn parse_helper_line(cl: &[u16]) -> Option<Vec<u16>> {
         let is_switch_word = !started_quoted
             && matches!(word.text.first(), Some(&c) if c == u16::from(b'/') || c == u16::from(b'-'))
             && !word.text.contains(&u16::from(b'.'));
-        if is_switch_word && eq_word(&word.text[1..], SELF_UPDATE_SWITCH) {
+        if is_switch_word && crate::cli::eq_switch(&word.text[1..], SELF_UPDATE_SWITCH) {
             pending = true;
         }
     }
@@ -109,12 +94,17 @@ pub(crate) fn parse_helper_line(cl: &[u16]) -> Option<Vec<u16>> {
 }
 
 /// The startup-sweep predicate: staging residuals (`riviv-update-*`
-/// `.exe`) and the replace backup (`<exe file name>.old`). Pure so the
-/// naming contract is testable.
+/// `.exe`), the replace backup (`<exe file name>.old`), and the
+/// interrupted-swap staging copy (`<exe file name>.tmp` — a crash
+/// between the tmp write and ReplaceFileW would otherwise strand it
+/// forever; review #238's sweep blind spot). Pure so the naming
+/// contract is testable.
 pub(crate) fn is_staging_residual(file_name: &str, exe_file_name: &str) -> bool {
     let lower = file_name.to_ascii_lowercase();
+    let exe = exe_file_name.to_ascii_lowercase();
     (lower.starts_with(STAGING_PREFIX) && lower.ends_with(".exe"))
-        || lower == format!("{}.old", exe_file_name.to_ascii_lowercase())
+        || lower == format!("{exe}.old")
+        || lower == format!("{exe}.tmp")
 }
 
 /// The parent half: spawn the verified staging exe as the helper with
@@ -169,12 +159,17 @@ pub(crate) fn spawn_helper(staging: &Path, orig: &Path) -> bool {
     let mut pi = PROCESS_INFORMATION::default();
     // SAFETY: cmdline is a fresh NUL-terminated wide buffer handed over
     // as a mutable pointer (CreateProcessW's documented may-write
-    // contract); si/pi are live out-params; bInheritHandles=TRUE is
-    // what crosses the stdin handle; no env/cwd override — the helper
-    // resolves every path absolutely itself.
+    // contract); lpApplicationName is deliberately NULL — the module
+    // comes from the command line's first QUOTED word (quote stripping
+    // applies only to lpCommandLine; a quoted lpApplicationName is a
+    // literal path with quotes in it = ERROR_INVALID_NAME, review #238
+    // P1 with the on-machine P/Invoke proof); si/pi are live
+    // out-params; bInheritHandles=TRUE is what crosses the stdin
+    // handle; no env/cwd override — the helper resolves every path
+    // absolutely itself.
     let spawned = unsafe {
         CreateProcessW(
-            PCWSTR(cmdline.as_ptr()),
+            None,
             Some(windows::core::PWSTR(cmdline.as_mut_ptr())),
             None,
             None,
@@ -433,6 +428,9 @@ mod tests {
         assert!(is_staging_residual("RIVIV-UPDATE-V0.9.0.EXE", "riviv.exe"));
         assert!(is_staging_residual("riviv.exe.old", "riviv.exe"));
         assert!(is_staging_residual("MyViewer.exe.old", "MyViewer.exe"));
+        // The interrupted-swap staging copy (a crash between the tmp
+        // write and ReplaceFileW) — review #238's blind spot, swept.
+        assert!(is_staging_residual("riviv.exe.tmp", "riviv.exe"));
         // Not residuals: the exe itself, ordinary files, a released
         // portable asset (no -update- infix), a differently-named old
         // file. The installed flavor's staged Setup DOES match the
@@ -444,6 +442,7 @@ mod tests {
             "riviv.exe"
         ));
         assert!(!is_staging_residual("riviv.old", "riviv.exe"));
+        assert!(!is_staging_residual("other.exe.tmp", "riviv.exe"));
         assert!(is_staging_residual(
             "riviv-update-v0.9.0.exe",
             "MyViewer.exe"
@@ -472,13 +471,16 @@ mod tests {
         let keep = dir.join("riviv.exe");
         let residual = dir.join("riviv-update-v9.9.9.exe");
         let backup = dir.join(format!("{exe_name}.old"));
+        let stranded_tmp = dir.join(format!("{exe_name}.tmp"));
         std::fs::write(&keep, b"exe").unwrap();
         std::fs::write(&residual, b"stale helper").unwrap();
         std::fs::write(&backup, b"old bytes").unwrap();
+        std::fs::write(&stranded_tmp, b"partial swap").unwrap();
         sweep_staging(&dir);
         assert!(keep.is_file(), "an unrelated exe is never swept");
         assert!(!residual.exists());
         assert!(!backup.exists());
+        assert!(!stranded_tmp.exists());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -365,7 +365,7 @@ pub(crate) fn on_reply(hwnd: HWND) {
             let text = loc::get(loc::Id::UpdateNewVersionText).replace("%s", version);
             let text_wide = to_wide(&text);
             let caption = to_wide(loc::get(loc::Id::AppName));
-            // The three-button form (#237; ADR 0009 D8, P4=A): YES =
+            // The three-button form (#237; ADR 0009 D9, P4=A): YES =
             // download+verify+install (the full trusted channel), NO =
             // the notify-only escape hatch (open the releases page),
             // CANCEL = just dismiss.
@@ -407,7 +407,9 @@ pub(crate) fn on_reply(hwnd: HWND) {
 }
 
 /// One localized verdict box (caption = the app name, like show_about).
-fn show_box(hwnd: HWND, text: &str, flags: MESSAGEBOX_STYLE) {
+/// The install flow's boxes share it (its module kept its own twin only
+/// until review #238 collapsed the duplication).
+pub(crate) fn show_box(hwnd: HWND, text: &str, flags: MESSAGEBOX_STYLE) {
     let text_wide = to_wide(text);
     let caption = to_wide(loc::get(loc::Id::AppName));
     // SAFETY: both buffers outlive the modal call; hwnd is the live
