@@ -12,6 +12,22 @@
 (#81)本无可测注入通道,且随 #90 GDI 删除而消亡。其余 %TEMP% 脚本维持
 不入库,不作为回归门。
 
+## smoke237-trusted-update.ps1(#237 更新下载+验签+安装信任锚,PR #238)
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File smoke\smoke237-trusted-update.ps1 [-NewExe <path>] [-OldExe <path>] [-ProbeExe <path>]
+```
+
+场景(S0-S6;新 exe 与 v0.8.0 基线臂 exe 双臂,断言全部 SHA 对拍不用版本号;
+S3/S5 走真实 GitHub 渠道,网络不可达时如实 BLOCKED):S1 helper 自替换端到端
+(`-update-self-to` 短路先于 RIVIV mutex——持锁真窗口在场时换体仍落地,
+牺牲父进程句柄经 STARTF_USESTDHANDLES/hStdInput 继承,替换后下一启动清扫
+helper 残体);S2 悬空参退出码 2;S3 三钮 Available(2/6/7)+「是」在无 .sig
+资产渠道的今日真实行为=下载失败框;S4 riviv-sign 篡改臂(rc1 VERIFY-FAIL/
+原样 VERIFY-OK);S5 写拒绝目录臂;S6 smoke78 回归 + 旧文案钉检查(只报告)。
+退出码:0 全绿 / 1 FAIL / 2 缺 exe / 4 外来活 riviv。日志
+`%TEMP%\riviv-237-smoke\smoke237.log`。
+
 ## smoke126-renderer.ps1(#126 `-renderer` sticky 开关 + dump output_gen)
 
 ```powershell
