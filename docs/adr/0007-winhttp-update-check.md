@@ -34,7 +34,7 @@ ADR 0001 的用户级 = 图片加载失败且规定**不弹框**;更新网络失
 
 ### D5. notify-only 边界
 
-「打开下载页」= ShellExecuteW 开 `https://github.com/jaredshuai/riviv/releases/latest`(canonical 永远指向最新,无需解析 html_url)。riviv **永不下载、永不校验、永不替换**任何文件——GitHub `assets[].digest` 是 integrity-only(与二进制同信任域,#208 R4),称「已验证下载」前须另立信任锚,那是 O1=B 的前置而非本刀的事。
+「打开下载页」= ShellExecuteW 开 `https://github.com/jaredshuai/riviv/releases/latest`(canonical 永远指向最新,无需解析 html_url)。riviv **永不下载、永不校验、永不替换**任何文件——GitHub `assets[].digest` 是 integrity-only(与二进制同信任域,#208 R4),称「已验证下载」前须另立信任锚,那是 O1=B 的前置而非本刀的事。**后继刀已落(#237)**:信任锚 = Ed25519 pinned-key 域分离验签,手动 Available 框升三钮(是=下载验签安装/否=仅开页/取消),详见 [ADR 0009](0009-trusted-download-install.md);启动 flash 维持本 ADR 的 notify-only。
 
 ### D6. 启动自动检查(#214/#217;O2=B 后继刀)
 

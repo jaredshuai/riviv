@@ -28,6 +28,12 @@ resvg = "0.48.1"
 # ADR)。0.0.x 无 semver 承诺 → 精确锁,版本升级一律独立票;registry feature
 # 默认开(带 pixel decode),传递面 av1/heif/core 以探针树为准。
 oxideav-avif = "=0.0.15"
+# 更新「下载+验签」信任锚(#237/ADR 0009):Ed25519 pinned-key 验签,纯逻辑层。
+# 零依赖单叶 crate;opt_size = 算术层 inline(never),舍速度换体积(单次更新
+# 非热路径);精确锁,版本升级一律独立票(spike #235 E2 实测 +30,208 B 探针口径)
+ed25519-compact = { version = "=2.6.0", default-features = false, features = [
+    "opt_size",
+] }
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Globalization",
@@ -48,6 +54,9 @@ windows = { version = "0.62", features = [
     # 系统组件、1607 地板自带
     "Win32_Networking_WinHttp",
     "Win32_System_Com",
+    # self-replace helper 的继承句柄读回(GetStdHandle,#237)——kernel32
+    # 自带,零新 DLL
+    "Win32_System_Console",
     "Win32_System_DataExchange",
     "Win32_System_Environment",
     "Win32_System_LibraryLoader",

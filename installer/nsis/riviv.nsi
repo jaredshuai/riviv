@@ -161,6 +161,21 @@ Function .onInit
 
 no_existing_install_dir:
 
+	;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+	; #237: the in-app update path passes the CURRENT install dir explicitly.
+	; Without this, $INSTDIR defaults to Program Files and the uninstall-key
+	; restore above never fires (nothing writes that key today) — an update
+	; over a custom-dir install would silently install a second copy and
+	; strand the old one.
+	;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+	ClearErrors
+	${GetOptions} $CMDLINE "/installdir" $R1
+	IfErrors no_update_installdir
+	StrCpy $INSTDIR $R1
+
+no_update_installdir:
+
 	; get the existing ini filename.
 	StrCpy $existing_ini_filename "$APPDATA\riviv\riviv.ini"
 

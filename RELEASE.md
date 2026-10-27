@@ -46,3 +46,12 @@
 - **发版**（v0.2.0 实走 2026-09-30;v0.3.0 复走同链 2026-10-02 零改动零意外;v0.4.0 复走同链 2026-10-02,新知=在仓库目录外(资产暂存目录)跑 `gh release create` 须带 `-R jaredshuai/riviv`,否则 `no git remotes found`;v0.5.0 复走同链 2026-10-06,新知=**三语安装器须 `installer/build-installer.ps1` 跑三遍**(`-Lang Chinese`/`ChineseTraditional`/`English` 各一遍,#203 起单语言单 exe 语义),发布命令随之增至四资产;v0.6.0 复走同链 2026-10-07 零新知(发布 exe 机器面 QA=资源版本/启动/干净退出探针照跑,4/4);v0.7.0 复走同链 2026-10-23,新知=**发版字节以发版全量干净重构建为准**——PR 期间的合并态/双臂实测若落在后续代码修复提交之前,绝对值会漂(#220 arm B 实录 8,529,920 B 系 e119d78 修复前中间代码态;v0.7.0 发版全量干净构建主仓库 target 与 worktree 双口径一致 = 8,523,264 B,AVIF 净增量 +1,626,112 B ≈ +1.55 MiB,ADR 0008/README/AGENTS 基线数字已随发版同步 PR 订正;v0.8.0 复走同链 2026-10-24 零意外,新知=**说明稿截图随发版 PR 入库 `docs/assets/`**(截图探针先 SetProcessDPIAware 再 GetWindowRect,否则 unaware 虚拟化把窗口坐标折半;四资产上传后下载回验 SHA,与机器面 QA 过的 staged exe 逐字节同源)):`git push origin vX.Y.Z` 推 annotated tag → `gh release create vX.Y.Z -R jaredshuai/riviv --title "…" --notes-file <说明稿> --latest <portable.exe> <zh-CN-Setup.exe> <zh-TW-Setup.exe> <en-US-Setup.exe>`——四资产一次上传,Latest 标记即时生效;portable 资产=release exe 改名复制。
 - v0.1.0 为网页手建(无命令留档,历史形态)。
 - **未验证**的仅剩:安装包对外发布命令自动化(以上 CLI 为单机手工链;无 CI 发版流水线,CI 仅跑门禁 #93)。本机试打（`installer/build-installer.ps1`）不等于发版。
+
+### 签名仪式(#237 起,ADR 0009;**首个带签名资产的发版生效**——下个版本即首验)
+
+工具 = `tools/riviv-sign/`(仓内独立小工程,`cd tools/riviv-sign && cargo build --release` 出 `target/release/riviv-sign.exe`;有意不做主 crate 第二 [[bin]],防 feature 合并污染 ship 构建)。
+
+1. **密钥(一次性,#237 实现时已做)**:`riviv-sign keygen <seed-file>` 生成生产钥;公钥 hex 已嵌 `src/sig.rs::PUBKEY_HEX`。私钥 seed 文件**离线双拷、永不入库、不进构建**;丢失/泄漏事故预案与换钥语义见 ADR 0009 D7(换钥=改代码发版,老版本内置更新断供,用户手动过渡一次)。
+2. **发版新步骤**(插在四资产构建后、`gh release create` 前):staging 目录内逐资产 `riviv-sign sign <seed> vX.Y.Z <asset>` → 产出 `<asset>.sig`(raw 64 B)×4;被签消息 = `"riviv-update-v1\n"+tag+"\n"+资产名+"\n"+资产字节`(域分离,与客户端 `src/sig.rs` 同构——跨实现向量钉测在主 crate 测试网)。
+3. **上传面 4+4=8 文件**:`gh release create` 资产列表追加四个 `.sig`。
+4. **回验环节升格**(机械面不变量 +1):四资产上传后,下载 exe+sig → `riviv-sign verify <pubkey-hex> vX.Y.Z <exe> <sig>` 全部 VERIFY-OK → 再按既有 SHA 对拍(与 staged QA exe 同源)。此步 = signer↔client 消息构造同构的端到端哨兵。

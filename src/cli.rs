@@ -28,19 +28,23 @@ use crate::playlist::SortMode;
 /// One tokenizer word (string.c:804-835): the unquoted text. Whether the
 /// raw word STARTED with a quote (viv.c:4801-4806's `was_quote`) is the
 /// caller's to read off the slice BEFORE consuming the word.
+/// `self_replace`'s helper-line scan reads `text` too (same tokenizer,
+/// one grammar).
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Word {
-    text: Vec<u16>,
+pub(crate) struct Word {
+    pub(crate) text: Vec<u16>,
 }
 
-/// `wchar_is_ws` (wchar.c:37-47).
-fn is_ws(c: u16) -> bool {
+/// `wchar_is_ws` (wchar.c:37-47). Also `self_replace`'s helper-line
+/// scan (same tokenizer, one grammar).
+pub(crate) fn is_ws(c: u16) -> bool {
     c == b' ' as u16 || c == b'\t' as u16 || c == b'\r' as u16 || c == b'\n' as u16
 }
 
 /// `string_get_word` + `string_skip_ws` in one step: consume the next
 /// word starting at `i`, leaving `i` past the following whitespace.
-fn next_word(cl: &[u16], i: &mut usize) -> Word {
+/// Also `self_replace`'s helper-line scan (same tokenizer, one grammar).
+pub(crate) fn next_word(cl: &[u16], i: &mut usize) -> Word {
     let mut text = Vec::new();
     let mut quoted = false;
     while *i < cl.len() {

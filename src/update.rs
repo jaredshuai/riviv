@@ -40,8 +40,8 @@ use windows::Win32::Networking::WinHttp::{
 use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{
-    IDYES, MB_ICONERROR, MB_ICONINFORMATION, MB_ICONQUESTION, MB_OK, MB_YESNO, MESSAGEBOX_STYLE,
-    MessageBoxW, PostMessageW, SW_SHOWNORMAL, WM_APP,
+    IDNO, IDYES, MB_ICONERROR, MB_ICONINFORMATION, MB_ICONQUESTION, MB_OK, MB_YESNOCANCEL,
+    MESSAGEBOX_STYLE, MessageBoxW, PostMessageW, SW_SHOWNORMAL, WM_APP,
 };
 use windows::core::PCWSTR;
 
@@ -85,8 +85,10 @@ static REPLY_QUEUE: Mutex<VecDeque<Outcome>> = Mutex::new(VecDeque::new());
 pub(crate) enum Outcome {
     /// The latest release is at or below the running version.
     UpToDate,
-    /// A strictly newer release exists; the payload is the tag minus
-    /// the leading `v` (the dialog composes it into the localized text).
+    /// A strictly newer release exists; the payload is the RAW tag
+    /// spelling ("v0.9.0" — the install flow's download URL and the
+    /// signature's domain separation both key on it, #237; the
+    /// presentation sites strip the `v` for display).
     Available(String),
     /// The network failed or the response was unparseable. A separate
     /// user-level category from ADR 0001's image-load failure — that
@@ -147,9 +149,7 @@ pub(crate) fn decide(current: &str, latest_tag: &str) -> Outcome {
     // the server-side tag stays strict (cubic #211 P3).
     let current = current.split_once('-').map_or(current, |(v, _)| v);
     match (parse_semver(current), parse_semver(latest_tag)) {
-        (Some(c), Some(l)) if l > c => {
-            Outcome::Available(latest_tag.trim_start_matches('v').to_string())
-        }
+        (Some(c), Some(l)) if l > c => Outcome::Available(latest_tag.to_string()),
         (Some(_), Some(_)) => Outcome::UpToDate,
         _ => Outcome::Failed,
     }
@@ -360,10 +360,15 @@ pub(crate) fn on_reply(hwnd: HWND) {
                 MB_ICONINFORMATION | MB_OK,
             );
         }
-        Outcome::Available(version) if manual => {
-            let text = loc::get(loc::Id::UpdateNewVersionText).replace("%s", &version);
+        Outcome::Available(tag) if manual => {
+            let version = tag.trim_start_matches('v');
+            let text = loc::get(loc::Id::UpdateNewVersionText).replace("%s", version);
             let text_wide = to_wide(&text);
             let caption = to_wide(loc::get(loc::Id::AppName));
+            // The three-button form (#237; ADR 0009 D8, P4=A): YES =
+            // download+verify+install (the full trusted channel), NO =
+            // the notify-only escape hatch (open the releases page),
+            // CANCEL = just dismiss.
             // SAFETY: both buffers outlive the modal call; hwnd is the
             // live owner.
             let choice = unsafe {
@@ -371,11 +376,13 @@ pub(crate) fn on_reply(hwnd: HWND) {
                     Some(hwnd),
                     PCWSTR(text_wide.as_ptr()),
                     PCWSTR(caption.as_ptr()),
-                    MB_ICONQUESTION | MB_YESNO,
+                    MB_ICONQUESTION | MB_YESNOCANCEL,
                 )
             };
-            if choice == IDYES {
-                open_releases_page(hwnd);
+            match choice {
+                IDYES => crate::update_install::begin_install(hwnd, tag.clone()),
+                IDNO => open_releases_page(hwnd),
+                _ => {}
             }
         }
         Outcome::Failed if manual => {
@@ -390,8 +397,9 @@ pub(crate) fn on_reply(hwnd: HWND) {
         // the daily gate re-notifies on the next day's launch, so one
         // missed flash (replaced by a panscan flash, status bar off,
         // fullscreen slideshow) has no lasting cost.
-        Outcome::Available(version) => {
-            let text = loc::get(loc::Id::UpdateAvailableTemp).replace("%s", &version);
+        Outcome::Available(tag) => {
+            let text =
+                loc::get(loc::Id::UpdateAvailableTemp).replace("%s", tag.trim_start_matches('v'));
             crate::window::status_set_temp_text(hwnd, Some(text));
         }
         Outcome::UpToDate | Outcome::Failed => {}
@@ -433,12 +441,20 @@ fn open_releases_page(hwnd: HWND) {
     };
 }
 
-/// The unsafe shell: one GET over WinHTTP with a UA header (GitHub's
-/// API rejects UA-less requests) and hard timeouts. Every failure maps
+/// The streaming sink `winhttp_get` feeds: `(chunk, bytes_before_chunk)`,
+/// Err aborts the transfer (budget breach or write failure — the sink
+/// owns both destination and budget).
+pub(crate) type ChunkSink<'a> = &'a mut dyn FnMut(&[u8], usize) -> Result<(), ()>;
+
+/// The unsafe transport shell shared by every update GET (#237 factored
+/// the #210 original): one GET over WinHTTP with a UA header (GitHub's
+/// API rejects UA-less requests) and hard timeouts, streaming every
+/// chunk to `on_chunk` until EOF — the sink owns both destination and
+/// budget, and its Err aborts the transfer. Every transport failure maps
 /// to Err — network failures are expected and user-level (ADR 0007
 /// D1/D3), with the GetLastError stage breadcrumbed to stderr as the
 /// smoke/diagnostic channel.
-fn fetch_latest_body() -> Result<String, ()> {
+pub(crate) fn winhttp_get(host: &str, path: &str, on_chunk: ChunkSink<'_>) -> Result<(), ()> {
     // RAII so every early return closes what was opened; drop order
     // below is request -> connect -> session (children before the
     // session), and the guard tolerates the null of an aborted open.
@@ -457,7 +473,7 @@ fn fetch_latest_body() -> Result<String, ()> {
             // SAFETY: reads the calling thread's last error immediately
             // after the failed call.
             let code = unsafe { GetLastError() }.0;
-            eprintln!("update check: {} failed (GetLastError={code})", $stage);
+            eprintln!("update: {} failed (GetLastError={code})", $stage);
             return Err(());
         }};
     }
@@ -486,7 +502,7 @@ fn fetch_latest_body() -> Result<String, ()> {
     if unsafe { WinHttpSetTimeouts(session.0, 5_000, 5_000, 5_000, 10_000) }.is_err() {
         fail!("WinHttpSetTimeouts");
     }
-    let host = to_wide(API_HOST);
+    let host = to_wide(host);
     // SAFETY: host is NUL-terminated; session.0 is the live session.
     let connect = unsafe {
         WinHttpConnect(
@@ -501,10 +517,12 @@ fn fetch_latest_body() -> Result<String, ()> {
     }
     let connect = Handle(connect);
     let verb = to_wide("GET");
-    let path = to_wide(API_PATH);
+    let path = to_wide(path);
     // SAFETY: verb/path are NUL-terminated; null version/referrer and a
     // null accept-types array select the documented defaults (HTTP/1.1,
     // no referer, no Accept header); connect.0 is the live connection.
+    // The default redirect policy follows same-scheme 302s — the
+    // release-assets CDN chain, proven by spike #235 E3.
     let request = unsafe {
         WinHttpOpenRequest(
             connect.0,
@@ -538,7 +556,7 @@ fn fetch_latest_body() -> Result<String, ()> {
     if unsafe { WinHttpReceiveResponse(request.0, std::ptr::null_mut()) }.is_err() {
         fail!("WinHttpReceiveResponse");
     }
-    let mut body: Vec<u8> = Vec::new();
+    let mut total = 0usize;
     loop {
         let mut avail: u32 = 0;
         // SAFETY: avail is the out-param; request.0 is live.
@@ -547,13 +565,6 @@ fn fetch_latest_body() -> Result<String, ()> {
         }
         if avail == 0 {
             break;
-        }
-        if !body_fits(body.len(), avail as usize) {
-            eprintln!(
-                "update check: response exceeds the {} B budget",
-                MAX_BODY_BYTES
-            );
-            return Err(());
         }
         let mut chunk = vec![0u8; avail as usize];
         let mut read: u32 = 0;
@@ -568,8 +579,27 @@ fn fetch_latest_body() -> Result<String, ()> {
             break;
         }
         chunk.truncate(read as usize);
-        body.extend_from_slice(&chunk);
+        on_chunk(&chunk, total)?;
+        total += read as usize;
     }
+    Ok(())
+}
+
+/// The check's fetch: the full API body in memory within the D4 budget
+/// (`winhttp_get`'s memory sink; #210's original, factored #237).
+fn fetch_latest_body() -> Result<String, ()> {
+    let mut body: Vec<u8> = Vec::new();
+    winhttp_get(API_HOST, API_PATH, &mut |chunk, _| {
+        if !body_fits(body.len(), chunk.len()) {
+            eprintln!(
+                "update check: response exceeds the {} B budget",
+                MAX_BODY_BYTES
+            );
+            return Err(());
+        }
+        body.extend_from_slice(chunk);
+        Ok(())
+    })?;
     // GitHub's API is UTF-8; a hostile body that is not decodes lossily
     // into something tag-less, which decide() maps to Failed anyway.
     Ok(String::from_utf8_lossy(&body).into_owned())
@@ -638,7 +668,9 @@ mod tests {
         assert!(matches!(decide("0.5.0", "v0.5.0"), Outcome::UpToDate));
         assert!(matches!(decide("0.5.0", "v0.4.0"), Outcome::UpToDate));
         match decide("0.5.0", "v0.6.0") {
-            Outcome::Available(v) => assert_eq!(v, "0.6.0"),
+            Outcome::Available(v) => {
+                assert_eq!(v, "v0.6.0", "the raw tag spelling rides along (#237)")
+            }
             other => panic!("expected Available, got {other:?}"),
         }
         assert!(matches!(decide("0.5.0", "garbage"), Outcome::Failed));
@@ -650,7 +682,7 @@ mod tests {
             Outcome::UpToDate
         ));
         match decide("1.0.0-beta.1", "v1.1.0") {
-            Outcome::Available(v) => assert_eq!(v, "1.1.0"),
+            Outcome::Available(v) => assert_eq!(v, "v1.1.0"),
             other => panic!("expected Available, got {other:?}"),
         }
         assert!(matches!(decide("0.5.0", "v1.0.0-rc1"), Outcome::Failed));

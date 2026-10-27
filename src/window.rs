@@ -135,6 +135,7 @@ use crate::text::{
     temp_slideshow_rate_text, title_wide, to_wide,
 };
 use crate::update;
+use crate::update_install;
 use crate::zoom::{FitPolicy, View, Viewport};
 use windows::Win32::System::Power::{
     ES_CONTINUOUS, ES_DISPLAY_REQUIRED, ES_SYSTEM_REQUIRED, SetThreadExecutionState,
@@ -9661,6 +9662,12 @@ unsafe extern "system" fn wnd_proc(
             update::on_reply(hwnd);
             LRESULT(0)
         }
+        // #237: the update INSTALL flight's reply (WM_APP+5 — +4's
+        // sibling, same payload-free contract over its own queue).
+        update_install::INSTALL_REPLY_MESSAGE => {
+            update_install::on_install_reply(hwnd);
+            LRESULT(0)
+        }
         WM_CLOSE => {
             // #80 design §9: the -dump-viewport intent renders the current
             // viewport scene BEFORE the teardown; then the ordinary close
@@ -10011,6 +10018,19 @@ pub(crate) fn run() -> Result<(), String> {
     if crate::assoc::process_install_command_line(&mut config) {
         return Ok(());
     }
+    // The self-update helper's short-circuit (#237; ADR 0009 D5): the
+    // OLD instance launches the staging exe with `-update-self-to
+    // <orig>` and THIS process must never reach the single-instance
+    // gate below — the old instance still owns the RIVIV mutex, so a
+    // helper that reached the gate would be forwarded to the old
+    // window as a "second instance" line and silently discarded (#109's
+    // load-bearing interaction). Same position discipline as the
+    // installer's /install pass above; the helper exits here with its
+    // own exit code (0 = the swap completed).
+    if let Some(orig) = crate::self_replace::parse_helper_line(&crate::assoc::command_line_wide()) {
+        let code = crate::self_replace::run_helper(&orig);
+        std::process::exit(code as i32);
+    }
     // The single-instance gate (#21; upstream viv.c:5278-5341 — config
     // first, viv.c:5261 → 5278, class registration after): with
     // multiple_instances off (the default), a second process hands its
@@ -10126,6 +10146,21 @@ pub(crate) fn run() -> Result<(), String> {
     } else {
         None // multiple_instances=1: no mutex is created at all (viv.c:5278)
     };
+    // The update-staging sweep (#237; ADR 0009 D5): delete leftover
+    // `riviv-update-*.exe` staging files and `<exe>.old` backups from
+    // interrupted flights — the previous helper's own image could not
+    // be deleted while it ran. Two directories: beside the exe
+    // (portable staging + the replace backup) and %TEMP% (the
+    // installed flavor's Setup staging). Failures are ignored (a
+    // still-running Setup or a straggler old image is simply retried
+    // next launch).
+    if let Some(dir) = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+    {
+        crate::self_replace::sweep_staging(&dir);
+    }
+    crate::self_replace::sweep_staging(&std::env::temp_dir());
     // The decode worker, started once per process before any load is
     // requested (at most one decode is ever active — see `loadthread.rs`).
     // A spawn failure is system-level: fail loud (ADR 0001) via run's Err —
