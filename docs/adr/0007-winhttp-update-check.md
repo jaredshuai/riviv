@@ -1,8 +1,8 @@
 # ADR 0007: 应用内更新检查(notify-only)——WinHTTP 静态导入
 
 - 日期: 2026-10-06
-- 状态: 已接受(O1:A / O2:A / O3:A / O4:A / O5:A / O6:A 全按推荐,用户拍板 2026-10-06「全按推荐」;实现票 #210;spike #208 证据电池 `docs/spikes/s-auto-update.md`。**O2 后继刀已落**:启动自动检查经 #214 spike(`docs/spikes/s-startup-update-check.md`)P1-P4 全按推荐,用户拍板 2026-10-07「全按推荐」,实现票 #217,决策 = D6)
-- 范围: Help→Check for Updates 的网络栈选型与导入面、回执协议、失败语义;**不含**下载/安装/portable 自替换(O1=B/C 留作后继刀)。启动自动检查原为 O2=B 留作后继刀,**已由 D6 裁定落地**(#214/#217)
+- 状态: 已接受(O1:A / O2:A / O3:A / O4:A / O5:A / O6:A 全按推荐,用户拍板 2026-10-06「全按推荐」;实现票 #210;spike #208 证据电池 `docs/spikes/s-auto-update.md`。**O2 后继刀已落**:启动自动检查经 #214 spike(`docs/spikes/s-startup-update-check.md`)P1-P4 全按推荐,用户拍板 2026-10-07「全按推荐」,实现票 #217,决策 = D6。**O1 后继刀已落(#237)**:下载+验签+安装信任锚,用户拍板 2026-10-26 P1-P4 全按推荐,见 [ADR 0009](0009-trusted-download-install.md))
+- 范围: Help→Check for Updates 的网络栈选型与导入面、回执协议、失败语义;下载/安装/portable 自替换原为 O1=B/C 留作后继刀,**已由 ADR 0009(#237)落地**(本 ADR 的传输壳被其参数化为 `winhttp_get` 共用);启动自动检查原为 O2=B 留作后继刀,**已由 D6 裁定落地**(#214/#217)
 - 上游权威: #208 spike(横评/PE 基线/依赖原则核对)、AGENTS「依赖原则」第 6 条(系统能力装机≈100% 且无授权费)、s1-platform-floor(新增 DLL 静态导入须 dumpbin 证据并写 ADR)、ADR 0001(错误处理姿态的边界——本 ADR 明确其**不**裁更新网络失败)
 
 ## 背景
@@ -30,11 +30,11 @@ ADR 0001 的用户级 = 图片加载失败且规定**不弹框**;更新网络失
 
 ### D4. 解析与比较 = 手写纯函数,严苛失败
 
-不引 serde/semver crate:响应手解析 `"tag_name":"vX.Y.Z"` 单字段(宽容字段序/空白,值形状严格);semver 三元数值比较(**数值比较非字典序**,0.10>0.9 钉测);任何畸形(含非 200 的错误 JSON——其中无 tag_name)→ Failed,永不出假「有新版」。读体上限 64 KB(敌意面纪律);跳过 HTTP 状态码查询 FFI(非 200 体无 tag_name 自然落 Failed,少一处签名面)。
+不引 serde/semver crate:响应手解析 `"tag_name":"vX.Y.Z"` 单字段(宽容字段序/空白,值形状严格);semver 三元数值比较(**数值比较非字典序**,0.10>0.9 钉测);任何畸形(含非 200 的错误 JSON——其中无 tag_name)→ Failed,永不出假「有新版」。读体上限 64 KB(敌意面纪律);跳过 HTTP 状态码查询 FFI(非 200 体无 tag_name 自然落 Failed,少一处签名面)。**#237 订正**:传输壳参数化为共享 `winhttp_get` 后统一加了 HTTP 200 门(资产下载需要;检查路径的 Failed 语义不变,只是失败更早、面包屑更干净——本条「自然落 Failed」作为设计理由已被取代,签名面代价随共享壳摊销)。
 
 ### D5. notify-only 边界
 
-「打开下载页」= ShellExecuteW 开 `https://github.com/jaredshuai/riviv/releases/latest`(canonical 永远指向最新,无需解析 html_url)。riviv **永不下载、永不校验、永不替换**任何文件——GitHub `assets[].digest` 是 integrity-only(与二进制同信任域,#208 R4),称「已验证下载」前须另立信任锚,那是 O1=B 的前置而非本刀的事。
+「打开下载页」= ShellExecuteW 开 `https://github.com/jaredshuai/riviv/releases/latest`(canonical 永远指向最新,无需解析 html_url)。riviv **永不下载、永不校验、永不替换**任何文件——GitHub `assets[].digest` 是 integrity-only(与二进制同信任域,#208 R4),称「已验证下载」前须另立信任锚,那是 O1=B 的前置而非本刀的事。**后继刀已落(#237)**:信任锚 = Ed25519 pinned-key 域分离验签,手动 Available 框升三钮(是=下载验签安装/否=仅开页/取消),详见 [ADR 0009](0009-trusted-download-install.md);启动 flash 维持本 ADR 的 notify-only。
 
 ### D6. 启动自动检查(#214/#217;O2=B 后继刀)
 

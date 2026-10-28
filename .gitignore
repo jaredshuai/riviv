@@ -1,4 +1,5 @@
 /target
+/tools/riviv-sign/target
 
 # 可重建的本地索引 / 工具私有目录
 .codegraph/

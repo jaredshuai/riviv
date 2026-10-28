@@ -1,0 +1,22 @@
+[package]
+name = "riviv-sign"
+version = "0.1.0"
+edition = "2024"
+description = "riviv release signing tool (#237) — keygen/sign/verify over the domain-separated update message"
+license = "MIT"
+publish = false
+
+# 独立小工程,#237 载重决策:不得做主 crate 第二 [[bin]]——同一构建图内 cargo 的
+# feature 合并会把签名侧 feature 并进 ship 构建污染最小面(spike #235)。
+[dependencies]
+# 与主 crate 同版同档精确锁;sign/keygen 侧同 crate 零额外面
+ed25519-compact = { version = "=2.6.0", default-features = false, features = [
+    "opt_size",
+] }
+# keygen 的 OS 随机源(ProcessPrng, bcryptprimitives.dll)——仅本工具用,
+# 主 crate 不启用此 feature,不进 ship 构建
+windows = { version = "0.62", features = ["Win32_Security_Cryptography"] }
+
+[profile.release]
+lto = "thin"
+strip = true

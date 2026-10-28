@@ -125,7 +125,9 @@ mod pixels;
 mod playlist;
 mod preload;
 mod rename_dlg;
+mod self_replace;
 mod shell;
+mod sig;
 mod slideshow;
 mod status;
 mod surface;
@@ -135,6 +137,7 @@ mod tile;
 mod toolbar;
 mod transform_stage;
 mod update;
+mod update_install;
 mod window;
 mod zoom;
 
