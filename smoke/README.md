@@ -18,11 +18,12 @@
 powershell -NoProfile -ExecutionPolicy Bypass -File smoke\smoke237-trusted-update.ps1 [-NewExe <path>] [-OldExe <path>] [-ProbeExe <path>]
 ```
 
-参数默认指向本仓开发机路径(`-NewExe`/`-OldExe`/`-SignExe`/`-Repo` 见脚本
-param 块)——他机运行前三个 exe 参数**必给**,否则 S0 以 `MISSING EXE` 退 2;
-`-ProbeExe` 缺省为空则 S3/S5/S7 按 BLOCKED 略过(探针 = 临时 worktree 把版本改
-0.0.1 构建的 exe,用完即删)。S0 前置门会**杀掉 staged 路径下的在跑 riviv**
-进程并复建 staged 目录(0 线程墓碑放行)。
+参数默认指向本仓开发机路径(见脚本 param 块)——他机运行 `-NewExe`/`-OldExe`
+**必给**(缺一 S0 以 `MISSING EXE` 退 2);`-SignExe` 缺失不挡 S0,只使 S4 按
+BLOCKED 略过;`-ProbeExe`(0.0.1 探针)**缺省时脚本自建**:`git worktree add
+--detach` 打 `$Repo`/`$Branch`、版本改 0.0.1、构建后复制并删除 worktree(构建
+失败才使 S3/S5/S7 按 BLOCKED 略过)。S0 前置门会**杀掉 staged 路径下的在跑
+riviv** 进程并复建 staged 目录(0 线程墓碑放行)。
 
 场景(S0-S7;新 exe 与 v0.8.0 基线臂 exe 双臂,断言全部 SHA 对拍不用版本号;
 S3/S5/S7 走真实 GitHub 渠道,网络不可达时如实 BLOCKED):S1 helper 自替换端到端

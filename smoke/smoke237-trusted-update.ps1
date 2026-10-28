@@ -1216,7 +1216,7 @@ if ($ok7) {
     $stagedOutsideExeDir = ($crumb7.Contains('update install: fetching')) -and (-not $crumb7.Contains($S7Dir))
     $res7left = @(Get-Residue $env:TEMP) + @(Get-Residue $S7Dir)
     $dummyOk = (Test-Path (Join-Path $S7Dir 'Uninstall.exe'))
-    $ok7 = $up7 -and $txtOk7 -and ($code7 -eq 0) -and $fetchOk -and $flavorOk -and ($res7left.Count -eq 0) -and $dummyOk
+    $ok7 = $up7 -and $txtOk7 -and ($code7 -eq 0) -and $fetchOk -and $flavorOk -and $stagedOutsideExeDir -and ($res7left.Count -eq 0) -and $dummyOk
     Det 'S7.arm' $ok7 ('failedBox=[' + (Fmt20 $txt7b) + '] exit=' + $code7 + ' fetchBreadcrumb=' + $fetchOk + ' flavorInstalled=' + $flavorOk + ' stagingNotBesideExe=' + $stagedOutsideExeDir + ' residue=' + ($res7left -join ';') + ' dummyUninstallIntact=' + $dummyOk)
     if ($ok7) {
         $ev7 = 'Installed probe: yes -> localized Setup fetch [' + $setupName + '] -> failed box; zero staging residue (%TEMP% + exe dir), dummy Uninstall.exe untouched, exit 0'
