@@ -18,6 +18,12 @@
 powershell -NoProfile -ExecutionPolicy Bypass -File smoke\smoke237-trusted-update.ps1 [-NewExe <path>] [-OldExe <path>] [-ProbeExe <path>]
 ```
 
+参数默认指向本仓开发机路径(`-NewExe`/`-OldExe`/`-SignExe`/`-Repo` 见脚本
+param 块)——他机运行前三个 exe 参数**必给**,否则 S0 以 `MISSING EXE` 退 2;
+`-ProbeExe` 缺省为空则 S3/S5/S7 按 BLOCKED 略过(探针 = 临时 worktree 把版本改
+0.0.1 构建的 exe,用完即删)。S0 前置门会**杀掉 staged 路径下的在跑 riviv**
+进程并复建 staged 目录(0 线程墓碑放行)。
+
 场景(S0-S7;新 exe 与 v0.8.0 基线臂 exe 双臂,断言全部 SHA 对拍不用版本号;
 S3/S5/S7 走真实 GitHub 渠道,网络不可达时如实 BLOCKED):S1 helper 自替换端到端
 (`-update-self-to` 短路先于 RIVIV mutex——持锁真窗口在场时换体仍落地;P/Invoke
@@ -29,7 +35,8 @@ Available(2/6/7)+「是」→下载失败框(渠道无 .sig);S4 riviv-sign 篡�
 (rc1 VERIFY-FAIL/原样 VERIFY-OK);S5 写拒绝目录臂;S7 Installed 形态语言臂
 (哑 Uninstall.exe 邻接 → 本地化 Setup 资产名随框文案语言,%TEMP% staging 不
 落 exe 目录);S6 smoke78 回归 + 旧文案钉检查(只报告)。退出码:0 无 FAIL /
-1 有 FAIL / 2 缺 exe / 4 外来活 riviv。日志
+1 有 FAIL / 2 缺 exe / 4 环境门(staged 根目录清不掉、非 staged 路径的外来活
+riviv 在场、或清扫后仍有 staged riviv 存活——三者任一)。日志
 `%TEMP%\riviv-237-smoke\smoke237.log`。
 
 ## smoke126-renderer.ps1(#126 `-renderer` sticky 开关 + dump output_gen)

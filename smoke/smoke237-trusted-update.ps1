@@ -287,7 +287,7 @@ function Test-FailText($s) {
 # honest BLOCKED marker for the network arms - seeing it means the real
 # channel is unreachable, not that the wiring is wrong.
 $zhCheck = -join @([char]0x66F4, [char]0x65B0, [char]0x68C0, [char]0x67E5, [char]0x5931, [char]0x8D25)      # zh-CN
-$zhCheckTw = -join @([char]0x66F4, [char]0x65B0, [char]0x6AA2, [char]0x67E5, [char]0x5931, [char]0x8D25)   # zh-Hant
+$zhCheckTw = -join @([char]0x66F4, [char]0x65B0, [char]0x6AA2, [char]0x67E5, [char]0x5931, [char]0x6557)   # zh-Hant
 function Test-CheckFailText($s) {
     return $s.Contains('Update check failed') -or $s.Contains($zhCheck) -or $s.Contains($zhCheckTw)
 }
