@@ -423,18 +423,25 @@ fn fetch_sig(path: &str) -> Result<[u8; 64], ()> {
 /// Stream one asset to disk within the 128 MB budget, deleting the
 /// partial on any failure (the network-failure row of ADR 0009 D6).
 ///
-/// The file is created WITHOUT delete-sharing (`FILE_SHARE_READ` only —
-/// a std `File::create` shares delete POSIX-style) and the handle is
-/// RETURNED OPEN as the flight's staging guard: from the first written
-/// byte until the handoff drops it, another instance's startup sweep
-/// cannot delete this staging file (review #238 codex r3/cubic P2 —
-/// the sweep race degrades to a harmless no-op instead of eating a
-/// live flight's download/verify/launch).
+/// Returns the flight's staging GUARD: after the stream lands, the
+/// write handle is dropped and the file is REOPENED `GENERIC_READ`
+/// with `FILE_SHARE_READ` only (no delete-sharing — a std open shares
+/// delete POSIX-style). That read-only guard is held through verify
+/// and the handoff, so a concurrent instance's startup sweep cannot
+/// delete a live flight's staging file (review #238 codex r3/cubic).
+/// It must be READ access at the end: the helper/Setup launch maps the
+/// image while the guard is still open, and an image open coexists
+/// with a read-sharing holder but NOT with a WRITE-access holder
+/// (cubic #238 round 4 — the loader does not share write). The
+/// drop-write/reopen-read seam is a microsecond window back to the
+/// pre-guard state; a sweep hit there degrades to the same fail-soft
+/// retry.
 fn fetch_to_file(path: &str, dest: &Path) -> Result<std::fs::File, ()> {
     use std::os::windows::io::FromRawHandle;
+    use windows::Win32::Foundation::GENERIC_READ;
     use windows::Win32::Foundation::GENERIC_WRITE;
     use windows::Win32::Storage::FileSystem::{
-        CREATE_ALWAYS, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ,
+        CREATE_ALWAYS, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, OPEN_EXISTING,
     };
     let dest_w = to_wide(&dest.to_string_lossy());
     // SAFETY: dest_w is NUL-terminated and live; the Result-wrapped
@@ -477,12 +484,44 @@ fn fetch_to_file(path: &str, dest: &Path) -> Result<std::fs::File, ()> {
         total += chunk.len();
         Ok(())
     });
+    drop(file); // the write handle's job is done (and must not survive
+    // into the launch — see the doc above)
     if result.is_err() {
-        drop(file); // release our own no-delete handle before removing
         let _ = std::fs::remove_file(dest);
-        Err(())
-    } else {
-        Ok(file)
+        return Err(());
+    }
+    // The guard: reopen read-only, no delete-sharing. Held through
+    // verify and handoff (the caller drops it after the helper/Setup
+    // image is mapped).
+    // SAFETY: dest_w is NUL-terminated and live; the file exists (the
+    // stream just landed); the Result-wrapped handle is checked before
+    // the File takes sole ownership.
+    let guard = unsafe {
+        CreateFileW(
+            PCWSTR(dest_w.as_ptr()),
+            GENERIC_READ.0,
+            FILE_SHARE_READ,
+            None,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            None,
+        )
+    };
+    match guard {
+        Ok(h) => {
+            // SAFETY: h is a fresh valid handle we own; the File takes
+            // exclusive ownership (no double close).
+            Ok(unsafe { std::fs::File::from_raw_handle(h.0 as _) })
+        }
+        Err(e) => {
+            eprintln!(
+                "update install: reopening {} as the staging guard failed: {e} (proceeding unguarded)",
+                dest.display()
+            );
+            // Unguarded continuation: the sweep race is a fail-soft
+            // degradation, not worth failing the whole flight over.
+            std::fs::File::open(dest).map_err(|_| ())
+        }
     }
 }
 
