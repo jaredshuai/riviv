@@ -144,11 +144,18 @@ pub(crate) enum InstallOutcome {
     /// confirm box).
     Ready {
         flavor: Flavor,
-        /// The verified staging file (`riviv-update-<tag>.exe`).
+        /// The verified staging file (`riviv-update-<tag>-<pid>.exe`).
         staged: PathBuf,
         /// The running exe's directory (the Setup relay's /installdir;
         /// the portable arm reads current_exe itself).
         install_dir: PathBuf,
+        /// The staging GUARD: an open no-delete-share handle on the
+        /// staged file, held from download through the handoff so a
+        /// concurrent startup sweep cannot delete a live flight's
+        /// file (review #238 codex r3). Dropped right after the
+        /// handoff call returns — by then the helper/Setup image is
+        /// mapped and protects itself.
+        guard: Option<std::fs::File>,
     },
     /// Network/disk class (the staging partial is already deleted).
     DownloadFailed,
@@ -233,10 +240,14 @@ fn run_install(tag: &str) -> InstallOutcome {
         Err(_) => return InstallOutcome::DownloadFailed,
     };
     // 2. The asset, streaming to disk within the 128 MB budget; a
-    //    failed transfer deletes its partial.
-    if fetch_to_file(&dl_path(tag, &asset, false), &staged).is_err() {
-        return InstallOutcome::DownloadFailed;
-    }
+    //    failed transfer deletes its partial. The returned open handle
+    //    is the staging GUARD (no delete-sharing) — held through
+    //    verify and into the handoff so a concurrent startup sweep
+    //    cannot eat a live flight's file (review #238 codex r3).
+    let guard = match fetch_to_file(&dl_path(tag, &asset, false), &staged) {
+        Ok(g) => g,
+        Err(_) => return InstallOutcome::DownloadFailed,
+    };
     // 3. Verify on the completed byte stream (ADR 0009 D3: verify after
     //    the stream lands, never mid-flight). The message binds tag +
     //    asset name, so a replayed or substituted artifact fails here.
@@ -244,6 +255,7 @@ fn run_install(tag: &str) -> InstallOutcome {
         Ok(b) => b,
         Err(e) => {
             eprintln!("update install: reading back {}: {e}", staged.display());
+            drop(guard); // release our own no-delete handle first
             let _ = std::fs::remove_file(&staged);
             return InstallOutcome::DownloadFailed;
         }
@@ -253,6 +265,7 @@ fn run_install(tag: &str) -> InstallOutcome {
             "update install: signature check FAILED — {asset} tag={tag} against pubkey {}… (download deleted, nothing executed)",
             &crate::sig::PUBKEY_HEX[..16]
         );
+        drop(guard); // release our own no-delete handle first
         let _ = std::fs::remove_file(&staged);
         let _ = std::fs::remove_file(&sig_path);
         return InstallOutcome::SigFailed;
@@ -264,6 +277,7 @@ fn run_install(tag: &str) -> InstallOutcome {
         flavor,
         staged,
         install_dir: exe_dir,
+        guard: Some(guard),
     }
 }
 
@@ -278,6 +292,7 @@ pub(crate) fn on_install_reply(hwnd: HWND) {
         InstallOutcome::Ready {
             flavor: Flavor::Portable,
             staged,
+            guard,
             ..
         } => {
             // No second confirm — the three-button YES already committed
@@ -289,12 +304,17 @@ pub(crate) fn on_install_reply(hwnd: HWND) {
                     loc::get(loc::Id::UpdateReplaceFailedText),
                     MB_ICONERROR | MB_OK,
                 );
+                drop(guard); // release our own no-delete handle first
                 let _ = std::fs::remove_file(&staged);
                 return;
             };
             if crate::self_replace::spawn_helper(&staged, &orig) {
+                // The helper's image is mapped now — it protects itself;
+                // the guard's job (sweep protection) is done.
+                drop(guard);
                 close_self(hwnd);
             } else {
+                drop(guard); // release our own no-delete handle first
                 crate::update::show_box(
                     hwnd,
                     loc::get(loc::Id::UpdateReplaceFailedText),
@@ -307,6 +327,7 @@ pub(crate) fn on_install_reply(hwnd: HWND) {
             flavor: Flavor::Installed,
             staged,
             install_dir,
+            guard,
         } => {
             // The one pre-launch notice (the spike's adopted box):
             // riviv closes and the installer runs. Cancel keeps the
@@ -338,6 +359,7 @@ pub(crate) fn on_install_reply(hwnd: HWND) {
                     false,
                 ) {
                     eprintln!("update install: launching the Setup failed: {e}");
+                    drop(guard); // release our own no-delete handle first
                     let _ = std::fs::remove_file(&staged);
                     crate::update::show_box(
                         hwnd,
@@ -346,8 +368,12 @@ pub(crate) fn on_install_reply(hwnd: HWND) {
                     );
                     return;
                 }
+                // The Setup's image is mapped (its process creation ran
+                // inside shell_execute) — it protects itself now.
+                drop(guard);
                 close_self(hwnd);
             } else {
+                drop(guard); // release our own no-delete handle first
                 let _ = std::fs::remove_file(&staged);
             }
         }
@@ -396,10 +422,45 @@ fn fetch_sig(path: &str) -> Result<[u8; 64], ()> {
 
 /// Stream one asset to disk within the 128 MB budget, deleting the
 /// partial on any failure (the network-failure row of ADR 0009 D6).
-fn fetch_to_file(path: &str, dest: &Path) -> Result<(), ()> {
-    let mut file = std::fs::File::create(dest).map_err(|e| {
-        eprintln!("update install: create {}: {e}", dest.display());
-    })?;
+///
+/// The file is created WITHOUT delete-sharing (`FILE_SHARE_READ` only —
+/// a std `File::create` shares delete POSIX-style) and the handle is
+/// RETURNED OPEN as the flight's staging guard: from the first written
+/// byte until the handoff drops it, another instance's startup sweep
+/// cannot delete this staging file (review #238 codex r3/cubic P2 —
+/// the sweep race degrades to a harmless no-op instead of eating a
+/// live flight's download/verify/launch).
+fn fetch_to_file(path: &str, dest: &Path) -> Result<std::fs::File, ()> {
+    use std::os::windows::io::FromRawHandle;
+    use windows::Win32::Foundation::GENERIC_WRITE;
+    use windows::Win32::Storage::FileSystem::{
+        CREATE_ALWAYS, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ,
+    };
+    let dest_w = to_wide(&dest.to_string_lossy());
+    // SAFETY: dest_w is NUL-terminated and live; the Result-wrapped
+    // handle is checked before use and owned by the File built from it
+    // (closed exactly once on drop).
+    let raw = unsafe {
+        CreateFileW(
+            PCWSTR(dest_w.as_ptr()),
+            GENERIC_WRITE.0,
+            FILE_SHARE_READ,
+            None,
+            CREATE_ALWAYS,
+            FILE_ATTRIBUTE_NORMAL,
+            None,
+        )
+    };
+    let raw = match raw {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("update install: create {}: {e}", dest.display());
+            return Err(());
+        }
+    };
+    // SAFETY: raw is a fresh valid handle we own; the File takes
+    // exclusive ownership (no double close).
+    let mut file = unsafe { std::fs::File::from_raw_handle(raw.0 as _) };
     let mut total = 0usize;
     let result = crate::update::winhttp_get(DL_HOST, path, &mut |chunk, _| {
         if !asset_fits(total, chunk.len()) {
@@ -417,9 +478,12 @@ fn fetch_to_file(path: &str, dest: &Path) -> Result<(), ()> {
         Ok(())
     });
     if result.is_err() {
+        drop(file); // release our own no-delete handle before removing
         let _ = std::fs::remove_file(dest);
+        Err(())
+    } else {
+        Ok(file)
     }
-    result
 }
 
 #[cfg(test)]
