@@ -5,6 +5,19 @@ history by git-cliff (cliff.toml is the policy; do not hand-edit the output).
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+## [0.9.0] - 2026-10-29
+### Added
+
+- Feat(update): #237 下载+验签+安装信任锚——ed25519 域分离验签+双形态安装+riviv-sign (77a0e8c)
+### Fixed
+
+- Fix(smoke): #233 评审采纳——空 ProductVersion 哨兵防断言退化 (c8bd688)
+- Fix(update): #238 评审处置——spawn_helper 引号 appname 必败(P1 实证)+清扫补 .tmp 盲区+孪生函数收敛+D8/D9 引用订正 (ab51bcd)
+- Fix(update): #238 bot 评审二轮处置——cubic 20+4/codex 4:采纳 15 项,证据反驳 3 项,3 项已先修 (0154eb6)
+- Fix(update): #238 codex r3 P1——staging 护柄:FILE_SHARE_READ 无删除共享句柄横跨下载→验签→交接,他实例清扫结构性拒删在飞文件 (5cf8a67)
+- Fix(smoke/docs): #238 漏轮处置——cubic 05:54×3/06:21×7/14:47×2 (39db662)
+- Fix(update): #238 cubic r4 P1——护柄改读开:写柄若存活到交接,镜像加载(不共享写)即共享冲突;下载毕弃写柄重开 GENERIC_READ 无删除共享,本机探针三连证(读开下启动 code 0+删除被拒) (8a6dac1)
+
 ## [0.8.0] - 2026-10-24
 ### Added
 
